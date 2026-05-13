@@ -159,8 +159,8 @@ Work with all backends.
 | **punctuate-all** | Punctuation restoration | XLM-RoBERTa-base (12L, d=768), 6 classes | 12 languages | MIT | [`cstr/punctuate-all-GGUF`](https://huggingface.co/cstr/punctuate-all-GGUF) |
 | **PCS** | Punc + truecase + SBD | XLM-RoBERTa-base (12L), 4 heads | 47 languages | Apache-2.0 | `--punc-model pcs` |
 | **truecaser&#8209;lstm** | German truecasing (best) | BiLSTM char-level (2×150, 3.2 MB, 97.9% F1) | German | Apache-2.0 | `--truecase-model lstm` |
-| **truecaser&#8209;crf** | German truecasing | CRF + context features (24 MB) | German | MIT | `--truecase-model crf` |
-| **truecaser&#8209;de** | German truecasing (simple) | Statistical word-frequency (375K entries, 9 MB) | German | MIT | `--truecase-model auto` |
+| **truecaser&#8209;crf** | German truecasing | CRF + context features (8.5 MB) | German | MIT | `--truecase-model crf` |
+| **truecaser&#8209;de** | German truecasing (simple) | Statistical word-frequency (71K entries, 1.7 MB) | German | MIT | `--truecase-model auto` |
 | **CLD3** | Text language ID | Embedding-bag → FC + ReLU → softmax (~1.5 MB F32) | 109 ISO 639-1 | Apache-2.0 | [`cstr/cld3-GGUF`](https://huggingface.co/cstr/cld3-GGUF) |
 | **GlotLID-V3** | Text language ID | fastText supervised, flat softmax | 2102 ISO 639-3 + script | Apache-2.0 | [`cstr/glotlid-GGUF`](https://huggingface.co/cstr/glotlid-GGUF) |
 | **LID-176** | Text language ID | fastText supervised, hierarchical softmax | 176 ISO 639-1 | CC-BY-SA-3.0 | [`cstr/fasttext-lid176-GGUF`](https://huggingface.co/cstr/fasttext-lid176-GGUF) |
