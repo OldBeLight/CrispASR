@@ -3309,13 +3309,8 @@ CA_EXPORT int crispasr_detect_language_pcm(const float* samples, int32_t n_sampl
 //   * -1 — invalid args (null pointer, n_threads <= 0, out_cap < 1).
 //   *  1 — dispatcher init failure (bad GGUF, unsupported architecture).
 //   *  2 — output buffer too small for the predicted label.
-CA_EXPORT int crispasr_text_detect_language(
-    const char* text,
-    const char* model_path,
-    int32_t n_threads,
-    char* out_label_buf,
-    int32_t out_label_cap,
-    float* out_confidence) {
+CA_EXPORT int crispasr_text_detect_language(const char* text, const char* model_path, int32_t n_threads,
+                                            char* out_label_buf, int32_t out_label_cap, float* out_confidence) {
     if (!text || !model_path || !out_label_buf || out_label_cap <= 0)
         return -1;
     if (n_threads <= 0)
