@@ -23,6 +23,7 @@ struct CrispasrRegistryEntry {
     std::string approx_size; // human-readable (e.g. "~467 MB")
     std::string companion_filename;
     std::string companion_url;
+    std::string license; // empty = permissive; non-empty = printed to stderr on download
 };
 
 /// Look up a registry entry by backend name. Returns true on hit.

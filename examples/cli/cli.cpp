@@ -759,7 +759,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.target_lang.c_str());
     fprintf(stderr, "             --no-punctuation       [%-7s] disable punctuation (canary, cohere)\n",
             params.punctuation ? "false" : "true");
-    fprintf(stderr, "             --punc-model FNAME     [%-7s] FireRedPunc GGUF (or 'auto' to download)\n",
+    fprintf(stderr,
+            "             --punc-model FNAME     [%-7s] punctuation GGUF: auto|firered|fullstop|punctuate-all\n",
             params.punc_model.c_str());
     fprintf(stderr, "             --flush-after N        [%-7d] flush SRT to stdout every N segments (0=all at end)\n",
             params.flush_after);

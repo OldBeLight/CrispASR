@@ -1006,6 +1006,16 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 "fireredpunc-q4_k.gguf",
                 "https://huggingface.co/cstr/fireredpunc-GGUF/resolve/main/fireredpunc-q4_k.gguf", params.no_prints,
                 "crispasr[punc]", params.cache_dir);
+        } else if (punc_path == "fullstop") {
+            punc_path = crispasr_cache::ensure_cached_file(
+                "fullstop-punc-q4_k.gguf",
+                "https://huggingface.co/cstr/fullstop-punc-multilang-GGUF/resolve/main/fullstop-punc-q4_k.gguf",
+                params.no_prints, "crispasr[punc]", params.cache_dir);
+        } else if (punc_path == "punctuate-all") {
+            punc_path = crispasr_cache::ensure_cached_file(
+                "punctuate-all-q4_k.gguf",
+                "https://huggingface.co/cstr/punctuate-all-GGUF/resolve/main/punctuate-all-q4_k.gguf", params.no_prints,
+                "crispasr[punc]", params.cache_dir);
         }
         if (!punc_path.empty()) {
             punc_ctx.reset(fireredpunc_init(punc_path.c_str()));

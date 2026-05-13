@@ -109,7 +109,7 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_moonshine_streaming_backend();
     if (name == "gemma4-e2b" || name == "gemma4e2b" || name == "gemma4")
         return crispasr_make_gemma4_e2b_backend();
-    if (name == "moonshine")
+    if (name == "moonshine" || name == "moonshine-de" || name == "moonshine-tiny-de")
         return crispasr_make_moonshine_backend();
     if (name.rfind("omniasr", 0) == 0)
         return crispasr_make_omniasr_backend();

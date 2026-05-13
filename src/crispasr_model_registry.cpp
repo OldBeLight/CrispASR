@@ -17,6 +17,7 @@ struct Entry {
     const char* approx_size;
     const char* companion_file; // optional extra file (e.g. tokenizer.bin, primary voice). NULL if none.
     const char* companion_url;
+    const char* license; // NULL = permissive (MIT/Apache/etc.), non-NULL = printed to stderr on download
 };
 
 // Extra companion files beyond the single inline `companion_file/url` slot.
@@ -97,6 +98,18 @@ constexpr Entry k_registry[] = {
     {"moonshine", "moonshine-tiny-q4_k.gguf",
      "https://huggingface.co/cstr/moonshine-tiny-GGUF/resolve/main/moonshine-tiny-q4_k.gguf", "~20 MB",
      "tokenizer.bin", "https://huggingface.co/cstr/moonshine-tiny-GGUF/resolve/main/tokenizer.bin"},
+    // moonshine-de: fidoriel/moonshine-base-de fine-tune (61.5M, 6.9% WER
+    // on CV22-de). Best quality German moonshine. CC-BY-NC-SA-4.0.
+    {"moonshine-de", "moonshine-base-de-fidoriel-q4_k.gguf",
+     "https://huggingface.co/cstr/moonshine-base-de-fidoriel-GGUF/resolve/main/moonshine-base-de-fidoriel-q4_k.gguf", "~39 MB",
+     "tokenizer.bin", "https://huggingface.co/cstr/moonshine-base-de-fidoriel-GGUF/resolve/main/tokenizer.bin",
+     "CC-BY-NC-SA-4.0"},
+    // moonshine-tiny-de: fidoriel/moonshine-tiny-de fine-tune (27M, 11.4%
+    // WER on CV22-de). Smaller/faster alternative. CC-BY-NC-SA-4.0.
+    {"moonshine-tiny-de", "moonshine-tiny-de-fidoriel-q4_k.gguf",
+     "https://huggingface.co/cstr/moonshine-tiny-de-fidoriel-GGUF/resolve/main/moonshine-tiny-de-fidoriel-q4_k.gguf", "~17 MB",
+     "tokenizer.bin", "https://huggingface.co/cstr/moonshine-tiny-de-fidoriel-GGUF/resolve/main/tokenizer.bin",
+     "CC-BY-NC-SA-4.0"},
     {"wav2vec2-de", "wav2vec2-large-xlsr-53-german-q4_k.gguf",
      "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-german-GGUF/resolve/main/wav2vec2-large-xlsr-53-german-q4_k.gguf",
      "~222 MB", nullptr, nullptr},
@@ -493,6 +506,7 @@ void fill(CrispasrRegistryEntry& out, const Entry& e, const std::string& preferr
         out.companion_filename.clear();
         out.companion_url.clear();
     }
+    out.license = e.license ? e.license : "";
 }
 
 const ExtraCompanion* find_extras(const char* backend) {
@@ -513,6 +527,12 @@ void download_extras(const Entry& e, bool quiet, const std::string& cache_dir_ov
         return;
     for (const ExtraCompanion* it = extras; it->file && it->url; ++it) {
         crispasr_cache::ensure_cached_file(it->file, it->url, quiet, "crispasr", cache_dir_override);
+    }
+}
+
+void print_license_note(const CrispasrRegistryEntry& e, bool quiet) {
+    if (!quiet && !e.license.empty()) {
+        fprintf(stderr, "crispasr: note: %s is licensed %s (non-commercial)\n", e.filename.c_str(), e.license.c_str());
     }
 }
 
@@ -613,10 +633,12 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
             if (!dl.empty() && !match.companion_filename.empty() && !match.companion_url.empty())
                 crispasr_cache::ensure_cached_file(match.companion_filename, match.companion_url, quiet, "crispasr",
                                                    cache_dir_override);
-            if (!dl.empty())
+            if (!dl.empty()) {
                 if (const Entry* match_entry =
                         !backend_name.empty() ? find_by_backend(backend_name) : find_by_filename(model_arg))
                     download_extras(*match_entry, quiet, cache_dir_override);
+                print_license_note(match, quiet);
+            }
             return dl;
         }
         // Either no registry match or caller didn't authorise download —
@@ -643,9 +665,11 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
     }
     // Backend-specific extras (e.g. kokoro German backbone + voice) — opt-in
     // per backend via k_extras.
-    if (!result.empty())
+    if (!result.empty()) {
         if (const Entry* entry = find_by_backend(backend_name))
             download_extras(*entry, quiet, cache_dir_override);
+        print_license_note(e, quiet);
+    }
 
     return result;
 }
