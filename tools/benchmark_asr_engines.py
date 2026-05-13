@@ -95,6 +95,7 @@ JFK_REF = (
 GGUF_DIR = Path("/Volumes/backups/ai/crispasr")
 GGUF_FILES = {
     "q4_k": "parakeet-tdt-0.6b-v3-q4_k.gguf",
+    "q5_0": "parakeet-tdt-0.6b-v3-q5_0.gguf",
     "q8_0": "parakeet-tdt-0.6b-v3-q8_0.gguf",
     "f16":  "parakeet-tdt-0.6b-v3.gguf",  # repo's non-quant is f16-sized
 }
