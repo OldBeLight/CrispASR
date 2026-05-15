@@ -135,6 +135,7 @@ jobs:
           - firered-asr2-aed
           - glm-asr-nano
           - cohere-transcribe
+          - granite-speech-4.1-2b
     steps:
       - uses: actions/checkout@v4
 

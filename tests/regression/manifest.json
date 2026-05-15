@@ -34,7 +34,7 @@
       "name": "moonshine-tiny",
       "backend_id": "moonshine",
       "skip_diff": true,
-      "_skip_diff_note": "Awaiting Kaggle rebake to produce ref.gguf. Remove skip_diff and add fixture_ref_path + diff_thresholds once uploaded.",
+      "_skip_diff_note": "Reference backend available at tools/reference_backends/moonshine.py. Run dump_reference.py --backend moonshine --model-dir usefulsensors/moonshine-tiny --audio samples/jfk.wav to generate ref.gguf, upload to cstr/crispasr-regression-fixtures, then remove skip_diff.",
       "gguf": {
         "repo": "cstr/moonshine-tiny-GGUF",
         "revision": "28281de882bac021e9241e640f44a9a289607e03",
@@ -49,7 +49,7 @@
       "name": "moonshine-base",
       "backend_id": "moonshine",
       "skip_diff": true,
-      "_skip_diff_note": "Awaiting Kaggle rebake.",
+      "_skip_diff_note": "Reference backend available at tools/reference_backends/moonshine.py (same as moonshine-tiny, just change model-dir to usefulsensors/moonshine-base). Upload ref.gguf to cstr/crispasr-regression-fixtures to graduate.",
       "gguf": {
         "repo": "cstr/moonshine-base-GGUF",
         "revision": "bfb1ef9865b9f83f35f050ab03e5e9ddaf736b7b",
@@ -149,6 +149,21 @@
       "sample": "samples/jfk.wav",
       "expected_transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.",
       "expected_transcript_source": "captured 2026-05-15 with HF revision b9bcdb1, CPU-only, samples/jfk.wav"
+    },
+    {
+      "name": "granite-speech-4.1-2b",
+      "backend_id": "granite",
+      "skip_diff": true,
+      "_skip_diff_note": "Awaiting Kaggle rebake. Note: IBM Granite NLE outputs lowercase without punctuation.",
+      "gguf": {
+        "repo": "cstr/granite-speech-4.1-2b-GGUF",
+        "revision": "7ee888f67b68fd6a25af5903ca5b3829ca32c215",
+        "file": "granite-speech-4.1-2b-q4_k.gguf",
+        "approx_size_mb": 2806
+      },
+      "sample": "samples/jfk.wav",
+      "expected_transcript": "and so my fellow americans ask not what your country can do for you ask what you can do for your country",
+      "expected_transcript_source": "captured 2026-05-15 with HF revision 7ee888f, CPU-only, samples/jfk.wav. IBM Granite NLE outputs normalised lowercase without punctuation."
     }
   ]
 }

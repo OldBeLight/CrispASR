@@ -273,6 +273,24 @@ catch_discover_tests(test-chatterbox-params
     PROPERTIES LABELS "unit;chatterbox"
 )
 
+# ─── test-qwen3-tts-cv-style — Catch2 unit tests for qwen3_tts_set_cv_style_instruct
+# (issue #91: --instruct silently ignored for CustomVoice models).
+# Exercises null-ctx guards and default-params sanity — no GGUF needed. ─────
+add_executable(test-qwen3-tts-cv-style
+    test-qwen3-tts-cv-style.cpp
+)
+target_include_directories(test-qwen3-tts-cv-style PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-qwen3-tts-cv-style PRIVATE
+    Catch2::Catch2WithMain
+    qwen3_tts
+)
+catch_discover_tests(test-qwen3-tts-cv-style
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;qwen3-tts"
+)
+
 # ─── test - flash - attn - defaults — Catch2 unit tests for the PLAN #89
 # flash_attn-field plumbing across every backend with use_gpu.
 # Auto-skips backends not built into the current libcrispasr slice

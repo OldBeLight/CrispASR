@@ -57,6 +57,7 @@
 #include "chatterbox.h"
 #include "lid_cld3.h"
 #include "lid_fasttext.h"
+#include "moonshine.h"
 
 #include "common-crispasr.h"
 
@@ -635,6 +636,23 @@ static std::string chatterbox_find_s3gen(const std::string& model_path) {
     return "";
 }
 
+// ---- moonshine ----
+
+static StageResult moonshine_encoder_r(moonshine_context* ctx, const float* samples, int n_samples) {
+    StageResult r;
+    float* out = nullptr;
+    int seq_len = 0, hidden_dim = 0;
+    if (moonshine_encode(ctx, samples, n_samples, &out, &seq_len, &hidden_dim) != 0 || !out) {
+        r.note = "moonshine_encode failed";
+        return r;
+    }
+    r.shape = {seq_len, hidden_dim};
+    r.data.assign(out, out + (size_t)seq_len * hidden_dim);
+    free(out);
+    r.ok = true;
+    return r;
+}
+
 } // namespace
 
 
@@ -715,7 +733,7 @@ int main(int argc, char** argv) {
                 "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, "
                 "granite-4.1, "
                 "granite-nle, parakeet, chatterbox, "
-                "canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus\n"
+                "canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine\n"
                 "  model.gguf    crispasr-compatible model weights\n"
                 "  reference.gguf  archive produced by tools/dump_reference.py\n"
                 "  audio.wav     16 kHz mono WAV\n",
@@ -2545,6 +2563,31 @@ int main(int argc, char** argv) {
             free(our_data);
         }
         snac_decoder_free(ctx);
+    } else if (backend_name == "moonshine" || backend_name == "moonshine-streaming") {
+        // Moonshine (UsefulSensors tiny/base). Streaming variant uses the same
+        // encoder API, so both map here. The diff harness only checks the
+        // encoder output stage; transcript regression is in the nightly matrix.
+        moonshine_init_params mp{};
+        mp.model_path = model_path.c_str();
+        mp.tokenizer_path = nullptr;
+        mp.n_threads = 4;
+        moonshine_context* ctx = moonshine_init_with_params(mp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load moonshine model '%s'\n", model_path.c_str());
+            return 4;
+        }
+
+        auto enc_r = moonshine_encoder_r(ctx, samples.data(), (int)samples.size());
+        if (enc_r.ok) {
+            auto rep = ref.compare("encoder_output", enc_r.data.data(), enc_r.data.size());
+            print_row("encoder_output", rep, COS_THRESHOLD);
+            record(rep);
+        } else {
+            printf("[ERR ] encoder_output          %s\n", enc_r.note.c_str());
+            n_fail++;
+        }
+
+        moonshine_free(ctx);
     } else if (backend_name == "lid-cld3") {
         // CLD3 text-LID. Input text rides in ref metadata under "input_text"
         // (set by tools/reference_backends/lid_cld3.py from LID_TEXT or
@@ -2594,11 +2637,12 @@ int main(int argc, char** argv) {
         }
         lid_cld3_free(ctx);
     } else {
-        fprintf(stderr,
-                "crispasr-diff: backend '%s' is not recognised. "
-                "Supported: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, granite-4.1, "
-                "granite-nle, parakeet, canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, lid-cld3.\n",
-                backend_name.c_str());
+        fprintf(
+            stderr,
+            "crispasr-diff: backend '%s' is not recognised. "
+            "Supported: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, granite-4.1, "
+            "granite-nle, parakeet, canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, lid-cld3.\n",
+            backend_name.c_str());
         return 5;
     }
 
