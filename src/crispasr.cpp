@@ -871,6 +871,12 @@ struct whisper_segment {
     std::vector<whisper_token_data> tokens;
 
     bool speaker_turn_next;
+
+    // Parallel to `tokens` when wparams.alt_n > 0 (greedy decode).
+    // alts[i] is the top-N alternative-candidate list for tokens[i].
+    // May be shorter than tokens (or empty) when capture was off or
+    // the path through whisper didn't populate it.
+    std::vector<std::vector<whisper_alt_token>> alts;
 };
 
 struct whisper_batch {
@@ -1191,6 +1197,10 @@ struct whisper_grammar_candidate {
 
 struct whisper_sequence {
     std::vector<whisper_token_data> tokens;
+
+    // Parallel to `tokens` when wparams.alt_n > 0 (greedy decode).
+    // Beam search leaves this empty.
+    std::vector<std::vector<whisper_alt_token>> alts;
 
     // the accumulated transcription in the current iteration (used to truncate the tokens array)
     int result_len;
@@ -6271,6 +6281,8 @@ struct whisper_full_params whisper_full_default_params(enum whisper_sampling_str
         /*.vad_model_path              =*/nullptr,
 
         /* vad_params =*/whisper_vad_default_params(),
+
+        /*.alt_n =*/0,
     };
 
     switch (strategy) {
@@ -6345,6 +6357,9 @@ static int whisper_wrap_segment(struct whisper_context& ctx, struct whisper_stat
             state.result_all.back().text = std::move(text);
             state.result_all.back().t1 = token.t0;
             state.result_all.back().tokens.resize(i);
+            if ((int)state.result_all.back().alts.size() > i) {
+                state.result_all.back().alts.resize(i);
+            }
             state.result_all.back().speaker_turn_next = false;
 
             state.result_all.push_back({});
@@ -6354,6 +6369,10 @@ static int whisper_wrap_segment(struct whisper_context& ctx, struct whisper_stat
             // add tokens [i, end] to the new segment
             state.result_all.back().tokens.insert(state.result_all.back().tokens.end(), segment.tokens.begin() + i,
                                                   segment.tokens.end());
+            if (i < (int)segment.alts.size()) {
+                state.result_all.back().alts.insert(state.result_all.back().alts.end(), segment.alts.begin() + i,
+                                                    segment.alts.end());
+            }
 
             state.result_all.back().speaker_turn_next = segment.speaker_turn_next;
 
@@ -6698,7 +6717,43 @@ static bool whisper_sequence_tokens_equal(const whisper_sequence& a, const whisp
     return true;
 }
 
-static whisper_token_data whisper_sample_token(whisper_context& ctx, const whisper_decoder& decoder, bool best) {
+// Pick the top-`n` alternative candidates from `probs`, excluding the
+// chosen token id, and write them descending-by-probability into `out`.
+// Cheap because n is tiny (capped at 5 by the C-ABI layer); a small
+// partial-sort would also work but std::vector + nth-pass keeps the
+// dependency surface minimal.
+static void whisper_collect_top_alts(const std::vector<float>& probs, int n_logits, int chosen_id, int n,
+                                     std::vector<whisper_alt_token>& out) {
+    out.clear();
+    if (n <= 0 || n_logits <= 0) {
+        return;
+    }
+    out.reserve(n);
+    for (int i = 0; i < n_logits; ++i) {
+        if (i == chosen_id) {
+            continue;
+        }
+        const float p = probs[i];
+        if (p <= 0.0f || p == -INFINITY) {
+            continue;
+        }
+        if ((int)out.size() < n) {
+            out.push_back({(whisper_token)i, p});
+            // Bubble up to maintain descending-by-p order on each insert.
+            for (int k = (int)out.size() - 1; k > 0 && out[k].p > out[k - 1].p; --k) {
+                std::swap(out[k], out[k - 1]);
+            }
+        } else if (p > out.back().p) {
+            out.back() = {(whisper_token)i, p};
+            for (int k = (int)out.size() - 1; k > 0 && out[k].p > out[k - 1].p; --k) {
+                std::swap(out[k], out[k - 1]);
+            }
+        }
+    }
+}
+
+static whisper_token_data whisper_sample_token(whisper_context& ctx, const whisper_decoder& decoder, bool best,
+                                               int alt_n = 0, std::vector<whisper_alt_token>* out_alts = nullptr) {
     whisper_token_data result = {
         0, 0, 0.0f, 0.0f, 0.0f, 0.0f, -1, -1, -1, 0.0f,
     };
@@ -6749,6 +6804,12 @@ static whisper_token_data whisper_sample_token(whisper_context& ctx, const whisp
     if (result.id >= vocab.token_beg) {
         result.tid = result.id;
         result.pt = result.p;
+    }
+
+    if (out_alts && alt_n > 0) {
+        whisper_collect_top_alts(probs, n_logits, result.id, alt_n, *out_alts);
+    } else if (out_alts) {
+        out_alts->clear();
     }
 
     return result;
@@ -7320,6 +7381,7 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                 auto& decoder = state->decoders[j];
 
                 decoder.sequence.tokens.clear();
+                decoder.sequence.alts.clear();
                 decoder.sequence.result_len = 0;
                 decoder.sequence.sum_logprobs_all = 0.0;
                 decoder.sequence.sum_logprobs = -INFINITY;
@@ -7474,10 +7536,22 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
 
                             switch (params.strategy) {
                             case whisper_sampling_strategy::CRISPASR_SAMPLING_GREEDY: {
+                                // Greedy / sampled paths can both capture top-N
+                                // alternatives — they share the same probs[]
+                                // and a single chosen token. Beam search below
+                                // doesn't (siblings ≠ alternatives).
+                                std::vector<whisper_alt_token> tmp_alts;
+                                std::vector<whisper_alt_token>* alts_out =
+                                    params.alt_n > 0 ? &tmp_alts : nullptr;
                                 if (t_cur < 1e-6f) {
-                                    decoder.sequence.tokens.push_back(whisper_sample_token(*ctx, decoder, true));
+                                    decoder.sequence.tokens.push_back(
+                                        whisper_sample_token(*ctx, decoder, true, params.alt_n, alts_out));
                                 } else {
-                                    decoder.sequence.tokens.push_back(whisper_sample_token(*ctx, decoder, false));
+                                    decoder.sequence.tokens.push_back(
+                                        whisper_sample_token(*ctx, decoder, false, params.alt_n, alts_out));
+                                }
+                                if (params.alt_n > 0) {
+                                    decoder.sequence.alts.push_back(std::move(tmp_alts));
                                 }
 
                                 decoder.sequence.sum_logprobs_all += decoder.sequence.tokens.back().plog;
@@ -7793,6 +7867,11 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                     }
 
                     decoder.sequence.tokens.resize(decoder.sequence.result_len);
+                    // Keep alts ≤ tokens; truncated entries are dropped along
+                    // with the tokens they belonged to.
+                    if ((int)decoder.sequence.alts.size() > decoder.sequence.result_len) {
+                        decoder.sequence.alts.resize(decoder.sequence.result_len);
+                    }
                     whisper_sequence_score(params, decoder.sequence);
 
                     CRISPASR_LOG_DEBUG(
@@ -7919,9 +7998,12 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
 
                             //printf("tt0 = %d, tt1 = %d, text = %s, token = %s, token_id = %d, tid = %d\n", tt0, tt1, text.c_str(), ctx->vocab.id_to_token[tokens_cur[i].id].c_str(), tokens_cur[i].id, tokens_cur[i].tid);
 
-                            result_all.push_back({tt0, tt1, text, state->no_speech_prob, {}, speaker_turn_next});
+                            result_all.push_back({tt0, tt1, text, state->no_speech_prob, {}, speaker_turn_next, {}});
                             for (int j = i0; j <= i; j++) {
                                 result_all.back().tokens.push_back(tokens_cur[j]);
+                                if (j < (int)best_decoder.sequence.alts.size()) {
+                                    result_all.back().alts.push_back(best_decoder.sequence.alts[j]);
+                                }
                             }
 
                             int n_new = 1;
@@ -7965,9 +8047,12 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                         }
                     }
 
-                    result_all.push_back({tt0, tt1, text, state->no_speech_prob, {}, speaker_turn_next});
+                    result_all.push_back({tt0, tt1, text, state->no_speech_prob, {}, speaker_turn_next, {}});
                     for (int j = i0; j < (int)tokens_cur.size(); j++) {
                         result_all.back().tokens.push_back(tokens_cur[j]);
+                        if (j < (int)best_decoder.sequence.alts.size()) {
+                            result_all.back().alts.push_back(best_decoder.sequence.alts[j]);
+                        }
                     }
 
                     int n_new = 1;
@@ -8328,6 +8413,63 @@ float whisper_full_get_token_p_from_state(struct whisper_state* state, int i_seg
 
 float whisper_full_get_token_p(struct whisper_context* ctx, int i_segment, int i_token) {
     return ctx->state->result_all[i_segment].tokens[i_token].p;
+}
+
+// Top-N alternative token candidates: bounds-check both axes (segment +
+// token + alt index) and return safe defaults — alts are an optional
+// signal so missing data isn't an error condition.
+int whisper_full_get_token_n_alts_from_state(struct whisper_state* state, int i_segment, int i_token) {
+    if (!state || i_segment < 0 || i_segment >= (int)state->result_all.size()) {
+        return 0;
+    }
+    const auto& seg = state->result_all[i_segment];
+    if (i_token < 0 || i_token >= (int)seg.alts.size()) {
+        return 0;
+    }
+    return (int)seg.alts[i_token].size();
+}
+
+int whisper_full_get_token_n_alts(struct whisper_context* ctx, int i_segment, int i_token) {
+    return ctx ? whisper_full_get_token_n_alts_from_state(ctx->state, i_segment, i_token) : 0;
+}
+
+whisper_token whisper_full_get_token_alt_id_from_state(struct whisper_state* state, int i_segment, int i_token,
+                                                       int i_alt) {
+    if (!state || i_segment < 0 || i_segment >= (int)state->result_all.size()) {
+        return 0;
+    }
+    const auto& seg = state->result_all[i_segment];
+    if (i_token < 0 || i_token >= (int)seg.alts.size()) {
+        return 0;
+    }
+    const auto& a = seg.alts[i_token];
+    if (i_alt < 0 || i_alt >= (int)a.size()) {
+        return 0;
+    }
+    return a[i_alt].id;
+}
+
+whisper_token whisper_full_get_token_alt_id(struct whisper_context* ctx, int i_segment, int i_token, int i_alt) {
+    return ctx ? whisper_full_get_token_alt_id_from_state(ctx->state, i_segment, i_token, i_alt) : 0;
+}
+
+float whisper_full_get_token_alt_p_from_state(struct whisper_state* state, int i_segment, int i_token, int i_alt) {
+    if (!state || i_segment < 0 || i_segment >= (int)state->result_all.size()) {
+        return 0.0f;
+    }
+    const auto& seg = state->result_all[i_segment];
+    if (i_token < 0 || i_token >= (int)seg.alts.size()) {
+        return 0.0f;
+    }
+    const auto& a = seg.alts[i_token];
+    if (i_alt < 0 || i_alt >= (int)a.size()) {
+        return 0.0f;
+    }
+    return a[i_alt].p;
+}
+
+float whisper_full_get_token_alt_p(struct whisper_context* ctx, int i_segment, int i_token, int i_alt) {
+    return ctx ? whisper_full_get_token_alt_p_from_state(ctx->state, i_segment, i_token, i_alt) : 0.0f;
 }
 
 float whisper_full_get_segment_no_speech_prob(struct whisper_context* ctx, int i_segment) {

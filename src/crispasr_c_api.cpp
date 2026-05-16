@@ -283,6 +283,67 @@ CA_EXPORT float crispasr_token_p(whisper_context* ctx, int i_seg, int i_tok) {
 }
 
 // =========================================================================
+// Alternative-candidate tokens (`alt_n` knob, greedy decode only)
+// =========================================================================
+//
+// Whisper's per-step softmax produces a full distribution over the vocab;
+// `whisper_full_get_token_data` returns just the chosen token. When
+// `wparams.alt_n > 0` (set via crispasr_params_set_alt_n), the decoder
+// also stashes the top-N runner-up candidates so consumers can build
+// tap-to-pick UIs for ambiguous proper nouns / technical jargon. Beam
+// search is excluded (siblings are beam-conditional, not greedy alts).
+CA_EXPORT void crispasr_params_set_alt_n(whisper_full_params* p, int n) {
+    if (p)
+        p->alt_n = n < 0 ? 0 : (n > 32 ? 32 : n); // sanity clamp; UI caps at 5
+}
+
+CA_EXPORT int crispasr_token_n_alts(whisper_context* ctx, int i_seg, int i_tok) {
+    if (!ctx)
+        return 0;
+    return whisper_full_get_token_n_alts(ctx, i_seg, i_tok);
+}
+
+CA_EXPORT int32_t crispasr_token_alt_id(whisper_context* ctx, int i_seg, int i_tok, int i_alt) {
+    if (!ctx)
+        return 0;
+    return (int32_t)whisper_full_get_token_alt_id(ctx, i_seg, i_tok, i_alt);
+}
+
+CA_EXPORT float crispasr_token_alt_p(whisper_context* ctx, int i_seg, int i_tok, int i_alt) {
+    if (!ctx)
+        return 0.0f;
+    return whisper_full_get_token_alt_p(ctx, i_seg, i_tok, i_alt);
+}
+
+// Resolve alt token id to its display string via whisper's vocab. Writes
+// into the caller's buffer; returns bytes written (excluding NUL), 0
+// on empty / out-of-range, or -1 when the buffer is too small. Mirrors
+// the registry-lookup ABI's "fill caller buffer" convention.
+CA_EXPORT int crispasr_token_alt_text(whisper_context* ctx, int i_seg, int i_tok, int i_alt, char* out, int out_cap) {
+    if (!ctx || !out || out_cap <= 0)
+        return -1;
+    const int n = whisper_full_get_token_n_alts(ctx, i_seg, i_tok);
+    if (i_alt < 0 || i_alt >= n) {
+        if (out_cap > 0)
+            out[0] = '\0';
+        return 0;
+    }
+    const whisper_token id = whisper_full_get_token_alt_id(ctx, i_seg, i_tok, i_alt);
+    const char* t = whisper_token_to_str(ctx, id);
+    if (!t) {
+        out[0] = '\0';
+        return 0;
+    }
+    const int len = (int)std::strlen(t);
+    if (len + 1 > out_cap) {
+        return -1;
+    }
+    std::memcpy(out, t, (size_t)len);
+    out[len] = '\0';
+    return len;
+}
+
+// =========================================================================
 // Language detection
 // =========================================================================
 //
@@ -951,6 +1012,12 @@ struct crispasr_session {
     float no_speech_thold = 0.6f;
     float temperature_inc = 0.2f;
 
+    // Per-token top-N alternative-candidate capture (whisper greedy
+    // decode only). 0 = off (default). Written into wparams.alt_n on
+    // every whisper dispatch. UI caps at 5 to keep memory tame at
+    // ~50 KB/min of audio.
+    int alt_n = 0;
+
     // GBNF grammar-constrained sampling state (whisper backend only —
     // wparams.grammar_rules lives in whisper_full_params, no analog
     // on other backends today).
@@ -1056,11 +1123,20 @@ struct crispasr_session_seg {
     std::string text;
     int64_t t0 = 0; // centiseconds absolute
     int64_t t1 = 0;
+    struct word_alt {
+        std::string text;
+        float p = 0.0f;
+    };
     struct word {
         std::string text;
         int64_t t0 = 0; // centiseconds absolute
         int64_t t1 = 0;
         float p = 1.0f;
+        // Top-N alternative candidates for the first content token of
+        // this word (whisper greedy decode only, when alt_n > 0).
+        // Empty when alts weren't captured or the backend doesn't
+        // produce them. Ordered descending by p.
+        std::vector<word_alt> alts;
     };
     std::vector<word> words;
 };
@@ -1078,6 +1154,12 @@ struct ca_token_record {
     int64_t t0;
     int64_t t1;
     float p;
+    // Optional per-token top-N alternative candidates. Only the
+    // whisper-greedy path populates these (when alt_n > 0); other
+    // backends leave it empty. emit_words_from_tokens attaches the
+    // alts of each word's first content-bearing token to the emitted
+    // word — see the inline note there for why first-token only.
+    std::vector<crispasr_session_seg::word_alt> alts;
 };
 
 // GPT-2 byte-level BPE decoder. Mirrors HF's bytes_to_unicode reverse map.
@@ -1211,6 +1293,15 @@ static std::vector<crispasr_session_seg::word> emit_words_from_tokens(const std:
 
         if (!have_cur) {
             cur.t0 = tk.t0;
+            // Attribute the first content token's top-N alts to the
+            // emitted word. Whisper tokens are sub-word (BPE-ish), so
+            // for a multi-token word like "kubectl" → ["kub","ect","l"]
+            // we surface alternatives of "kub" only. That's the
+            // discriminating token in practice — if the user sees
+            // "cubicle" as an alt for "kub", they know the model
+            // wavered there. Full word-level enumeration would require
+            // expanding a token-tree per word; out of scope for v1.
+            cur.alts = tk.alts;
             have_cur = true;
         }
         cur.t1 = tk.t1;
@@ -2109,6 +2200,18 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         wparams.logprob_thold = s->logprob_thold;
         wparams.no_speech_thold = s->no_speech_thold;
         wparams.temperature_inc = s->temperature_inc;
+        // Alt-token capture (greedy decode only). 0 = off. The whisper
+        // backend writes top-N runners-up onto each chosen token so
+        // session_result_word_alt_* can surface them for ambiguous
+        // word tap-to-pick UIs.
+        wparams.alt_n = s->alt_n;
+        // We need token-level data to build the per-word records below
+        // (whisper otherwise reports only segment text). Token
+        // timestamps are cheap once whisper_full has the tokens
+        // resident; turn them on unconditionally on the session path
+        // so word-level UIs work the same way they do for parakeet /
+        // canary.
+        wparams.token_timestamps = true;
         // Whisper text-suppression + prompt-carry extras. All three
         // map directly onto wparams; an empty regex passes nullptr
         // (whisper's "no suppression" sentinel) instead of an empty
@@ -2140,6 +2243,48 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
                 seg.text = t;
             seg.t0 = whisper_full_get_segment_t0(s->whisper_ctx, i);
             seg.t1 = whisper_full_get_segment_t1(s->whisper_ctx, i);
+
+            // Convert whisper's per-token output into the unified
+            // ca_token_record shape and run it through
+            // emit_words_from_tokens — same grouping logic the
+            // parakeet/canary paths use. Special / EOT / timestamp
+            // tokens are filtered so they don't appear as garbage
+            // words. When alt_n > 0, each content token also carries
+            // its top-N runner-up candidates which flow through to
+            // word.alts (attached to the word's first content token).
+            const int n_tok = whisper_full_n_tokens(s->whisper_ctx, i);
+            std::vector<ca_token_record> toks;
+            toks.reserve((size_t)std::max(0, n_tok));
+            for (int j = 0; j < n_tok; ++j) {
+                const whisper_token_data td = whisper_full_get_token_data(s->whisper_ctx, i, j);
+                if (td.id >= whisper_token_eot(s->whisper_ctx)) {
+                    continue; // skip EOT / timestamp / lang / special tokens
+                }
+                const char* ttext = whisper_full_get_token_text(s->whisper_ctx, i, j);
+                if (!ttext || ttext[0] == '\0') {
+                    continue;
+                }
+                ca_token_record rec;
+                rec.text = ttext;
+                rec.t0 = td.t0;
+                rec.t1 = td.t1;
+                rec.p = td.p;
+                const int n_alts = whisper_full_get_token_n_alts(s->whisper_ctx, i, j);
+                if (n_alts > 0) {
+                    rec.alts.reserve((size_t)n_alts);
+                    for (int k = 0; k < n_alts; ++k) {
+                        const whisper_token alt_id = whisper_full_get_token_alt_id(s->whisper_ctx, i, j, k);
+                        const float alt_p = whisper_full_get_token_alt_p(s->whisper_ctx, i, j, k);
+                        const char* alt_text = whisper_token_to_str(s->whisper_ctx, alt_id);
+                        crispasr_session_seg::word_alt wa;
+                        wa.text = alt_text ? alt_text : "";
+                        wa.p = alt_p;
+                        rec.alts.push_back(std::move(wa));
+                    }
+                }
+                toks.push_back(std::move(rec));
+            }
+            seg.words = emit_words_from_tokens(toks);
             r->segments.push_back(std::move(seg));
         }
         return r;
@@ -3663,6 +3808,44 @@ CA_EXPORT float crispasr_session_result_word_p(crispasr_session_result* r, int i
     return (i_word >= 0 && i_word < (int)ws.size()) ? ws[i_word].p : -1.0f;
 }
 
+// Top-N alternative candidates for the word's first content token.
+// Returns 0 / "" / 0.0f when alts weren't captured (alt_n was 0, the
+// backend doesn't produce alts, or indices are out of range). Ordered
+// descending by p.
+CA_EXPORT int crispasr_session_result_word_n_alts(crispasr_session_result* r, int i_seg, int i_word) {
+    if (!r || i_seg < 0 || i_seg >= (int)r->segments.size())
+        return 0;
+    auto& ws = r->segments[i_seg].words;
+    if (i_word < 0 || i_word >= (int)ws.size())
+        return 0;
+    return (int)ws[i_word].alts.size();
+}
+
+CA_EXPORT const char* crispasr_session_result_word_alt_text(crispasr_session_result* r, int i_seg, int i_word,
+                                                            int i_alt) {
+    if (!r || i_seg < 0 || i_seg >= (int)r->segments.size())
+        return "";
+    auto& ws = r->segments[i_seg].words;
+    if (i_word < 0 || i_word >= (int)ws.size())
+        return "";
+    auto& alts = ws[i_word].alts;
+    if (i_alt < 0 || i_alt >= (int)alts.size())
+        return "";
+    return alts[i_alt].text.c_str();
+}
+
+CA_EXPORT float crispasr_session_result_word_alt_p(crispasr_session_result* r, int i_seg, int i_word, int i_alt) {
+    if (!r || i_seg < 0 || i_seg >= (int)r->segments.size())
+        return 0.0f;
+    auto& ws = r->segments[i_seg].words;
+    if (i_word < 0 || i_word >= (int)ws.size())
+        return 0.0f;
+    auto& alts = ws[i_word].alts;
+    if (i_alt < 0 || i_alt >= (int)alts.size())
+        return 0.0f;
+    return alts[i_alt].p;
+}
+
 CA_EXPORT void crispasr_session_result_free(crispasr_session_result* r) {
     if (r)
         delete r;
@@ -4604,6 +4787,23 @@ CA_EXPORT int crispasr_session_set_fallback_thresholds(crispasr_session* s, floa
     if (temperature_inc > 1.0f)
         temperature_inc = 1.0f;
     s->temperature_inc = temperature_inc;
+    return 0;
+}
+
+// Per-token top-N alternative-candidate capture (whisper greedy
+// decode only). Writes the sticky value onto the session; the
+// transcribe path forwards it into wparams.alt_n on every dispatch.
+// 0 = off (the upstream default). Bumped beyond 5 is allowed but
+// the UI caps at 5; greater values just cost more memory.
+//
+// Non-whisper backends silently ignore — none of the other engines'
+// wparams equivalents have a runner-ups concept today (parakeet's
+// hypothesis lattice is closest in shape but exposed via a
+// different API).
+CA_EXPORT int crispasr_session_set_alt_n(crispasr_session* s, int n) {
+    if (!s)
+        return -1;
+    s->alt_n = n < 0 ? 0 : (n > 32 ? 32 : n);
     return 0;
 }
 

@@ -150,6 +150,18 @@ extern "C" {
         float vlen;        // voice length of the token
     } whisper_token_data;
 
+    // Top-N alternative candidate for a sampled token. Populated when
+    // wparams.alt_n > 0 (greedy decode only). The `p` is the softmax
+    // probability at the same decode step the chosen token came from.
+    // Surfaced via whisper_full_get_token_alt_* and the session-result
+    // crispasr_session_result_word_alt_* accessors so consumers can build
+    // tap-to-pick UIs for ambiguous words (Whisper's first-choice token
+    // is often plausible but wrong for proper nouns / technical jargon).
+    typedef struct whisper_alt_token {
+        whisper_token id; // alternate candidate token id
+        float         p;  // probability at the same decode step in [0, 1]
+    } whisper_alt_token;
+
     typedef struct whisper_model_loader {
         void * context;
 
@@ -588,6 +600,11 @@ extern "C" {
         const char * vad_model_path;              // Path to VAD model
 
         whisper_vad_params vad_params;
+
+        // Capture top-N alternative-candidate tokens at each greedy-sampled
+        // step. 0 (default) = off. Beam-search siblings are not captured —
+        // they're conditional on the beam, not greedy alternatives.
+        int alt_n;
     };
 
     // NOTE: this function allocates memory, and it is the responsibility of the caller to free the pointer - see whisper_free_context_params & whisper_free_params()
@@ -670,6 +687,16 @@ extern "C" {
     // Get the probability of the specified token in the specified segment
     CRISPASR_API float whisper_full_get_token_p           (struct whisper_context * ctx, int i_segment, int i_token);
     CRISPASR_API float whisper_full_get_token_p_from_state(struct whisper_state * state, int i_segment, int i_token);
+
+    // Top-N alternative candidates for a sampled token. Returns 0 / 0 / 0.0f
+    // when alts are not captured (wparams.alt_n == 0, beam search, or i_alt
+    // out of range). The chosen token is not present in the alts list.
+    CRISPASR_API int           whisper_full_get_token_n_alts           (struct whisper_context * ctx, int i_segment, int i_token);
+    CRISPASR_API int           whisper_full_get_token_n_alts_from_state(struct whisper_state * state, int i_segment, int i_token);
+    CRISPASR_API whisper_token whisper_full_get_token_alt_id           (struct whisper_context * ctx, int i_segment, int i_token, int i_alt);
+    CRISPASR_API whisper_token whisper_full_get_token_alt_id_from_state(struct whisper_state * state, int i_segment, int i_token, int i_alt);
+    CRISPASR_API float         whisper_full_get_token_alt_p            (struct whisper_context * ctx, int i_segment, int i_token, int i_alt);
+    CRISPASR_API float         whisper_full_get_token_alt_p_from_state (struct whisper_state * state, int i_segment, int i_token, int i_alt);
 
     //
     // Voice Activity Detection (VAD)
