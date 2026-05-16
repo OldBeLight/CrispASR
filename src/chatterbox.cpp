@@ -246,60 +246,54 @@ static std::vector<int32_t> tokenize_text_bpe(const cb_tokenizer& tok, const std
     const auto& be = core_bpe::byte_encoder();
     std::vector<int32_t> result;
 
-    // GPT-2 pre-tokenizer: split on whitespace boundaries (simplified)
-    // Each word gets a leading Ġ (U+0120) if preceded by space
-    std::string buf;
-    for (size_t i = 0; i < text.size(); i++) {
-        if (i > 0 && text[i] != ' ' && text[i - 1] == ' ') {
-            // Encode accumulated word
-            if (!buf.empty()) {
-                std::string encoded;
-                for (uint8_t b : buf) {
-                    int cp = be[b];
-                    if (cp < 128)
-                        encoded += (char)cp;
-                    else {
-                        // UTF-8 encode the codepoint
-                        if (cp < 0x80)
-                            encoded += (char)cp;
-                        else if (cp < 0x800) {
-                            encoded += (char)(0xC0 | (cp >> 6));
-                            encoded += (char)(0x80 | (cp & 0x3F));
-                        } else {
-                            encoded += (char)(0xE0 | (cp >> 12));
-                            encoded += (char)(0x80 | ((cp >> 6) & 0x3F));
-                            encoded += (char)(0x80 | (cp & 0x3F));
-                        }
-                    }
-                }
-                core_bpe::bpe_one(tok.token_to_id, tok.merge_rank, encoded, result);
-                buf.clear();
-            }
-            // Start new word with Ġ prefix (byte 0x20 = space maps to Ġ = U+0120)
-        }
-        if (text[i] != ' ' || i == 0 || text[i - 1] != ' ') {
-            buf += text[i];
-        }
-    }
-    // Encode remaining
-    if (!buf.empty()) {
+    // GPT-2 pre-tokenizer: split into "(optional leading space) + (non-space
+    // run)" chunks matching the ` ?\p{L}+` arm of the GPT-2 regex. byte_encoder
+    // maps byte 0x20 to U+0120 ("Ġ"), so a chunk like " world" encodes as
+    // "Ġworld" — the trained vocab entry. Issue #94 follow-up: the previous
+    // implementation appended the trailing space to the *previous* word
+    // (yielding "helloĠ" + bare "world") which produced unseen BPE pieces
+    // and audibly broken synthesis for less-common words ("hello chatterbox
+    // turbo" came out as "henay…"). See tools/tok_test.py for the diff.
+    auto encode_chunk = [&](const char* begin, const char* end) {
+        if (begin == end)
+            return;
         std::string encoded;
-        for (uint8_t b : buf) {
-            int cp = be[b];
-            if (cp < 128)
+        for (const char* p = begin; p < end; ++p) {
+            const int cp = be[(uint8_t)*p];
+            if (cp < 0x80) {
                 encoded += (char)cp;
-            else {
-                if (cp < 0x800) {
-                    encoded += (char)(0xC0 | (cp >> 6));
-                    encoded += (char)(0x80 | (cp & 0x3F));
-                } else {
-                    encoded += (char)(0xE0 | (cp >> 12));
-                    encoded += (char)(0x80 | ((cp >> 6) & 0x3F));
-                    encoded += (char)(0x80 | (cp & 0x3F));
-                }
+            } else if (cp < 0x800) {
+                encoded += (char)(0xC0 | (cp >> 6));
+                encoded += (char)(0x80 | (cp & 0x3F));
+            } else {
+                encoded += (char)(0xE0 | (cp >> 12));
+                encoded += (char)(0x80 | ((cp >> 6) & 0x3F));
+                encoded += (char)(0x80 | (cp & 0x3F));
             }
         }
         core_bpe::bpe_one(tok.token_to_id, tok.merge_rank, encoded, result);
+    };
+
+    size_t i = 0;
+    while (i < text.size()) {
+        const size_t start = i;
+        if (text[i] == ' ') {
+            // Consume one leading space if it's followed by a non-space char
+            // (the " ?\p{L}+" arm). Multiple consecutive spaces are emitted as
+            // one whitespace chunk (the "\s+" arm), so the BPE merger can
+            // recover any multi-Ġ vocab entry the trained tokenizer used.
+            if (i + 1 < text.size() && text[i + 1] != ' ') {
+                ++i;
+            } else {
+                while (i < text.size() && text[i] == ' ')
+                    ++i;
+                encode_chunk(text.data() + start, text.data() + i);
+                continue;
+            }
+        }
+        while (i < text.size() && text[i] != ' ')
+            ++i;
+        encode_chunk(text.data() + start, text.data() + i);
     }
     return result;
 }
