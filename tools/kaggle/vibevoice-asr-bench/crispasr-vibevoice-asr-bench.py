@@ -5,18 +5,15 @@
 # https://huggingface.co/cstr/vibevoice-asr-GGUF/discussions/1
 # report Q4_K is bad. Sunknown specifically said "clear high quality
 # speech without background noise transcribes to just '[Music]'" on
-# CUDA. The F16 was just uploaded today; this kernel:
+# CUDA. The F16 was just uploaded; this kernel:
 #
-#   1. Builds CrispASR-CLI with CUDA.
-#   2. Downloads both F16 (15.5 GB) and Q4_K (4.5 GB).
-#   3. Transcribes samples/jfk.wav with each.
-#   4. Prints both transcripts side-by-side.
+#   1. Builds CrispASR-CLI CPU-only (fast; CUDA build takes 10+ h).
+#   2. Downloads Q4_K (4.5 GB) first and transcribes samples/jfk.wav.
+#   3. Downloads F16 (15.5 GB) if ≥60 min of wall-time remain.
+#   4. Prints both transcripts side-by-side vs gold.
 #
-# Expectation: F16 produces a real transcript; Q4_K confirms the
-# regression (either gibberish or "[Music]"). If both work, the
-# regression reports are environment-specific to one of the
-# reporters' setups. If only F16 works, that's an actionable
-# datapoint we can post back to the discussion.
+# CPU result isolates whether Q4_K is fundamentally broken (bad quant)
+# vs a CUDA-specific regression.
 
 # %% [code]
 import json
@@ -27,7 +24,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ── unbuffered I/O + step checkpoint (HF live-progress on by default) ──
 os.environ["PYTHONUNBUFFERED"] = "1"
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -42,6 +38,8 @@ _HF_LAST_PUSH = 0.0
 _HF_REPO = "cstr/crispasr-kaggle-progress"
 _HF_PATH = (f"runs/{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
             f"-vibevoice-asr-bench.jsonl")
+
+MAX_WALL_S = 8 * 3600  # Kaggle GPU limit is 9 h; leave 1 h margin
 
 
 def _push_hf():
@@ -75,7 +73,6 @@ def step(name, **extra):
 step("script.start")
 
 # %% [code]
-# Read HF_TOKEN from Kaggle secret if present (for HF progress push).
 try:
     from kaggle_secrets import UserSecretsClient
     tok = UserSecretsClient().get_secret("HF_TOKEN")
@@ -115,12 +112,15 @@ step("git-clone.done")
 step("cmake-configure.begin")
 BUILD = WORK / "build"
 import shutil as _shutil
-HAS_GPU = _shutil.which("nvcc") is not None
 CMAKE_FLAGS = [
     "-DCMAKE_BUILD_TYPE=Release",
     "-DCRISPASR_BUILD_TESTS=OFF",
     "-DCRISPASR_BUILD_EXAMPLES=ON",
     "-DCRISPASR_BUILD_SERVER=OFF",
+    # CPU-only: avoids 10+ hour CUDA kernel compilation
+    "-DGGML_CUDA=OFF",
+    "-DGGML_BLAS=ON",
+    "-DGGML_BLAS_VENDOR=OpenBLAS",
 ]
 if _shutil.which("ccache"):
     CCACHE_DIR = WORK / ".ccache"
@@ -129,15 +129,10 @@ if _shutil.which("ccache"):
     CMAKE_FLAGS += [
         "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
         "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
-        "-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache",
     ]
 if _shutil.which("mold"):
     for kind in ("EXE", "SHARED", "MODULE"):
         CMAKE_FLAGS.append(f"-DCMAKE_{kind}_LINKER_FLAGS=-fuse-ld=mold")
-if HAS_GPU:
-    CMAKE_FLAGS += ["-DGGML_CUDA=ON", "-DGGML_CUDA_NO_VMM=ON",
-                    "-DCMAKE_CUDA_ARCHITECTURES=60",
-                    "-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc"]
 subprocess.check_call(
     ["cmake", "-S", str(REPO), "-B", str(BUILD), "-G", "Ninja", *CMAKE_FLAGS])
 step("cmake-configure.done")
@@ -152,30 +147,13 @@ assert CRISPASR.is_file(), f"binary missing: {CRISPASR}"
 step("cmake-build.done", binary=str(CRISPASR))
 
 # %% [code]
-# Pre-download both quants from HF
-step("download-f16.begin")
-from huggingface_hub import hf_hub_download
-MODELS_DIR = WORK / "models"
-MODELS_DIR.mkdir(exist_ok=True)
-f16_path = hf_hub_download(
-    repo_id="cstr/vibevoice-asr-GGUF",
-    filename="vibevoice-asr-f16.gguf",
-    local_dir=str(MODELS_DIR),
-)
-step("download-f16.done", size_gb=round(Path(f16_path).stat().st_size / 1e9, 2))
-
-step("download-q4_k.begin")
-q4k_path = hf_hub_download(
-    repo_id="cstr/vibevoice-asr-GGUF",
-    filename="vibevoice-asr-q4_k.gguf",
-    local_dir=str(MODELS_DIR),
-)
-step("download-q4_k.done", size_gb=round(Path(q4k_path).stat().st_size / 1e9, 2))
-
-# %% [code]
-# Transcribe with each. samples/jfk.wav already in the repo.
 WAV = REPO / "samples" / "jfk.wav"
 assert WAV.is_file(), f"sample WAV missing: {WAV}"
+MODELS_DIR = WORK / "models"
+MODELS_DIR.mkdir(exist_ok=True)
+GOLD = ("And so, my fellow Americans, ask not what your country can do for you, "
+        "ask what you can do for your country.")
+
 
 def transcribe(gguf: Path, label: str) -> dict:
     step(f"transcribe-{label}.begin", gguf=gguf.name)
@@ -190,7 +168,6 @@ def transcribe(gguf: Path, label: str) -> dict:
         return {"label": label, "transcript": None, "wallclock_s": 600,
                 "stderr_tail": "TIMEOUT"}
     elapsed = time.time() - t0
-    # Take the last non-empty stdout line (the CLI's transcript output)
     text_lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
     transcript = text_lines[-1] if text_lines else "(no stdout)"
     step(f"transcribe-{label}.done", wallclock_s=round(elapsed, 1),
@@ -204,12 +181,39 @@ def transcribe(gguf: Path, label: str) -> dict:
     }
 
 
-results = []
-for label, path in (("F16", Path(f16_path)), ("Q4_K", Path(q4k_path))):
-    results.append(transcribe(path, label))
+# %% [code]
+# ── Q4_K first (4.5 GB) ──────────────────────────────────────────────────────
+from huggingface_hub import hf_hub_download
+
+step("download-q4_k.begin")
+q4k_path = hf_hub_download(
+    repo_id="cstr/vibevoice-asr-GGUF",
+    filename="vibevoice-asr-q4_k.gguf",
+    local_dir=str(MODELS_DIR),
+)
+step("download-q4_k.done", size_gb=round(Path(q4k_path).stat().st_size / 1e9, 2))
+
+results = [transcribe(Path(q4k_path), "Q4_K")]
 
 # %% [code]
-# Headline comparison
+# ── F16 only if ≥30 min remain ───────────────────────────────────────────────
+elapsed_now = time.time() - _T0
+remaining = MAX_WALL_S - elapsed_now
+step("time-check", elapsed_s=round(elapsed_now), remaining_s=round(remaining))
+
+if remaining >= 60 * 60:
+    step("download-f16.begin")
+    f16_path = hf_hub_download(
+        repo_id="cstr/vibevoice-asr-GGUF",
+        filename="vibevoice-asr-f16.gguf",
+        local_dir=str(MODELS_DIR),
+    )
+    step("download-f16.done", size_gb=round(Path(f16_path).stat().st_size / 1e9, 2))
+    results.append(transcribe(Path(f16_path), "F16"))
+else:
+    step("skip-f16", reason="insufficient time remaining")
+
+# %% [code]
 step("results.begin")
 print("\n=== TRANSCRIPTS ===\n", flush=True)
 for r in results:
@@ -219,11 +223,8 @@ for r in results:
         print(f"        stderr tail: {r['stderr_tail']}")
     print()
 
-GOLD = ("And so, my fellow Americans, ask not what your country can do for you, "
-        "ask what you can do for your country.")
 print(f"\nGOLD: {GOLD!r}\n")
 
-# Save JSON sidecar
 RESULTS_PATH = WORK / "vibevoice-asr-bench.json"
 RESULTS_PATH.write_text(json.dumps({
     "ts": datetime.now(timezone.utc).isoformat(),
