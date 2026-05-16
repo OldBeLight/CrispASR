@@ -77,6 +77,7 @@ jobs:
                ! -name 'json.hpp' \
                ! -name 'stb_vorbis.c' \
                ! -path '*/coreml/*' \
+               ! -path '*/rnnoise/*' \
                -print0 \
           | xargs -0 clang-format --dry-run --Werror 2>&1 || true)
           ERRORS=$(echo "$OUT" | grep -c 'error:.*clang-format' || true)
@@ -164,6 +165,7 @@ jobs:
             --suppress='*:src/miniaudio.h' \
             --suppress='*:*miniaudio.h' \
             --suppress='*:*stb_vorbis.c' \
+            --suppress='*:*rnnoise/*' \
             --suppress=unknownMacro \
             --suppress=nullPointerOutOfMemory \
             --suppress=nullPointerArithmeticOutOfMemory \
