@@ -157,21 +157,24 @@ add_library(crispasr
             # building their own copy.
             grammar-parser.h
             grammar-parser.cpp
-            # RNNoise-based audio enhancement (xiph/rnnoise v0.1, BSD-3).
-            # Vendored under src/rnnoise/. Consumed by the CLI and by
-            # the C-ABI `crispasr_enhance_audio_rnnoise`. ~80 KB GRU
-            # weights embedded in rnnoise_data.c — no model file
-            # downloads required.
-            crispasr_enhance.h
-            crispasr_enhance.cpp
-            rnnoise/rnnoise.h
-            rnnoise/denoise.c
-            rnnoise/rnn.c
-            rnnoise/rnn_data.c
-            rnnoise/pitch.c
-            rnnoise/celt_lpc.c
-            rnnoise/kiss_fft.c
             )
+
+# RNNoise uses C99 VLAs and M_PI — both unsupported by MSVC out of the box.
+# Exclude the whole feature on Windows rather than patching vendored sources.
+if (NOT MSVC)
+    target_sources(crispasr PRIVATE
+        crispasr_enhance.h
+        crispasr_enhance.cpp
+        rnnoise/rnnoise.h
+        rnnoise/denoise.c
+        rnnoise/rnn.c
+        rnnoise/rnn_data.c
+        rnnoise/pitch.c
+        rnnoise/celt_lpc.c
+        rnnoise/kiss_fft.c
+    )
+    target_compile_definitions(crispasr PRIVATE CRISPASR_RNNOISE=1)
+endif()
 
 # RNNoise's C sources predate the strict implicit-decl errors that
 # clang 16+ defaults to. Silence those warnings on a per-file basis

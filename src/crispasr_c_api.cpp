@@ -20,10 +20,12 @@
 #include <vector>
 
 #include "crispasr.h"
-#include "crispasr_vad.h"            // VAD slicing + stitching (shared with CLI)
-#include "crispasr_diarize.h"        // Speaker diarization (shared with CLI)
-#include "crispasr_lid.h"            // Language identification (shared with CLI)
-#include "crispasr_enhance.h"        // RNNoise audio enhancement (shared with CLI)
+#include "crispasr_vad.h"     // VAD slicing + stitching (shared with CLI)
+#include "crispasr_diarize.h" // Speaker diarization (shared with CLI)
+#include "crispasr_lid.h"     // Language identification (shared with CLI)
+#if defined(CRISPASR_RNNOISE)
+#include "crispasr_enhance.h" // RNNoise audio enhancement (shared with CLI)
+#endif
 #include "text_lid_dispatch.h"       // Text-LID backend-agnostic façade (CLD3 + fastText)
 #include "crispasr_aligner.h"        // CTC / forced-aligner word timings (shared with CLI)
 #include "crispasr_cache.h"          // HF download + filesystem cache (shared with CLI)
@@ -3526,6 +3528,7 @@ CA_EXPORT int crispasr_detect_language_pcm(const float* samples, int32_t n_sampl
 //   * -2 — RNNoise init / processing failure (resampler init, etc).
 // ---------------------------------------------------------------------------
 CA_EXPORT int crispasr_enhance_audio_rnnoise(const float* in_pcm, int32_t n_samples, float* out_pcm, int32_t out_cap) {
+#if defined(CRISPASR_RNNOISE)
     if (!in_pcm || !out_pcm || n_samples <= 0 || out_cap < n_samples)
         return -1;
 
@@ -3536,6 +3539,13 @@ CA_EXPORT int crispasr_enhance_audio_rnnoise(const float* in_pcm, int32_t n_samp
     if (!crispasr_enhance_audio(in_pcm, n_samples, out_pcm, opts))
         return -2;
     return 0;
+#else
+    (void)in_pcm;
+    (void)n_samples;
+    (void)out_pcm;
+    (void)out_cap;
+    return -2; // RNNoise not compiled on this platform
+#endif
 }
 
 // ---------------------------------------------------------------------------
