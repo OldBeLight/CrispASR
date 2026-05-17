@@ -85,18 +85,43 @@ audio under `/Volumes/backups/ai/crispasr/issue94-audio/topk-fix/`):
    (step-1 max 12.37 with F16 vs 12.39 with Q8_0), so this is not a
    weight-quantisation effect.
 
-Open follow-up: the residual T3 logit-magnitude divergence between
-the C++ GPT-2 graph (`build_graph_t3_gpt2_kv`) and HF GPT-2.
-Investigated and ruled out: speech_head bias missing, WPE
-double-add, attention scale, flash_attn vs naive softmax (Llama
-path uses the same pattern and works), prefill length mismatch,
-GPT-2 LayerNorm scale/bias loading, GELU variant. Most likely
-remaining suspects: subtle K/V cache layout / read mismatch at
-`T == 1` (the cache is written as `(hd, T, n_kv, 1)` and read back
-as `(hd, Lk, n_kv)`); or attention numerics inside
-`ggml_flash_attn_ext` for small T with the GPT-2 head geometry
-(n_h=16, hd=64). Needs a per-layer hidden-state diff with the
-Python reference to localise the divergence layer.
+Per-layer bisect (added 2026-05-17):
+
+`CRISPASR_CHATTERBOX_DUMP_GPT2_LAYERS=1` makes the GPT-2 graph dump
+each block's `post_attn` and `post_ffn` hidden states to
+`/tmp/cb_gpt2_step_<n_past>_LNN_*.bin`. The companion Python tool
+`tools/cb_turbo_perlayer_dump_pyref.py` produces the matching Python
+files; `tools/cb_turbo_perlayer_diff.py` walks both sets and reports
+per-layer cosine similarity at the first AR step.
+
+For `"hello world test"` (seed 0, forced `tok0=4024`) the bisect shows:
+
+    L00_post_attn cos=0.99893    L00_post_ffn cos=0.99774
+    L01_post_attn cos=0.99832    L01_post_ffn cos=0.99868
+    L02_post_attn cos=0.99795    L02_post_ffn cos=0.99847
+    L03_post_attn cos=0.99741    L03_post_ffn cos=0.99792
+    L04_post_attn cos=0.99418    L04_post_ffn cos=0.99434
+    L05_post_attn cos=0.94450    ← jump
+    L05_post_ffn  cos=0.93701
+    L06–L23       cos 0.91–0.97 (does not recover)
+
+L00–L04 stay above 0.994; the divergence locus is **L05 attention**.
+Magnitudes (rms) match closely on both sides at the jump (1.83 vs
+1.84), so the issue is direction, not scale — consistent with a sharp
+softmax attention pattern at L05 where small K/V precision noise flips
+which prefill position is attended to.
+
+Ruled out so far: speech_head bias missing, WPE double-add, attention
+scale, GPT-2 LayerNorm scale/bias loading, GELU variant, `scale_attn_
+by_inverse_layer_idx` (False on this config), `scale_attn_weights`
+(True on both sides), prefill length mismatch, Q8_0 vs F16 weight
+precision, F32 KV cache (read as F32 or stored as F32 — neither
+helps). The naive `softmax(QK^T)V` replacement isn't viable yet —
+my first cut produced wrong outputs from L00 (layout bug), so the
+flash-attn vs naive comparison is still open. Suspects remaining:
+(a) `ggml_flash_attn_ext` numerics at `T == 1` with the GPT-2 head
+geometry, (b) accumulated drift in earlier layers that just happens
+to cross a softmax boundary at L05.
 
 ---
 

@@ -1852,6 +1852,20 @@ static ggml_cgraph* build_graph_t3_gpt2_kv(chatterbox_context* c, int n_past, in
 
     ggml_tensor* cur = embeds;
 
+    // Issue #94 follow-up: per-layer hidden-state dump for the GPT-2 graph.
+    // Set CRISPASR_CHATTERBOX_DUMP_GPT2_LAYERS=1 to mark the input embed,
+    // each post-attn-residual, each post-FFN-residual, and the post-ln_f
+    // tensor as graph outputs. The runner side reads them by name. This
+    // lets us bisect which transformer layer first diverges from the
+    // HuggingFace reference at the T == 1 decoding step.
+    // Don't rename `embeds` — runner reads it back as "inputs_embeds" to set
+    // input data on it. For the per-layer dump we just retrieve "inputs_embeds"
+    // by its existing name.
+    const bool dump_layers = (std::getenv("CRISPASR_CHATTERBOX_DUMP_GPT2_LAYERS") != nullptr);
+    if (dump_layers) {
+        ggml_set_output(embeds);
+    }
+
     for (uint32_t il = 0; il < hp.n_layers; il++) {
         const auto& b = c->t3.gpt2_blocks[il];
         ggml_tensor* residual = cur;
@@ -1918,6 +1932,13 @@ static ggml_cgraph* build_graph_t3_gpt2_kv(chatterbox_context* c, int n_past, in
         attn = ggml_mul_mat(ctx0, b.attn_output_w, attn);
         attn = ggml_add(ctx0, attn, b.attn_output_b);
         cur = ggml_add(ctx0, residual, attn);
+        if (dump_layers) {
+            char nm[32];
+            std::snprintf(nm, sizeof nm, "L%02u_post_attn", il);
+            ggml_set_name(cur, nm);
+            ggml_set_output(cur);
+            ggml_build_forward_expand(gf, cur);
+        }
 
         // FFN
         residual = cur;
@@ -1933,6 +1954,13 @@ static ggml_cgraph* build_graph_t3_gpt2_kv(chatterbox_context* c, int n_past, in
         mlp = ggml_add(ctx0, mlp, b.ffn_proj_b);
 
         cur = ggml_add(ctx0, residual, mlp);
+        if (dump_layers) {
+            char nm[32];
+            std::snprintf(nm, sizeof nm, "L%02u_post_ffn", il);
+            ggml_set_name(cur, nm);
+            ggml_set_output(cur);
+            ggml_build_forward_expand(gf, cur);
+        }
     }
 
     // Final LayerNorm
@@ -2005,6 +2033,39 @@ static float* run_t3_gpt2_kv(chatterbox_context* c, const float* embeds, int n_t
     if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "kartoffelbox: T3 GPT-2 compute failed\n");
         return nullptr;
+    }
+    // Issue #94 follow-up: optional per-layer hidden-state dump for bisecting
+    // T3 step >= 1 divergence vs the HF reference. The graph builder names
+    // L_in_emb, LNN_post_attn, LNN_post_ffn. Files are written to
+    // /tmp/cb_gpt2_step_<n_past>_<name>.bin as raw little-endian float32 of
+    // size D*T (T is usually 1 on the AR-step call). The runner doesn't know
+    // whether the graph builder added these names (env-gated), so we tolerate
+    // misses.
+    if (std::getenv("CRISPASR_CHATTERBOX_DUMP_GPT2_LAYERS")) {
+        auto dump = [&](const char* nm) {
+            ggml_tensor* t = ggml_graph_get_tensor(gf, nm);
+            if (!t) {
+                return;
+            }
+            size_t nbytes = ggml_nbytes(t);
+            std::vector<uint8_t> buf(nbytes);
+            ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
+            char path[256];
+            std::snprintf(path, sizeof path, "/tmp/cb_gpt2_step_%d_%s.bin", n_past, nm);
+            FILE* fp = std::fopen(path, "wb");
+            if (fp) {
+                std::fwrite(buf.data(), 1, nbytes, fp);
+                std::fclose(fp);
+            }
+        };
+        dump("inputs_embeds");
+        for (uint32_t il = 0; il < c->hp.n_layers; il++) {
+            char nm1[32], nm2[32];
+            std::snprintf(nm1, sizeof nm1, "L%02u_post_attn", il);
+            std::snprintf(nm2, sizeof nm2, "L%02u_post_ffn", il);
+            dump(nm1);
+            dump(nm2);
+        }
     }
     ggml_tensor* out = ggml_graph_get_tensor(gf, "logits");
     float* r = (float*)malloc((size_t)vocab * sizeof(float));
