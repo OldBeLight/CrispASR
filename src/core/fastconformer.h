@@ -93,29 +93,56 @@ struct PreEncodeWeights {
     ggml_tensor *out_w = nullptr, *out_b = nullptr;     // Linear(W3*C → d_model)
 };
 
+// Snap a 4D conv output (OW, OH, OC, N) as a 2D named dup (OC*OW, OH) for
+// staged comparison.  Feature ordering: k = oc*(OW) + ow  (matches Python's
+// x.transpose(1,2).reshape(T, C*Freq) convention).
+static inline void snap_conv4d(ggml_context* ctx0, ggml_cgraph* gf, ggml_tensor* t, const char* name) {
+    // permute(1, 2, 0, 3): (OW,OH,OC,N) → (OH,OC,OW,N)
+    ggml_tensor* p = ggml_cont(ctx0, ggml_permute(ctx0, t, 1, 2, 0, 3));
+    // reshape to (OC*OW, OH): ne[0]=OC*OW fastest, ne[1]=OH (T_enc)
+    const int64_t C_Freq = t->ne[2] * t->ne[0]; // OC * OW
+    const int64_t T_enc = t->ne[1];             // OH
+    ggml_tensor* flat = ggml_reshape_2d(ctx0, p, C_Freq, T_enc);
+    ggml_tensor* snap = ggml_dup(ctx0, flat);
+    ggml_set_name(snap, name);
+    ggml_build_forward_expand(gf, snap);
+}
+
 // Build the dw_striding pre-encoder. Input `mel` has shape (n_mels, T_mel).
 // Returns a (d_model, T_enc) tensor where T_enc is read off the intermediate
 // conv output via the caller (write it back through `out_T_enc`).
+// When `gf` is non-null, named dup snaps are added after each conv step for
+// staged comparison via the diff harness.
 static inline ggml_tensor* build_pre_encode(ggml_context* ctx0, ggml_tensor* mel, const PreEncodeWeights& w,
-                                            int subsampling_channels, int* out_T_enc) {
+                                            int subsampling_channels, int* out_T_enc, ggml_cgraph* gf = nullptr) {
     auto bias_4d = [&](ggml_tensor* b) {
         return ggml_cast(ctx0, ggml_reshape_4d(ctx0, b, 1, 1, b->ne[0], 1), GGML_TYPE_F32);
     };
 
     ggml_tensor* cur = ggml_conv_2d(ctx0, w.conv0_w, mel, 2, 2, 1, 1, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv0_b));
+    if (gf)
+        snap_conv4d(ctx0, gf, cur, "pre_enc_c0");
     cur = ggml_relu(ctx0, cur);
 
     cur = ggml_conv_2d_dw(ctx0, w.conv2_w, cur, 2, 2, 1, 1, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv2_b));
+    if (gf)
+        snap_conv4d(ctx0, gf, cur, "pre_enc_c2");
     cur = ggml_conv_2d(ctx0, w.conv3_w, cur, 1, 1, 0, 0, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv3_b));
+    if (gf)
+        snap_conv4d(ctx0, gf, cur, "pre_enc_c3");
     cur = ggml_relu(ctx0, cur);
 
     cur = ggml_conv_2d_dw(ctx0, w.conv5_w, cur, 2, 2, 1, 1, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv5_b));
+    if (gf)
+        snap_conv4d(ctx0, gf, cur, "pre_enc_c5");
     cur = ggml_conv_2d(ctx0, w.conv6_w, cur, 1, 1, 0, 0, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv6_b));
+    if (gf)
+        snap_conv4d(ctx0, gf, cur, "pre_enc_c6");
     cur = ggml_relu(ctx0, cur);
 
     const int H3 = (int)cur->ne[1];

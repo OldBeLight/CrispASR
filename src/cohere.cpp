@@ -1184,6 +1184,7 @@ static std::vector<float> cohere_compute_features(const cohere_hparams& hp, cons
     p.layout = core_mel::Layout::TimeMels;
     p.log_eps = (float)(1.0 / (1 << 24));
     p.center_pad = true;
+    p.drop_last_frame = true; // NeMo returns feat_len = floor(n_samples/hop) frames
 
     auto mel =
         core_mel::compute(pe.data(), n_samples, fe_window_data, win, fe_mel_fb_data, n_freqs, cohere_fft_r2c, p, T_out);

@@ -6,6 +6,38 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-17 Graduate canary-1b-v2 mel + encoder to full diff
+
+The canary encoder had cos_min=0.917 for `pre_encode_output` vs
+NeMo reference — well below the 0.999 graduation threshold. Two
+sessions of diff-testing chased the bug through the pre_encode conv
+pipeline, testing F16 quantization (ruled out — Python F16 also gave
+0.990), ggml conv2d/im2col math (verified correct), and intermediate
+conv stages (added `snap_conv4d` + per-stage hooks in Python backend).
+
+Root cause: **one extra boundary mel frame**. The C++ STFT produced
+`floor((n+pad-n_fft)/hop)+1` frames (1101 for jfk.wav), while NeMo's
+`AudioToMelSpectrogramPreprocessor` returns `feat_len = floor(n/hop)`
+valid frames (1100). The 1101st frame was boundary garbage — after
+per-feature z-normalization, its values diverged by ±4 in z-score
+units, propagating through the 8× conv downsampling (max_abs=356 at
+pre_encode) and then through 32 conformer layers.
+
+Fix: `p.drop_last_frame = true` in `core_mel::Params` for all three
+NeMo backends (canary, parakeet, cohere). Also disabled NeMo dither
+(`featurizer.dither = 0.0`) and clipped the Python reference mel to
+`feat_len` for deterministic reference dumps.
+
+Result: mel cos_min=1.000, pre_encode cos_min=0.999999,
+encoder_output cos_min=0.999280. All 32 layers pass except layers
+18–19 (F16 precision, cos_min=0.9977/0.9988, recovers by layer 20).
+Deleted the silence-only `canary_dummy.wav` test file (degenerate
+input that masked the real mel issue).
+
+Takeaway: see LEARNINGS.md "STFT frame count" entry.
+
+---
+
 ## 2026-05-17 Issue #89 round 2 — revert chunked-slice context expansion
 
 `lenhone` reported that parakeet-tdt-0.6b-ja still dropped words across

@@ -384,6 +384,12 @@ constexpr Entry k_registry[] = {
     {"lid-firered", "firered-lid-f16.gguf",
      "https://huggingface.co/cstr/firered-lid-GGUF/resolve/main/firered-lid-f16.gguf",
      "~300 MB", nullptr, nullptr},
+    // VoxCPM2: openbmb/VoxCPM2 diffusion AR TTS, 30 languages, 48kHz,
+    // Apache 2.0. Tokenizer-free, voice cloning via reference audio.
+    // Default: Q4_K (1.6 GB, practical for CPU). F16 at same repo.
+    {"voxcpm2-tts", "voxcpm2-q4_k.gguf",
+     "https://huggingface.co/cstr/voxcpm2-GGUF/resolve/main/voxcpm2-q4_k.gguf",
+     "~1.6 GB", nullptr, nullptr},
 };
 
 // Multi-companion extras. When a backend needs >1 auxiliary file the

@@ -478,6 +478,7 @@ static std::vector<float> parakeet_compute_mel_impl(parakeet_context* ctx, const
     p.layout = core_mel::Layout::TimeMels;
     p.log_eps = (float)(1.0 / (1 << 24));
     p.center_pad = true;
+    p.drop_last_frame = true; // NeMo returns feat_len = floor(n_samples/hop) frames
     p.preemph = 0.97f;
 
     auto mel = core_mel::compute(samples, n_samples, window_raw.data(), win, mel_fb.data(), n_freqs, parakeet_fft_r2c,

@@ -191,6 +191,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # `kaldi_native_fbank`. Captures mel_spectrogram (T, 80) Kaldi fbank+CMVN
     # and encoder_output (T_enc, 1280) Conformer encoder.
     "firered-asr": "reference_backends.firered_asr",
+    # VoxCPM2 TTS: diffusion AR TTS with 4 transformer sub-networks.
+    # model_dir = openbmb/VoxCPM2 HF snapshot. Audio arg = reference WAV
+    # for voice cloning (optional). Synth text from VOXCPM2_SYN_TEXT env.
+    "voxcpm2-tts": "reference_backends.voxcpm2_tts",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import

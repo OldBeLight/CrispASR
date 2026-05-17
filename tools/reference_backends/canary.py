@@ -42,6 +42,14 @@ DEFAULT_STAGES = [
     "mel_spectrogram",
     "pre_encode_output",
     "encoder_output",
+    # Intermediate pre-encoder conv stages for bug isolation.
+    # Named pre_enc_c{idx} where idx is the nn.Sequential index in
+    # enc.pre_encode.conv (0=first conv, 2=dw, 3=pw, 5=dw, 6=pw).
+    "pre_enc_c0",
+    "pre_enc_c2",
+    "pre_enc_c3",
+    "pre_enc_c5",
+    "pre_enc_c6",
 ] + [f"encoder_layer_{i}" for i in range(32)]
 
 
@@ -91,6 +99,11 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         model = nemo_asr.models.ASRModel.restore_from(pretrained)
     model.eval()
 
+    # Disable dither for deterministic mel comparison against C++.
+    if hasattr(model, "preprocessor") and hasattr(model.preprocessor, "featurizer"):
+        model.preprocessor.featurizer.dither = 0.0
+        model.preprocessor.featurizer.pad_to = 0
+
     # Free sub-models and caches that are not needed for encoder-only
     # inference to reduce peak RAM. Canary loads an auxiliary CTC model
     # during restoration; we can drop it after loading.
@@ -121,6 +134,27 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     stage_modules = []
     if "pre_encode_output" in stages and hasattr(enc, "pre_encode"):
         stage_modules.append(("pre_encode_output", enc.pre_encode))
+    # Intermediate conv sub-module hooks (4D outputs, handled separately below).
+    _pre_conv_indices = {
+        "pre_enc_c0": 0,
+        "pre_enc_c2": 2,
+        "pre_enc_c3": 3,
+        "pre_enc_c5": 5,
+        "pre_enc_c6": 6,
+    }
+    pre_conv_handles = []
+    pre_conv_captured: Dict[str, torch.Tensor] = {}
+    if hasattr(enc, "pre_encode") and hasattr(enc.pre_encode, "conv"):
+        conv_seq = enc.pre_encode.conv
+        for stage_name, idx in _pre_conv_indices.items():
+            if stage_name in stages and idx < len(conv_seq):
+                def _make_hook(name):
+                    def hook(_m, _inp, out):
+                        t = out[0] if isinstance(out, (tuple, list)) else out
+                        pre_conv_captured[name] = t.detach().cpu().float()
+                    return hook
+                pre_conv_handles.append(
+                    conv_seq[idx].register_forward_hook(_make_hook(stage_name)))
     layers = getattr(enc, "layers", None)
     if layers is not None:
         for i in range(len(layers)):
@@ -136,7 +170,8 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         # n_mels as the fast axis. Transpose so the numpy flat ordering
         # matches. Same convention as parakeet.py.
         if "mel_spectrogram" in stages:
-            m = feats[0].transpose(0, 1).contiguous()
+            T_valid = int(feat_len.item())  # NeMo valid frame count
+            m = feats[0, :, :T_valid].transpose(0, 1).contiguous()
             out["mel_spectrogram"] = m.detach().cpu().float().numpy()
 
         encf, enc_len = model.encoder(audio_signal=feats, length=feat_len)
@@ -149,5 +184,21 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
             out["encoder_output"] = e.detach().cpu().float().numpy()
 
     _hooks.drop_hooks(handles)
+    for h in pre_conv_handles:
+        h.remove()
     out.update(_hooks.finalize(captured, T_max=int(enc_len.item())))
+
+    # Reshape 4D conv outputs (B=1, C, H=T, W=Freq) → (T, C*Freq).
+    # C*Freq is the "feature" axis (fastest in C++), T is the time axis.
+    # Ordering: feature k = channel*(Freq) + freq_bin  (channel outermost).
+    # Do NOT clip to T_enc here — each conv stage has its own time dimension
+    # (conv0 OH≈T_mel//2, conv2 OH≈T_mel//4, conv5/6 OH=T_enc).
+    for stage_name, t4 in pre_conv_captured.items():
+        # t4: (B=1, C, H=T_stage, W=Freq)
+        t = t4[0]              # (C, T_stage, Freq)
+        C, T_stage, Freq = t.shape
+        # Permute to (T, C, Freq), then flatten C*Freq → feature axis.
+        t = t.permute(1, 0, 2).contiguous().reshape(T_stage, C * Freq)
+        out[stage_name] = t.numpy()
+
     return out

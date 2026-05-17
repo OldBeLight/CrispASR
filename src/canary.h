@@ -105,6 +105,15 @@ float* canary_compute_mel(struct canary_context* ctx, const float* samples, int 
 float* canary_run_encoder(struct canary_context* ctx, const float* mel, int n_mels, int T_mel, int* out_T_enc,
                           int* out_d_model);
 
+// Staged encoder: runs the encoder with dup snapshots at every layer boundary
+// and invokes `cb` once per named stage. Stage names: "pre_enc_out",
+// "enc_L00".."enc_L31", "enc_out". T_enc and d_model are the actual shapes.
+// Returns 0 on success, -1 on error. Used by crispasr-diff for per-layer
+// cosine comparison against the Python reference.
+typedef void (*canary_stage_cb)(const char* stage_name, const float* data, int T_enc, int d_model, void* userdata);
+int canary_run_encoder_staged(struct canary_context* ctx, const float* mel, int n_mels, int T_mel, canary_stage_cb cb,
+                              void* userdata);
+
 // Internal smoke test: load and report all hparams. Returns 0 on success.
 int canary_test_load(struct canary_context* ctx);
 

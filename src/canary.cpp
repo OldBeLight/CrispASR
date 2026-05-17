@@ -466,7 +466,8 @@ static std::vector<float> canary_compute_mel_impl(canary_context* ctx, const flo
     p.layout = core_mel::Layout::TimeMels;
     p.log_eps = (float)(1.0 / (1 << 24));
     p.center_pad = true;
-    p.preemph = 0.97f; // NeMo AudioToMelSpectrogramPreprocessor default (#37)
+    p.drop_last_frame = true; // NeMo returns feat_len = floor(n_samples/hop) frames
+    p.preemph = 0.97f;        // NeMo AudioToMelSpectrogramPreprocessor default (#37)
 
     return core_mel::compute(samples, n_samples, window_raw.data(), win, mel_fb.data(), n_freqs, canary_fft_r2c, p,
                              T_out);
@@ -521,6 +522,59 @@ static ggml_cgraph* canary_build_graph_encoder(canary_context* ctx, int T_mel) {
     };
     for (uint32_t il = 0; il < hp.enc_n_layers; il++) {
         cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp);
+    }
+
+    ggml_set_name(cur, "enc_out");
+    ggml_build_forward_expand(gf, cur);
+    ggml_free(ctx0);
+    return gf;
+}
+
+// Staged graph: same as above but snapshots intermediate tensors via ggml_dup
+// so they survive after the allocator reclaims intermediate buffers.
+// Names: "pre_enc_out", "enc_L00".."enc_L31", "enc_out".
+// Graph size is larger (~33 extra dup nodes), so we use 24576 max nodes.
+static ggml_cgraph* canary_build_graph_encoder_staged(canary_context* ctx, int T_mel) {
+    const auto& m = ctx->model;
+    const auto& hp = m.hparams;
+    const int n_mels = (int)hp.n_mels;
+
+    ggml_init_params ip = {
+        /*mem_size=*/ctx->compute_meta.size(),
+        /*mem_buffer=*/ctx->compute_meta.data(),
+        /*no_alloc=*/true,
+    };
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 24576, false);
+
+    ggml_tensor* mel_t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_mels, T_mel);
+    ggml_set_name(mel_t, "mel");
+    ggml_set_input(mel_t);
+
+    int T = 0;
+    ggml_tensor* cur =
+        core_conformer::build_pre_encode(ctx0, mel_t, m.pre_encode, (int)hp.subsampling_channels, &T, gf);
+
+    {
+        ggml_tensor* snap = ggml_dup(ctx0, cur);
+        ggml_set_name(snap, "pre_enc_out");
+        ggml_build_forward_expand(gf, snap);
+    }
+
+    ggml_tensor* pos_enc = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int)hp.d_model, 2 * T - 1);
+    ggml_set_name(pos_enc, "pos_enc");
+    ggml_set_input(pos_enc);
+
+    core_conformer::BlockParams bp = {
+        (int)hp.d_model, (int)hp.n_heads, (int)hp.head_dim, (int)hp.conv_kernel, kLayerNormEps,
+    };
+    char lbuf[32];
+    for (uint32_t il = 0; il < hp.enc_n_layers; il++) {
+        cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp);
+        snprintf(lbuf, sizeof(lbuf), "enc_L%02u", il);
+        ggml_tensor* snap = ggml_dup(ctx0, cur);
+        ggml_set_name(snap, lbuf);
+        ggml_build_forward_expand(gf, snap);
     }
 
     ggml_set_name(cur, "enc_out");
@@ -1104,6 +1158,91 @@ extern "C" float* canary_run_encoder(struct canary_context* ctx, const float* me
         return nullptr;
     std::memcpy(r, enc.data(), enc.size() * sizeof(float));
     return r;
+}
+
+extern "C" int canary_run_encoder_staged(struct canary_context* ctx, const float* mel, int n_mels, int T_mel,
+                                         canary_stage_cb cb, void* userdata) {
+    if (!ctx || !mel || T_mel <= 0 || !cb)
+        return -1;
+    if (n_mels != (int)ctx->model.hparams.n_mels) {
+        fprintf(stderr, "canary: mel feature mismatch (%d vs %d)\n", n_mels, (int)ctx->model.hparams.n_mels);
+        return -1;
+    }
+
+    if (!ctx->sched) {
+        ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+        int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 24576, false, false);
+    }
+    if (ctx->compute_meta.empty()) {
+        ctx->compute_meta.resize(ggml_tensor_overhead() * 24576 + ggml_graph_overhead_custom(24576, false));
+    }
+
+    ggml_cgraph* gf = canary_build_graph_encoder_staged(ctx, T_mel);
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "canary: failed to alloc staged encoder graph\n");
+        return -1;
+    }
+
+    ggml_tensor* mel_in = ggml_graph_get_tensor(gf, "mel");
+    ggml_backend_tensor_set(mel_in, mel, 0, (size_t)n_mels * T_mel * sizeof(float));
+
+    ggml_tensor* pos_in = ggml_graph_get_tensor(gf, "pos_enc");
+    int T_enc = (int)pos_in->ne[1];
+    T_enc = (T_enc + 1) / 2;
+    auto pe = core_conformer::make_pos_enc((int)ctx->model.hparams.d_model, T_enc);
+    ggml_backend_tensor_set(pos_in, pe.data(), 0, pe.size() * sizeof(float));
+
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "canary: staged encoder compute failed\n");
+        return -1;
+    }
+
+    const int d = (int)ctx->model.hparams.d_model;
+
+    // Retrieve and deliver each named snapshot in order.
+    // deliver() assumes ne[0]=d_model (standard encoder output format).
+    auto deliver = [&](const char* name) {
+        ggml_tensor* t = ggml_graph_get_tensor(gf, name);
+        if (!t)
+            return;
+        const int t_steps = (int)t->ne[1];
+        std::vector<float> buf((size_t)d * t_steps);
+        ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(float));
+        cb(name, buf.data(), t_steps, d, userdata);
+    };
+    // deliver_dyn() uses the tensor's own ne[0] as the feature dim.
+    // Used for intermediate conv snaps where the feature count differs.
+    auto deliver_dyn = [&](const char* name) {
+        ggml_tensor* t = ggml_graph_get_tensor(gf, name);
+        if (!t)
+            return;
+        const int feat = (int)t->ne[0];
+        const int t_steps = (int)t->ne[1];
+        std::vector<float> buf((size_t)feat * t_steps);
+        ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(float));
+        cb(name, buf.data(), t_steps, feat, userdata);
+    };
+
+    deliver_dyn("pre_enc_c0");
+    deliver_dyn("pre_enc_c2");
+    deliver_dyn("pre_enc_c3");
+    deliver_dyn("pre_enc_c5");
+    deliver_dyn("pre_enc_c6");
+    deliver("pre_enc_out");
+
+    const int n_layers = (int)ctx->model.hparams.enc_n_layers;
+    char lbuf[32];
+    for (int il = 0; il < n_layers; il++) {
+        snprintf(lbuf, sizeof(lbuf), "enc_L%02d", il);
+        deliver(lbuf);
+    }
+
+    deliver("enc_out");
+
+    return 0;
 }
 
 extern "C" struct canary_context_params canary_context_default_params(void) {

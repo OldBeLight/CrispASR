@@ -119,6 +119,12 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     else:
         model = nemo_asr.models.ASRModel.restore_from(pretrained)
     model.eval()
+
+    # Disable dither for deterministic mel comparison against C++.
+    if hasattr(model, "preprocessor") and hasattr(model.preprocessor, "featurizer"):
+        model.preprocessor.featurizer.dither = 0.0
+        model.preprocessor.featurizer.pad_to = 0
+
     dev = next(model.parameters()).device
 
     sig = torch.from_numpy(audio.astype(np.float32)).unsqueeze(0).to(dev)
@@ -154,7 +160,8 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         # Transpose so flat-element ordering matches what
         # parakeet_compute_mel returns.
         if "mel_spectrogram" in stages:
-            m = feats[0].transpose(0, 1).contiguous()
+            T_valid = int(feat_len.item())  # NeMo valid frame count
+            m = feats[0, :, :T_valid].transpose(0, 1).contiguous()
             out["mel_spectrogram"] = m.detach().cpu().float().numpy()
 
         encf, enc_len = model.encoder(audio_signal=feats, length=feat_len)

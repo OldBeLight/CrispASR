@@ -70,6 +70,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <sys/stat.h>
 #include <string>
@@ -275,6 +276,44 @@ static StageResult parakeet_encoder_with_ref_mel_r(parakeet_context* ctx, const 
 }
 
 // ---- canary (NeMo FastConformer + Transformer decoder) ----
+
+// File-scope capture container for canary_run_encoder_staged.
+// Using a static C function avoids the GCC restriction that non-capturing
+// lambdas cannot reference locally-defined types through void* casts.
+struct CanaryStageCap {
+    std::map<std::string, std::vector<float>> stages;
+};
+static void canary_stage_capture_cb(const char* name, const float* data, int T_enc, int d_model, void* ud) {
+    auto* c = static_cast<CanaryStageCap*>(ud);
+    c->stages[name].assign(data, data + (size_t)T_enc * d_model);
+}
+
+// Feed the reference mel into the C++ encoder to isolate encoder bugs from
+// mel-computation divergence. Reference mel shape: ne[0]=n_mels, ne[1]=T_mel
+// (TimeMels layout, n_mels contiguous — matches canary_run_encoder's input).
+static StageResult canary_encoder_with_ref_mel_r(canary_context* ctx, const crispasr_diff::Ref& ref) {
+    StageResult r;
+    auto pair = ref.get_f32("mel_spectrogram");
+    auto shp = ref.shape("mel_spectrogram");
+    if (!pair.first || shp.size() < 2) {
+        r.note = "reference mel_spectrogram not in archive";
+        return r;
+    }
+    // GGUF ne[0]=n_mels (fast), ne[1]=T_mel — matches canary_run_encoder layout.
+    const int n_mels = (int)shp[0];
+    const int T_mel = (int)shp[1];
+    int T_enc = 0, d_model = 0;
+    float* enc = canary_run_encoder(ctx, pair.first, n_mels, T_mel, &T_enc, &d_model);
+    if (!enc) {
+        r.note = "canary_run_encoder returned null";
+        return r;
+    }
+    r.shape = {T_enc, d_model};
+    r.data.assign(enc, enc + (size_t)T_enc * d_model);
+    free(enc);
+    r.ok = true;
+    return r;
+}
 
 static StageResult canary_mel_r(canary_context* ctx, const float* samples, int n_samples) {
     StageResult r;
@@ -735,7 +774,7 @@ int main(int argc, char** argv) {
                 "\n"
                 "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, "
                 "granite-4.1, "
-                "granite-nle, parakeet, chatterbox, "
+                "granite-nle, parakeet, chatterbox, voxcpm2-tts, "
                 "canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, moonshine-streaming\n"
                 "  model.gguf    crispasr-compatible model weights\n"
                 "  reference.gguf  archive produced by tools/dump_reference.py\n"
@@ -2338,6 +2377,91 @@ int main(int argc, char** argv) {
             n_fail++;
         }
 
+        // ---- Staged encoder using C++ mel (isolates encoder bugs from
+        //      mel-computation differences). Compares pre_enc_out + each layer.
+        //      Uses the C++ mel (which may have fewer frames due to
+        //      drop_last_frame) for a fair comparison against the reference.
+        {
+            // Prefer C++ mel (matches the drop_last_frame convention).
+            // Fall back to reference mel if C++ mel wasn't computed.
+            const float* staged_mel = nullptr;
+            int staged_n_mels = 0, staged_T_mel = 0;
+            if (mel_r.ok && !mel_r.data.empty()) {
+                staged_n_mels = mel_r.shape.size() >= 1 ? (int)mel_r.shape[0] : 128;
+                staged_T_mel = mel_r.shape.size() >= 2 ? (int)mel_r.shape[1] : 0;
+                staged_mel = mel_r.data.data();
+            } else {
+                auto mel_pair = ref.get_f32("mel_spectrogram");
+                auto mel_shp = ref.shape("mel_spectrogram");
+                if (mel_pair.first && mel_shp.size() >= 2) {
+                    staged_n_mels = (int)mel_shp[0];
+                    staged_T_mel = (int)mel_shp[1];
+                    staged_mel = mel_pair.first;
+                }
+            }
+            if (staged_mel && staged_T_mel > 0) {
+                // Collect staged outputs via file-scope callback (see CanaryStageCap).
+                CanaryStageCap cap;
+                int staged_ok = canary_run_encoder_staged(ctx, staged_mel, staged_n_mels, staged_T_mel,
+                                                          canary_stage_capture_cb, &cap);
+
+                if (staged_ok == 0) {
+                    // Intermediate conv snaps: pre_enc_c0/2/3/5/6
+                    static const struct {
+                        const char* cpp;
+                        const char* ref;
+                    } kPreEncStages[] = {
+                        {"pre_enc_c0", "pre_enc_c0"}, {"pre_enc_c2", "pre_enc_c2"}, {"pre_enc_c3", "pre_enc_c3"},
+                        {"pre_enc_c5", "pre_enc_c5"}, {"pre_enc_c6", "pre_enc_c6"},
+                    };
+                    for (const auto& ps : kPreEncStages) {
+                        if (cap.stages.count(ps.cpp) && ref.has(ps.ref)) {
+                            auto& v = cap.stages[ps.cpp];
+                            auto rep = ref.compare(ps.ref, v.data(), v.size());
+                            print_row(ps.ref, rep, COS_THRESHOLD);
+                            record(rep);
+                        }
+                    }
+
+                    // pre_enc_out vs reference "pre_encode_output"
+                    if (cap.stages.count("pre_enc_out") && ref.has("pre_encode_output")) {
+                        auto& v = cap.stages["pre_enc_out"];
+                        auto rep = ref.compare("pre_encode_output", v.data(), v.size());
+                        print_row("pre_encode_output", rep, COS_THRESHOLD);
+                        record(rep);
+                    }
+
+                    // Per-layer: enc_L%02d vs "encoder_layer_%d"
+                    char stage_cpp[32], stage_ref[32];
+                    for (int il = 0; il < 32; il++) {
+                        snprintf(stage_cpp, sizeof(stage_cpp), "enc_L%02d", il);
+                        snprintf(stage_ref, sizeof(stage_ref), "encoder_layer_%d", il);
+                        if (!cap.stages.count(stage_cpp) || !ref.has(stage_ref))
+                            break;
+                        auto& v = cap.stages[stage_cpp];
+                        auto rep = ref.compare(stage_ref, v.data(), v.size());
+                        char label[48];
+                        snprintf(label, sizeof(label), "encoder_layer_%d", il);
+                        print_row(label, rep, COS_THRESHOLD);
+                        record(rep);
+                        // Note: don't break early so we can see full layer progression
+                    }
+
+                    // Final encoder_output with reference mel
+                    if (cap.stages.count("enc_out") && ref.has("encoder_output")) {
+                        auto& v = cap.stages["enc_out"];
+                        auto rep = ref.compare("encoder_output", v.data(), v.size());
+                        print_row("encoder_output_ref_mel", rep, COS_THRESHOLD);
+                        record(rep);
+                    }
+                } else {
+                    printf("[SKIP] staged encoder  canary_run_encoder_staged failed\n");
+                }
+            } else {
+                printf("[SKIP] staged encoder  no mel available for staged comparison\n");
+            }
+        }
+
         canary_free(ctx);
     } else if (backend_name == "cohere") {
         auto cp = cohere_context_default_params();
@@ -2823,7 +2947,7 @@ int main(int argc, char** argv) {
                 "crispasr-diff: backend '%s' is not recognised. "
                 "Supported: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, granite-4.1, "
                 "granite-nle, parakeet, canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, "
-                "moonshine-streaming, lid-cld3, glm-asr, firered-asr.\n",
+                "moonshine-streaming, lid-cld3, glm-asr, firered-asr, voxcpm2-tts.\n",
                 backend_name.c_str());
         return 5;
     }

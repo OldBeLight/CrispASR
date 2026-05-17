@@ -2601,10 +2601,23 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                     if (fsize > 12 && fsize <= INT32_MAX) {
                         std::vector<uint8_t> buf((size_t)fsize);
                         const size_t rd = fread(buf.data(), 1, buf.size(), fv);
-                        if (rd != buf.size() || !vibevoice_parse_mono_pcm16_wav(buf.data(), buf.size(), ref_pcm)) {
+                        uint32_t wav_sr = 0;
+                        if (rd != buf.size() ||
+                            !vibevoice_parse_mono_pcm16_wav(buf.data(), buf.size(), ref_pcm, &wav_sr)) {
                             fprintf(stderr,
                                     "vibevoice TTS: voice WAV '%s' must be mono PCM16 with a RIFF/WAVE header\n",
                                     voice_wav);
+                        }
+                        // Resample to 24 kHz if needed (σ-VAE encoders expect 24 kHz input).
+                        if (!ref_pcm.empty() && wav_sr > 0 && wav_sr != 24000) {
+                            std::vector<float> resampled;
+                            vibevoice_resample_linear(ref_pcm, wav_sr, 24000, resampled);
+                            if (verbosity >= 1)
+                                fprintf(stderr,
+                                        "vibevoice TTS: resampled voice ref %u Hz → 24000 Hz "
+                                        "(%zu → %zu samples)\n",
+                                        wav_sr, ref_pcm.size(), resampled.size());
+                            ref_pcm = std::move(resampled);
                         }
                     }
                     fclose(fv);
@@ -2615,7 +2628,8 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                     // Normalize to -25 dB FS (matches Microsoft's default).
                     vibevoice_normalize_ref_pcm(ref_pcm);
 
-                    // TTS Voice Cloning uses ONLY the acoustic encoder and applies scaling
+                    // TTS Voice Cloning: acoustic encoder (with scaling) + semantic encoder
+                    // combined via element-wise sum, matching Microsoft's Python reference.
                     float sf = 0.196f, bf = -0.049f;
                     auto* tsf = G("speech_scaling_factor");
                     auto* tbf = G("speech_bias_factor");
@@ -2624,20 +2638,57 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                     if (tbf)
                         ggml_backend_tensor_get(tbf, &bf, 0, sizeof(float));
 
+                    // 1. Acoustic encoder → scale → acoustic connector
                     int T_at = 0, vd_at = 0;
                     auto at_mean = run_encoder_stage(ctx, "at_enc", ref_pcm.data(), n_samples_ref, &T_at, &vd_at);
 
-                    if (!at_mean.empty()) {
+                    // 2. Semantic encoder → semantic connector (no scaling)
+                    int T_st = 0, vd_st = 0;
+                    auto st_mean = run_encoder_stage(ctx, "st_enc", ref_pcm.data(), n_samples_ref, &T_st, &vd_st);
+
+                    if (!at_mean.empty() && !st_mean.empty()) {
                         n_voice_frames = T_at;
                         for (int i = 0; i < T_at * vd_at; i++)
                             at_mean[i] = (at_mean[i] + bf) * sf;
 
+                        auto at_feat = run_connector_stage(ctx, "at_conn", at_mean.data(), T_at, vd_at);
+                        auto st_feat = run_connector_stage(ctx, "se_conn", st_mean.data(), T_st, vd_st);
+
+                        if (!at_feat.empty() && !st_feat.empty() && T_at == T_st) {
+                            // Element-wise sum of acoustic + semantic features
+                            voice_embeds.resize(T_at * hp.d_lm);
+                            for (int i = 0; i < T_at * hp.d_lm; i++)
+                                voice_embeds[i] = at_feat[i] + st_feat[i];
+                            if (verbosity >= 1)
+                                fprintf(stderr,
+                                        "vibevoice TTS: voice ref encoded: %d frames "
+                                        "(acoustic+semantic combined)\n",
+                                        T_at);
+                        } else if (!at_feat.empty()) {
+                            // Fallback: acoustic-only if semantic fails or frame mismatch
+                            if (verbosity >= 1)
+                                fprintf(stderr,
+                                        "vibevoice TTS: semantic path unavailable (T_at=%d, T_st=%d), "
+                                        "using acoustic-only\n",
+                                        T_at, T_st);
+                            voice_embeds = at_feat;
+                        }
+                    } else if (!at_mean.empty()) {
+                        // Legacy fallback: acoustic-only (e.g. old GGUFs without semantic tensors)
+                        n_voice_frames = T_at;
+                        for (int i = 0; i < T_at * vd_at; i++)
+                            at_mean[i] = (at_mean[i] + bf) * sf;
                         auto at_feat = run_connector_stage(ctx, "at_conn", at_mean.data(), T_at, vd_at);
                         if (!at_feat.empty())
                             voice_embeds = at_feat;
                     }
                 }
             }
+        }
+
+        // Dump voice clone intermediates for diff harness
+        if (dump_dir && n_voice_frames > 0) {
+            vibevoice_dump_f32(dump_dir, "tts_voice_embeds", voice_embeds.data(), voice_embeds.size());
         }
 
         // Build prompt tokens

@@ -21,8 +21,12 @@ inline uint32_t vibevoice_wav_rd_u32(const uint8_t* data, std::size_t off) {
            ((uint32_t)data[off + 3] << 24);
 }
 
-inline bool vibevoice_parse_mono_pcm16_wav(const uint8_t* data, std::size_t size, std::vector<float>& pcm) {
+// Parse mono PCM16 WAV, returning float samples and the native sample rate.
+inline bool vibevoice_parse_mono_pcm16_wav(const uint8_t* data, std::size_t size, std::vector<float>& pcm,
+                                           uint32_t* out_sample_rate = nullptr) {
     pcm.clear();
+    if (out_sample_rate)
+        *out_sample_rate = 0;
     if (!data || size < 12)
         return false;
     if (std::memcmp(data, "RIFF", 4) != 0 || std::memcmp(data + 8, "WAVE", 4) != 0)
@@ -30,6 +34,7 @@ inline bool vibevoice_parse_mono_pcm16_wav(const uint8_t* data, std::size_t size
 
     uint32_t audio_format = 0;
     uint32_t channels = 0;
+    uint32_t sample_rate = 0;
     uint32_t bits_per_sample = 0;
     std::size_t data_offset = 0;
     uint32_t data_size = 0;
@@ -44,6 +49,7 @@ inline bool vibevoice_parse_mono_pcm16_wav(const uint8_t* data, std::size_t size
         if (std::memcmp(data + offset, "fmt ", 4) == 0 && chunk_sz >= 16) {
             audio_format = vibevoice_wav_rd_u16(data, chunk_data);
             channels = vibevoice_wav_rd_u16(data, chunk_data + 2);
+            sample_rate = vibevoice_wav_rd_u32(data, chunk_data + 4);
             bits_per_sample = vibevoice_wav_rd_u16(data, chunk_data + 14);
         } else if (std::memcmp(data + offset, "data", 4) == 0) {
             data_offset = chunk_data;
@@ -65,7 +71,30 @@ inline bool vibevoice_parse_mono_pcm16_wav(const uint8_t* data, std::size_t size
         const int16_t s = (int16_t)vibevoice_wav_rd_u16(data, off);
         pcm[i] = (float)s / 32768.0f;
     }
+    if (out_sample_rate)
+        *out_sample_rate = sample_rate;
     return true;
+}
+
+// Simple linear-interpolation resample (good enough for voice reference conditioning).
+inline void vibevoice_resample_linear(const std::vector<float>& in, uint32_t sr_in, uint32_t sr_out,
+                                      std::vector<float>& out) {
+    if (sr_in == sr_out || in.empty()) {
+        out = in;
+        return;
+    }
+    const double ratio = (double)sr_in / (double)sr_out;
+    const std::size_t n_out = (std::size_t)std::ceil((double)in.size() / ratio);
+    out.resize(n_out);
+    for (std::size_t i = 0; i < n_out; i++) {
+        const double src_pos = (double)i * ratio;
+        const std::size_t idx = (std::size_t)src_pos;
+        const float frac = (float)(src_pos - (double)idx);
+        if (idx + 1 < in.size())
+            out[i] = in[idx] * (1.0f - frac) + in[idx + 1] * frac;
+        else
+            out[i] = in[std::min(idx, in.size() - 1)];
+    }
 }
 
 inline void vibevoice_normalize_ref_pcm(std::vector<float>& pcm, float target_dbfs = -25.0f) {

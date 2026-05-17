@@ -822,6 +822,18 @@ target_compile_features   (vibevoice PUBLIC cxx_std_17)
 target_link_libraries     (vibevoice PUBLIC crispasr-core ggml ggml-base ggml-cpu)
 
 # ---------------------------------------------------------------------------
+# voxcpm2_tts — openbmb/VoxCPM2 (diffusion AR TTS, 30 languages, 48kHz)
+# ---------------------------------------------------------------------------
+add_library(voxcpm2_tts STATIC voxcpm2_tts.h voxcpm2_tts.cpp)
+set_target_properties(voxcpm2_tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(voxcpm2_tts PUBLIC .)
+target_compile_features   (voxcpm2_tts PUBLIC cxx_std_17)
+target_link_libraries     (voxcpm2_tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(voxcpm2_tts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # kokoro — hexgrad/Kokoro-82M + yl4579/StyleTTS2-LJSpeech (iSTFTNet TTS)
 # ---------------------------------------------------------------------------
 add_library(kokoro STATIC kokoro.h kokoro.cpp)
@@ -1223,6 +1235,9 @@ if (TARGET m2m100)
 endif()
 if (TARGET t5_translate)
     target_link_libraries(crispasr PUBLIC t5_translate)
+endif()
+if (TARGET voxcpm2_tts)
+    target_link_libraries(crispasr PUBLIC voxcpm2_tts)
 endif()
 if (TARGET kokoro)
     target_link_libraries(crispasr PUBLIC kokoro)

@@ -10,6 +10,51 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## mel / preprocessor
+
+### STFT frame count: NeMo `feat_len` vs raw STFT output
+
+NeMo's `AudioToMelSpectrogramPreprocessor` computes the STFT over the
+full center-padded signal, producing `T = floor((n+pad-n_fft)/hop)+1`
+frames. But the returned `feat_len` is `floor(n_samples/hop)`, which
+is one less when `n_samples` is an exact multiple of `hop_length`.
+Frames beyond `feat_len` are treated as padding (zeroed in the output
+tensor). The per-feature z-normalization runs over all `T` frames
+(including the padding one), but the padding frame's z-score ends up
+zero because it equals the mean of a near-constant band.
+
+The C++ `core_mel::compute` produces the raw `T` frames and normalizes
+all of them. The boundary frame is NOT zero — it has valid but
+edge-contaminated STFT content, so after z-norm its values diverge by
+±4 z-score units from the NeMo reference.
+
+Fix: set `p.drop_last_frame = true` for all backends that use NeMo-
+style center-padded STFT (canary, parakeet, cohere). This drops the
+final frame, matching NeMo's `feat_len`.
+
+Signature: mel cos_min ≈ 0.94 but cos_mean ≈ 0.999; exactly one
+frame dominates `max_abs`; the worst frame is always the last.
+
+### Dither must be disabled for deterministic reference dumps
+
+NeMo's default `dither: 1e-5` adds per-sample Gaussian noise. Tiny
+for real speech, but non-deterministic — each dump produces slightly
+different mel values. Disable in the reference backend with
+`model.preprocessor.featurizer.dither = 0.0` before running the
+forward pass.
+
+### Silence is a degenerate test input for per-feature-z normalization
+
+All-zero audio → constant log-mel → per-feature z-norm divides 0/ε →
+all-zero mel. NeMo produces a small negative constant (≈ −0.16) for
+the same input because batch-norm running stats or ε handling differ.
+The C++ producing all-zero mel is mathematically correct but creates
+a misleading diff: cos_min=1.0 (zero vs constant is handled as
+"perfect" by the cosine comparison's zero-guard). Always test with
+real speech.
+
+---
+
 ## ggml / inference engine
 
 ### RoPE mode mapping: ALWAYS `NEOX` for modern models

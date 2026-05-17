@@ -20,24 +20,25 @@ extern "C" {
 
 namespace {
 
-constexpr int   kRnnoiseFrameSize  = 480;     // samples per RNNoise frame @ 48 kHz
-constexpr int   kInputSampleRate   = 16000;   // ASR-canonical rate
-constexpr int   kRnnoiseSampleRate = 48000;   // RNNoise internal rate
-constexpr float kRnnoiseScale      = 32768.0f; // classic rnnoise wants short-range floats
+constexpr int kRnnoiseFrameSize = 480;    // samples per RNNoise frame @ 48 kHz
+constexpr int kInputSampleRate = 16000;   // ASR-canonical rate
+constexpr int kRnnoiseSampleRate = 48000; // RNNoise internal rate
+constexpr float kRnnoiseScale = 32768.0f; // classic rnnoise wants short-range floats
 
 bool enhance_rnnoise(const float* in_samples, int n_samples, float* out_samples, bool verbose) {
     if (in_samples == nullptr || out_samples == nullptr || n_samples <= 0) {
-        if (verbose) std::fprintf(stderr, "[enhance] invalid args\n");
+        if (verbose)
+            std::fprintf(stderr, "[enhance] invalid args\n");
         return false;
     }
 
     // ---- 16 kHz -> 48 kHz upsample ----
-    ma_resampler_config up_cfg = ma_resampler_config_init(
-        ma_format_f32, /*channels=*/1, kInputSampleRate, kRnnoiseSampleRate,
-        ma_resample_algorithm_linear);
+    ma_resampler_config up_cfg = ma_resampler_config_init(ma_format_f32, /*channels=*/1, kInputSampleRate,
+                                                          kRnnoiseSampleRate, ma_resample_algorithm_linear);
     ma_resampler up;
     if (ma_resampler_init(&up_cfg, NULL, &up) != MA_SUCCESS) {
-        if (verbose) std::fprintf(stderr, "[enhance] upsampler init failed\n");
+        if (verbose)
+            std::fprintf(stderr, "[enhance] upsampler init failed\n");
         return false;
     }
 
@@ -46,13 +47,13 @@ bool enhance_rnnoise(const float* in_samples, int n_samples, float* out_samples,
     const size_t up_cap = static_cast<size_t>(n_samples) * 3 + kRnnoiseFrameSize;
     std::vector<float> up_buf(up_cap, 0.0f);
 
-    ma_uint64 frames_in  = static_cast<ma_uint64>(n_samples);
+    ma_uint64 frames_in = static_cast<ma_uint64>(n_samples);
     ma_uint64 frames_out = up_cap;
-    ma_result rc = ma_resampler_process_pcm_frames(
-        &up, in_samples, &frames_in, up_buf.data(), &frames_out);
+    ma_result rc = ma_resampler_process_pcm_frames(&up, in_samples, &frames_in, up_buf.data(), &frames_out);
     ma_resampler_uninit(&up, NULL);
     if (rc != MA_SUCCESS) {
-        if (verbose) std::fprintf(stderr, "[enhance] upsample failed (rc=%d)\n", (int)rc);
+        if (verbose)
+            std::fprintf(stderr, "[enhance] upsample failed (rc=%d)\n", (int)rc);
         return false;
     }
 
@@ -61,15 +62,18 @@ bool enhance_rnnoise(const float* in_samples, int n_samples, float* out_samples,
     // doesn't lose the tail. The padding is zero so it doesn't
     // affect downsampled output content.
     int padded = ((up_count + kRnnoiseFrameSize - 1) / kRnnoiseFrameSize) * kRnnoiseFrameSize;
-    if (padded > static_cast<int>(up_buf.size())) up_buf.resize(padded, 0.0f);
+    if (padded > static_cast<int>(up_buf.size()))
+        up_buf.resize(padded, 0.0f);
 
     // ---- scale [-1, 1] -> [-32768, 32767] ----
-    for (int i = 0; i < up_count; ++i) up_buf[i] *= kRnnoiseScale;
+    for (int i = 0; i < up_count; ++i)
+        up_buf[i] *= kRnnoiseScale;
 
     // ---- RNNoise frame loop ----
     DenoiseState* st = rnnoise_create(NULL);
     if (st == nullptr) {
-        if (verbose) std::fprintf(stderr, "[enhance] rnnoise_create failed\n");
+        if (verbose)
+            std::fprintf(stderr, "[enhance] rnnoise_create failed\n");
         return false;
     }
     float frame[kRnnoiseFrameSize];
@@ -81,26 +85,27 @@ bool enhance_rnnoise(const float* in_samples, int n_samples, float* out_samples,
     rnnoise_destroy(st);
 
     // ---- scale back to [-1, 1] ----
-    for (int i = 0; i < padded; ++i) up_buf[i] /= kRnnoiseScale;
+    for (int i = 0; i < padded; ++i)
+        up_buf[i] /= kRnnoiseScale;
 
     // ---- 48 kHz -> 16 kHz downsample ----
-    ma_resampler_config down_cfg = ma_resampler_config_init(
-        ma_format_f32, /*channels=*/1, kRnnoiseSampleRate, kInputSampleRate,
-        ma_resample_algorithm_linear);
+    ma_resampler_config down_cfg = ma_resampler_config_init(ma_format_f32, /*channels=*/1, kRnnoiseSampleRate,
+                                                            kInputSampleRate, ma_resample_algorithm_linear);
     ma_resampler down;
     if (ma_resampler_init(&down_cfg, NULL, &down) != MA_SUCCESS) {
-        if (verbose) std::fprintf(stderr, "[enhance] downsampler init failed\n");
+        if (verbose)
+            std::fprintf(stderr, "[enhance] downsampler init failed\n");
         return false;
     }
 
     std::vector<float> down_buf(static_cast<size_t>(n_samples) + 64, 0.0f);
-    ma_uint64 dn_in  = static_cast<ma_uint64>(padded);
+    ma_uint64 dn_in = static_cast<ma_uint64>(padded);
     ma_uint64 dn_out = down_buf.size();
-    rc = ma_resampler_process_pcm_frames(
-        &down, up_buf.data(), &dn_in, down_buf.data(), &dn_out);
+    rc = ma_resampler_process_pcm_frames(&down, up_buf.data(), &dn_in, down_buf.data(), &dn_out);
     ma_resampler_uninit(&down, NULL);
     if (rc != MA_SUCCESS) {
-        if (verbose) std::fprintf(stderr, "[enhance] downsample failed (rc=%d)\n", (int)rc);
+        if (verbose)
+            std::fprintf(stderr, "[enhance] downsample failed (rc=%d)\n", (int)rc);
         return false;
     }
 
@@ -116,13 +121,13 @@ bool enhance_rnnoise(const float* in_samples, int n_samples, float* out_samples,
     return true;
 }
 
-}  // anonymous
+} // namespace
 
 bool crispasr_enhance_audio(const float* in_samples, int n_samples, float* out_samples,
                             const CrispasrEnhanceOptions& opts) {
     switch (opts.method) {
-        case CrispasrEnhanceMethod::Rnnoise:
-            return enhance_rnnoise(in_samples, n_samples, out_samples, opts.verbose);
+    case CrispasrEnhanceMethod::Rnnoise:
+        return enhance_rnnoise(in_samples, n_samples, out_samples, opts.verbose);
     }
     return false;
 }

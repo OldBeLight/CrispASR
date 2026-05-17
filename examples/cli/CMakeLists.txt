@@ -30,6 +30,7 @@ add_executable(${TARGET}
     crispasr_backend_orpheus.cpp
     crispasr_backend_chatterbox.cpp
     crispasr_backend_indextts.cpp
+    crispasr_backend_voxcpm2_tts.cpp
     crispasr_backend_kokoro.cpp
     crispasr_backend_m2m100.cpp
     crispasr_backend_t5.cpp
@@ -164,6 +165,7 @@ target_link_libraries(crispasr-diff PRIVATE
     gemma4_e2b
     mimo_tokenizer
     mimo_asr
+    voxcpm2_tts
     crispasr-diff-lib
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
@@ -240,6 +242,7 @@ target_link_libraries(${TARGET} PRIVATE
     chatterbox
     indextts
     kokoro
+    voxcpm2_tts
     m2m100
     t5_translate
     canary_ctc

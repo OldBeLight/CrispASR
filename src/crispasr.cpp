@@ -7541,8 +7541,7 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                                 // and a single chosen token. Beam search below
                                 // doesn't (siblings ≠ alternatives).
                                 std::vector<whisper_alt_token> tmp_alts;
-                                std::vector<whisper_alt_token>* alts_out =
-                                    params.alt_n > 0 ? &tmp_alts : nullptr;
+                                std::vector<whisper_alt_token>* alts_out = params.alt_n > 0 ? &tmp_alts : nullptr;
                                 if (t_cur < 1e-6f) {
                                     decoder.sequence.tokens.push_back(
                                         whisper_sample_token(*ctx, decoder, true, params.alt_n, alts_out));
