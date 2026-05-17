@@ -1853,18 +1853,19 @@ static ggml_cgraph* build_graph_t3_gpt2_kv(chatterbox_context* c, int n_past, in
     ggml_tensor* cur = embeds;
 
     // Issue #94 follow-up: per-layer hidden-state dump for the GPT-2 graph.
-    // Set CRISPASR_CHATTERBOX_DUMP_GPT2_LAYERS=1 to mark the input embed,
-    // each post-attn-residual, each post-FFN-residual, and the post-ln_f
-    // tensor as graph outputs. The runner side reads them by name. This
-    // lets us bisect which transformer layer first diverges from the
-    // HuggingFace reference at the T == 1 decoding step.
-    // Don't rename `embeds` — runner reads it back as "inputs_embeds" to set
-    // input data on it. For the per-layer dump we just retrieve "inputs_embeds"
-    // by its existing name.
+    // Set CRISPASR_CHATTERBOX_DUMP_GPT2_LAYERS=1 to mark each
+    // post-attn-residual and post-FFN-residual as graph outputs. The runner
+    // side reads them by name and writes raw float32 to
+    // /tmp/cb_gpt2_step_<n_past>_LNN_post_{attn,ffn}.bin. Lets us bisect
+    // which transformer layer first diverges from the HuggingFace reference
+    // at the T == 1 decoding step.
+    //
+    // Note: the input tensor (`inputs_embeds`) is *not* dumped — set_output
+    // on a set_input tensor is ignored by the scheduler in practice and the
+    // memory gets repurposed after layer 0 reads it. Verify the input via a
+    // stderr print of `tok_embed.data()` first10 in the AR-loop call site if
+    // you need to compare it against speech_emb(tok) + wpe(pos).
     const bool dump_layers = (std::getenv("CRISPASR_CHATTERBOX_DUMP_GPT2_LAYERS") != nullptr);
-    if (dump_layers) {
-        ggml_set_output(embeds);
-    }
 
     for (uint32_t il = 0; il < hp.n_layers; il++) {
         const auto& b = c->t3.gpt2_blocks[il];
@@ -2058,7 +2059,6 @@ static float* run_t3_gpt2_kv(chatterbox_context* c, const float* embeds, int n_t
                 std::fclose(fp);
             }
         };
-        dump("inputs_embeds");
         for (uint32_t il = 0; il < c->hp.n_layers; il++) {
             char nm1[32], nm2[32];
             std::snprintf(nm1, sizeof nm1, "L%02u_post_attn", il);
