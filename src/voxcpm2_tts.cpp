@@ -1674,43 +1674,94 @@ static uint32_t utf8_next(const std::string& s, size_t& i) {
     i += 1; return 0xFFFD;
 }
 
-// Tokenize: CJK expansion -> whitespace pre-tokenize -> BPE -> append audio_start
+// Tokenize: SentencePiece BPE with ▁ word boundaries + CJK post-expansion
 static std::vector<int32_t> vox_tokenize(const vox_tokenizer& tok,
                                            const std::string& text) {
-    // CJK post-expansion: pad each CJK char with spaces
-    std::string expanded;
-    expanded.reserve(text.size() * 2);
+    // Step 1: Normalize — prepend ▁, replace spaces with ▁
+    // ▁ = U+2581 = \xe2\x96\x81
+    std::string normalized = "\xe2\x96\x81";
+    for (char c : text) {
+        if (c == ' ') normalized += "\xe2\x96\x81";
+        else normalized += c;
+    }
+
+    // Step 2: BPE encode using vocab ordering as merge priority
+    // Start with UTF-8 codepoint symbols
+    std::vector<std::string> symbols;
     {
         size_t pos = 0;
-        while (pos < text.size()) {
+        while (pos < normalized.size()) {
             size_t prev = pos;
-            uint32_t cp = utf8_next(text, pos);
-            if (is_cjk(cp)) {
-                expanded += ' ';
-                // re-encode cp as UTF-8
-                utf8_encode_cp(cp, expanded);
-                expanded += ' ';
-            } else {
-                expanded.append(text, prev, pos - prev);
+            utf8_next(normalized, pos);
+            symbols.push_back(normalized.substr(prev, pos - prev));
+        }
+    }
+
+    // Greedy BPE merge: repeatedly merge the pair with lowest merged-token ID
+    while (symbols.size() > 1) {
+        int best_id = INT_MAX, best_pos = -1;
+        for (int k = 0; k + 1 < (int)symbols.size(); k++) {
+            std::string merged = symbols[k] + symbols[k + 1];
+            auto it = tok.token_to_id.find(merged);
+            if (it != tok.token_to_id.end() && it->second < best_id) {
+                best_id = it->second;
+                best_pos = k;
+            }
+        }
+        if (best_pos < 0) break;
+        symbols[best_pos] = symbols[best_pos] + symbols[best_pos + 1];
+        symbols.erase(symbols.begin() + best_pos + 1);
+    }
+
+    // Convert symbols to IDs
+    std::vector<int32_t> result;
+    for (const auto& sym : symbols) {
+        auto it = tok.token_to_id.find(sym);
+        if (it != tok.token_to_id.end()) {
+            result.push_back(it->second);
+        } else {
+            // Byte fallback: encode each byte as <0xNN>
+            for (unsigned char c : sym) {
+                char hex[8];
+                snprintf(hex, sizeof(hex), "<0x%02X>", c);
+                auto jt = tok.token_to_id.find(hex);
+                if (jt != tok.token_to_id.end()) result.push_back(jt->second);
             }
         }
     }
 
-    std::vector<int32_t> result;
-    size_t i = 0;
-    bool first = true;
-    while (i < expanded.size()) {
-        while (i < expanded.size() && (expanded[i]==' '||expanded[i]=='\t'||expanded[i]=='\n')) i++;
-        if (i >= expanded.size()) break;
-        size_t j = i;
-        while (j < expanded.size() && expanded[j]!=' '&&expanded[j]!='\t'&&expanded[j]!='\n') j++;
-        std::string word = expanded.substr(i, j - i);
-        if (!first) word = " " + word;
-        first = false;
-        std::string encoded = vox_bytes_to_unicode(word.data(), word.size());
-        vox_bpe_one(tok, encoded, result);
-        i = j;
+    // Step 3: CJK post-expansion — split multi-char CJK tokens into individual chars
+    std::vector<int32_t> expanded;
+    for (int32_t id : result) {
+        if (id < 0 || id >= (int32_t)tok.id_to_token.size()) {
+            expanded.push_back(id);
+            continue;
+        }
+        const std::string& ts = tok.id_to_token[id];
+        // Check if token is multi-char CJK (remove ▁ prefix first)
+        std::string clean = ts;
+        while (clean.size() >= 3 && clean.substr(0, 3) == "\xe2\x96\x81")
+            clean = clean.substr(3);
+        if (clean.empty()) { expanded.push_back(id); continue; }
+        // Count CJK codepoints
+        int n_cjk = 0, n_total = 0;
+        { size_t p = 0; while (p < clean.size()) { if (is_cjk(utf8_next(clean, p))) n_cjk++; n_total++; } }
+        if (n_cjk == n_total && n_total >= 2) {
+            // Split into individual chars
+            size_t p = 0;
+            while (p < clean.size()) {
+                size_t prev = p;
+                utf8_next(clean, p);
+                std::string ch = clean.substr(prev, p - prev);
+                auto jt = tok.token_to_id.find(ch);
+                if (jt != tok.token_to_id.end()) expanded.push_back(jt->second);
+                else expanded.push_back(id);  // fallback: keep original
+            }
+        } else {
+            expanded.push_back(id);
+        }
     }
+    result = expanded;
 
     if (tok.audio_start_token >= 0) {
         result.push_back(tok.audio_start_token);
@@ -1770,17 +1821,18 @@ static bool vox_load_weights(voxcpm2_context* ctx, const char* path) {
     hp.patch_frames = kv_u32(meta, "vae.patch_frames", hp.patch_frames);
     hp.patch_dim    = kv_u32(meta, "vae.patch_dim",    hp.patch_dim);
 
-    // Tokenizer vocab from GGUF string arrays
+    // Tokenizer: try GGUF string arrays first, then vocab blob tensor
     {
         auto tokens = kv_str_array(meta, "tokenizer.ggml.tokens");
-        auto merges = kv_str_array(meta, "tokenizer.ggml.merges");
-        ctx->tokenizer.id_to_token = tokens;
-        for (size_t b = 0; b < tokens.size(); b++) {
-            ctx->tokenizer.token_to_id[tokens[b]] = (int32_t)b;
+        if (!tokens.empty()) {
+            ctx->tokenizer.id_to_token = tokens;
+            for (size_t b = 0; b < tokens.size(); b++)
+                ctx->tokenizer.token_to_id[tokens[b]] = (int32_t)b;
+            auto merges = kv_str_array(meta, "tokenizer.ggml.merges");
+            for (size_t b = 0; b < merges.size(); b++)
+                ctx->tokenizer.merge_rank[merges[b]] = (int32_t)b;
         }
-        for (size_t b = 0; b < merges.size(); b++) {
-            ctx->tokenizer.merge_rank[merges[b]] = (int32_t)b;
-        }
+        // Note: vocab blob tensor is loaded after weights (see below)
     }
 
     free_metadata(meta);
@@ -1797,30 +1849,35 @@ static bool vox_load_weights(voxcpm2_context* ctx, const char* path) {
     auto& T = ctx->tensors;
     vox_weights& W = ctx->weights;
 
-    // Check if vocab blob tensor exists and override tokenizer from it
+    // Check if vocab blob tensor exists and override tokenizer from it.
+    // The GGUF stores each vocab entry as [uint16 len][bytes...] packed into
+    // a 1-D F32 tensor where each float holds one byte value.
     {
-        ggml_tensor* vocab_t = try_get(T, "tokenizer.vocab");
-        if (vocab_t) {
+        ggml_tensor* vocab_t = try_get(T, "tokenizer.vocab_tensor");
+        if (vocab_t && ctx->tokenizer.id_to_token.empty()) {
             int n = (int)ggml_nelements(vocab_t);
-            std::vector<float> blob(n);
-            ggml_backend_tensor_get(vocab_t, blob.data(), 0, (size_t)n * sizeof(float));
-            // Decode F32 -> uint8 bytes -> null-separated token strings
+            std::vector<float> fp_buf(n);
+            ggml_backend_tensor_get(vocab_t, fp_buf.data(), 0, (size_t)n * sizeof(float));
+            // Decode F32 -> uint8 raw bytes
+            std::vector<uint8_t> raw(n);
+            for (int i = 0; i < n; i++) raw[i] = (uint8_t)(int)fp_buf[i];
+            // Parse [uint16 len][bytes len] entries
             ctx->tokenizer.id_to_token.clear();
             ctx->tokenizer.token_to_id.clear();
-            size_t start = 0;
-            for (int b = 0; b <= n; b++) {
-                bool end_of = (b == n) || ((int)blob[b] == 0);
-                if (end_of) {
-                    std::string tok_str;
-                    tok_str.reserve(b - start);
-                    for (size_t k = start; k < (size_t)b; k++) {
-                        tok_str.push_back((char)(uint8_t)(unsigned char)(int)blob[k]);
-                    }
-                    int32_t id = (int32_t)ctx->tokenizer.id_to_token.size();
-                    ctx->tokenizer.id_to_token.push_back(tok_str);
-                    ctx->tokenizer.token_to_id[tok_str] = id;
-                    start = (size_t)b + 1;
-                }
+            int offset = 0;
+            int n_vocab = (int)hp.n_vocab;
+            for (int v = 0; v < n_vocab && offset + 2 <= n; v++) {
+                uint16_t len = (uint16_t)(raw[offset] | (raw[offset+1] << 8));
+                offset += 2;
+                if (offset + len > n) break;
+                std::string tok_str((const char*)(raw.data() + offset), len);
+                offset += len;
+                ctx->tokenizer.id_to_token.push_back(tok_str);
+                ctx->tokenizer.token_to_id[tok_str] = (int32_t)v;
+            }
+            if (ctx->verbosity >= 1) {
+                fprintf(stderr, "voxcpm2: loaded %zu tokens from vocab blob\n",
+                        ctx->tokenizer.id_to_token.size());
             }
         }
     }

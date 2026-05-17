@@ -2911,6 +2911,21 @@ int main(int argc, char** argv) {
                 auto rep = ref.compare("mel_spectrogram", fv.data(), fv.size());
                 print_row("mel_spectrogram", rep, COS_THRESHOLD);
                 record(rep);
+                // DEBUG: compare fbank at multiple positions
+                auto rp = ref.get_f32("mel_spectrogram");
+                if (rp.first) {
+                    for (int fr : {0, 1, 100, 500, 1097}) {
+                        if (fr >= n_frames || (size_t)(fr+1)*80 > rp.second) continue;
+                        float dot=0,na=0,nb=0;
+                        for (int j=0; j<80; j++) {
+                            float a=fv[fr*80+j], b=rp.first[fr*80+j];
+                            dot+=a*b; na+=a*a; nb+=b*b;
+                        }
+                        float cs = (na>0&&nb>0) ? dot/(sqrtf(na)*sqrtf(nb)) : 1.0f;
+                        printf("[DBG ] fbank fr=%4d cos=%.6f cpp=%.4f ref=%.4f\n",
+                               fr, cs, fv[fr*80], rp.first[fr*80]);
+                    }
+                }
             } else {
                 printf("[ERR ] mel_spectrogram         firered_asr_compute_fbank returned null\n");
                 n_fail++;
