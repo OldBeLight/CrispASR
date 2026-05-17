@@ -38,6 +38,10 @@ struct chatterbox_context_params {
     float repetition_penalty; // repetition penalty (default 1.2)
     float min_p;              // min_p sampling (default 0.05)
     float top_p;              // top_p sampling (default 1.0)
+    int top_k;                // top_k sampling, 0 = disabled (default 0).
+                              // chatterbox-turbo enables top_k=1000 + top_p=0.95
+                              // + min_p=0 to match HF inference_turbo defaults
+                              // (tts_turbo.py:248-260, t3.py:415).
     int max_speech_tokens;    // upper bound on T3 AR decode (default 1000)
     int cfm_steps;            // number of CFM Euler steps (default 10)
     bool flash_attn;          // PLAN #89 plumbing — T3 Llama-style AR
@@ -124,6 +128,7 @@ void chatterbox_set_cfm_steps(struct chatterbox_context* ctx, int steps);
 void chatterbox_set_temperature(struct chatterbox_context* ctx, float temperature);
 void chatterbox_set_top_p(struct chatterbox_context* ctx, float top_p);
 void chatterbox_set_min_p(struct chatterbox_context* ctx, float min_p);
+void chatterbox_set_top_k(struct chatterbox_context* ctx, int top_k);
 void chatterbox_set_repetition_penalty(struct chatterbox_context* ctx, float r);
 void chatterbox_set_max_speech_tokens(struct chatterbox_context* ctx, int n);
 

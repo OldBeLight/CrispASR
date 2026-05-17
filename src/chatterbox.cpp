@@ -418,113 +418,238 @@ static double rand_uniform_torch_u32(mt19937_state& rng) {
     return (double)mt19937_next(rng) * (1.0 / 4294967296.0);
 }
 
-static int32_t sample_token(const float* logits, int vocab_size, float temperature, float min_p, float top_p,
+static int32_t sample_token(const float* logits, int vocab_size, float temperature, int top_k, float min_p, float top_p,
                             float rep_penalty, const std::vector<int32_t>& prev_tokens, mt19937_state& rng) {
+    // Issue #94: two distinct LogitsProcessorList orderings exist in the
+    // chatterbox python reference, and they're not interchangeable:
+    //
+    //   base inference (t3.py:309-378):  rep_penalty → temperature → min_p → top_p
+    //   inference_turbo (t3.py:415-490): temperature → top_k → top_p → rep_penalty
+    //
+    // Selecting on `top_k > 0` keeps base bit-equivalent to the prior C++
+    // (top_k defaults to 0) while giving turbo the right ordering. The
+    // turbo path skips min_p entirely (turbo defaults set min_p=0); the
+    // base path skips top_k (defaults to 0). Both paths share the final
+    // softmax → torch.multinomial implementation.
     std::vector<float> probs(vocab_size);
+    const float kNegInf = -std::numeric_limits<float>::infinity();
+    const bool use_hf_turbo_order = (top_k > 0);
 
-    // Apply repetition penalty
-    for (int i = 0; i < vocab_size; i++) {
-        probs[i] = logits[i];
-    }
-    if (rep_penalty != 1.0f) {
-        std::vector<uint8_t> seen((size_t)vocab_size, 0);
-        for (int32_t tok : prev_tokens) {
-            if (tok >= 0 && tok < vocab_size) {
-                if (seen[(size_t)tok]) {
-                    continue;
+    if (!use_hf_turbo_order) {
+        // --- Base order: rep_penalty → temperature → min_p → top_p ----
+        for (int i = 0; i < vocab_size; i++) {
+            probs[i] = logits[i];
+        }
+        if (rep_penalty != 1.0f) {
+            std::vector<uint8_t> seen((size_t)vocab_size, 0);
+            for (int32_t tok : prev_tokens) {
+                if (tok >= 0 && tok < vocab_size) {
+                    if (seen[(size_t)tok]) {
+                        continue;
+                    }
+                    seen[(size_t)tok] = 1;
+                    if (probs[tok] > 0)
+                        probs[tok] /= rep_penalty;
+                    else
+                        probs[tok] *= rep_penalty;
                 }
-                seen[(size_t)tok] = 1;
-                if (probs[tok] > 0)
-                    probs[tok] /= rep_penalty;
-                else
-                    probs[tok] *= rep_penalty;
             }
         }
-    }
 
-    // Temperature
-    if (temperature <= 0.0f) {
-        // Greedy
-        return (int32_t)(std::max_element(probs.begin(), probs.end()) - probs.begin());
-    }
-    if (temperature != 1.0f) {
-        for (int i = 0; i < vocab_size; i++) {
-            probs[i] /= temperature;
+        if (temperature <= 0.0f) {
+            return (int32_t)(std::max_element(probs.begin(), probs.end()) - probs.begin());
         }
-    }
+        if (temperature != 1.0f) {
+            for (int i = 0; i < vocab_size; i++) {
+                probs[i] /= temperature;
+            }
+        }
 
-    // Min-p filtering
-    if (min_p > 0.0f) {
-        float max_val = *std::max_element(probs.begin(), probs.end());
+        if (min_p > 0.0f) {
+            float max_val = *std::max_element(probs.begin(), probs.end());
+            float sum = 0.0f;
+            for (int i = 0; i < vocab_size; i++) {
+                probs[i] = std::exp(probs[i] - max_val);
+                sum += probs[i];
+            }
+            for (int i = 0; i < vocab_size; i++) {
+                probs[i] /= sum;
+            }
+
+            float max_prob = *std::max_element(probs.begin(), probs.end());
+            float threshold = max_prob * min_p;
+            std::vector<uint8_t> to_remove((size_t)vocab_size, 0);
+            for (int i = 0; i < vocab_size; i++) {
+                if (probs[i] < threshold) {
+                    to_remove[(size_t)i] = 1;
+                }
+            }
+            auto best_it = std::max_element(probs.begin(), probs.end());
+            if (best_it != probs.end()) {
+                to_remove[(size_t)(best_it - probs.begin())] = 0;
+            }
+            for (int i = 0; i < vocab_size; i++) {
+                if (to_remove[(size_t)i]) {
+                    probs[i] = 0.0f;
+                }
+            }
+        }
+
+        if (top_p < 1.0f) {
+            std::vector<int> indices(vocab_size);
+            for (int i = 0; i < vocab_size; i++)
+                indices[i] = i;
+            std::sort(indices.begin(), indices.end(), [&](int a, int b) { return probs[a] < probs[b]; });
+            std::vector<uint8_t> to_remove((size_t)vocab_size, 0);
+            float cumsum = 0.0f;
+            for (int idx : indices) {
+                cumsum += probs[idx];
+                if (cumsum <= (1.0f - top_p)) {
+                    to_remove[(size_t)idx] = 1;
+                }
+            }
+            if (!indices.empty()) {
+                to_remove[(size_t)indices.back()] = 0;
+            }
+            for (int i = 0; i < vocab_size; i++) {
+                if (to_remove[(size_t)i]) {
+                    probs[i] = 0.0f;
+                }
+            }
+        }
+
+        float sum = 0.0f;
+        bool already_probs = (min_p > 0.0f);
+        if (!already_probs) {
+            float max_val = *std::max_element(probs.begin(), probs.end());
+            for (int i = 0; i < vocab_size; i++) {
+                probs[i] = std::exp(probs[i] - max_val);
+            }
+        }
+        for (int i = 0; i < vocab_size; i++) {
+            sum += probs[i];
+        }
+        if (sum <= 0.0f) {
+            return (int32_t)(std::max_element(logits, logits + vocab_size) - logits);
+        }
+        for (int i = 0; i < vocab_size; i++) {
+            probs[i] /= sum;
+        }
+    } else {
+        // --- HF turbo order: temperature → top_k → top_p → rep_penalty ---
+        // Operates on logits (not softmaxed probs) until the final softmax.
+        // Matches HF LogitsProcessorList composition in T3.inference_turbo
+        // (chatterbox/models/t3/t3.py:415-490): rep_penalty is applied
+        // AFTER top_k/top_p, so masked tokens (-inf) stay masked even if
+        // they were previously seen.
+        std::vector<float> work(vocab_size);
+        for (int i = 0; i < vocab_size; i++) {
+            work[i] = logits[i];
+        }
+
+        if (temperature <= 0.0f) {
+            return (int32_t)(std::max_element(work.begin(), work.end()) - work.begin());
+        }
+        if (temperature != 1.0f) {
+            for (int i = 0; i < vocab_size; i++) {
+                work[i] /= temperature;
+            }
+        }
+
+        if (top_k < vocab_size) {
+            // HF TopKLogitsWarper: indices_to_remove = scores < topk(scores, k).values[-1]
+            std::vector<int> idx(vocab_size);
+            for (int i = 0; i < vocab_size; i++)
+                idx[i] = i;
+            std::nth_element(idx.begin(), idx.begin() + (top_k - 1), idx.end(),
+                             [&](int a, int b) { return work[a] > work[b]; });
+            const float kth_value = work[idx[top_k - 1]];
+            for (int i = 0; i < vocab_size; i++) {
+                if (work[i] < kth_value) {
+                    work[i] = kNegInf;
+                }
+            }
+        }
+
+        if (top_p < 1.0f) {
+            // HF TopPLogitsWarper sorts logits ascending, softmaxes the
+            // sorted vector, and drops indices whose cumulative softmax
+            // probability is <= (1 - top_p). min_tokens_to_keep=1 means
+            // the top-1 token is always retained.
+            float max_val = kNegInf;
+            for (int i = 0; i < vocab_size; i++) {
+                if (work[i] > max_val) {
+                    max_val = work[i];
+                }
+            }
+            std::vector<float> sm(vocab_size);
+            float sum = 0.0f;
+            for (int i = 0; i < vocab_size; i++) {
+                sm[i] = std::exp(work[i] - max_val);
+                sum += sm[i];
+            }
+            if (sum > 0.0f) {
+                for (int i = 0; i < vocab_size; i++) {
+                    sm[i] /= sum;
+                }
+                std::vector<int> indices(vocab_size);
+                for (int i = 0; i < vocab_size; i++)
+                    indices[i] = i;
+                std::sort(indices.begin(), indices.end(), [&](int a, int b) { return sm[a] < sm[b]; });
+                float cumsum = 0.0f;
+                for (size_t k = 0; k + 1 < indices.size(); k++) {
+                    cumsum += sm[indices[k]];
+                    if (cumsum <= (1.0f - top_p)) {
+                        work[indices[k]] = kNegInf;
+                    }
+                }
+            }
+        }
+
+        if (rep_penalty != 1.0f) {
+            std::vector<uint8_t> seen((size_t)vocab_size, 0);
+            for (int32_t tok : prev_tokens) {
+                if (tok >= 0 && tok < vocab_size) {
+                    if (seen[(size_t)tok]) {
+                        continue;
+                    }
+                    seen[(size_t)tok] = 1;
+                    if (work[tok] == kNegInf) {
+                        continue;
+                    }
+                    if (work[tok] > 0)
+                        work[tok] /= rep_penalty;
+                    else
+                        work[tok] *= rep_penalty;
+                }
+            }
+        }
+
+        // Final softmax. Tokens masked to -inf become 0 cleanly via exp().
+        float max_val = kNegInf;
+        for (int i = 0; i < vocab_size; i++) {
+            if (work[i] > max_val) {
+                max_val = work[i];
+            }
+        }
+        if (max_val == kNegInf) {
+            return (int32_t)(std::max_element(logits, logits + vocab_size) - logits);
+        }
         float sum = 0.0f;
         for (int i = 0; i < vocab_size; i++) {
-            probs[i] = std::exp(probs[i] - max_val);
+            probs[i] = std::exp(work[i] - max_val);
             sum += probs[i];
+        }
+        if (sum <= 0.0f) {
+            return (int32_t)(std::max_element(logits, logits + vocab_size) - logits);
         }
         for (int i = 0; i < vocab_size; i++) {
             probs[i] /= sum;
         }
 
-        float max_prob = *std::max_element(probs.begin(), probs.end());
-        float threshold = max_prob * min_p;
-        std::vector<uint8_t> to_remove((size_t)vocab_size, 0);
-        for (int i = 0; i < vocab_size; i++) {
-            if (probs[i] < threshold) {
-                to_remove[(size_t)i] = 1;
-            }
-        }
-        auto best_it = std::max_element(probs.begin(), probs.end());
-        if (best_it != probs.end()) {
-            to_remove[(size_t)(best_it - probs.begin())] = 0;
-        }
-        for (int i = 0; i < vocab_size; i++) {
-            if (to_remove[(size_t)i]) {
-                probs[i] = 0.0f;
-            }
-        }
-    }
-
-    // Top-p filtering
-    if (top_p < 1.0f) {
-        std::vector<int> indices(vocab_size);
-        for (int i = 0; i < vocab_size; i++)
-            indices[i] = i;
-        std::sort(indices.begin(), indices.end(), [&](int a, int b) { return probs[a] < probs[b]; });
-        std::vector<uint8_t> to_remove((size_t)vocab_size, 0);
-        float cumsum = 0.0f;
-        for (int idx : indices) {
-            cumsum += probs[idx];
-            if (cumsum <= (1.0f - top_p)) {
-                to_remove[(size_t)idx] = 1;
-            }
-        }
-        if (!indices.empty()) {
-            to_remove[(size_t)indices.back()] = 0;
-        }
-        for (int i = 0; i < vocab_size; i++) {
-            if (to_remove[(size_t)i]) {
-                probs[i] = 0.0f;
-            }
-        }
-    }
-
-    // Softmax / re-normalize after filtering
-    float sum = 0.0f;
-    bool already_probs = (min_p > 0.0f);
-    if (!already_probs) {
-        float max_val = *std::max_element(probs.begin(), probs.end());
-        for (int i = 0; i < vocab_size; i++) {
-            probs[i] = std::exp(probs[i] - max_val);
-        }
-    }
-    for (int i = 0; i < vocab_size; i++) {
-        sum += probs[i];
-    }
-    if (sum <= 0.0f) {
-        return (int32_t)(std::max_element(logits, logits + vocab_size) - logits);
-    }
-    for (int i = 0; i < vocab_size; i++) {
-        probs[i] /= sum;
+        // Suppress unused-warning for min_p on this branch (turbo defaults
+        // set min_p=0, so this is intentional).
+        (void)min_p;
     }
 
     // Faithful CPU torch.multinomial(probs, num_samples=1) port:
@@ -2039,6 +2164,7 @@ extern "C" struct chatterbox_context_params chatterbox_context_default_params(vo
     p.repetition_penalty = 1.2f;
     p.min_p = 0.05f;
     p.top_p = 1.0f;
+    p.top_k = 0;
     p.max_speech_tokens = 1000;
     p.cfm_steps = 10;
     // PLAN #89: flash_attn defaults to true (lost in commit ff5536ae;
@@ -2080,16 +2206,19 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
     // Issue #94 follow-up: chatterbox-turbo's Python tts_turbo.generate()
     // explicitly disables CFG (cfg_weight=0.0 default, plus a log line
     // "CFG, min_p and exaggeration are not supported by Turbo version"
-    // when set). The C++ default of 0.5 was fine because the !is_gpt2
-    // guard at the use site disables CFG branching anyway, but it's
-    // tidier to make the defaults match Python here. We do NOT touch
-    // top_p / min_p — Python turbo's `top_p=0.95 + top_k=1000` combo is
-    // not safely reproducible without adding top_k support (which we
-    // don't have today); the base-style defaults `min_p=0.05 + top_p=1.0`
-    // empirically produce closer audio than top_p=0.95 alone, which
-    // lets too many low-probability garbage tokens through.
+    // when set). It also runs a different sampler stack from base
+    // chatterbox: HF inference_turbo wires `temperature → top_k=1000 →
+    // top_p=0.95 → repetition_penalty` (tts_turbo.py:248-260,
+    // chatterbox/models/t3/t3.py:415-490). top_k=1000 is what filters
+    // the long-tail garbage that an isolated top_p=0.95 lets through —
+    // without it, the multinomial pick at step 1 lands on S3GEN_SIL
+    // (4299) on most prompts, producing the "IN-and-Hello…" /
+    // "HI Low World Test" prefix artifact users were hearing.
     if (is_gpt2) {
         c->params.cfg_weight = 0.0f;
+        c->params.min_p = 0.0f;
+        c->params.top_p = 0.95f;
+        c->params.top_k = 1000;
     }
 
     if (params.verbosity >= 1) {
@@ -2381,11 +2510,19 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
         } else {
             std::memcpy(blended.data(), logits, V * sizeof(float));
         }
-
+        // Python's HF inference_turbo passes input_ids = generated_speech_tokens
+        // (NO BOS) to RepetitionPenaltyLogitsProcessor from step 1 onward; only
+        // at step 0 is input_ids = speech_start_token = [BOS] (t3.py:450 vs
+        // t3.py:471). Match that exactly here: at step 0 token_hist = [BOS]
+        // (penalizing the BOS logit, which is normally far below speech
+        // tokens anyway); from step 1 onward token_hist = generated tokens.
         std::vector<int32_t> token_hist;
-        token_hist.reserve(speech_tokens.size() + 1);
-        token_hist.push_back((int32_t)ctx->hp.start_speech_token);
-        token_hist.insert(token_hist.end(), speech_tokens.begin(), speech_tokens.end());
+        if (speech_tokens.empty()) {
+            token_hist.push_back((int32_t)ctx->hp.start_speech_token);
+        } else {
+            token_hist.reserve(speech_tokens.size());
+            token_hist.insert(token_hist.end(), speech_tokens.begin(), speech_tokens.end());
+        }
         // Sample next token. CRISPASR_CHATTERBOX_TEMP overrides the
         // configured temperature for divergence-debugging experiments
         // (temperature=0 forces greedy argmax — eliminates multinomial
@@ -2395,7 +2532,7 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
         if (const char* e = std::getenv("CRISPASR_CHATTERBOX_TEMP"); e && *e) {
             temp_eff = std::strtof(e, nullptr);
         }
-        int32_t tok = sample_token(blended.data(), V, temp_eff, ctx->params.min_p, ctx->params.top_p,
+        int32_t tok = sample_token(blended.data(), V, temp_eff, ctx->params.top_k, ctx->params.min_p, ctx->params.top_p,
                                    ctx->params.repetition_penalty, token_hist, ctx->rng_state);
         free(logits);
         logits = nullptr;
@@ -3342,6 +3479,16 @@ extern "C" void chatterbox_set_min_p(struct chatterbox_context* ctx, float min_p
         min_p = 1.0f;
     }
     ctx->params.min_p = min_p;
+}
+
+extern "C" void chatterbox_set_top_k(struct chatterbox_context* ctx, int top_k) {
+    if (!ctx) {
+        return;
+    }
+    if (top_k < 0) {
+        top_k = 0;
+    }
+    ctx->params.top_k = top_k;
 }
 
 extern "C" void chatterbox_set_repetition_penalty(struct chatterbox_context* ctx, float r) {

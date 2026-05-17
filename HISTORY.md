@@ -37,6 +37,67 @@ Verified on M1 / macOS Tahoe 26.2:
 - chatterbox (base): 28 s init + working `/v1/audio/speech`.
 - `CRISPASR_GGUF_MMAP=0` opt-out: 37 s init, still works.
 
+### 2026-05-17 follow-up — T3 sampler reorder
+
+`src/chatterbox.cpp` `sample_token` had base-chatterbox's ordering
+(rep_penalty → temperature → min_p → top_p) hard-wired, but the
+Python turbo path runs a different `LogitsProcessorList`
+(`chatterbox/models/t3/t3.py:415-490`): temperature → top_k → top_p
+→ repetition_penalty. The two are not interchangeable — applying
+rep_penalty before top_k/top_p reshapes the survival set in a way
+base never needed because base sets `top_k=0`.
+
+- Added `top_k` to `chatterbox_context_params` + `chatterbox_set_top_k`
+  setter (default 0 = off, preserves base behaviour bit-equivalent).
+- `sample_token` now bifurcates on `top_k > 0`: turbo path follows the
+  HF order on raw logits, base path keeps the pre-fix ordering on
+  softmaxed probs. Both paths share the existing torch.multinomial CPU
+  port.
+- `chatterbox_init_from_file` extends the existing `is_gpt2` block
+  (was just `cfg_weight=0`) to also set `min_p=0`, `top_p=0.95`,
+  `top_k=1000` — the exact `tts_turbo.py:248-260` defaults.
+- Aligned `token_hist` passed to rep_penalty with Python: BOS is in
+  the history at step 0 only, then drops out (matches `t3.py:450` vs
+  `t3.py:471`).
+
+Diagnostic finding from the Python reference (captured 2026-05-17,
+audio under `/Volumes/backups/ai/crispasr/issue94-audio/topk-fix/`):
+
+1. Python's turbo sampler also emits S3GEN_SIL (4299) as the second
+   generated speech token on both `"hello world test"` and `"hello
+   chatterbox turbo"` — so 4299-at-step-1 is not the audible defect.
+2. Feeding Python's captured tokens through C++ `chatterbox_synthesize_
+   from_tokens` produces clean audio ("HEllo world test..", "HEllo
+   chatterbox turbo..") — so S3Gen + HiFT on the C++ side are correct
+   end-to-end for inputs sourced from Python's T3.
+3. With C++'s natural sampler the same prompt only round-trips cleanly
+   on ~3/19 random seeds; the Python turbo path is clean on 6/6 seeds
+   tested with the same prompts. The Python path is robust to seed
+   variation; the C++ path is fragile.
+4. The compression is in raw T3 logits, not the sampler. Forcing
+   Python to sample the same step-0 token as our C++ (`tok0=4024`)
+   gives Python a step-1 max logit of 13.75 vs C++'s 12.39 — and the
+   C++ top-token spread is ~1.4 logits wider than Python's at the
+   top of the distribution. After temperature + top_k + top_p that
+   shows up as the sampled token landing on phonemically-bad tokens
+   more often, which then propagates through the AR loop.
+5. F16 weights reproduce the same compression as Q8_0 weights
+   (step-1 max 12.37 with F16 vs 12.39 with Q8_0), so this is not a
+   weight-quantisation effect.
+
+Open follow-up: the residual T3 logit-magnitude divergence between
+the C++ GPT-2 graph (`build_graph_t3_gpt2_kv`) and HF GPT-2.
+Investigated and ruled out: speech_head bias missing, WPE
+double-add, attention scale, flash_attn vs naive softmax (Llama
+path uses the same pattern and works), prefill length mismatch,
+GPT-2 LayerNorm scale/bias loading, GELU variant. Most likely
+remaining suspects: subtle K/V cache layout / read mismatch at
+`T == 1` (the cache is written as `(hd, T, n_kv, 1)` and read back
+as `(hd, Lk, n_kv)`); or attention numerics inside
+`ggml_flash_attn_ext` for small T with the GPT-2 head geometry
+(n_h=16, hd=64). Needs a per-layer hidden-state diff with the
+Python reference to localise the divergence layer.
+
 ---
 
 ## 2026-05-16 Cross-Stack Audit Hardening
