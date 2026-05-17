@@ -367,11 +367,12 @@ if (APPLE AND GGML_METAL)
     )
 endif()
 
-# ─── test_chunk_context — Catch2 unit tests for chunk boundary context (issue #89)
+# ─── test_chunk_context — Catch2 unit tests for the energy-minima chunker (issue #89)
 #
-# Covers: audio_chunking::split_at_energy_minima slice coverage, ctx_l/ctx_r
-# expansion math at slice boundaries, and segment-timestamp filtering.
-# Pure CPU, no model load.
+# Covers: audio_chunking::split_at_energy_minima slice coverage / contiguity
+# / single-slice cases. The ctx_l/ctx_r expansion and word-trim that the
+# original 617cd02 round added were reverted (see issue #89 round 2); the
+# tests that pinned them are gone with the code. Pure CPU, no model load.
 add_executable(test_chunk_context
     test_chunk_context.cpp
 )

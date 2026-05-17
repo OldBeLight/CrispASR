@@ -6,6 +6,57 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-17 Issue #89 round 2 — revert chunked-slice context expansion
+
+`lenhone` reported that parakeet-tdt-0.6b-ja still dropped words across
+`--chunk-seconds` boundaries after the 617cd02 fix. Reproduced on a
+33 s JA concat (`reazon_baseball + reazon_meal + reazon_raft`) at
+`--chunk-seconds 10`:
+
+    Pre-fix (617cd02 word-trim):
+      "ピ ッ チャ ー の 岡 本 は 1 回 戦 の 鳥 取 城 北 戦 は 8 回、 6 対 対 3 3 点 …
+       腹 す いた い つ もの 手 料 理 ちゃん と お い しく して く れる ジ ュ ー う ん そこ の …"
+      Note: every kana spaced; "6対対33" duplicated "対"; missing "お" before "腹"
+
+    Post-revert (no context, no trim):
+      "ピッチャーの岡本は1回戦の鳥取城北戦は8回6失点。 6対3、3点リードの場面で3人目で
+       マウンドに上がりました。 お腹すいたいつもの手料理ちゃんとおいしくしてくれるジューうん。
+       そこの上流から丸太を組んでいかだにしてる。 どんどん流したんです、これを。"
+
+Two failure modes in 617cd02:
+
+1. **TDT emission-frame drift**: the FastConformer encoder is bidirectional,
+   so feeding ±2 s of neighbour audio shifts the TDT decoder's emission
+   frame for boundary words by 1–2 frames between adjacent slices' passes.
+   The "assign each word to the slice it STARTS in" rule
+   (`w.t0 < sl.t0_cs || w.t0 >= sl.t1_cs`) is *deterministic* only if the
+   same audio content produces the same `t_start` regardless of which
+   context window it appears in — which is not what the encoder
+   guarantees. A word can land outside *both* adjacent slices' ranges
+   and disappear entirely (the user's symptom).
+
+2. **Text rebuild assumed space-prefix tokens**: the trim rebuilt
+   `seg.text` from surviving words with `if (!rebuilt.empty() && w.text[0] != ' ') rebuilt += ' '`.
+   parakeet-ja emits no-space tokens (every kana is its own word with no
+   leading space), so the rebuild inserted a literal space between every
+   character.
+
+Fix is a revert. Each slice transcribes its own audio only;
+`audio_chunking::split_at_energy_minima` already places chunk seams at
+the quietest 100 ms within the search window (PLAN #80b), so boundaries
+fall in pauses and the encoder gets coherent input on either side
+without needing the ±2 s borrow. The 617cd02-era unit tests in
+`tests/test_chunk_context.cpp` that pinned the broken ctx/filter math
+are removed; the file now only covers `split_at_energy_minima` (4 tests,
+22 assertions, all passing).
+
+Verified on JFK 11 s @ 5 s chunks (English parakeet) — full quote
+intact; the very-short 3 s case still has boundary trouble but no
+worse than the 617cd02 round, and the user's reported chunk sizes
+(10, 30, 180) all land safely above that threshold.
+
+---
+
 ## 2026-05-17 PRs #92 + #95 — streaming JSON+VAD merge policy
 
 Two @CKwasd PRs accepted as a pair:
