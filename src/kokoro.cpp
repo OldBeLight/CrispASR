@@ -714,26 +714,90 @@ static inline float* kokoro_align_repeat(const float* features, int D, int L, co
 static const float kAdaIn1dEps = 1e-5f; // PyTorch InstanceNorm1d default
 
 static inline ggml_tensor* kokoro_adain1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style, ggml_tensor* fc_w,
-                                          ggml_tensor* fc_b) {
+                                          ggml_tensor* fc_b, const char* dbg_prefix = nullptr) {
     const int C = (int)x->ne[0];
 
-    // Instance norm: transpose (C, T) → (T, C); ggml_norm normalises along ne[0]=T
-    // per other dim ⇒ per-channel mean+var along T; transpose back.
-    ggml_tensor* xt = ggml_cont(ctx, ggml_transpose(ctx, x));
-    xt = ggml_norm(ctx, xt, kAdaIn1dEps);
+    // Instance norm: per-channel mean+var across T. We used to use
+    // ggml_norm on the (T, C) transposed tensor, but ggml-metal's
+    // kernel_norm_fuse_impl (kernel_norm_f32 path, ne00 not divisible
+    // by 4) computes WRONG mean/variance for the short-T predictor F0/N
+    // case (T=65). CPU norm gives every row mean≈0, std≈1; Metal norm
+    // scatters means up to ±0.26 and stds up to 2.7 across many rows.
+    // The cascade through AdaIN1d × LeakyReLU × Conv1d × AdaIN1d ×
+    // LeakyReLU × Conv1d destroys the predictor's f0_curve/n_curve and
+    // the downstream decoder, producing garbage audio.
+    //
+    // Manual mean → sub → variance → sqrt(var+eps) → div mirrors the
+    // semantics of ggml_norm but routes through well-exercised
+    // primitive ops (sum_rows, scale_bias, sub, sqr, sqrt, div) that
+    // do not exhibit the Metal regression. The ggml_norm op itself
+    // should be fixed upstream, but this restores correctness without
+    // a ggml-metal patch.
+    ggml_tensor* xt = ggml_cont(ctx, ggml_transpose(ctx, x)); // (T, C)
+    if (dbg_prefix) {
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "%s_pre_norm_TC", dbg_prefix);
+        ggml_set_name(xt, nm);
+        ggml_set_output(xt);
+    }
+    const int T = (int)xt->ne[0];
+    const float inv_T = 1.0f / (float)T;
+    ggml_tensor* mean = ggml_scale(ctx, ggml_sum_rows(ctx, xt), inv_T); // (1, C)
+    ggml_tensor* centered = ggml_sub(ctx, xt, mean);                    // (T, C)
+    ggml_tensor* var = ggml_scale(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, centered)),
+                                  inv_T); // (1, C)
+    ggml_tensor* std_val = ggml_sqrt(ctx, ggml_scale_bias(ctx, var, 1.0f,
+                                                          kAdaIn1dEps)); // (1, C)
+    xt = ggml_div(ctx, centered, std_val);                               // (T, C)
+    if (dbg_prefix) {
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "%s_post_norm_TC", dbg_prefix);
+        ggml_set_name(xt, nm);
+        ggml_set_output(xt);
+    }
     ggml_tensor* normed = ggml_cont(ctx, ggml_transpose(ctx, xt)); // (C, T)
+    if (dbg_prefix) {
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "%s_normed", dbg_prefix);
+        ggml_set_name(normed, nm);
+        ggml_set_output(normed);
+    }
 
     // gamma, beta from fc(s).
     ggml_tensor* h = ggml_mul_mat(ctx, fc_w, style);
     h = ggml_add(ctx, h, fc_b);
+    if (dbg_prefix) {
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "%s_h", dbg_prefix);
+        ggml_set_name(h, nm);
+        ggml_set_output(h);
+    }
     const size_t ts = ggml_type_size(GGML_TYPE_F32);
     ggml_tensor* gamma = ggml_view_2d(ctx, h, C, 1, h->nb[1], (size_t)0 * C * ts);
     ggml_tensor* beta = ggml_view_2d(ctx, h, C, 1, h->nb[1], (size_t)1 * C * ts);
 
     // (1 + γ) * normed + β  →  normed + normed*γ + β  (saves the "1" tensor).
     ggml_tensor* x_gamma = ggml_mul(ctx, normed, gamma);
+    if (dbg_prefix) {
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "%s_xgamma", dbg_prefix);
+        ggml_set_name(x_gamma, nm);
+        ggml_set_output(x_gamma);
+    }
     ggml_tensor* out = ggml_add(ctx, normed, x_gamma);
+    if (dbg_prefix) {
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "%s_normed_plus_xgamma", dbg_prefix);
+        ggml_set_name(out, nm);
+        ggml_set_output(out);
+    }
     out = ggml_add(ctx, out, beta);
+    if (dbg_prefix) {
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "%s_out", dbg_prefix);
+        ggml_set_name(out, nm);
+        ggml_set_output(out);
+    }
     return out;
 }
 
@@ -778,17 +842,34 @@ static inline ggml_tensor* kokoro_adain_resblk(ggml_context* ctx, ggml_tensor* x
                                                ggml_tensor* adain1_w, ggml_tensor* adain1_b, ggml_tensor* adain2_w,
                                                ggml_tensor* adain2_b, ggml_tensor* conv1_w, ggml_tensor* conv1_b,
                                                ggml_tensor* conv2_w, ggml_tensor* conv2_b, ggml_tensor* pool_w,
-                                               ggml_tensor* pool_b, ggml_tensor* conv1x1_w) {
+                                               ggml_tensor* pool_b, ggml_tensor* conv1x1_w,
+                                               const char* dbg_prefix = nullptr) {
     const bool upsample = (pool_w != nullptr);
     const int dim_in = (int)x->ne[0];
     (void)dim_in;
 
     // ---- Residual path ----
-    ggml_tensor* xt = kokoro_adain1d(ctx, x, style, adain1_w, adain1_b); // (Cin, T)
+    char nm[64];
+    auto tag = [&](ggml_tensor* t, const char* suffix) {
+        if (!dbg_prefix)
+            return;
+        std::snprintf(nm, sizeof(nm), "%s_%s", dbg_prefix, suffix);
+        ggml_set_name(t, nm);
+        ggml_set_output(t);
+    };
+    char ad1_prefix_buf[80];
+    const char* ad1_prefix = nullptr;
+    if (dbg_prefix) {
+        std::snprintf(ad1_prefix_buf, sizeof(ad1_prefix_buf), "%s_adain1", dbg_prefix);
+        ad1_prefix = ad1_prefix_buf;
+    }
+    ggml_tensor* xt = kokoro_adain1d(ctx, x, style, adain1_w, adain1_b, ad1_prefix); // (Cin, T)
     xt = ggml_leaky_relu(ctx, xt, kAdainLeakySlope, /*inplace=*/false);
+    tag(xt, "after_lr1");
 
     if (upsample) {
         xt = kokoro_pool_2x_depthwise(ctx, xt, pool_w, pool_b); // (Cin, 2T)
+        tag(xt, "after_pool");
     }
 
     // conv1: Conv1d(dim_in → dim_out, k=3, pad=1). Layout flow:
@@ -805,10 +886,19 @@ static inline ggml_tensor* kokoro_adain_resblk(ggml_context* ctx, ggml_tensor* x
         return ggml_cont(ctx, ggml_transpose(ctx, y)); // (Cout, T)
     };
 
-    xt = conv_k3(xt, conv1_w, conv1_b);                      // (Cout, T')
-    xt = kokoro_adain1d(ctx, xt, style, adain2_w, adain2_b); // (Cout, T')
+    xt = conv_k3(xt, conv1_w, conv1_b); // (Cout, T')
+    tag(xt, "after_conv1");
+    char ad2_prefix_buf[80];
+    const char* ad2_prefix = nullptr;
+    if (dbg_prefix) {
+        std::snprintf(ad2_prefix_buf, sizeof(ad2_prefix_buf), "%s_adain2", dbg_prefix);
+        ad2_prefix = ad2_prefix_buf;
+    }
+    xt = kokoro_adain1d(ctx, xt, style, adain2_w, adain2_b, ad2_prefix); // (Cout, T')
     xt = ggml_leaky_relu(ctx, xt, kAdainLeakySlope, /*inplace=*/false);
+    tag(xt, "after_lr2");
     xt = conv_k3(xt, conv2_w, conv2_b); // (Cout, T')
+    tag(xt, "after_conv2");
 
     // ---- Shortcut path ----
     ggml_tensor* sc = x;
@@ -1217,8 +1307,13 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
         auto w0 = load_resblk(prefix, 0, /*has_pool=*/false);
         auto w1 = load_resblk(prefix, 1, /*has_pool=*/true);
         auto w2 = load_resblk(prefix, 2, /*has_pool=*/false);
+        // Debug bisect: expose every intermediate of the F0[0] block so
+        // crispasr-diff can dump GPU vs CPU values side by side and
+        // identify the first op whose Metal output diverges from CPU.
+        char dbg0[64];
+        std::snprintf(dbg0, sizeof(dbg0), "dbg_pred_%s_0", stage_branch);
         y = kokoro_adain_resblk(ctx0, y, style_pred, w0.a1w, w0.a1b, w0.a2w, w0.a2b, w0.c1w, w0.c1b, w0.c2w, w0.c2b,
-                                /*pool*/ nullptr, nullptr, /*conv1x1*/ nullptr);
+                                /*pool*/ nullptr, nullptr, /*conv1x1*/ nullptr, dbg0);
         // Tag each AdainResBlk1d output as `pred_{f0,n}_{k}_out` so
         // crispasr-diff can compare them against the Python reference
         // and pinpoint the first stage that diverges on Metal.
@@ -1349,24 +1444,7 @@ static float* kokoro_run_f0n(kokoro_context* c, const int32_t* raw_ids, int n_ra
         std::free(en);
         return nullptr;
     }
-    // KOKORO_F0N_FORCE_CPU=1: pin every node of the F0/N graph to the
-    // CPU backend via the scheduler. Diagnostic for the short-input
-    // Metal regression where pred_f0_0_out + downstream collapse —
-    // bisect localized the divergence to inside this graph. Forcing
-    // CPU here while leaving the predictor + decoder on Metal isolates
-    // whether the bug lives in F0Ntrain specifically or in the
-    // scheduler's handling of the F0Ntrain → decoder boundary.
-    static const bool s_f0n_cpu = []() {
-        const char* v = std::getenv("KOKORO_F0N_FORCE_CPU");
-        return v && *v && *v != '0';
-    }();
     ggml_backend_sched_reset(c->sched);
-    if (s_f0n_cpu && c->backend_cpu && c->backend_cpu != c->backend) {
-        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
-            ggml_tensor* t = ggml_graph_node(gf, i);
-            ggml_backend_sched_set_tensor_backend(c->sched, t, c->backend_cpu);
-        }
-    }
     if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
         fprintf(stderr, "kokoro: sched_alloc_graph failed for F0Ntrain\n");
         std::free(en);
@@ -1628,21 +1706,6 @@ static float* kokoro_run_decoder_body(kokoro_context* c, const int32_t* raw_ids,
         return nullptr;
     }
     ggml_backend_sched_reset(c->sched);
-    // KOKORO_DEC_FORCE_CPU=1: pin every node of the decoder-body graph
-    // to CPU. Twin of KOKORO_F0N_FORCE_CPU — same AdainResBlk1d bug on
-    // Metal hits the decoder too for short utterances. Both env vars
-    // together form a temporary workaround for the kokoro short-input
-    // Metal regression until the underlying kernel bug is fixed.
-    static const bool s_dec_cpu = []() {
-        const char* v = std::getenv("KOKORO_DEC_FORCE_CPU");
-        return v && *v && *v != '0';
-    }();
-    if (s_dec_cpu && c->backend_cpu && c->backend_cpu != c->backend) {
-        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
-            ggml_tensor* t = ggml_graph_node(gf, i);
-            ggml_backend_sched_set_tensor_backend(c->sched, t, c->backend_cpu);
-        }
-    }
     if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
         fprintf(stderr, "kokoro: sched_alloc_graph failed for decoder body\n");
         std::free(asr);
