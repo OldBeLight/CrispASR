@@ -248,6 +248,54 @@ op replacements. The diagnostic infrastructure
 against Python's cache, or trying a bit-exact F32 mul_mat) can
 keep narrowing the locus.
 
+**Deep-debug round (2026-05-17 cont'd):**
+
+Two more candidate fixes tested against the L05 cos 0.944 baseline:
+
+1. **F16 weights** (full `chatterbox-turbo-t3-f16.gguf` + `s3gen-f16`):
+   per-layer bisect is *identical* to Q8_0 within 5e-5 (L00 0.99893
+   vs 0.99893; L05 0.94470 vs 0.94450; matching outlier at dim 265 /
+   head-4 / hd-9). Confirms **weight quantisation is not the bug** —
+   neither input-side Q8 quant (which F16 avoids via the PR-01
+   `vec_dot_type = GGML_TYPE_F32` patch) nor weight-side precision
+   loss accounts for the L00 0.1% drift.
+
+2. **`ggml_norm` Accelerate bypass**: forced
+   `ggml_compute_forward_norm_f32` onto the `ggml_vec_cvar_f32` path
+   (double accumulator) instead of the macOS Accelerate
+   `vDSP_measqv` F32-acc path. No measurable change — L05 cos 0.94427
+   vs the prior 0.94450. **`ggml_norm` precision vs PyTorch CPU
+   LayerNorm (Welford's algorithm) is not dominant either.**
+
+Inventory of CrispASR ggml patches in `tools/upstream-prs/` that
+*could* have been relevant: PR-01 (F16 mul_mat saturation, already
+active and confirmed not load-bearing here), PR-08 (Metal norm
+cross-simdgroup, Metal-only — chatterbox runs on CPU). None of the
+shipped patches address CPU mul_mat or softmax precision.
+
+**Conclusion**: the L00 0.1% drift is an *accumulation* of multiple
+tiny per-op numerics differences — likely a combination of
+mul_mat F32 SIMD accumulator order vs PyTorch's CPU BLAS, `tanhf`
+in `ggml_gelu` vs PyTorch's libm, exp/softmax in `ggml_soft_max_ext`
+vs PyTorch's, and similar single-ULP differences. Each contributes
+< 0.05% per layer, sums to ~0.6% by L04, then gets amplified ~9× by
+L05's sharp attention. No single-knob fix surfaced; a real fix needs
+**bit-exact F32 op replacements** matching PyTorch's CPU accumulation
+across mul_mat, LayerNorm, GELU, and softmax — outside the scope of
+issue #94 as originally filed.
+
+**Practical user-facing baseline**: across 19 random RNG seeds for
+"hello chatterbox turbo" with default sampling
+(`temp=0.8 top_k=1000 top_p=0.95`, matching Python), ~3/19 ≈ 16%
+produce Whisper-clean "HEllo, Chatterbox Turbo" output. The rest
+start with a brief onset artifact ("SO,", "UH,", "ANy?", "IN no,",
+etc.) before the intelligible "Chatterbox Turbo" payload. The
+sampler matches Python exactly so this is the residual T3 drift
+compounding through the AR loop. Workaround for users who care
+about the onset artifact: sweep `CRISPASR_CHATTERBOX_T3_SEED` until
+a clean output appears; or fall back to base chatterbox (the
+Llama-style backbone doesn't have L05's amplification).
+
 ---
 
 ## 2026-05-16 Cross-Stack Audit Hardening
