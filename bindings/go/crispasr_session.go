@@ -105,6 +105,20 @@ int crispasr_diarize_segments_abi(const float* left_pcm, const float* right_pcm,
                                   int is_stereo, struct crispasr_diarize_seg_abi* segs, int n_segs,
                                   const struct crispasr_diarize_opts_abi* opts);
 
+// --- Pluggable speaker embedder, clustering, pyannote cache (#107 P6) ---
+void*       crispasr_speaker_embedder_make_abi(const char* model_spec, int n_threads, const char* cache_dir);
+void        crispasr_speaker_embedder_free_abi(void* embedder);
+int         crispasr_speaker_embedder_dim_abi(const void* embedder);
+int         crispasr_speaker_embedder_embed_abi(void* embedder, const float* pcm_16k, int n_samples, float* out);
+const char* crispasr_speaker_embedder_name_abi(const void* embedder);
+int         crispasr_speaker_cluster_abi(const float* embeddings, int n, int dim,
+                                         float merge_threshold, int max_speakers, int* labels_out);
+void*       crispasr_pyannote_cache_compute_abi(const float* full_audio, int n_samples,
+                                                const char* model_path, int n_threads);
+void        crispasr_pyannote_cache_free_abi(void* cache);
+int         crispasr_pyannote_cache_apply_abi(const void* cache, long long slice_t0_cs,
+                                              struct crispasr_diarize_seg_abi* segs, int n_segs);
+
 // --- Standalone LID (PLAN #59) ---
 int crispasr_detect_language_pcm(const float* samples, int n_samples, int method,
                                   const char* model_path, int n_threads, int use_gpu,
@@ -733,6 +747,177 @@ func DiarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeS
 		segs[i].Speaker = int32(cSegs[i].speaker)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Pluggable speaker embedder + cosine clustering + pyannote cache (#107 P6).
+// Same building blocks the CLI's --diarize-embedder path uses; expose them
+// here so Go callers can compose the diarize pipeline without shelling out.
+// ---------------------------------------------------------------------------
+
+// SpeakerEmbedder wraps a pluggable speaker-embedding model.
+//
+// Known aliases (case-insensitive):
+//   "auto" / "titanet"                            -> TitaNet-Large (192-d)
+//   "indextts" / "indextts-bigvgan" / "ecapa"     -> IndexTTS-BigVGAN ECAPA-TDNN (512-d)
+//   any .gguf path                                -> TitaNet (or IndexTTS if "indextts" in name)
+//
+// Always call Close() — the C-side context owns model weights.
+type SpeakerEmbedder struct {
+	handle unsafe.Pointer
+}
+
+// NewSpeakerEmbedder builds an embedder from a CLI-style model spec.
+// cacheDir overrides the auto-download cache root (empty for the
+// CrispASR default of ~/.cache/crispasr/).
+func NewSpeakerEmbedder(modelSpec string, nThreads int, cacheDir string) (*SpeakerEmbedder, error) {
+	cSpec := C.CString(modelSpec)
+	defer C.free(unsafe.Pointer(cSpec))
+	cCache := C.CString(cacheDir)
+	defer C.free(unsafe.Pointer(cCache))
+	h := C.crispasr_speaker_embedder_make_abi(cSpec, C.int(nThreads), cCache)
+	if h == nil {
+		return nil, fmt.Errorf("failed to build speaker embedder %q", modelSpec)
+	}
+	return &SpeakerEmbedder{handle: h}, nil
+}
+
+// Dim returns the output embedding dimension (e.g. 192 for TitaNet).
+func (e *SpeakerEmbedder) Dim() int {
+	if e == nil || e.handle == nil {
+		return 0
+	}
+	return int(C.crispasr_speaker_embedder_dim_abi(e.handle))
+}
+
+// Name returns the adapter name for logging.
+func (e *SpeakerEmbedder) Name() string {
+	if e == nil || e.handle == nil {
+		return ""
+	}
+	cName := C.crispasr_speaker_embedder_name_abi(e.handle)
+	if cName == nil {
+		return ""
+	}
+	return C.GoString(cName)
+}
+
+// Embed extracts one embedding from mono 16 kHz float32 PCM. Returns
+// nil when the underlying model rejected the input (e.g. too short).
+func (e *SpeakerEmbedder) Embed(pcm16k []float32) []float32 {
+	if e == nil || e.handle == nil || len(pcm16k) == 0 {
+		return nil
+	}
+	d := e.Dim()
+	if d <= 0 {
+		return nil
+	}
+	out := make([]float32, d)
+	ok := C.crispasr_speaker_embedder_embed_abi(
+		e.handle,
+		(*C.float)(unsafe.Pointer(&pcm16k[0])),
+		C.int(len(pcm16k)),
+		(*C.float)(unsafe.Pointer(&out[0])),
+	)
+	if ok == 0 {
+		return nil
+	}
+	return out
+}
+
+// Close frees the C-side context. Safe to call multiple times.
+func (e *SpeakerEmbedder) Close() {
+	if e == nil || e.handle == nil {
+		return
+	}
+	C.crispasr_speaker_embedder_free_abi(e.handle)
+	e.handle = nil
+}
+
+// AgglomerativeCluster groups n embeddings of dimension dim into
+// clusters by single-linkage cosine similarity. mergeThreshold stops
+// the merging when the closest pair falls below the threshold;
+// maxSpeakers is a hard cap.
+//
+// Returns one cluster ID per input in [0, k) assigned in
+// first-appearance order.
+func AgglomerativeCluster(embeddings []float32, n, dim int,
+	mergeThreshold float32, maxSpeakers int) ([]int32, error) {
+	if n <= 0 || dim <= 0 || len(embeddings) < n*dim {
+		return nil, fmt.Errorf("invalid arguments to AgglomerativeCluster")
+	}
+	out := make([]int32, n)
+	rc := C.crispasr_speaker_cluster_abi(
+		(*C.float)(unsafe.Pointer(&embeddings[0])),
+		C.int(n), C.int(dim), C.float(mergeThreshold), C.int(maxSpeakers),
+		(*C.int)(unsafe.Pointer(&out[0])),
+	)
+	if rc < 0 {
+		return nil, fmt.Errorf("crispasr_speaker_cluster_abi failed")
+	}
+	return out, nil
+}
+
+// PyannoteCache holds pyannote-seg posteriors over a full audio buffer.
+// Compute once at the start of a pipeline, then call Apply for each
+// set of segment ranges. Gives cross-slice speaker-ID consistency.
+type PyannoteCache struct {
+	handle unsafe.Pointer
+}
+
+// NewPyannoteCache pre-computes pyannote-seg posteriors over pcm16k.
+// modelPath must point at a pyannote-seg .gguf.
+func NewPyannoteCache(pcm16k []float32, modelPath string, nThreads int) (*PyannoteCache, error) {
+	if len(pcm16k) == 0 {
+		return nil, fmt.Errorf("empty audio")
+	}
+	cPath := C.CString(modelPath)
+	defer C.free(unsafe.Pointer(cPath))
+	h := C.crispasr_pyannote_cache_compute_abi(
+		(*C.float)(unsafe.Pointer(&pcm16k[0])),
+		C.int(len(pcm16k)), cPath, C.int(nThreads),
+	)
+	if h == nil {
+		return nil, fmt.Errorf("failed to compute pyannote cache from %q", modelPath)
+	}
+	return &PyannoteCache{handle: h}, nil
+}
+
+// Apply scores segs against the cached posteriors. Each segment's
+// Speaker is set to 0/1/2 (local pyannote-seg track index) or -1 for
+// silence. sliceT0Cs is the absolute centisecond at which the cache
+// buffer starts (usually 0 — the cache covers the whole input audio).
+func (c *PyannoteCache) Apply(segs []DiarizeSeg, sliceT0Cs int64) error {
+	if c == nil || c.handle == nil {
+		return fmt.Errorf("nil pyannote cache")
+	}
+	if len(segs) == 0 {
+		return nil
+	}
+	cSegs := make([]C.struct_crispasr_diarize_seg_abi, len(segs))
+	for i, s := range segs {
+		cSegs[i].t0_cs = C.longlong(s.T0)
+		cSegs[i].t1_cs = C.longlong(s.T1)
+		cSegs[i].speaker = C.int(s.Speaker)
+	}
+	rc := C.crispasr_pyannote_cache_apply_abi(c.handle, C.longlong(sliceT0Cs),
+		&cSegs[0], C.int(len(cSegs)))
+	if rc != 0 {
+		return fmt.Errorf("crispasr_pyannote_cache_apply_abi rc=%d", int(rc))
+	}
+	for i := range segs {
+		segs[i].Speaker = int32(cSegs[i].speaker)
+	}
+	return nil
+}
+
+// Close frees the C-side cache. Safe to call multiple times.
+func (c *PyannoteCache) Close() {
+	if c == nil || c.handle == nil {
+		return
+	}
+	C.crispasr_pyannote_cache_free_abi(c.handle)
+	c.handle = nil
 }
 
 // ---------------------------------------------------------------------------
