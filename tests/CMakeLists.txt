@@ -255,14 +255,18 @@ catch_discover_tests(test-diarize-pyannote
     PROPERTIES LABELS "unit;diarize"
 )
 
-# Live end-to-end check that --diarize-method pyannote produces ≥2
-# distinct speaker labels on a real multi-speaker WAV. Opt-in via
-# CRISPASR_TEST_DIARIZE_{WAV,MODEL} env vars; skips cleanly otherwise.
+# Live end-to-end checks that --diarize-method pyannote (and optional
+# --diarize-embedder) produce sensible labels on a real multi-speaker
+# WAV. Opt-in via env vars; skips cleanly otherwise. Compiles the
+# CLI-side cluster helper directly so the embedder variant doesn't
+# need to link the whole crispasr-cli executable.
 add_executable(test-diarize-pyannote-live
     test-diarize-pyannote-live.cpp
+    ${PROJECT_SOURCE_DIR}/examples/cli/crispasr_speaker_cluster.cpp
 )
 target_include_directories(test-diarize-pyannote-live PRIVATE
     ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples/cli
 )
 target_link_libraries(test-diarize-pyannote-live PRIVATE
     Catch2::Catch2WithMain

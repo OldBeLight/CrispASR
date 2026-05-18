@@ -16,7 +16,9 @@
 // pyannote front-end). Standard sample: any clip with ≥2 speakers,
 // e.g. a podcast snippet, an interview, or a sherpa-onnx demo file.
 
+#include "../examples/cli/crispasr_speaker_cluster.h"
 #include "../src/crispasr_diarize.h"
+#include "../src/titanet.h"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -24,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -151,4 +154,135 @@ TEST_CASE("apply_pyannote live: multi-speaker WAV yields ≥2 distinct speaker l
     // two speaker IDs must surface. If this fails on a known multi-
     // speaker fixture, we've reintroduced the collapse from #107.
     REQUIRE(speakers.size() >= 2);
+}
+
+// ----------------------------------------------------------------------
+// Embedder-path live test (#107 P3).
+// ----------------------------------------------------------------------
+// Builds speaker embeddings for each 1 s segment of the fixture via
+// TitaNet, clusters on cosine similarity, and asserts that the
+// resulting GLOBAL speaker IDs respect the fixture's known turn
+// structure: JFK regions cluster together, distinct from the TTS-
+// baker region. This is the "no regression in TitaNet-based global
+// stability" check that complements the pyannote-local test above.
+//
+// Run with three env vars:
+//   CRISPASR_TEST_DIARIZE_WAV    - the same 2-speaker WAV as above
+//   CRISPASR_TEST_DIARIZE_MODEL  - pyannote-seg-3.0 GGUF (unused here
+//                                  but kept consistent with the
+//                                  pyannote-only test so a single
+//                                  setup runs both cases)
+//   CRISPASR_TEST_TITANET_MODEL  - titanet-large GGUF
+TEST_CASE("apply_embedder live: TitaNet clusters fixture JFK vs TTS regions", "[live][diarize][pyannote][embedder]") {
+    const char* wav_path = getenv_or_null("CRISPASR_TEST_DIARIZE_WAV");
+    const char* titanet_path = getenv_or_null("CRISPASR_TEST_TITANET_MODEL");
+    if (!wav_path || !titanet_path) {
+        SKIP("set CRISPASR_TEST_DIARIZE_WAV + CRISPASR_TEST_TITANET_MODEL to run this "
+             "live test (TitaNet clustering on a multi-speaker WAV)");
+    }
+
+    std::vector<float> mono;
+    int sr = 0;
+    REQUIRE(load_wav_mono_16k(wav_path, mono, sr));
+    REQUIRE(sr == 16000);
+    REQUIRE(mono.size() > (size_t)sr * 5);
+
+    // Build 1-second segment ranges spanning the file. We embed each
+    // chunk directly via TitaNet rather than going through any ASR
+    // backend, so the test stays free of language-model dependencies.
+    struct SegRange {
+        int64_t t0_cs;
+        int64_t t1_cs;
+    };
+    std::vector<SegRange> ranges;
+    const int64_t dur_cs = (int64_t)(mono.size() * 100 / 16000);
+    constexpr int64_t kSegCs = 100;
+    for (int64_t t = 0; t + kSegCs <= dur_cs; t += kSegCs)
+        ranges.push_back({t, t + kSegCs});
+    REQUIRE(ranges.size() >= 5);
+
+    // Load TitaNet and extract one 192-d embedding per range.
+    titanet_context* tctx = titanet_init(titanet_path, 4);
+    REQUIRE(tctx != nullptr);
+
+    constexpr int DIM = 192;
+    std::vector<float> embeddings;
+    embeddings.reserve(ranges.size() * (size_t)DIM);
+    std::vector<size_t> kept_indices;
+    kept_indices.reserve(ranges.size());
+
+    std::vector<float> tmp(DIM);
+    for (size_t i = 0; i < ranges.size(); i++) {
+        const int s0 = (int)(ranges[i].t0_cs * 160);
+        const int s1 = (int)(ranges[i].t1_cs * 160);
+        if (s1 - s0 < 4000) // <250 ms — TitaNet's noisy floor
+            continue;
+        const int got = titanet_embed(tctx, mono.data() + s0, s1 - s0, tmp.data());
+        if (got != DIM)
+            continue;
+        embeddings.insert(embeddings.end(), tmp.begin(), tmp.end());
+        kept_indices.push_back(i);
+    }
+    titanet_free(tctx);
+    REQUIRE(kept_indices.size() >= 5);
+
+    // Cluster with the same settings the CLI uses by default.
+    std::vector<int> labels = crispasr_agglomerative_cluster(embeddings, (int)kept_indices.size(), DIM,
+                                                             /*merge_threshold=*/0.5f,
+                                                             /*max_speakers=*/8);
+    REQUIRE(labels.size() == kept_indices.size());
+
+    // Per-range cluster lookup so we can compute majority labels per
+    // known fixture region.
+    std::map<size_t, int> idx_to_label;
+    for (size_t k = 0; k < kept_indices.size(); k++)
+        idx_to_label[kept_indices[k]] = labels[k];
+
+    // Region majority helper: scans ranges with t0/t1 inside [a, b)
+    // and returns the cluster ID that appears most often, or -1 if
+    // no embedded segment falls in the region.
+    auto region_majority = [&](int64_t cs_a, int64_t cs_b) -> int {
+        std::map<int, int> counts;
+        for (size_t i = 0; i < ranges.size(); i++) {
+            if (ranges[i].t0_cs >= cs_a && ranges[i].t1_cs <= cs_b) {
+                auto it = idx_to_label.find(i);
+                if (it != idx_to_label.end() && it->second >= 0)
+                    counts[it->second]++;
+            }
+        }
+        int best = -1, best_count = 0;
+        for (const auto& kv : counts)
+            if (kv.second > best_count) {
+                best = kv.first;
+                best_count = kv.second;
+            }
+        return best;
+    };
+
+    // Fixture layout (deterministic, generated by
+    // tools/diarize_pyannote_smoke.sh):
+    //   0–11 s         JFK (real speech, low pitch male)
+    //   11.5–15.5 s    TTS-baker (resampled to 16 kHz)
+    //   16–27 s        JFK (repeat)
+    //   27.5–31.5 s    TTS-baker (repeat)
+    const int jfk_a_cluster = region_majority(0, 1000);
+    const int jfk_b_cluster = region_majority(1700, 2600);
+    const int baker_cluster = region_majority(1200, 1500);
+
+    INFO("majority clusters: jfk_a=" << jfk_a_cluster << " jfk_b=" << jfk_b_cluster << " baker=" << baker_cluster);
+
+    // All three regions had embeddable segments.
+    REQUIRE(jfk_a_cluster >= 0);
+    REQUIRE(jfk_b_cluster >= 0);
+    REQUIRE(baker_cluster >= 0);
+
+    // Within-speaker stability: both JFK regions land in the same
+    // cluster (the global-ID guarantee that pyannote-only could not
+    // give us).
+    REQUIRE(jfk_a_cluster == jfk_b_cluster);
+
+    // Across-speaker discrimination: JFK and the TTS-baker do not
+    // share a cluster. If this fails the embedder is collapsing real
+    // voice differences.
+    REQUIRE(jfk_a_cluster != baker_cluster);
 }

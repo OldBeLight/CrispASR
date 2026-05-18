@@ -72,12 +72,69 @@ if [[ ! -f "$model" ]]; then
         "https://huggingface.co/cstr/pyannote-v3-segmentation-GGUF/resolve/main/pyannote-seg-3.0.gguf"
 fi
 
-# 3) Build the live test target.
-echo "[smoke] building test-diarize-pyannote-live"
-cmake --build "$build_dir" --target test-diarize-pyannote-live >/dev/null
+# 3) Build the live test target + the CLI binary (the CLI is what the
+#    end-to-end embedder spawn-pass needs; the test-only target covers
+#    the library API path).
+echo "[smoke] building test-diarize-pyannote-live + crispasr"
+cmake --build "$build_dir" --target test-diarize-pyannote-live crispasr-cli >/dev/null
 
-# 4) Run it. The test asserts ≥2 distinct speaker labels surface.
-echo "[smoke] running"
+# 4a) C++ live test (lib API + TitaNet clustering when its model is
+#     reachable). Two TEST_CASEs: pyannote-only and pyannote+TitaNet.
+#     The TitaNet variant pulls titanet-large.gguf via the standard
+#     crispasr cache.
+titanet_cache="${HOME}/.cache/crispasr/titanet-large.gguf"
+echo "[smoke] running C++ live tests"
 CRISPASR_TEST_DIARIZE_WAV="$wav" \
 CRISPASR_TEST_DIARIZE_MODEL="$model" \
+CRISPASR_TEST_TITANET_MODEL="$titanet_cache" \
     "$build_dir/bin/test-diarize-pyannote-live" --success
+
+# 4b) CLI spawn smoke. Two passes against the same fixture so we
+#     catch wire-up bugs that the C++ API tests can't (e.g. output
+#     writers ignoring segs[i].speaker, missing CLI flag plumbing).
+#
+#     Pass 1: pyannote only -> should label ≥1 speaker on the fixture.
+#     Pass 2: --diarize-embedder auto -> globally stable cluster IDs
+#             across the file (e.g. ≥2 distinct labels for our 2-
+#             speaker fixture, with JFK regions sharing a cluster).
+#
+#     We use cohere as the ASR backend because it produces word
+#     timestamps (which the segment-splitting step needs), runs
+#     fast on M1, and ships in the auto-download cache.
+backend_model="${HOME}/.cache/crispasr/cohere-transcribe-q4_k.gguf"
+if [[ ! -f "$backend_model" ]]; then
+    echo "[smoke] WARNING: $backend_model missing — skipping CLI spawn smoke"
+    echo "[smoke] (run \`crispasr --backend cohere -m auto ...\` once to populate it)"
+    exit 0
+fi
+
+run_cli_and_check() {
+    local label="$1"
+    shift
+    local out_prefix="${TMPDIR:-/tmp}/diarize-smoke-${label}"
+    rm -f "${out_prefix}.json"
+    "$build_dir/bin/crispasr" --backend cohere -m "$backend_model" -f "$wav" \
+        --diarize --diarize-method pyannote --sherpa-segment-model auto \
+        "$@" -ojf -of "$out_prefix" >/dev/null 2>&1
+    local n_distinct
+    n_distinct=$(python -c "
+import json, sys
+from collections import Counter
+try:
+    d = json.load(open('${out_prefix}.json'))
+except Exception as e:
+    print('PARSE_FAIL', e); sys.exit(1)
+labels = [s.get('speaker','') for s in d.get('transcription', []) if s.get('speaker')]
+print(len(set(labels)))
+")
+    echo "[smoke] CLI ${label}: distinct speaker labels = ${n_distinct}"
+    [[ "$n_distinct" -ge 1 ]] || { echo "[smoke] FAIL: ${label} produced no labels"; return 1; }
+}
+
+echo "[smoke] CLI pass 1: pyannote-only"
+run_cli_and_check pyannote-only
+
+echo "[smoke] CLI pass 2: pyannote + TitaNet embedder"
+run_cli_and_check pyannote-embedder --diarize-embedder auto
+
+echo "[smoke] all CLI passes succeeded"
