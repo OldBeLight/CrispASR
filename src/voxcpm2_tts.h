@@ -35,6 +35,7 @@ struct voxcpm2_context_params {
     int inference_steps; // CFM Euler steps, default 10 (tradeoff: quality vs speed)
     float cfg_value;     // Classifier-free guidance scale, default 2.0
     int max_len;         // Max AR steps, default 2000
+    uint32_t seed;       // RNG seed for CFM noise (0 = use default 42)
 };
 
 struct voxcpm2_context_params voxcpm2_context_default_params(void);

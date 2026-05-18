@@ -54,7 +54,7 @@ public:
         double best_score = -1.0;
         for (int run = 0; run < n_runs; run++) {
             if (n_runs > 1)
-                kyutai_stt_set_seed(ctx_, (unsigned int)(run * 0x9E3779B9u + 1u));
+                kyutai_stt_set_seed(ctx_, (unsigned int)(params.seed ^ (run * 0x9E3779B9u + 1u)));
             kyutai_stt_result_ex* cand = kyutai_stt_transcribe_ex(ctx_, samples, n_samples, t_offset_cs);
             if (!cand)
                 continue;

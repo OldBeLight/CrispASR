@@ -31,6 +31,7 @@ struct indextts_context_params {
     int top_k;                // top-k sampling (default 50)
     float repetition_penalty; // repetition penalty (default 1.2)
     int max_mel_tokens;       // upper bound on AR decode (default 1500)
+    uint64_t seed;            // RNG seed (0 = use default)
 };
 
 struct indextts_context_params indextts_context_default_params(void);

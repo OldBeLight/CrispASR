@@ -3610,6 +3610,12 @@ extern "C" void chatterbox_set_max_speech_tokens(struct chatterbox_context* ctx,
     ctx->params.max_speech_tokens = n;
 }
 
+extern "C" void chatterbox_set_seed(struct chatterbox_context* ctx, uint32_t seed) {
+    if (!ctx)
+        return;
+    ctx->rng_seed = seed;
+}
+
 extern "C" void chatterbox_tokens_free(int32_t* tokens) {
     free(tokens);
 }

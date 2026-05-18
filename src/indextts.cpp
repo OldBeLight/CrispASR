@@ -1952,6 +1952,7 @@ extern "C" struct indextts_context_params indextts_context_default_params(void) 
     p.top_k = 30;                 // Python default: 30
     p.repetition_penalty = 10.0f; // Python default: 10.0 (critical for quality)
     p.max_mel_tokens = 600;       // Python default: 600
+    p.seed = 0;
     return p;
 }
 
@@ -1960,6 +1961,8 @@ extern "C" struct indextts_context* indextts_init_from_file(const char* path_mod
     auto* c = new indextts_context();
     c->params = params;
     c->n_threads = params.n_threads > 0 ? params.n_threads : 4;
+    if (params.seed != 0)
+        c->rng_state = params.seed;
 
     // Pass 1: metadata
     {

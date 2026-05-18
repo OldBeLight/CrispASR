@@ -52,6 +52,8 @@ public:
         if (env_max)
             cp.max_len = atoi(env_max);
 
+        cp.seed = (uint32_t)p.seed;
+
         ctx_ = voxcpm2_init_from_file(p.model.c_str(), cp);
         if (!ctx_) {
             fprintf(stderr, "crispasr[voxcpm2-tts]: failed to load model '%s'\n", p.model.c_str());

@@ -53,7 +53,8 @@ public:
         for (int run = 0; run < n_runs; run++) {
             // Mix run index into the sticky seed override. Run 0 keeps
             // historical behaviour (seed_override=0 → audio-derived seed).
-            moonshine_set_seed(ctx_, run == 0 ? 0 : ((uint64_t)run * 0x9E3779B97F4A7C15ULL));
+            moonshine_set_seed(ctx_, params.seed != 0 ? (params.seed ^ ((uint64_t)run * 0x9E3779B97F4A7C15ULL))
+                                                     : (run == 0 ? 0 : ((uint64_t)run * 0x9E3779B97F4A7C15ULL)));
             moonshine_result* cand = moonshine_transcribe_with_probs(ctx_, samples, n_samples);
             if (!cand)
                 continue;

@@ -288,6 +288,7 @@ struct voxcpm2_context {
     int inference_steps = 10;
     float cfg_value = 2.0f;
     int max_len = 2000;
+    uint32_t seed = 0;
 
     // RNG for CFM noise generation (seeded per synthesis call)
     mt19937_state rng;
@@ -508,12 +509,15 @@ static void swiglu_ffn_cpu(ggml_backend_t cpu_be, ggml_tensor* gate_w, ggml_tens
 // Operates on interleaved layout: pairs (i, i+head_dim/2) within each head.
 // ---------------------------------------------------------------------------
 
-static void rope_apply_cpu(float* qk, int head_dim, int n_heads, int pos, float theta, int /*n_ctx_orig*/) {
+static void rope_apply_cpu(float* qk, int head_dim, int n_heads, int pos, float theta, int /*n_ctx_orig*/,
+                           const float* short_factors = nullptr) {
     for (int h = 0; h < n_heads; h++) {
         float* vec = qk + h * head_dim;
         for (int i = 0; i < head_dim / 2; i++) {
-            float freq = 1.0f / std::pow(theta, (float)(2 * i) / (float)head_dim);
-            float angle = (float)pos * freq;
+            float inv_freq = 1.0f / std::pow(theta, (float)(2 * i) / (float)head_dim);
+            float angle = (float)pos * inv_freq;
+            if (short_factors)
+                angle /= short_factors[i];
             float cos_a = std::cos(angle);
             float sin_a = std::sin(angle);
             float x0 = vec[i];
@@ -586,13 +590,58 @@ static void causal_attn_step(const float* q_in,  // [n_q  * hd]
 }
 
 // ---------------------------------------------------------------------------
+// LongRoPE positional embedding for bidirectional attention.
+// Applies in-place to Q[T * n_heads * hd] and K[T * n_kv * hd].
+// short_factors: [hd/2] factors; theta: base frequency; scaling: overall scale.
+// Formula: angle = pos / (short_factor[i] * theta^(2i/hd))
+// Rotation: (x0, x1) -> (x0*cos - x1*sin, x0*sin + x1*cos)
+//   where x0 = vec[i], x1 = vec[i + hd/2]  (rotate_half convention)
+// ---------------------------------------------------------------------------
+
+static void longrope_apply_bidir(float* Q, float* K, int T, int n_q, int n_kv, int hd, float theta,
+                                 const float* short_factors) {
+    int half_hd = hd / 2;
+    for (int pos = 0; pos < T; pos++) {
+        // Apply to Q heads
+        for (int h = 0; h < n_q; h++) {
+            float* vec = Q + (size_t)pos * n_q * hd + (size_t)h * hd;
+            for (int i = 0; i < half_hd; i++) {
+                float inv_freq = 1.0f / std::pow(theta, (float)(2 * i) / (float)hd);
+                float angle = (float)pos * inv_freq / short_factors[i];
+                float cos_a = std::cos(angle);
+                float sin_a = std::sin(angle);
+                float x0 = vec[i];
+                float x1 = vec[i + half_hd];
+                vec[i] = x0 * cos_a - x1 * sin_a;
+                vec[i + half_hd] = x0 * sin_a + x1 * cos_a;
+            }
+        }
+        // Apply to K heads
+        for (int h = 0; h < n_kv; h++) {
+            float* vec = K + (size_t)pos * n_kv * hd + (size_t)h * hd;
+            for (int i = 0; i < half_hd; i++) {
+                float inv_freq = 1.0f / std::pow(theta, (float)(2 * i) / (float)hd);
+                float angle = (float)pos * inv_freq / short_factors[i];
+                float cos_a = std::cos(angle);
+                float sin_a = std::sin(angle);
+                float x0 = vec[i];
+                float x1 = vec[i + half_hd];
+                vec[i] = x0 * cos_a - x1 * sin_a;
+                vec[i + half_hd] = x0 * sin_a + x1 * cos_a;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bidirectional (full) attention for LocEnc / LocDiT — no mask
 // x_in: [T * d] row-major, out: [T * d] row-major
+// When rope_factors != nullptr, applies LongRoPE to Q/K before attention.
 // ---------------------------------------------------------------------------
 
 static void bidir_attn_full(const float* x_in, int T, int d, ggml_tensor* q_w, ggml_tensor* k_w, ggml_tensor* v_w,
                             ggml_tensor* o_w, int n_q, int n_kv, int hd, float attn_scale, ggml_backend_t cpu_be,
-                            float* out) {
+                            float* out, const float* rope_factors = nullptr, float rope_theta = 10000.0f) {
     int grp = n_q / n_kv;
 
     std::vector<float> Q((size_t)T * n_q * hd);
@@ -604,6 +653,11 @@ static void bidir_attn_full(const float* x_in, int T, int d, ggml_tensor* q_w, g
         matmul_mv(cpu_be, q_w, xt, d, Q.data() + (size_t)t * n_q * hd, n_q * hd);
         matmul_mv(cpu_be, k_w, xt, d, K.data() + (size_t)t * n_kv * hd, n_kv * hd);
         matmul_mv(cpu_be, v_w, xt, d, V.data() + (size_t)t * n_kv * hd, n_kv * hd);
+    }
+
+    // Apply LongRoPE if factors provided
+    if (rope_factors) {
+        longrope_apply_bidir(Q.data(), K.data(), T, n_q, n_kv, hd, rope_theta, rope_factors);
     }
 
     std::vector<float> attn_out((size_t)T * n_q * hd, 0.0f);
@@ -671,8 +725,9 @@ static void tslm_layer_step(voxcpm2_context* ctx, int layer, float* hidden, int 
     matmul_mv(cpu_be, L.attn_k_w, normed.data(), d, k.data(), n_kv * hd);
     matmul_mv(cpu_be, L.attn_v_w, normed.data(), d, v.data(), n_kv * hd);
 
-    rope_apply_cpu(q.data(), hd, n_q, pos, hp.tslm_rope_theta, (int)hp.tslm_max_pos);
-    rope_apply_cpu(k.data(), hd, n_kv, pos, hp.tslm_rope_theta, (int)hp.tslm_max_pos);
+    const float* tslm_rope_sf = ctx->weights.tslm_rope_short ? tensor_data_f32(ctx->weights.tslm_rope_short) : nullptr;
+    rope_apply_cpu(q.data(), hd, n_q, pos, hp.tslm_rope_theta, (int)hp.tslm_max_pos, tslm_rope_sf);
+    rope_apply_cpu(k.data(), hd, n_kv, pos, hp.tslm_rope_theta, (int)hp.tslm_max_pos, tslm_rope_sf);
 
     causal_attn_step(q.data(), k.data(), v.data(), attn_out.data(), ctx->tslm_kv, layer, n_q, n_kv, hd, attn_scale);
 
@@ -924,6 +979,10 @@ static std::vector<float> locenc_forward(voxcpm2_context* ctx, const float* patc
 
     std::vector<float> normed((size_t)T * d), attn_out((size_t)T * d), ffn_h(d);
 
+    // LongRoPE factors for LocEnc (same as TSLM/LocDiT)
+    const float* rope_factors = W.tslm_rope_short ? tensor_data_f32(W.tslm_rope_short) : nullptr;
+    float rope_theta = hp.tslm_rope_theta;
+
     for (int l = 0; l < (int)hp.locenc_n_layers; l++) {
         const vox_enc_layer& L = W.locenc_layers[l];
 
@@ -932,7 +991,7 @@ static std::vector<float> locenc_forward(voxcpm2_context* ctx, const float* patc
         }
 
         bidir_attn_full(normed.data(), T, d, L.attn_q_w, L.attn_k_w, L.attn_v_w, L.attn_o_w, n_q, n_kv, hd, ascale,
-                        cpu_be, attn_out.data());
+                        cpu_be, attn_out.data(), rope_factors, rope_theta);
 
         for (size_t i = 0; i < (size_t)T * d; i++)
             cur[i] += attn_out[i];
@@ -1103,6 +1162,10 @@ static std::vector<float> locdit_forward(voxcpm2_context* ctx, const float* x_ra
     }
 
     // --- Bidirectional transformer layers ---
+    // LongRoPE factors for LocDiT (same as TSLM/LocEnc)
+    const float* rope_factors = W.tslm_rope_short ? tensor_data_f32(W.tslm_rope_short) : nullptr;
+    float rope_theta = hp.tslm_rope_theta;
+
     std::vector<float> normed((size_t)T * d), attn_out((size_t)T * d), ffn_h(d);
 
     for (int l = 0; l < (int)hp.locdit_n_layers; l++) {
@@ -1113,7 +1176,7 @@ static std::vector<float> locdit_forward(voxcpm2_context* ctx, const float* x_ra
         }
 
         bidir_attn_full(normed.data(), T, d, L.attn_q_w, L.attn_k_w, L.attn_v_w, L.attn_o_w, n_q, n_kv, hd, ascale,
-                        cpu_be, attn_out.data());
+                        cpu_be, attn_out.data(), rope_factors, rope_theta);
 
         for (size_t i = 0; i < (size_t)T * d; i++)
             cur[i] += attn_out[i];
@@ -2096,43 +2159,44 @@ static bool vox_load_weights(voxcpm2_context* ctx, const char* path) {
 
     vox_hparams& hp = ctx->hp;
 
-    hp.tslm_n_layers = kv_u32(meta, "tslm.n_layers", hp.tslm_n_layers);
-    hp.tslm_d_model = kv_u32(meta, "tslm.d_model", hp.tslm_d_model);
-    hp.tslm_n_heads = kv_u32(meta, "tslm.n_heads", hp.tslm_n_heads);
-    hp.tslm_n_kv = kv_u32(meta, "tslm.n_kv_heads", hp.tslm_n_kv);
-    hp.tslm_head_dim = kv_u32(meta, "tslm.head_dim", hp.tslm_head_dim);
-    hp.tslm_ff_dim = kv_u32(meta, "tslm.ff_dim", hp.tslm_ff_dim);
-    hp.tslm_max_pos = kv_u32(meta, "tslm.max_pos", hp.tslm_max_pos);
-    hp.tslm_rope_theta = kv_f32(meta, "tslm.rope_theta", hp.tslm_rope_theta);
-    hp.rms_norm_eps = kv_f32(meta, "tslm.rms_norm_eps", hp.rms_norm_eps);
+    // GGUF keys use "voxcpm2." prefix (set by the converter)
+    hp.tslm_n_layers = kv_u32(meta, "voxcpm2.tslm.n_layers", hp.tslm_n_layers);
+    hp.tslm_d_model = kv_u32(meta, "voxcpm2.tslm.d_model", hp.tslm_d_model);
+    hp.tslm_n_heads = kv_u32(meta, "voxcpm2.tslm.n_heads", hp.tslm_n_heads);
+    hp.tslm_n_kv = kv_u32(meta, "voxcpm2.tslm.n_kv_heads", hp.tslm_n_kv);
+    hp.tslm_head_dim = kv_u32(meta, "voxcpm2.tslm.head_dim", hp.tslm_head_dim);
+    hp.tslm_ff_dim = kv_u32(meta, "voxcpm2.tslm.ff_dim", hp.tslm_ff_dim);
+    hp.tslm_max_pos = kv_u32(meta, "voxcpm2.tslm.max_pos", hp.tslm_max_pos);
+    hp.tslm_rope_theta = kv_f32(meta, "voxcpm2.tslm.rope_theta", hp.tslm_rope_theta);
+    hp.rms_norm_eps = kv_f32(meta, "voxcpm2.tslm.rms_norm_eps", hp.rms_norm_eps);
 
-    hp.ralm_n_layers = kv_u32(meta, "ralm.n_layers", hp.ralm_n_layers);
-    hp.ralm_d_model = kv_u32(meta, "ralm.d_model", hp.ralm_d_model);
-    hp.ralm_n_heads = kv_u32(meta, "ralm.n_heads", hp.ralm_n_heads);
-    hp.ralm_n_kv = kv_u32(meta, "ralm.n_kv_heads", hp.ralm_n_kv);
-    hp.ralm_head_dim = kv_u32(meta, "ralm.head_dim", hp.ralm_head_dim);
-    hp.ralm_ff_dim = kv_u32(meta, "ralm.ff_dim", hp.ralm_ff_dim);
+    hp.ralm_n_layers = kv_u32(meta, "voxcpm2.ralm.n_layers", hp.ralm_n_layers);
+    hp.ralm_d_model = kv_u32(meta, "voxcpm2.ralm.d_model", hp.ralm_d_model);
+    hp.ralm_n_heads = kv_u32(meta, "voxcpm2.ralm.n_heads", hp.ralm_n_heads);
+    hp.ralm_n_kv = kv_u32(meta, "voxcpm2.ralm.n_kv_heads", hp.ralm_n_kv);
+    hp.ralm_head_dim = kv_u32(meta, "voxcpm2.ralm.head_dim", hp.ralm_head_dim);
+    hp.ralm_ff_dim = kv_u32(meta, "voxcpm2.ralm.ff_dim", hp.ralm_ff_dim);
 
-    hp.locenc_n_layers = kv_u32(meta, "locenc.n_layers", hp.locenc_n_layers);
-    hp.locenc_d_model = kv_u32(meta, "locenc.d_model", hp.locenc_d_model);
-    hp.locenc_n_heads = kv_u32(meta, "locenc.n_heads", hp.locenc_n_heads);
-    hp.locenc_n_kv = kv_u32(meta, "locenc.n_kv_heads", hp.locenc_n_kv);
-    hp.locenc_head_dim = kv_u32(meta, "locenc.head_dim", hp.locenc_head_dim);
-    hp.locenc_ff_dim = kv_u32(meta, "locenc.ff_dim", hp.locenc_ff_dim);
+    hp.locenc_n_layers = kv_u32(meta, "voxcpm2.locenc.n_layers", hp.locenc_n_layers);
+    hp.locenc_d_model = kv_u32(meta, "voxcpm2.locenc.d_model", hp.locenc_d_model);
+    hp.locenc_n_heads = kv_u32(meta, "voxcpm2.locenc.n_heads", hp.locenc_n_heads);
+    hp.locenc_n_kv = kv_u32(meta, "voxcpm2.locenc.n_kv_heads", hp.locenc_n_kv);
+    hp.locenc_head_dim = kv_u32(meta, "voxcpm2.locenc.head_dim", hp.locenc_head_dim);
+    hp.locenc_ff_dim = kv_u32(meta, "voxcpm2.locenc.ff_dim", hp.locenc_ff_dim);
 
-    hp.locdit_n_layers = kv_u32(meta, "locdit.n_layers", hp.locdit_n_layers);
-    hp.locdit_d_model = kv_u32(meta, "locdit.d_model", hp.locdit_d_model);
-    hp.locdit_n_heads = kv_u32(meta, "locdit.n_heads", hp.locdit_n_heads);
-    hp.locdit_n_kv = kv_u32(meta, "locdit.n_kv_heads", hp.locdit_n_kv);
-    hp.locdit_head_dim = kv_u32(meta, "locdit.head_dim", hp.locdit_head_dim);
-    hp.locdit_ff_dim = kv_u32(meta, "locdit.ff_dim", hp.locdit_ff_dim);
+    hp.locdit_n_layers = kv_u32(meta, "voxcpm2.locdit.n_layers", hp.locdit_n_layers);
+    hp.locdit_d_model = kv_u32(meta, "voxcpm2.locdit.d_model", hp.locdit_d_model);
+    hp.locdit_n_heads = kv_u32(meta, "voxcpm2.locdit.n_heads", hp.locdit_n_heads);
+    hp.locdit_n_kv = kv_u32(meta, "voxcpm2.locdit.n_kv_heads", hp.locdit_n_kv);
+    hp.locdit_head_dim = kv_u32(meta, "voxcpm2.locdit.head_dim", hp.locdit_head_dim);
+    hp.locdit_ff_dim = kv_u32(meta, "voxcpm2.locdit.ff_dim", hp.locdit_ff_dim);
 
-    // Override n_vocab from GGUF metadata
+    // Token IDs
     hp.n_vocab = kv_u32(meta, "tokenizer.n_vocab", hp.n_vocab);
-    hp.audio_start_token = kv_u32(meta, "tokenizer.audio_start_id", 0);
+    hp.audio_start_token = kv_u32(meta, "voxcpm2.audio_start_token", hp.audio_start_token);
 
-    hp.patch_frames = kv_u32(meta, "vae.patch_frames", hp.patch_frames);
-    hp.patch_dim = kv_u32(meta, "vae.patch_dim", hp.patch_dim);
+    hp.patch_frames = kv_u32(meta, "voxcpm2.patch_frames", hp.patch_frames);
+    hp.patch_dim = kv_u32(meta, "voxcpm2.vae.patch_dim", hp.patch_dim);
 
     // Tokenizer: try GGUF string arrays first, then vocab blob tensor
     {
@@ -2165,6 +2229,18 @@ static bool vox_load_weights(voxcpm2_context* ctx, const char* path) {
 
     // Infer n_kv for LocEnc/LocDiT from K weight shapes when not in metadata.
     // K weight: ne[0]=d_model (input), ne[1]=n_kv*head_dim (output)
+    {
+        auto it = T.find("ralm.blk.0.attn_k.weight");
+        if (it != T.end() && hp.ralm_head_dim > 0) {
+            uint32_t kv_dim = (uint32_t)it->second->ne[1];
+            uint32_t inferred = kv_dim / hp.ralm_head_dim;
+            if (inferred > 0 && inferred != hp.ralm_n_kv) {
+                if (ctx->verbosity >= 1)
+                    fprintf(stderr, "voxcpm2: ralm n_kv inferred from K weight: %u (was %u)\n", inferred, hp.ralm_n_kv);
+                hp.ralm_n_kv = inferred;
+            }
+        }
+    }
     {
         auto it = T.find("locenc.blk.0.attn_k.weight");
         if (it != T.end() && hp.locenc_head_dim > 0) {
@@ -2401,9 +2477,8 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
     ggml_backend_t cpu_be = get_cpu_backend();
     ggml_backend_cpu_set_n_threads(cpu_be, ctx->n_threads);
 
-    // Seed RNG for CFM noise (use a fixed seed for reproducibility in testing,
-    // or a time-based seed for varied output in production)
-    mt19937_seed(ctx->rng, 42);
+    // Seed RNG for CFM noise
+    mt19937_seed(ctx->rng, ctx->seed != 0 ? ctx->seed : 42);
 
     double t0_total = vox_now_ms();
     (void)ref_samples;
@@ -2419,46 +2494,51 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
         return nullptr;
     }
 
-    // 2. TSLM prefill
+    // 2. TSLM prefill (capture all positions for multi-position RALM)
     double t0_prefill = vox_now_ms();
-    std::vector<float> tslm_hidden = tslm_prefill(ctx, token_ids, cpu_be);
+    int d_tslm = (int)ctx->hp.tslm_d_model;
+    int T_tok = (int)token_ids.size();
 
-    // Apply TSLM output norm
-    {
-        int d = (int)ctx->hp.tslm_d_model;
-        std::vector<float> normed(d);
-        rms_norm_cpu(tslm_hidden.data(), tensor_data_f32(ctx->weights.tslm_output_norm), normed.data(), d,
-                     ctx->hp.rms_norm_eps);
-        tslm_hidden = normed;
+    std::vector<float> all_pos;
+    tslm_prefill_hooks hooks;
+    hooks.max_capture_positions = T_tok;
+    hooks.all_positions = &all_pos;
+    tslm_prefill_ex(ctx, token_ids, cpu_be, hooks);
+    int N_pos = (int)(all_pos.size() / d_tslm);
+
+    // Apply TSLM output norm to each position
+    std::vector<float> normed_all((size_t)N_pos * d_tslm);
+    for (int i = 0; i < N_pos; i++) {
+        rms_norm_cpu(all_pos.data() + (size_t)i * d_tslm, tensor_data_f32(ctx->weights.tslm_output_norm),
+                     normed_all.data() + (size_t)i * d_tslm, d_tslm, ctx->hp.rms_norm_eps);
     }
+    // Last-token TSLM output
+    std::vector<float> tslm_hidden(normed_all.data() + (size_t)(N_pos - 1) * d_tslm,
+                                   normed_all.data() + (size_t)N_pos * d_tslm);
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "voxcpm2: TSLM prefill %.1f ms\n", vox_now_ms() - t0_prefill);
     }
 
-    // 3. FSQ on TSLM hidden
-    std::vector<float> fsq_out = fsq_forward(ctx, tslm_hidden.data(), cpu_be);
+    // 3. FSQ masking: for zero-shot text-only, all positions are text → FSQ is not applied
 
-    // 4. fusion_concat_proj(cat(fsq_out, audio_feat_embed)) → RALM prefill
-    // For zero-shot, audio_feat_embed is zeros (no reference audio)
+    // 4. fusion_concat_proj + multi-position RALM prefill
+    // Python passes ALL positions through the RALM causally. The last position's output
+    // depends on KV from all previous positions, so single-token RALM gives wrong results.
+    std::vector<float> ralm_hidden;
     {
-        int d = (int)ctx->hp.tslm_d_model;
-        int in_dim = 2 * d; // 4096
-        std::vector<float> cat_buf(in_dim, 0.0f);
-        memcpy(cat_buf.data(), fsq_out.data(), d * sizeof(float));
-        // Second half is zeros (no audio feat for text-only zero-shot)
-        std::vector<float> fusion_out(d);
-        matmul_mv_bias(cpu_be, ctx->weights.fusion_w, ctx->weights.fusion_b, cat_buf.data(), in_dim, fusion_out.data(),
-                       d);
-        fsq_out = fusion_out;
-    }
-    std::vector<float> ralm_hidden = ralm_prefill(ctx, fsq_out, cpu_be);
-    // Apply RALM output norm
-    {
-        int d = (int)ctx->hp.ralm_d_model;
-        std::vector<float> normed(d);
-        rms_norm_cpu(ralm_hidden.data(), tensor_data_f32(ctx->weights.ralm_output_norm), normed.data(), d,
-                     ctx->hp.rms_norm_eps);
-        ralm_hidden = normed;
+        int in_dim = 2 * d_tslm;
+        std::vector<float> ralm_input((size_t)N_pos * d_tslm);
+        for (int i = 0; i < N_pos; i++) {
+            std::vector<float> cat_buf(in_dim, 0.0f);
+            std::memcpy(cat_buf.data(), normed_all.data() + (size_t)i * d_tslm, (size_t)d_tslm * sizeof(float));
+            matmul_mv_bias(cpu_be, ctx->weights.fusion_w, ctx->weights.fusion_b, cat_buf.data(), in_dim,
+                           ralm_input.data() + (size_t)i * d_tslm, d_tslm);
+        }
+        std::vector<float> ralm_out = ralm_prefill_multi(ctx, ralm_input.data(), N_pos, cpu_be);
+        int dr = (int)ctx->hp.ralm_d_model;
+        ralm_hidden.resize(dr);
+        rms_norm_cpu(ralm_out.data() + (size_t)(N_pos - 1) * dr, tensor_data_f32(ctx->weights.ralm_output_norm),
+                     ralm_hidden.data(), dr, ctx->hp.rms_norm_eps);
     }
 
     // 5. Build mu [2048] for LocDiT: mu = cat(lm_to_dit(tslm), res_to_dit(ralm))
@@ -2492,6 +2572,9 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
     int P_frames = (int)ctx->hp.patch_frames;
     std::vector<float> prev_patch_raw(feat_dim_vae * P_frames, 0.0f);
 
+    // FSQ output for AR loop (declared here so it's in scope)
+    std::vector<float> fsq_out;
+
     // 6. AR loop
     double t0_ar = vox_now_ms();
     std::vector<std::vector<float>> patches;
@@ -2508,18 +2591,20 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
         fill_gaussian_noise(noise.data(), (int)noise.size(), ctx->rng);
         std::vector<float> patch = cfm_euler_solve(ctx, mu.data(), prev_patch_raw.data(), ctx->inference_steps,
                                                    ctx->cfg_value, cpu_be, noise.data());
-        patches.push_back(patch);
 
-        // Update previous patch for next step
-        prev_patch_raw = patch;
-        // Resize to exactly feat_dim * P_frames if needed
-        prev_patch_raw.resize(feat_dim_vae * P_frames, 0.0f);
+        // Transpose patch from [C=64, T=4] channels-first (CFM output) to [T=4, C=64] time-first
+        // Python: pred_feat = cfm(...).transpose(1, 2)  → [B, T, C]
+        std::vector<float> patch_tf(feat_dim_vae * P_frames);
+        for (int t = 0; t < P_frames; t++)
+            for (int c = 0; c < feat_dim_vae; c++)
+                patch_tf[t * feat_dim_vae + c] = patch[c * P_frames + t];
 
-        // b. LocEnc on predicted patch (uses in_proj to project feat_dim=64 → d_locenc=1024)
-        // Pass the raw latent [feat_dim * patch_frames] — locenc_forward handles in_proj internally
-        std::vector<float> patch_enc_in = patch;
-        patch_enc_in.resize(feat_dim_vae * P_frames, 0.0f);
-        std::vector<float> enc_out = locenc_forward(ctx, patch_enc_in.data(), cpu_be);
+        // Store transposed patch for VAE (time-first [T, C]) and for next step's cond
+        patches.push_back(patch_tf);
+        prev_patch_raw = patch_tf;
+
+        // b. LocEnc on predicted patch (time-first [T, C])
+        std::vector<float> enc_out = locenc_forward(ctx, patch_tf.data(), cpu_be);
 
         // d. enc_to_lm_proj: locenc_d -> tslm_d
         std::vector<float> enc_lm(d_lm, 0.0f);
@@ -2564,9 +2649,11 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
         // f. FSQ
         fsq_out = fsq_forward(ctx, tslm_hidden.data(), cpu_be);
 
-        // g. proj.fusion(cat(lm_hidden, enc_lm)) [4096 -> 2048]
+        // g. proj.fusion(cat(fsq_out, enc_lm)) [4096 -> 2048]
+        // Python: fusion_concat_proj(cat(enc_outputs, audio_mask * feat_embed))
+        // For audio positions: enc_outputs = FSQ(tslm_output), feat_embed = enc_to_lm(locenc_out)
         std::vector<float> fusion_in((size_t)(d_lm + d_lm));
-        std::memcpy(fusion_in.data(), tslm_hidden.data(), (size_t)d_lm * sizeof(float));
+        std::memcpy(fusion_in.data(), fsq_out.data(), (size_t)d_lm * sizeof(float));
         std::memcpy(fusion_in.data() + d_lm, enc_lm.data(), (size_t)d_lm * sizeof(float));
 
         std::vector<float> fusion_out(d_ralm, 0.0f);
@@ -2594,7 +2681,10 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
             ralm_hidden = normed;
         }
 
-        // Update mu conditioning for next step
+        // Update mu conditioning for next step.
+        // Python: lm_hidden is FSQ'd before being used for lm_to_dit_proj at next iteration.
+        // In the AR loop, all new positions are audio positions → FSQ IS applied.
+        tslm_hidden = fsq_out; // Use FSQ'd output for lm_to_dit projection
         mu = build_mu(tslm_hidden, ralm_hidden);
         step++;
     }
@@ -2639,6 +2729,7 @@ struct voxcpm2_context_params voxcpm2_context_default_params(void) {
     p.inference_steps = 10;
     p.cfg_value = 2.0f;
     p.max_len = 2000;
+    p.seed = 0;
     return p;
 }
 
@@ -2654,6 +2745,7 @@ struct voxcpm2_context* voxcpm2_init_from_file(const char* path_model, struct vo
     ctx->inference_steps = params.inference_steps > 0 ? params.inference_steps : 10;
     ctx->cfg_value = params.cfg_value > 0.0f ? params.cfg_value : 2.0f;
     ctx->max_len = params.max_len > 0 ? params.max_len : 2000;
+    ctx->seed = params.seed;
 
     if (!vox_load_weights(ctx, path_model)) {
         fprintf(stderr, "voxcpm2: failed to load '%s'\n", path_model);
@@ -2873,6 +2965,96 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
         return out;
     }
 
+    if (stage == "dit_single_fwd") {
+        // Single LocDiT forward pass with reference input sequence.
+        // ref_samples should contain dit_input_seq [T_seq * d_dit] = [11 * 1024] floats.
+        // Runs 12 transformer layers + final norm + out_proj, returns velocity [C=64, T=4].
+        int d_dit = (int)ctx->hp.locdit_d_model;
+        int P_fr = (int)ctx->hp.patch_frames;
+        int feat_dim = 64;
+        int mu_toks = 2;
+        int T_seq = mu_toks + 1 + P_fr + P_fr; // 11
+        int expected_ref = T_seq * d_dit;      // 11264
+
+        if (!ref_samples || ref_n_samples < expected_ref) {
+            fprintf(stderr, "dit_single_fwd: need dit_input_seq reference (%d floats, got %d)\n", expected_ref,
+                    ref_n_samples);
+            return nullptr;
+        }
+
+        // Feed the reference sequence through 12 LocDiT layers + norm + out_proj
+        const vox_hparams& hp2 = ctx->hp;
+        const vox_weights& W2 = ctx->weights;
+        int d = d_dit;
+        int n_q = (int)hp2.locdit_n_heads;
+        int n_kv = (int)hp2.locdit_n_kv;
+        int hd = (int)hp2.locdit_head_dim;
+        float eps = hp2.rms_norm_eps;
+        float ascale = 1.0f / std::sqrt((float)hd);
+        int x_offset = mu_toks + 1 + P_fr; // 7
+
+        // Copy reference sequence into working buffer
+        std::vector<float> cur((size_t)T_seq * d);
+        std::memcpy(cur.data(), ref_samples, (size_t)expected_ref * sizeof(float));
+
+        // LongRoPE factors
+        const float* rope_factors = W2.tslm_rope_short ? tensor_data_f32(W2.tslm_rope_short) : nullptr;
+        float rope_theta = hp2.tslm_rope_theta;
+
+        std::vector<float> normed((size_t)T_seq * d), attn_out((size_t)T_seq * d), ffn_h(d);
+
+        for (int l = 0; l < (int)hp2.locdit_n_layers; l++) {
+            const vox_enc_layer& L = W2.locdit_layers[l];
+            for (int t = 0; t < T_seq; t++) {
+                rms_norm_cpu(cur.data() + (size_t)t * d, tensor_data_f32(L.norm1_w), normed.data() + (size_t)t * d, d,
+                             eps);
+            }
+            bidir_attn_full(normed.data(), T_seq, d, L.attn_q_w, L.attn_k_w, L.attn_v_w, L.attn_o_w, n_q, n_kv, hd,
+                            ascale, cpu_be, attn_out.data(), rope_factors, rope_theta);
+            for (size_t i = 0; i < (size_t)T_seq * d; i++)
+                cur[i] += attn_out[i];
+            for (int t = 0; t < T_seq; t++) {
+                rms_norm_cpu(cur.data() + (size_t)t * d, tensor_data_f32(L.norm2_w), normed.data() + (size_t)t * d, d,
+                             eps);
+                swiglu_ffn_cpu(cpu_be, L.ffn_gate_w, L.ffn_up_w, L.ffn_down_w, normed.data() + (size_t)t * d, d,
+                               (int)hp2.locdit_ff_dim, d, ffn_h.data());
+                float* ct = cur.data() + (size_t)t * d;
+                for (int i = 0; i < d; i++)
+                    ct[i] += ffn_h[i];
+            }
+        }
+
+        // Extract x-portion (last P_fr tokens) → final norm → out_proj
+        int out_size = feat_dim * P_fr;
+        std::vector<float> vel(out_size);
+        for (int p = 0; p < P_fr; p++) {
+            const float* h_p = cur.data() + (size_t)(x_offset + p) * d;
+            float* v_p = vel.data() + (size_t)p * feat_dim;
+            std::vector<float> normed_p(d);
+            if (W2.locdit_norm_w) {
+                rms_norm_cpu(h_p, tensor_data_f32(W2.locdit_norm_w), normed_p.data(), d, eps);
+            } else {
+                std::memcpy(normed_p.data(), h_p, (size_t)d * sizeof(float));
+            }
+            if (W2.locdit_out_proj_w && W2.locdit_out_proj_b) {
+                matmul_mv_bias(cpu_be, W2.locdit_out_proj_w, W2.locdit_out_proj_b, normed_p.data(), d, v_p, feat_dim);
+            }
+        }
+
+        // Output in time-first [T=4, C=64] layout (matching Python vel[0] which is [C=64, T=4])
+        // Actually Python vel_sf[0] is shape [C=64, T=4] (channels-first from estimator output)
+        // We produce [P_fr * feat_dim] in time-first layout → need to transpose to channels-first
+        std::vector<float> vel_cf(out_size);
+        for (int t = 0; t < P_fr; t++)
+            for (int c = 0; c < feat_dim; c++)
+                vel_cf[c * P_fr + t] = vel[t * feat_dim + c];
+
+        *out_n = out_size;
+        float* out = (float*)std::malloc((size_t)out_size * sizeof(float));
+        std::memcpy(out, vel_cf.data(), (size_t)out_size * sizeof(float));
+        return out;
+    }
+
     if (stage == "cfm_step0_result") {
         // CFM Euler solve using reference mu + noise when available.
         // ref_samples layout (packed by diff handler):
@@ -2934,9 +3116,16 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
         std::vector<float> zero_cond(state_size, 0.0f);
         std::vector<float> patch =
             cfm_euler_solve(ctx, mu.data(), zero_cond.data(), 10, ctx->cfg_value, cpu_be, noise.data());
-        *out_n = (int)patch.size();
-        float* out = (float*)std::malloc(patch.size() * sizeof(float));
-        std::memcpy(out, patch.data(), patch.size() * sizeof(float));
+        // CFM returns channels-first [C=64, T=4]. Python reference saves time-first [T=4, C=64]
+        // (pred_feat = cfm(...).transpose(1, 2)), so transpose to match.
+        int P_tf = P_fr, C_tf = 64;
+        std::vector<float> patch_tf(state_size);
+        for (int t = 0; t < P_tf; t++)
+            for (int c = 0; c < C_tf; c++)
+                patch_tf[t * C_tf + c] = patch[c * P_tf + t];
+        *out_n = (int)patch_tf.size();
+        float* out = (float*)std::malloc(patch_tf.size() * sizeof(float));
+        std::memcpy(out, patch_tf.data(), patch_tf.size() * sizeof(float));
         return out;
     }
 
@@ -2996,38 +3185,63 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
         return nullptr;
     }
 
-    if (stage == "lm_to_dit_hidden" || stage == "res_to_dit_hidden") {
-        // Run full pipeline to get projections: TSLM → FSQ → RALM → project
+    if (stage == "tslm_last_hidden") {
+        // Raw TSLM last-token output (normed, before projection) — for debugging
         std::vector<float> h = tslm_prefill(ctx, token_ids, cpu_be);
         int d = (int)ctx->hp.tslm_d_model;
-        int d_dit = (int)ctx->hp.locdit_d_model;
-        {
-            std::vector<float> normed(d);
-            rms_norm_cpu(h.data(), tensor_data_f32(ctx->weights.tslm_output_norm), normed.data(), d,
-                         ctx->hp.rms_norm_eps);
-            h = normed;
-        }
-        std::vector<float> tslm_out = h; // save for lm_to_dit
+        std::vector<float> normed(d);
+        rms_norm_cpu(h.data(), tensor_data_f32(ctx->weights.tslm_output_norm), normed.data(), d, ctx->hp.rms_norm_eps);
+        *out_n = d;
+        float* out = (float*)std::malloc((size_t)d * sizeof(float));
+        std::memcpy(out, normed.data(), (size_t)d * sizeof(float));
+        return out;
+    }
 
-        std::vector<float> fsq_out = fsq_forward(ctx, h.data(), cpu_be);
-        // fusion_concat_proj(cat(fsq_out, zeros))
-        {
-            int in_dim = 2 * d;
+    if (stage == "lm_to_dit_hidden" || stage == "res_to_dit_hidden") {
+        // Run full pipeline: TSLM (all positions) → norm → FSQ → fusion → RALM (multi) → project
+        // Must use multi-position RALM because the last position's output depends on all previous KV.
+        int d = (int)ctx->hp.tslm_d_model;
+        int d_dit = (int)ctx->hp.locdit_d_model;
+        int T_tok = (int)token_ids.size();
+
+        // Full TSLM prefill capturing all positions
+        std::vector<float> all_pos;
+        tslm_prefill_hooks hooks;
+        hooks.max_capture_positions = T_tok;
+        hooks.all_positions = &all_pos;
+        tslm_prefill_ex(ctx, token_ids, cpu_be, hooks);
+        int N = (int)(all_pos.size() / d);
+
+        // Apply output norm to each position
+        std::vector<float> normed_all((size_t)N * d);
+        for (int i = 0; i < N; i++) {
+            rms_norm_cpu(all_pos.data() + (size_t)i * d, tensor_data_f32(ctx->weights.tslm_output_norm),
+                         normed_all.data() + (size_t)i * d, d, ctx->hp.rms_norm_eps);
+        }
+        // Last-token TSLM output (for lm_to_dit)
+        std::vector<float> tslm_out(normed_all.data() + (size_t)(N - 1) * d, normed_all.data() + (size_t)N * d);
+
+        // FSQ masking: for zero-shot text-only, all positions are text (text_mask=1, audio_mask=0)
+        // → FSQ is NOT applied (text_mask * raw + audio_mask * FSQ = raw)
+
+        // fusion_concat_proj for each position (cat(enc_out, zeros) since audio_mask=0)
+        int in_dim = 2 * d;
+        std::vector<float> ralm_input((size_t)N * d);
+        for (int i = 0; i < N; i++) {
             std::vector<float> cat_buf(in_dim, 0.0f);
-            std::memcpy(cat_buf.data(), fsq_out.data(), d * sizeof(float));
-            std::vector<float> fusion_out(d);
+            std::memcpy(cat_buf.data(), normed_all.data() + (size_t)i * d, (size_t)d * sizeof(float));
             matmul_mv_bias(cpu_be, ctx->weights.fusion_w, ctx->weights.fusion_b, cat_buf.data(), in_dim,
-                           fusion_out.data(), d);
-            fsq_out = fusion_out;
+                           ralm_input.data() + (size_t)i * d, d);
         }
-        std::vector<float> ralm_h = ralm_prefill(ctx, fsq_out, cpu_be);
-        {
-            int dr = (int)ctx->hp.ralm_d_model;
-            std::vector<float> normed(dr);
-            rms_norm_cpu(ralm_h.data(), tensor_data_f32(ctx->weights.ralm_output_norm), normed.data(), dr,
-                         ctx->hp.rms_norm_eps);
-            ralm_h = normed;
-        }
+
+        // Multi-position RALM prefill (causal, all T positions)
+        std::vector<float> ralm_out = ralm_prefill_multi(ctx, ralm_input.data(), N, cpu_be);
+
+        // Apply RALM output norm and extract last position
+        int dr = (int)ctx->hp.ralm_d_model;
+        std::vector<float> ralm_h(dr);
+        rms_norm_cpu(ralm_out.data() + (size_t)(N - 1) * dr, tensor_data_f32(ctx->weights.ralm_output_norm),
+                     ralm_h.data(), dr, ctx->hp.rms_norm_eps);
 
         if (stage == "lm_to_dit_hidden") {
             if (ctx->weights.lm_to_dit_w && ctx->weights.lm_to_dit_b) {

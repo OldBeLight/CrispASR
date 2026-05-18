@@ -57,7 +57,7 @@ public:
             return out;
 
         // Sticky decode-time sampling controls.
-        canary_set_temperature(ctx_, params.temperature, /*seed=*/0);
+        canary_set_temperature(ctx_, params.temperature, params.seed);
 
         // Resolve src/tgt language with the fallback chain:
         //   source_lang -> language

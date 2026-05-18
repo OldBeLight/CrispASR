@@ -131,6 +131,7 @@ void chatterbox_set_min_p(struct chatterbox_context* ctx, float min_p);
 void chatterbox_set_top_k(struct chatterbox_context* ctx, int top_k);
 void chatterbox_set_repetition_penalty(struct chatterbox_context* ctx, float r);
 void chatterbox_set_max_speech_tokens(struct chatterbox_context* ctx, int n);
+void chatterbox_set_seed(struct chatterbox_context* ctx, uint32_t seed);
 
 void chatterbox_tokens_free(int32_t* tokens);
 void chatterbox_pcm_free(float* pcm);

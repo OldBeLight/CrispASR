@@ -59,7 +59,7 @@ public:
             return out;
 
         // Sticky decode-time sampling controls.
-        cohere_set_temperature(ctx_, params.temperature, /*seed=*/0);
+        cohere_set_temperature(ctx_, params.temperature, params.seed);
 
         cohere_result* r = cohere_transcribe_ex(ctx_, samples, n_samples, params.language.c_str(), t_offset_cs);
         if (!r)

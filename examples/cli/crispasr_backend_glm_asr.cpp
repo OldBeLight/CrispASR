@@ -53,7 +53,7 @@ public:
         double best_score = -1.0;
         for (int run = 0; run < n_runs; run++) {
             if (n_runs > 1)
-                glm_asr_set_seed(ctx_, (unsigned int)(run * 0x9E3779B9u + 1u));
+                glm_asr_set_seed(ctx_, (unsigned int)(params.seed ^ (run * 0x9E3779B9u + 1u)));
             glm_asr_result* cand = glm_asr_transcribe_with_probs(ctx_, samples, n_samples);
             if (!cand)
                 continue;
