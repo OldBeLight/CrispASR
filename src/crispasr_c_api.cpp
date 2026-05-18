@@ -139,6 +139,10 @@
 #include "speaker_db.h"
 #define CA_HAVE_TITANET 1
 #endif
+#include "crispasr_speaker_cluster.h"
+#include "crispasr_speaker_embedder.h"
+#include "crispasr_diarize_internal.h"
+#include "pyannote_seg.h"
 
 #ifdef _WIN32
 #define CA_EXPORT extern "C" __declspec(dllexport)
@@ -5011,3 +5015,129 @@ CA_EXPORT int32_t crispasr_speaker_db_enroll(const char* dir_path, const char* n
 }
 
 #endif // CA_HAVE_TITANET
+
+// =========================================================================
+// Pluggable speaker embedder, agglomerative clustering, and pyannote-seg
+// cache (issue #107 P6 — pipeline primitives so every language binding
+// can compose the same diarize flow the CLI does).
+// =========================================================================
+
+// ---- pluggable embedder ----
+// `model_spec` accepts "auto", "titanet", "indextts", "indextts-bigvgan",
+// "ecapa", or a path to a `.gguf`. Returns an opaque handle, or null on
+// failure. See crispasr_speaker_embedder.h for the dispatch rules.
+CA_EXPORT void* crispasr_speaker_embedder_make_abi(const char* model_spec, int32_t n_threads, const char* cache_dir) {
+    if (!model_spec)
+        return nullptr;
+    auto p =
+        crispasr_make_speaker_embedder(std::string(model_spec), n_threads, cache_dir ? std::string(cache_dir) : "");
+    return p.release(); // ownership transfers to the caller via free_abi
+}
+
+CA_EXPORT void crispasr_speaker_embedder_free_abi(void* embedder) {
+    if (embedder)
+        delete static_cast<CrispasrSpeakerEmbedder*>(embedder);
+}
+
+CA_EXPORT int32_t crispasr_speaker_embedder_dim_abi(const void* embedder) {
+    if (!embedder)
+        return 0;
+    return static_cast<const CrispasrSpeakerEmbedder*>(embedder)->dim();
+}
+
+// Embed one mono 16 kHz PCM range. `out` must hold at least dim() floats.
+// Returns 1 on success, 0 on failure (e.g. clip too short for the model).
+CA_EXPORT int32_t crispasr_speaker_embedder_embed_abi(void* embedder, const float* pcm_16k, int32_t n_samples,
+                                                      float* out) {
+    if (!embedder || !pcm_16k || n_samples <= 0 || !out)
+        return 0;
+    return static_cast<CrispasrSpeakerEmbedder*>(embedder)->embed(pcm_16k, n_samples, out) ? 1 : 0;
+}
+
+CA_EXPORT const char* crispasr_speaker_embedder_name_abi(const void* embedder) {
+    if (!embedder)
+        return "";
+    return static_cast<const CrispasrSpeakerEmbedder*>(embedder)->name();
+}
+
+// ---- agglomerative cosine clustering ----
+// Pure arithmetic. `embeddings` is a row-major n×dim buffer of (ideally
+// L2-normalized) speaker embeddings; `labels_out` is filled with one
+// cluster ID per input in [0, k). Returns the number of clusters k, or
+// -1 on invalid args.
+CA_EXPORT int32_t crispasr_speaker_cluster_abi(const float* embeddings, int32_t n, int32_t dim, float merge_threshold,
+                                               int32_t max_speakers, int32_t* labels_out) {
+    if (!embeddings || n <= 0 || dim <= 0 || !labels_out)
+        return -1;
+    std::vector<float> e(embeddings, embeddings + (size_t)n * (size_t)dim);
+    auto labels = crispasr_agglomerative_cluster(e, n, dim, merge_threshold, max_speakers);
+    int max_label = -1;
+    for (int i = 0; i < n; i++) {
+        labels_out[i] = (int32_t)labels[i];
+        if (labels[i] > max_label)
+            max_label = labels[i];
+    }
+    return max_label + 1; // total cluster count (0 means none assigned)
+}
+
+// ---- pyannote-seg cache ----
+// Pre-compute pyannote-seg posteriors over the FULL audio buffer once,
+// then apply them to per-segment scoring with stable local track IDs.
+// The cache is opaque; callers free it with the matching _free_abi.
+//
+// Returns null on model-load failure or empty audio.
+struct crispasr_pyannote_cache_abi {
+    std::vector<float> log_probs;
+    int T = 0;
+    double frame_dur_s = 0.0;
+};
+
+CA_EXPORT void* crispasr_pyannote_cache_compute_abi(const float* full_audio, int32_t n_samples, const char* model_path,
+                                                    int32_t n_threads) {
+    if (!full_audio || n_samples <= 0 || !model_path || !*model_path)
+        return nullptr;
+    pyannote_seg_context* pctx = pyannote_seg_init(model_path, n_threads > 0 ? n_threads : 4);
+    if (!pctx)
+        return nullptr;
+    int T = 0;
+    float* probs = pyannote_seg_run(pctx, full_audio, n_samples, &T);
+    pyannote_seg_free(pctx);
+    if (!probs || T <= 0) {
+        if (probs)
+            std::free(probs);
+        return nullptr;
+    }
+    auto* cache = new crispasr_pyannote_cache_abi();
+    cache->log_probs.assign(probs, probs + (size_t)T * 7);
+    cache->T = T;
+    cache->frame_dur_s = 270.0 / 16000.0;
+    std::free(probs);
+    return cache;
+}
+
+CA_EXPORT void crispasr_pyannote_cache_free_abi(void* cache) {
+    if (cache)
+        delete static_cast<crispasr_pyannote_cache_abi*>(cache);
+}
+
+// Score segs against a precomputed pyannote cache. Each seg's `speaker`
+// is set to 0/1/2 (local pyannote-seg track index) or -1 for silence.
+// `slice_t0_cs` is the absolute centisecond at which the cache buffer
+// starts (usually 0 — the cache covers the whole input audio).
+//
+// Returns 0 on success, -1 on invalid args.
+CA_EXPORT int32_t crispasr_pyannote_cache_apply_abi(const void* cache, int64_t slice_t0_cs,
+                                                    crispasr_diarize_seg_abi* segs, int32_t n_segs) {
+    if (!cache || !segs || n_segs <= 0)
+        return -1;
+    const auto* c = static_cast<const crispasr_pyannote_cache_abi*>(cache);
+    std::vector<CrispasrDiarizeSegment> lib_segs;
+    lib_segs.reserve(n_segs);
+    for (int i = 0; i < n_segs; i++)
+        lib_segs.push_back({segs[i].t0_cs, segs[i].t1_cs, segs[i].speaker});
+    crispasr_diarize_internal::assign_speakers_from_log_posteriors(c->log_probs.data(), c->T, c->frame_dur_s,
+                                                                   slice_t0_cs, lib_segs);
+    for (int i = 0; i < n_segs; i++)
+        segs[i].speaker = lib_segs[i].speaker;
+    return 0;
+}

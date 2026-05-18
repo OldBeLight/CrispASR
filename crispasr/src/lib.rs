@@ -1673,6 +1673,217 @@ pub fn diarize_segments(
 }
 
 // =========================================================================
+// Pluggable speaker embedder + cosine clustering + pyannote cache (#107 P6)
+// =========================================================================
+//
+// These are the same building blocks the CLI's `--diarize-embedder` path
+// uses. Together they let a Rust caller compose the full diarization
+// pipeline (pyannote segmentation -> per-speech-interval embeddings ->
+// agglomerative clustering -> globally stable speaker IDs).
+
+/// Pluggable speaker-embedding model. Wraps the
+/// `crispasr_speaker_embedder_*_abi` family in a safe Rust struct.
+pub struct SpeakerEmbedder {
+    raw: *mut std::ffi::c_void,
+}
+
+impl SpeakerEmbedder {
+    /// Build a speaker embedder by spec.
+    ///
+    /// `model_spec` accepts (case-insensitive):
+    ///   - `"auto"` / `"titanet"` -> TitaNet-Large (192-d)
+    ///   - `"indextts"` / `"indextts-bigvgan"` / `"ecapa"` ->
+    ///     IndexTTS-BigVGAN ECAPA-TDNN (512-d)
+    ///   - a `.gguf` path -> dispatched by filename
+    pub fn new(model_spec: &str, n_threads: i32, cache_dir: Option<&str>) -> Result<Self, String> {
+        let spec_c = std::ffi::CString::new(model_spec).map_err(|e| e.to_string())?;
+        let cache_c = cache_dir
+            .map(|s| std::ffi::CString::new(s))
+            .transpose()
+            .map_err(|e: std::ffi::NulError| e.to_string())?;
+        let cache_ptr = cache_c
+            .as_ref()
+            .map(|s| s.as_ptr())
+            .unwrap_or(std::ptr::null());
+        let raw = unsafe {
+            crispasr_sys::crispasr_speaker_embedder_make_abi(spec_c.as_ptr(), n_threads, cache_ptr)
+        };
+        if raw.is_null() {
+            return Err(format!(
+                "failed to build speaker embedder '{model_spec}'"
+            ));
+        }
+        Ok(Self { raw })
+    }
+
+    /// Output embedding dimension (e.g. 192 for TitaNet).
+    pub fn dim(&self) -> i32 {
+        unsafe { crispasr_sys::crispasr_speaker_embedder_dim_abi(self.raw) }
+    }
+
+    /// Backend name for logging (e.g. "titanet-large").
+    pub fn name(&self) -> String {
+        unsafe {
+            let p = crispasr_sys::crispasr_speaker_embedder_name_abi(self.raw);
+            if p.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        }
+    }
+
+    /// Extract one embedding from mono 16 kHz f32 PCM. Returns `None`
+    /// when the underlying model rejected the input (typically too
+    /// short for its mel pipeline).
+    pub fn embed(&self, pcm_16k: &[f32]) -> Option<Vec<f32>> {
+        let dim = self.dim();
+        if dim <= 0 || pcm_16k.is_empty() {
+            return None;
+        }
+        let mut out = vec![0.0f32; dim as usize];
+        let ok = unsafe {
+            crispasr_sys::crispasr_speaker_embedder_embed_abi(
+                self.raw,
+                pcm_16k.as_ptr(),
+                pcm_16k.len() as i32,
+                out.as_mut_ptr(),
+            )
+        };
+        if ok != 0 {
+            Some(out)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for SpeakerEmbedder {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { crispasr_sys::crispasr_speaker_embedder_free_abi(self.raw) };
+            self.raw = std::ptr::null_mut();
+        }
+    }
+}
+
+unsafe impl Send for SpeakerEmbedder {}
+
+/// Agglomerative single-linkage cosine clustering on L2-normalized
+/// speaker embeddings.
+///
+/// `embeddings` is a flat row-major `n * dim` buffer (e.g. four 192-d
+/// vectors -> 768 floats). Stops at `merge_threshold` similarity or
+/// when the count reaches `max_speakers`. Returns one cluster ID per
+/// input in `[0, k)` assigned in first-appearance order.
+pub fn agglomerative_cluster(
+    embeddings: &[f32],
+    n: i32,
+    dim: i32,
+    merge_threshold: f32,
+    max_speakers: i32,
+) -> Result<Vec<i32>, String> {
+    if n <= 0 || dim <= 0 || embeddings.len() < (n as usize) * (dim as usize) {
+        return Err("invalid arguments to agglomerative_cluster".to_string());
+    }
+    let mut out = vec![0i32; n as usize];
+    let k = unsafe {
+        crispasr_sys::crispasr_speaker_cluster_abi(
+            embeddings.as_ptr(),
+            n,
+            dim,
+            merge_threshold,
+            max_speakers,
+            out.as_mut_ptr(),
+        )
+    };
+    if k < 0 {
+        return Err("crispasr_speaker_cluster_abi returned -1".to_string());
+    }
+    Ok(out)
+}
+
+/// Pre-computed pyannote-seg posteriors over a full audio buffer.
+///
+/// Build once at the start of a diarize pipeline, then call
+/// [`PyannoteCache::apply`] for each set of segment ranges. Gives
+/// cross-slice consistency for pyannote-method diarization (#107 P2a)
+/// without re-running the segmentation net per slice.
+pub struct PyannoteCache {
+    raw: *mut std::ffi::c_void,
+}
+
+impl PyannoteCache {
+    /// Run pyannote-seg once over `pcm_16k` and cache the posteriors.
+    pub fn compute(pcm_16k: &[f32], model_path: &str, n_threads: i32) -> Result<Self, String> {
+        if pcm_16k.is_empty() {
+            return Err("empty audio".to_string());
+        }
+        let model_c = std::ffi::CString::new(model_path).map_err(|e| e.to_string())?;
+        let raw = unsafe {
+            crispasr_sys::crispasr_pyannote_cache_compute_abi(
+                pcm_16k.as_ptr(),
+                pcm_16k.len() as i32,
+                model_c.as_ptr(),
+                n_threads,
+            )
+        };
+        if raw.is_null() {
+            return Err(format!(
+                "failed to compute pyannote cache from '{model_path}'"
+            ));
+        }
+        Ok(Self { raw })
+    }
+
+    /// Score `segs` against the cached posteriors. Each segment's
+    /// `speaker` is set to `0/1/2` (local pyannote-seg track index) or
+    /// `-1` for silence.
+    pub fn apply(&self, segs: &mut [DiarizeSegment], slice_t0: f64) -> Result<(), String> {
+        if segs.is_empty() {
+            return Ok(());
+        }
+        let mut abi_segs: Vec<crispasr_sys::CrispasrDiarizeSegAbi> = segs
+            .iter()
+            .map(|s| crispasr_sys::CrispasrDiarizeSegAbi {
+                t0_cs: (s.t0 * 100.0).round() as i64,
+                t1_cs: (s.t1 * 100.0).round() as i64,
+                speaker: s.speaker,
+                _pad: 0,
+            })
+            .collect();
+        let rc = unsafe {
+            crispasr_sys::crispasr_pyannote_cache_apply_abi(
+                self.raw,
+                (slice_t0 * 100.0).round() as i64,
+                abi_segs.as_mut_ptr(),
+                abi_segs.len() as i32,
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "crispasr_pyannote_cache_apply_abi returned {rc}"
+            ));
+        }
+        for (i, s) in segs.iter_mut().enumerate() {
+            s.speaker = abi_segs[i].speaker;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PyannoteCache {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { crispasr_sys::crispasr_pyannote_cache_free_abi(self.raw) };
+            self.raw = std::ptr::null_mut();
+        }
+    }
+}
+
+unsafe impl Send for PyannoteCache {}
+
+// =========================================================================
 // FireRedPunc — punctuation restoration post-processor
 // =========================================================================
 

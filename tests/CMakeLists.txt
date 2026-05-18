@@ -262,11 +262,9 @@ catch_discover_tests(test-diarize-pyannote
 # need to link the whole crispasr-cli executable.
 add_executable(test-diarize-pyannote-live
     test-diarize-pyannote-live.cpp
-    ${PROJECT_SOURCE_DIR}/examples/cli/crispasr_speaker_cluster.cpp
 )
 target_include_directories(test-diarize-pyannote-live PRIVATE
     ${PROJECT_SOURCE_DIR}/src
-    ${PROJECT_SOURCE_DIR}/examples/cli
 )
 target_link_libraries(test-diarize-pyannote-live PRIVATE
     Catch2::Catch2WithMain
@@ -281,13 +279,13 @@ catch_discover_tests(test-diarize-pyannote-live
 # Pure arithmetic on synthetic embeddings; no model, no audio.
 add_executable(test-speaker-cluster
     test-speaker-cluster.cpp
-    ${PROJECT_SOURCE_DIR}/examples/cli/crispasr_speaker_cluster.cpp
 )
 target_include_directories(test-speaker-cluster PRIVATE
-    ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
 )
 target_link_libraries(test-speaker-cluster PRIVATE
     Catch2::Catch2WithMain
+    crispasr
 )
 catch_discover_tests(test-speaker-cluster
     TEST_SPEC "[unit]"

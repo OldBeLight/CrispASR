@@ -46,8 +46,6 @@ add_executable(${TARGET}
     crispasr_vad_cli.cpp
     crispasr_lid_cli.cpp
     crispasr_diarize_cli.cpp
-    crispasr_speaker_embedder.cpp
-    crispasr_speaker_cluster.cpp
     crispasr_output.cpp
     crispasr_model_mgr_cli.cpp
     crispasr_diagnostics.cpp

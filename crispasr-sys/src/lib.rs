@@ -585,4 +585,70 @@ extern "C" {
         embedding: *const c_float,
         dim: i32,
     ) -> i32;
+
+    // Pluggable speaker embedder + agglomerative clustering + pyannote
+    // cache (issue #107 P6). Same building blocks as the CLI's
+    // --diarize-embedder path; expose them so Rust callers can compose
+    // the diarize pipeline without round-tripping through the CLI.
+
+    /// Build a pluggable speaker embedder. `model_spec` is one of
+    /// `"auto"`, `"titanet"`, `"indextts"`, `"indextts-bigvgan"`,
+    /// `"ecapa"`, or a `.gguf` path. Returns null on failure.
+    pub fn crispasr_speaker_embedder_make_abi(
+        model_spec: *const c_char,
+        n_threads: i32,
+        cache_dir: *const c_char,
+    ) -> *mut c_void;
+
+    pub fn crispasr_speaker_embedder_free_abi(embedder: *mut c_void);
+
+    /// Output embedding dimension (e.g. 192 for TitaNet, 512 for
+    /// IndexTTS-BigVGAN).
+    pub fn crispasr_speaker_embedder_dim_abi(embedder: *const c_void) -> i32;
+
+    /// Extract one embedding. `out` must hold at least `dim()` floats.
+    /// Returns 1 on success, 0 if the model rejected the input.
+    pub fn crispasr_speaker_embedder_embed_abi(
+        embedder: *mut c_void,
+        pcm_16k: *const c_float,
+        n_samples: i32,
+        out: *mut c_float,
+    ) -> i32;
+
+    pub fn crispasr_speaker_embedder_name_abi(embedder: *const c_void) -> *const c_char;
+
+    /// Agglomerative single-linkage cosine clustering. `embeddings` is
+    /// a row-major `n × dim` buffer of (ideally L2-normalized) vectors.
+    /// `labels_out` receives one cluster ID per input in `[0, k)`.
+    /// Returns the cluster count `k`, or -1 on invalid arguments.
+    pub fn crispasr_speaker_cluster_abi(
+        embeddings: *const c_float,
+        n: i32,
+        dim: i32,
+        merge_threshold: c_float,
+        max_speakers: i32,
+        labels_out: *mut i32,
+    ) -> i32;
+
+    /// Pre-compute pyannote-seg posteriors over a full audio buffer.
+    /// Returns an opaque cache or null on failure. Free with
+    /// `crispasr_pyannote_cache_free_abi`.
+    pub fn crispasr_pyannote_cache_compute_abi(
+        full_audio: *const c_float,
+        n_samples: i32,
+        model_path: *const c_char,
+        n_threads: i32,
+    ) -> *mut c_void;
+
+    pub fn crispasr_pyannote_cache_free_abi(cache: *mut c_void);
+
+    /// Score `segs` against the cached posteriors. `slice_t0_cs` is the
+    /// absolute centisecond at which the cache buffer starts (typically
+    /// 0 — the cache covers the whole input audio).
+    pub fn crispasr_pyannote_cache_apply_abi(
+        cache: *const c_void,
+        slice_t0_cs: i64,
+        segs: *mut CrispasrDiarizeSegAbi,
+        n_segs: i32,
+    ) -> i32;
 }

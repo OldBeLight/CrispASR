@@ -4,7 +4,7 @@
 // pairwise structure is known a priori, so the test is deterministic
 // and needs no model load / no audio.
 
-#include "../examples/cli/crispasr_speaker_cluster.h"
+#include "../src/crispasr_speaker_cluster.h"
 
 #include <catch2/catch_test_macros.hpp>
 

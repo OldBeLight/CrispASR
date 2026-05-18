@@ -16,7 +16,7 @@
 // pyannote front-end). Standard sample: any clip with ≥2 speakers,
 // e.g. a podcast snippet, an interview, or a sherpa-onnx demo file.
 
-#include "../examples/cli/crispasr_speaker_cluster.h"
+#include "../src/crispasr_speaker_cluster.h"
 #include "../src/crispasr_diarize.h"
 #include "../src/titanet.h"
 

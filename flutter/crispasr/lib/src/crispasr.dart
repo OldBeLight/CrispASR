@@ -3125,3 +3125,183 @@ class CrispasrSpeakerDB {
     _handle = nullptr;
   }
 }
+
+// =====================================================================
+// Diarization pipeline primitives (issue #107 P6).
+// Pluggable speaker embedder + agglomerative cosine clustering +
+// pyannote-seg cache — the same building blocks the CLI's
+// --diarize-embedder path uses.
+// =====================================================================
+
+/// Pluggable speaker-embedding model. Dispatch:
+///   - `auto` / `titanet`           -> TitaNet-Large (192-d)
+///   - `indextts` / `indextts-bigvgan` / `ecapa`
+///                                  -> IndexTTS-BigVGAN ECAPA-TDNN (512-d)
+///   - any `.gguf` path             -> TitaNet (default; IndexTTS if the
+///                                     path contains "indextts")
+class CrispasrSpeakerEmbedder {
+  late final DynamicLibrary _lib;
+  Pointer<Void> _handle = nullptr;
+
+  CrispasrSpeakerEmbedder(DynamicLibrary lib, String modelSpec,
+      {int nThreads = 4, String cacheDir = ''})
+      : _lib = lib {
+    final makeFn = lib.lookupFunction<
+        Pointer<Void> Function(Pointer<Utf8>, Int32, Pointer<Utf8>),
+        Pointer<Void> Function(Pointer<Utf8>, int, Pointer<Utf8>)>(
+        'crispasr_speaker_embedder_make_abi');
+    final specPtr = modelSpec.toNativeUtf8();
+    final cachePtr = cacheDir.toNativeUtf8();
+    _handle = makeFn(specPtr, nThreads, cachePtr);
+    malloc.free(specPtr);
+    malloc.free(cachePtr);
+    if (_handle == nullptr) {
+      throw Exception('Failed to build speaker embedder: $modelSpec');
+    }
+  }
+
+  int get dim {
+    final dimFn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_speaker_embedder_dim_abi');
+    return dimFn(_handle);
+  }
+
+  String get name {
+    final nameFn = _lib.lookupFunction<
+        Pointer<Utf8> Function(Pointer<Void>),
+        Pointer<Utf8> Function(Pointer<Void>)>(
+        'crispasr_speaker_embedder_name_abi');
+    final p = nameFn(_handle);
+    return p == nullptr ? '' : p.toDartString();
+  }
+
+  /// Extract one embedding from mono 16 kHz float32 PCM. Returns null
+  /// when the underlying model rejected the input.
+  Float32List? embed(Float32List pcm16k) {
+    final embedFn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Float>, Int32, Pointer<Float>),
+        int Function(Pointer<Void>, Pointer<Float>, int, Pointer<Float>)>(
+        'crispasr_speaker_embedder_embed_abi');
+    final d = dim;
+    if (d <= 0) return null;
+    final pcmPtr = malloc<Float>(pcm16k.length);
+    pcmPtr.asTypedList(pcm16k.length).setAll(0, pcm16k);
+    final outPtr = malloc<Float>(d);
+    final ok = embedFn(_handle, pcmPtr, pcm16k.length, outPtr);
+    malloc.free(pcmPtr);
+    if (ok == 0) {
+      malloc.free(outPtr);
+      return null;
+    }
+    final result = Float32List.fromList(outPtr.asTypedList(d));
+    malloc.free(outPtr);
+    return result;
+  }
+
+  void close() {
+    if (_handle == nullptr) return;
+    final freeFn = _lib.lookupFunction<
+        Void Function(Pointer<Void>),
+        void Function(Pointer<Void>)>('crispasr_speaker_embedder_free_abi');
+    freeFn(_handle);
+    _handle = nullptr;
+  }
+}
+
+/// Agglomerative single-linkage cosine clustering on (ideally
+/// L2-normalized) speaker embeddings. `embeddings` is a flat row-major
+/// `n × dim` buffer; returns one cluster ID per input in `[0, k)`.
+List<int> crispasrAgglomerativeCluster(
+  DynamicLibrary lib,
+  Float32List embeddings, {
+  required int n,
+  required int dim,
+  double mergeThreshold = 0.5,
+  int maxSpeakers = 32,
+}) {
+  if (n <= 0 || dim <= 0 || embeddings.length < n * dim) {
+    return List<int>.filled(n.clamp(0, 1 << 30), -1);
+  }
+  final fn = lib.lookupFunction<
+      Int32 Function(Pointer<Float>, Int32, Int32, Float, Int32, Pointer<Int32>),
+      int Function(Pointer<Float>, int, int, double, int, Pointer<Int32>)>(
+      'crispasr_speaker_cluster_abi');
+  final embPtr = malloc<Float>(embeddings.length);
+  embPtr.asTypedList(embeddings.length).setAll(0, embeddings);
+  final outPtr = malloc<Int32>(n);
+  final rc = fn(embPtr, n, dim, mergeThreshold, maxSpeakers, outPtr);
+  final labels = List<int>.from(outPtr.asTypedList(n));
+  malloc.free(embPtr);
+  malloc.free(outPtr);
+  if (rc < 0) {
+    throw Exception('crispasr_speaker_cluster_abi: invalid arguments');
+  }
+  return labels;
+}
+
+/// Pre-computed pyannote-seg posteriors over a full audio buffer.
+class CrispasrPyannoteCache {
+  late final DynamicLibrary _lib;
+  Pointer<Void> _handle = nullptr;
+
+  CrispasrPyannoteCache(DynamicLibrary lib, Float32List pcm16k, String modelPath,
+      {int nThreads = 4})
+      : _lib = lib {
+    final computeFn = lib.lookupFunction<
+        Pointer<Void> Function(Pointer<Float>, Int32, Pointer<Utf8>, Int32),
+        Pointer<Void> Function(Pointer<Float>, int, Pointer<Utf8>, int)>(
+        'crispasr_pyannote_cache_compute_abi');
+    final pcmPtr = malloc<Float>(pcm16k.length);
+    pcmPtr.asTypedList(pcm16k.length).setAll(0, pcm16k);
+    final mp = modelPath.toNativeUtf8();
+    _handle = computeFn(pcmPtr, pcm16k.length, mp, nThreads);
+    malloc.free(pcmPtr);
+    malloc.free(mp);
+    if (_handle == nullptr) {
+      throw Exception('Failed to compute pyannote cache from $modelPath');
+    }
+  }
+
+  /// Score `segs` against the cached posteriors. Each segment's
+  /// `speaker` is set to 0/1/2 or -1 for silence.
+  void apply(List<DiarizeSegment> segs, {double sliceT0 = 0.0}) {
+    if (segs.isEmpty) return;
+    // ABI segment layout: t0_cs i64, t1_cs i64, speaker i32, _pad i32.
+    final segPtr = malloc<Uint8>(segs.length * 24);
+    final segBytes = segPtr.asTypedList(segs.length * 24);
+    final bd = segBytes.buffer.asByteData();
+    for (var i = 0; i < segs.length; i++) {
+      bd.setInt64(i * 24, (segs[i].t0 * 100).round(), Endian.host);
+      bd.setInt64(i * 24 + 8, (segs[i].t1 * 100).round(), Endian.host);
+      bd.setInt32(i * 24 + 16, segs[i].speaker, Endian.host);
+      bd.setInt32(i * 24 + 20, 0, Endian.host);
+    }
+    final applyFn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Int64, Pointer<Uint8>, Int32),
+        int Function(Pointer<Void>, int, Pointer<Uint8>, int)>(
+        'crispasr_pyannote_cache_apply_abi');
+    final rc = applyFn(
+        _handle, (sliceT0 * 100).round(), segPtr, segs.length);
+    if (rc != 0) {
+      malloc.free(segPtr);
+      throw Exception('crispasr_pyannote_cache_apply_abi returned $rc');
+    }
+    for (var i = 0; i < segs.length; i++) {
+      segs[i] = DiarizeSegment(
+        t0: segs[i].t0,
+        t1: segs[i].t1,
+        speaker: bd.getInt32(i * 24 + 16, Endian.host),
+      );
+    }
+    malloc.free(segPtr);
+  }
+
+  void close() {
+    if (_handle == nullptr) return;
+    final freeFn = _lib.lookupFunction<
+        Void Function(Pointer<Void>),
+        void Function(Pointer<Void>)>('crispasr_pyannote_cache_free_abi');
+    freeFn(_handle);
+    _handle = nullptr;
+  }
+}

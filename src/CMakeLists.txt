@@ -144,6 +144,14 @@ add_library(crispasr
             # CLI keeps the TTY prompting shim; the library does the
             # non-interactive resolve.
             crispasr_model_registry.cpp
+            # Pluggable speaker-embedding interface + concrete adapters
+            # (TitaNet, IndexTTS-ECAPA) and agglomerative cosine
+            # clustering, shared between the CLI's --diarize-embedder
+            # path and the C ABI's crispasr_speaker_embedder_* surface
+            # (#107 P6). The adapters depend on the lib-local titanet
+            # + indextts_voc runtimes also compiled in here.
+            crispasr_speaker_embedder.cpp
+            crispasr_speaker_cluster.cpp
             # Text-LLM chat C ABI (docs/prompts/chat-abi.md). Calls into
             # the private crispasr-llama-core static lib; the public
             # surface lives in include/crispasr_chat.h and exposes only
