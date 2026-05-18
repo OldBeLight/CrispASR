@@ -164,7 +164,7 @@ bool read_audio_data(const std::string & fname, std::vector<float>& pcmf32, std:
         pcmf32.resize(frame_count);
 
         for (uint64_t i = 0; i < frame_count; i++) {
-            pcmf32[i] = (stereo_data[2*i] + stereo_data[2*i + 1]);
+            pcmf32[i] = 0.5f * (stereo_data[2*i] + stereo_data[2*i + 1]);
         }
 
         pcmf32s.resize(2);
