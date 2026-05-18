@@ -2316,67 +2316,69 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
         }
     }
 
-    // Backend. The chatterbox T3 graph accumulates ~1e-2 logit drift on
-    // Metal/GPU vs CPU per forward pass — small per pass but past ~16
-    // decode steps the multinomial sampler crosses a probability
-    // threshold and the whole sequence diverges into garbled / repeating
-    // speech. Confirmed reproducible at every chatterbox commit since
-    // voice cloning landed (`86ac98eb`); root cause is some op in the
-    // 30-layer Llama graph (mul_mat / flash_attn / norm path) where
-    // Metal accumulator order differs from CPU enough to bite the
-    // sampler. Until the responsible kernel is patched in ggml-metal,
-    // chatterbox auto-falls-back to CPU for the T3 forward — the user
-    // sees clean cloned speech instead of broken output.
-    //
-    // CRISPASR_CHATTERBOX_FORCE_GPU=1 disables the auto-fallback for
-    // users who want to experiment with the broken GPU path
-    // (e.g. for kernel-level debugging).
+    // Backend split. The chatterbox graph has two halves: the T3 AR
+    // transformer (30-layer Llama, multinomial speech-token sampler) and
+    // S3Gen (Conformer encoder + CFM denoiser + HiFT vocoder). Verified
+    // 2026-05-18 (handover-prompts/chatterbox-gpu-bug-is-s3gen.md): with
+    // F16 T3 weights, T3 on GPU produces an AR speech-token sequence
+    // BIT-IDENTICAL to T3 on CPU, and the round-4 Q4_K×Q8_K kernel +
+    // PREC_F32 tagging in T3 keep Q4_K T3 within tolerance too. The
+    // user-audible "GPU produces garbled audio" regression is owned
+    // entirely by the three S3Gen sub-graphs — likely some Conv1d /
+    // norm precision plumbing that hasn't been audited yet. Default is
+    // therefore T3 GPU + S3Gen CPU: correct output, ~most of the GPU
+    // speedup (T3 AR loop is the slow stage).
     c->backend_cpu = ggml_backend_cpu_init();
     if (!c->backend_cpu) {
         fprintf(stderr, "chatterbox: failed to init CPU backend\n");
         delete c;
         return nullptr;
     }
-    // PLAN #83: BOTH T3 and s3gen drift on Metal/GPU vs CPU on M1-M4.
-    // Verified: T3 K-projection drifts ~1e-3 per element (LEARNINGS
-    // §"Methodical bisect, round 2"); enabling s3gen on GPU while keeping
-    // T3 on CPU also produces broken audio (low-RMS noise instead of
-    // intelligible speech), so s3gen has the same kind of mul_mat
-    // algorithmic divergence. Until a bespoke kernel_mul_mv_q4_K_q8_K
-    // Metal kernel lands that mirrors CPU's Q8_K-quantised-input dot
-    // product, both halves of chatterbox auto-fall-back to CPU.
-    //
-    // CRISPASR_CHATTERBOX_FORCE_GPU=1 keeps the legacy override (T3+s3gen
-    // both on GPU, expected to be broken). CRISPASR_CHATTERBOX_T3_CPU_S3GEN_GPU=1
-    // tries the selective split (kept for future regression once the kernel
-    // lands).
+    // Env knobs (all override the default):
+    //   CRISPASR_CHATTERBOX_FORCE_GPU=1       — both T3 and S3Gen on GPU
+    //                                           (legacy; S3Gen output is
+    //                                           garbled, kept for diag).
+    //   CRISPASR_CHATTERBOX_T3_CPU_S3GEN_GPU=1 — flip the split (S3Gen on
+    //                                           GPU only, T3 on CPU).
+    //   CRISPASR_CHATTERBOX_S3GEN_CPU=1       — force S3Gen to CPU even
+    //                                           under FORCE_GPU=1.
+    //   CRISPASR_CHATTERBOX_FULL_CPU=1        — old default; both halves
+    //                                           on CPU.
     // cppcheck-suppress duplicateAssignExpression
     bool t3_use_gpu = params.use_gpu;
     bool s3gen_use_gpu = params.use_gpu; // NOLINT — intentionally same init, diverges below
     if (params.use_gpu) {
-        const char* force_gpu_env = std::getenv("CRISPASR_CHATTERBOX_FORCE_GPU");
-        const bool force_gpu = force_gpu_env && *force_gpu_env && std::strcmp(force_gpu_env, "0") != 0;
-        const char* split_env = std::getenv("CRISPASR_CHATTERBOX_T3_CPU_S3GEN_GPU");
-        const bool split = split_env && *split_env && std::strcmp(split_env, "0") != 0;
+        auto env_set = [](const char* name) {
+            const char* v = std::getenv(name);
+            return v && *v && std::strcmp(v, "0") != 0;
+        };
+        const bool force_gpu = env_set("CRISPASR_CHATTERBOX_FORCE_GPU");
+        const bool split_t3_cpu = env_set("CRISPASR_CHATTERBOX_T3_CPU_S3GEN_GPU");
+        const bool s3gen_cpu_override = env_set("CRISPASR_CHATTERBOX_S3GEN_CPU");
+        const bool full_cpu = env_set("CRISPASR_CHATTERBOX_FULL_CPU");
 
-        // The quantized-weight mul_mat drift affects Metal, Vulkan, and
-        // potentially CUDA — the GPU dot-product algorithm diverges from
-        // CPU's Q8_K-input path. F16 weights match bit-identical but
-        // Q4_K/Q5_K/Q6_K/Q8_0 all drift. Not Metal-specific: Vulkan's
-        // mul_mat_vec_q4_k.comp uses the same F32-input algorithm.
-        // See commit 53ac0aa and PLAN #83 round 3.
-        if (force_gpu) {
-            fprintf(stderr, "chatterbox: T3+s3gen forced to GPU (CRISPASR_CHATTERBOX_FORCE_GPU=1) — output may be "
-                            "garbled past ~16 decode steps due to quantized mul_mat drift.\n");
-        } else if (split) {
+        if (full_cpu) {
+            fprintf(stderr, "chatterbox: full CPU (CRISPASR_CHATTERBOX_FULL_CPU=1).\n");
+            t3_use_gpu = false;
+            s3gen_use_gpu = false;
+        } else if (force_gpu) {
+            fprintf(stderr, "chatterbox: T3+s3gen forced to GPU (CRISPASR_CHATTERBOX_FORCE_GPU=1) — S3Gen GPU "
+                            "path is currently broken; expect garbled audio.\n");
+            if (s3gen_cpu_override) {
+                fprintf(stderr,
+                        "chatterbox: s3gen forced to CPU (CRISPASR_CHATTERBOX_S3GEN_CPU=1) — T3 stays on GPU.\n");
+                s3gen_use_gpu = false;
+            }
+        } else if (split_t3_cpu) {
             fprintf(stderr, "chatterbox: T3 → CPU, s3gen → GPU (CRISPASR_CHATTERBOX_T3_CPU_S3GEN_GPU=1). "
-                            "WARNING: s3gen also drifts on GPU; expect broken audio.\n");
+                            "WARNING: s3gen GPU path is broken; expect garbled audio.\n");
             t3_use_gpu = false;
         } else {
-            fprintf(stderr, "chatterbox: T3+s3gen auto-falling back to CPU — GPU has cumulative quantized "
-                            "mul_mat drift that breaks chatterbox sampling past ~16 decode steps. Override with "
-                            "CRISPASR_CHATTERBOX_FORCE_GPU=1 (output may be garbled).\n");
-            t3_use_gpu = false;
+            // Default: T3 on GPU, S3Gen on CPU (clean output, most of
+            // the GPU speedup). See chatterbox-gpu-bug-is-s3gen.md.
+            fprintf(stderr, "chatterbox: T3 → GPU, s3gen → CPU (default). Override with "
+                            "CRISPASR_CHATTERBOX_FORCE_GPU=1 (both GPU, broken) or "
+                            "CRISPASR_CHATTERBOX_FULL_CPU=1.\n");
             s3gen_use_gpu = false;
         }
     }
