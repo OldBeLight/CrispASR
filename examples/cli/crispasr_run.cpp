@@ -1451,8 +1451,13 @@ int crispasr_run_backend(const whisper_params& params_in) {
         std::vector<float> utterance_pcm;
         std::string prefix_committed;
         std::string last_partial_text; // dedupe key + prefix-mode tail
+        int64_t last_partial_decode_sample = -1;
         int64_t cumulative_samples = 0;
         const int64_t utterance_max_samples = (int64_t)params.stream_utterance_max_sec * SR;
+        const int64_t partial_decode_interval_samples =
+            ((int64_t)(params.stream_partial_decode_ms > 0 ? params.stream_partial_decode_ms : params.stream_step_ms) *
+             SR) /
+            1000;
         // Track whether the audio source ever produced any samples; if
         // it goes EOF without a single one, the subprocess most likely
         // failed before delivering PCM (e.g. ffmpeg couldn't open the
@@ -1503,12 +1508,10 @@ int crispasr_run_backend(const whisper_params& params_in) {
             }
 
             std::vector<crispasr_segment> segs;
-            // Per-slice text for the JSON state machine.
-            // Each entry is `(slice, text)`
-            // where the text has had `apply_punc_model` + (optionally)
-            // strip-punctuation applied. In VAD+JSON mode this is the
-            // stream output path; the legacy aggregate `segs` is left
-            // empty because JSON does not read it.
+            // Per-slice text for the JSON state machine. Each entry is
+            // `(slice, text)`. When `--stream-partial-decode-ms` skips this
+            // step's ASR partial decode, the text is empty but the slice timing
+            // still drives utterance boundaries and finalization.
             std::vector<std::pair<crispasr_audio_slice, std::string>> step_slice_text;
             bool decoded_segments_this_step = false;
             if (!stream_vad_path.empty()) {
@@ -1522,6 +1525,15 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 // machine *after* this loop runs, so it reflects the
                 // upper bound of all utterances finalized before this step.
                 const int64_t window_start_sample_now = cumulative_samples - (int64_t)pcm_window.size();
+                const bool final_silence_due =
+                    params.stream_json && params.stream_final_silence_ms > 0 && have_open_utterance &&
+                    last_speech_end_sample > 0 &&
+                    (cumulative_samples - last_speech_end_sample) * 1000 / SR >= params.stream_final_silence_ms;
+                const bool allow_partial_decode =
+                    !params.stream_json || last_partial_decode_sample < 0 || final_silence_due ||
+                    (partial_decode_interval_samples <= 0 ||
+                     cumulative_samples - last_partial_decode_sample >= partial_decode_interval_samples);
+                bool partial_decode_attempted_this_step = false;
                 constexpr int kStraddleMinSamples = 32000; // 2 s @ 16 kHz; backend-safe tail decode floor.
                 for (const auto& sl : slices) {
                     if (params.stream_json) {
@@ -1555,7 +1567,11 @@ int crispasr_run_backend(const whisper_params& params_in) {
                         // 32000 samples = 2 s @ 16 kHz, comfortably
                         // above every supported backend's encoder
                         // minimum.
-                        if (s_start_abs < finalized_until_sample) {
+                        if (!allow_partial_decode) {
+                            // Keep VAD slice timing in the JSON state machine
+                            // but skip the expensive ASR partial decode for
+                            // this step.
+                        } else if (s_start_abs < finalized_until_sample) {
                             const int sub_start = (int)(finalized_until_sample - window_start_sample_now);
                             const int sub_end = (int)sl.end;
                             const int sub_len = sub_end - sub_start;
@@ -1563,6 +1579,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
                                 whisper_params decode_params = params;
                                 decode_params.vad = false;
                                 decode_params.vad_model.clear();
+                                partial_decode_attempted_this_step = true;
                                 sl_for_text =
                                     backend->transcribe(pcm_window.data() + sub_start, sub_len, 0, decode_params);
                             }
@@ -1574,6 +1591,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
                             // new audio will be picked up on a later
                             // step once the subrange exceeds the min.
                         } else {
+                            partial_decode_attempted_this_step = true;
                             sl_for_text =
                                 backend->transcribe(pcm_window.data() + sl.start, sl.end - sl.start, sl.t0_cs, params);
                         }
@@ -1602,6 +1620,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                                     std::make_move_iterator(slice_segs.end()));
                     }
                 }
+                if (partial_decode_attempted_this_step)
+                    last_partial_decode_sample = cumulative_samples;
             } else {
                 segs = backend->transcribe(pcm_window.data(), (int)pcm_window.size(), 0, params);
                 if (!segs.empty())

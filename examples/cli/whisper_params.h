@@ -189,6 +189,10 @@ struct whisper_params {
     // detector jitter gaps, but never across --stream-final-on-silence-ms.
     // 0 disables streaming-specific post-merge.
     int32_t stream_vad_merge_gap_ms = 250;
+    // JSON streaming + VAD only: minimum interval between live partial ASR
+    // decodes. 0 = decode partials every --stream-step, preserving the
+    // previous behavior. VAD timing/finalization still runs every step.
+    int32_t stream_partial_decode_ms = 0;
     // JSON streaming + VAD only: control FireRedPunc placement when
     // --punc-model is loaded. "final" avoids the high-frequency partial
     // punc path; "partial" preserves the older partial+final behavior.

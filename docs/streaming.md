@@ -218,12 +218,22 @@ block.
 | `--stream-step N` | `3000` ms | Step between consecutive windows. Smaller = more frequent partial transcripts. |
 | `--stream-length N` | `10000` ms | Rolling context window cap. The decode buffer accumulates audio up to this many ms, then drops the oldest samples from the front. Larger = better accuracy on long-form content but higher per-step cost. |
 | `--stream-keep N` | `200` ms | Legacy — kept for compatibility, currently a no-op. The rolling buffer above subsumes it (see issue #84). |
+| `--stream-partial-decode-ms N` | `0` ms | JSON+VAD only. Minimum interval between live partial ASR decodes. `0` preserves the previous behavior and decodes every `--stream-step`; larger values keep VAD/final timing at `--stream-step` while reducing partial ASR cadence. |
 
 `--stream-vad-merge-gap-ms` defaults to `250` ms and applies only to
 `--stream-json --vad`. It merges adjacent VAD slices only across gaps smaller
 than that value. When `--stream-final-on-silence-ms` is enabled, the effective
 merge gap is clamped below the finalization threshold. Set it to `0` to disable
 this close-gap merge.
+
+`--stream-partial-decode-ms` is useful when low-latency VAD/final timing is
+desired but partial ASR decode is too expensive to run every step. For example,
+`--stream-step 500 --stream-partial-decode-ms 750` keeps VAD and silence
+finalization checks at 500 ms while allowing live partial ASR text at most every
+750 ms. Steps that skip partial decode still keep VAD slice timing for the JSON
+utterance state machine. When trailing silence has crossed the finalization
+threshold, one step may bypass the partial-decode throttle before finalization
+so short-utterance fallback finals can use a fresh normal partial.
 
 > **Note (issue #84).** Before May 2026, `--stream-length` was a
 > *ceiling* on `keep + step` rather than a true rolling cap, so

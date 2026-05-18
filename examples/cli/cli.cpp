@@ -537,6 +537,12 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
             fprintf(stderr, "crispasr: --stream-vad-merge-gap-ms must be >= 0\n");
             exit(2);
         }
+    } else if (arg == "--stream-partial-decode-ms") {
+        params.stream_partial_decode_ms = std::stoi(ARGV_NEXT);
+        if (params.stream_partial_decode_ms < 0) {
+            fprintf(stderr, "crispasr: --stream-partial-decode-ms must be >= 0\n");
+            exit(2);
+        }
     } else if (arg == "--stream-punc") {
         std::string mode = ARGV_NEXT;
         if (!crispasr_stream_punc_mode_valid(mode)) {
@@ -896,6 +902,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr,
             "  --stream-vad-merge-gap-ms N       [%-7d] JSON+VAD close-gap merge in ms; clamped below final silence\n",
             params.stream_vad_merge_gap_ms);
+    fprintf(stderr,
+            "  --stream-partial-decode-ms N      [%-7d] JSON+VAD minimum interval between partial ASR decodes; 0 = "
+            "every step\n",
+            params.stream_partial_decode_ms);
     fprintf(stderr, "  --stream-punc MODE                [%-7s] JSON+VAD FireRedPunc mode: off, final, or partial\n",
             params.stream_punc.c_str());
     fprintf(stderr,
