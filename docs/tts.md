@@ -531,15 +531,81 @@ knobs for power users:
 Set `INDEXTTS_DEBUG=1` for per-stage intermediate dumps (mel, conformer
 blocks, perceiver output) useful for diff-testing against Python.
 
-**Chinese (CJK) text** is handled via a port of the upstream
-`tokenize_by_CJK_char` pre-tokenizer plus the relevant subset of
-`TextNormalizer.char_rep_map` (CJK punctuation → ASCII). Token IDs are
-bit-identical to Python `sp.Encode` on the preprocessed text. Mixed
-CJK+English (e.g. `他用Python写了一个程序。`) works without special
-flags. Numbers-to-hanzi conversion and pinyin tone digits are not
-ported — they need the upstream wetext FST and are not currently in
-the CLI. ASR-validate Chinese output with a real Chinese ASR (e.g.
-Qwen3-ASR-0.6B); whisper-base over-counts CER ~5× on Mandarin.
+### IndexTTS Chinese text normalization
 
-Pass `-vv` to dump the BPE token IDs (`indextts: text_ids[...]`) for
-diffing against `sentencepiece` if the output sounds wrong.
+**Default in-process pipeline** handles ~95 % of real prompts:
+
+- A port of upstream `tokenize_by_CJK_char` (every CJK codepoint is
+  whitespace-surrounded so SentencePiece emits one `▁<char>` piece per
+  hanzi, matching the model's training distribution).
+- The relevant subset of `TextNormalizer.char_rep_map` — full-width
+  CJK punctuation `，。：；！？、…“”‘’（）《》【】「」—～·` mapped to ASCII
+  before the CJK splitter runs. Notably `。` (U+3002) sits **inside**
+  the CJK Unicode range used by `tokenize_by_CJK_char`, so it must be
+  punct-mapped first or it gets split as a CJK character and the
+  model hallucinates an extra trailing syllable.
+- ASCII upper-case for non-CJK runs (matches upstream's
+  `do_upper_case=True`).
+
+Token IDs are bit-identical to Python `sentencepiece.SentencePieceProcessor.Encode`
+on the preprocessed string. Mixed CJK+English
+(`他用Python写了一个程序。`) works without special flags. Pass `-vv` to
+dump the BPE token IDs (`indextts: text_ids[...]`) for diffing against
+the Python reference if output sounds wrong.
+
+**ASR-validate Chinese output with a real Chinese ASR.** `whisper-base`
+over-counts CER ~5× on Mandarin (we measured 21 % whisper-base vs
+3.8 % `qwen3-asr-0.6b` on the same audio); use Qwen3-ASR, the upstream
+Cohere transcribe API, or `whisper-large-v3` for CER numbers you can
+trust.
+
+**What the default does NOT do:** number → hanzi (`2025年` stays as
+literal digits, which the model can't pronounce cleanly), pinyin tone
+digits (`xuan4` is not restored to its real pronunciation),
+English contractions inside Chinese text, dates / times / currency /
+phone-number expansion. These need a full WFST-based normalizer
+(upstream IndexTTS uses [wetext](https://github.com/pengzhendong/wetext)
+on macOS, [WeTextProcessing](https://github.com/wenet-e2e/WeTextProcessing)
+elsewhere). We deliberately don't vendor that engine — OpenFST + the
+~1 MB of compiled `.fst` rule data is a heavy dependency for a feature
+most TTS prompts don't need.
+
+**Optional hook: `INDEXTTS_TEXT_NORMALIZER`** delegates normalization
+to any user-provided shell command that reads UTF-8 text on stdin and
+writes the normalized text to stdout. The output is then run through
+the default pipeline (CJK split + punct map + upper) before
+SentencePiece.
+
+Recommended setup with upstream wetext:
+
+```bash
+pip install wetext
+# Then on every IndexTTS invocation:
+INDEXTTS_TEXT_NORMALIZER="python $REPO/tools/wetext-normalize.py" \
+    ./build/bin/crispasr --backend indextts -m auto \
+        --tts "我有 3 个苹果，2025 年买的。" \
+        --voice ref.wav --tts-output out.wav
+```
+
+The wrapper at `tools/wetext-normalize.py` is a thin stdin → stdout
+shim around `wetext.Normalizer`; it accepts wetext's normal flags
+(`--lang zh`, `--traditional-to-simple`, `--remove-erhua`, etc.).
+Without `wetext` installed, the wrapper passes input through
+unchanged so the hook still degrades gracefully.
+
+**Failure modes — all fall back silently to the raw text:**
+
+- Hook command exits non-zero → warning to stderr, raw text used.
+- Hook stdout is empty → raw text used.
+- Hook isn't installed / `mkstemp` fails → warning, raw text used.
+- Hook hangs → currently no timeout; the synthesis blocks until the
+  subprocess exits (no protection against a buggy normalizer). Use
+  with shell commands you trust.
+
+**Security:** the env var IS passed to `system()` — the user is the one
+setting it, so don't expose this hook to text inputs from untrusted
+sources unless you also vet the env var.
+
+When the hook fires you'll see no extra log line by default; pass
+`-v` to confirm the post-hook tokenization (`indextts: text "..." ->
+N tokens`).

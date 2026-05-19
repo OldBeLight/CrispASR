@@ -44,6 +44,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <unistd.h> // unlink, close, write (external normalizer hook)
+
 namespace {
 
 // ── Hyperparameters ──────────────────────────────────────────────
@@ -250,6 +252,86 @@ static uint32_t normalize_cjk_punct(uint32_t cp) {
     default:
         return 0;
     }
+}
+
+// Optional external text-normalizer hook. When INDEXTTS_TEXT_NORMALIZER is
+// set, the input text is piped through that shell command (stdin → stdout)
+// before our in-process CJK preprocessor runs. Intended bridge for the
+// upstream wetext zh_normalizer (numbers→hanzi, dates, pinyin tones, etc.)
+// which we deliberately don't vendor — the WFST runtime + OpenFST
+// dependency is not worth carrying for a feature most TTS prompts don't
+// need.
+//
+// Recommended invocation (see tools/wetext-normalize.py):
+//   INDEXTTS_TEXT_NORMALIZER="python /path/to/tools/wetext-normalize.py"
+//
+// Any non-zero exit, empty stdout, or fork/exec failure silently falls back
+// to the raw text. The hook is not gated by language detection — users opt
+// in per invocation, and a no-op normalizer is no worse than not having
+// the hook at all.
+//
+// Security: the env var IS executed via system() — the user is the one
+// setting it. Don't expose this hook to untrusted input sources.
+static std::string maybe_external_normalize(const std::string& text) {
+    const char* cmd = getenv("INDEXTTS_TEXT_NORMALIZER");
+    if (!cmd || !cmd[0]) {
+        return text;
+    }
+
+    char in_path[] = "/tmp/crispasr-tn-in-XXXXXX";
+    char out_path[] = "/tmp/crispasr-tn-out-XXXXXX";
+    int in_fd = mkstemp(in_path);
+    if (in_fd < 0) {
+        fprintf(stderr, "indextts: INDEXTTS_TEXT_NORMALIZER: mkstemp(in) failed; using raw text\n");
+        return text;
+    }
+    int out_fd = mkstemp(out_path);
+    if (out_fd < 0) {
+        close(in_fd);
+        unlink(in_path);
+        fprintf(stderr, "indextts: INDEXTTS_TEXT_NORMALIZER: mkstemp(out) failed; using raw text\n");
+        return text;
+    }
+    ssize_t wrote = write(in_fd, text.data(), text.size());
+    close(in_fd);
+    close(out_fd);
+    if (wrote != (ssize_t)text.size()) {
+        unlink(in_path);
+        unlink(out_path);
+        fprintf(stderr, "indextts: INDEXTTS_TEXT_NORMALIZER: short write; using raw text\n");
+        return text;
+    }
+
+    std::string shell_cmd = std::string(cmd) + " < " + in_path + " > " + out_path;
+    int rc = system(shell_cmd.c_str());
+
+    std::string out;
+    if (rc == 0) {
+        FILE* f = fopen(out_path, "rb");
+        if (f) {
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+                out.append(buf, n);
+            }
+            fclose(f);
+            // Strip trailing whitespace (a single trailing newline from print()
+            // is the common case, but be defensive).
+            while (!out.empty() &&
+                   (out.back() == '\n' || out.back() == '\r' || out.back() == ' ' || out.back() == '\t')) {
+                out.pop_back();
+            }
+        }
+    } else {
+        fprintf(stderr, "indextts: INDEXTTS_TEXT_NORMALIZER exited %d; using raw text\n", rc);
+    }
+    unlink(in_path);
+    unlink(out_path);
+
+    if (out.empty()) {
+        return text;
+    }
+    return out;
 }
 
 // Match Python upstream order: punct map → tokenize_by_CJK_char → upper().
@@ -2261,7 +2343,7 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
 
     // 1. Run upstream-equivalent text preprocessing (CJK punct map + CJK
     //    char split + ASCII upper), then SentencePiece-encode.
-    std::string text_prepped = preprocess_indextts_text(text ? text : "");
+    std::string text_prepped = preprocess_indextts_text(maybe_external_normalize(text ? text : ""));
 
     std::vector<int32_t> text_tokens;
     if (ctx->tokenizer.loaded) {
@@ -2726,7 +2808,7 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
     // Step 2: Re-tokenize text for latent pass — must match the prefill
     // tokenization, otherwise the latent positions don't align with the
     // hidden states the GPT actually saw during generate().
-    std::string text_prepped2 = preprocess_indextts_text(text ? text : "");
+    std::string text_prepped2 = preprocess_indextts_text(maybe_external_normalize(text ? text : ""));
     std::vector<int32_t> text_tokens;
     if (ctx->tokenizer.loaded) {
         text_tokens = tokenize_bpe(ctx->tokenizer, text_prepped2);
