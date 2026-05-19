@@ -393,6 +393,8 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.chunk_seconds_explicit = true;
     } else if (arg == "--chunk-overlap") {
         params.chunk_overlap_seconds = std::stof(ARGV_NEXT);
+    } else if (arg == "--parakeet-decoder") {
+        params.parakeet_decoder = ARGV_NEXT;
     } else if (arg == "--lid-backend") {
         params.lid_backend = ARGV_NEXT;
     } else if (arg == "--lid-model") {

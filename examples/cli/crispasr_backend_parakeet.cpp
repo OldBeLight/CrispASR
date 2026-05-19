@@ -47,6 +47,16 @@ public:
             fprintf(stderr, "crispasr[parakeet]: failed to load model '%s'\n", p.model.c_str());
             return false;
         }
+        // CTC decode mode (hybrid TDT+CTC models).
+        if (p.parakeet_decoder == "ctc") {
+            if (parakeet_has_ctc(ctx_)) {
+                parakeet_set_ctc_mode(ctx_, true);
+                if (!p.no_prints)
+                    fprintf(stderr, "crispasr[parakeet]: using CTC decoder\n");
+            } else {
+                fprintf(stderr, "crispasr[parakeet]: --parakeet-decoder ctc requested but model has no CTC head\n");
+            }
+        }
         return true;
     }
 

@@ -150,6 +150,12 @@ struct parakeet_model {
     parakeet_predictor predictor;
     parakeet_joint joint;
 
+    // CTC head (hybrid TDT+CTC models). nullptr when not present.
+    ggml_tensor* ctc_w = nullptr; // Conv1d(d_model, ctc_vocab, 1) → (ctc_vocab, d_model, 1)
+    ggml_tensor* ctc_b = nullptr; // (ctc_vocab,)
+    bool has_ctc = false;
+    uint32_t ctc_vocab_size = 0;
+
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
 
@@ -179,6 +185,11 @@ struct parakeet_context {
     parakeet_joint_weights joint_w;
 
     int n_threads = 4;
+
+    // CTC decode mode. When true and the model has a CTC head, use CTC
+    // greedy decode instead of TDT. CTC is frame-synchronous and doesn't
+    // suffer from chunk-boundary text loss on bidirectional encoders.
+    bool decode_ctc = false;
 
     // Decode-time sampling controls. Default temperature == 0 keeps the
     // bit-identical pure-argmax path; > 0 switches the TDT decoder over
@@ -249,6 +260,11 @@ static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, co
         hp.blank_id = core_gguf::kv_u32(gctx, "parakeet.blank_id", hp.blank_id);
         hp.n_tdt_durations = core_gguf::kv_u32(gctx, "parakeet.n_tdt_durations", hp.n_tdt_durations);
         hp.frame_dur_cs = core_gguf::kv_u32(gctx, "parakeet.frame_dur_cs", hp.frame_dur_cs);
+
+        // CTC head metadata (hybrid TDT+CTC models).
+        model.has_ctc = core_gguf::kv_bool(gctx, "parakeet.has_ctc", false);
+        if (model.has_ctc)
+            model.ctc_vocab_size = core_gguf::kv_u32(gctx, "parakeet.ctc_vocab_size", 0);
 
         // Vocab: tokenizer.ggml.tokens is a string array.
         auto tokens = core_gguf::kv_str_array(gctx, "tokenizer.ggml.tokens");
@@ -370,6 +386,20 @@ static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, co
     j.pred_b = require(model, "joint.pred.bias");
     j.out_w = require(model, "joint.out.weight");
     j.out_b = require(model, "joint.out.bias");
+
+    // CTC head (optional)
+    if (model.has_ctc) {
+        auto it_w = model.tensors.find("ctc.weight");
+        auto it_b = model.tensors.find("ctc.bias");
+        if (it_w != model.tensors.end() && it_b != model.tensors.end()) {
+            model.ctc_w = it_w->second;
+            model.ctc_b = it_b->second;
+            fprintf(stderr, "parakeet: CTC head loaded (vocab=%u)\n", model.ctc_vocab_size);
+        } else {
+            fprintf(stderr, "parakeet: has_ctc=true but ctc tensors missing — falling back to TDT\n");
+            model.has_ctc = false;
+        }
+    }
 
     fprintf(stderr, "parakeet: vocab=%u  d_model=%u  n_layers=%u  n_heads=%u  ff=%u  pred=%u  joint=%u\n",
             model.hparams.vocab_size, model.hparams.d_model, model.hparams.n_layers, model.hparams.n_heads,
@@ -1182,6 +1212,74 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
 }
 
 // ===========================================================================
+// CTC greedy decode (for hybrid TDT+CTC models)
+// ===========================================================================
+
+static std::vector<parakeet_emitted_token> parakeet_ctc_decode(parakeet_context* ctx, const float* enc, int T_enc,
+                                                                int d_model) {
+    std::vector<parakeet_emitted_token> emitted;
+    if (!ctx->model.ctc_w || !ctx->model.ctc_b)
+        return emitted;
+
+    const int ctc_vocab = (int)ctx->model.ctc_vocab_size;
+    // CTC blank is the last token in the CTC vocab (NeMo convention).
+    const int ctc_blank = ctc_vocab - 1;
+
+    // Pull CTC head weights to CPU.
+    // ctc_w is Conv1d(d_model, ctc_vocab, 1) stored as (ctc_vocab, d_model, 1)
+    // → effectively a (ctc_vocab, d_model) matmul. May be F16.
+    const size_t w_numel = (size_t)ctc_vocab * d_model;
+    std::vector<float> w(w_numel);
+    std::vector<float> b((size_t)ctc_vocab);
+    if (ctx->model.ctc_w->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(ctx->model.ctc_w, w.data(), 0, w_numel * sizeof(float));
+    } else {
+        std::vector<ggml_fp16_t> tmp(w_numel);
+        ggml_backend_tensor_get(ctx->model.ctc_w, tmp.data(), 0, w_numel * sizeof(ggml_fp16_t));
+        for (size_t i = 0; i < w_numel; i++)
+            w[i] = ggml_fp16_to_fp32(tmp[i]);
+    }
+    ggml_backend_tensor_get(ctx->model.ctc_b, b.data(), 0, (size_t)ctc_vocab * sizeof(float));
+
+    // For each encoder frame: logits = w @ enc[t] + b, then argmax.
+    std::vector<float> logits((size_t)ctc_vocab);
+    int prev_tok = ctc_blank;
+    for (int t = 0; t < T_enc; t++) {
+        const float* e = enc + (size_t)t * d_model;
+        for (int v = 0; v < ctc_vocab; v++) {
+            float s = b[v];
+            const float* wv = w.data() + (size_t)v * d_model;
+            for (int k = 0; k < d_model; k++)
+                s += wv[k] * e[k];
+            logits[v] = s;
+        }
+        // Argmax
+        int tok = 0;
+        float tok_lp = logits[0];
+        for (int v = 1; v < ctc_vocab; v++) {
+            if (logits[v] > tok_lp) {
+                tok_lp = logits[v];
+                tok = v;
+            }
+        }
+        // CTC collapse: skip blanks and repeated tokens.
+        if (tok != ctc_blank && tok != prev_tok) {
+            // Softmax probability of the picked token.
+            float tok_p = 1.0f;
+            {
+                double sum = 0.0;
+                for (int v = 0; v < ctc_vocab; v++)
+                    sum += std::exp((double)(logits[v] - tok_lp));
+                tok_p = sum > 0.0 ? (float)(1.0 / sum) : 0.0f;
+            }
+            emitted.push_back({tok, t, t, tok_p});
+        }
+        prev_tok = tok;
+    }
+    return emitted;
+}
+
+// ===========================================================================
 // Backend selection
 // ===========================================================================
 
@@ -1256,6 +1354,16 @@ extern "C" void parakeet_set_temperature(struct parakeet_context* ctx, float tem
         return;
     ctx->decode_temperature = temperature;
     ctx->decode_seed = seed;
+}
+
+extern "C" void parakeet_set_ctc_mode(struct parakeet_context* ctx, bool ctc) {
+    if (!ctx)
+        return;
+    ctx->decode_ctc = ctc;
+}
+
+extern "C" bool parakeet_has_ctc(struct parakeet_context* ctx) {
+    return ctx && ctx->model.has_ctc;
 }
 
 extern "C" float* parakeet_compute_mel(struct parakeet_context* ctx, const float* samples, int n_samples,
@@ -1558,10 +1666,12 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
                 (double)enc[1], (double)enc[2], (double)enc[3]);
     }
 
-    // 3. TDT greedy decode
-    auto emitted = parakeet_tdt_decode(ctx, enc.data(), T_enc, (int)ctx->model.hparams.d_model);
+    // 3. Greedy decode (TDT or CTC)
+    const bool use_ctc = ctx->decode_ctc && ctx->model.has_ctc;
+    auto emitted = use_ctc ? parakeet_ctc_decode(ctx, enc.data(), T_enc, (int)ctx->model.hparams.d_model)
+                           : parakeet_tdt_decode(ctx, enc.data(), T_enc, (int)ctx->model.hparams.d_model);
     if (getenv("PARAKEET_DEBUG"))
-        fprintf(stderr, "parakeet: decode OK (%d tokens)\n", (int)emitted.size());
+        fprintf(stderr, "parakeet: %s decode OK (%d tokens)\n", use_ctc ? "CTC" : "TDT", (int)emitted.size());
 
     // 4. Build result
     auto* r = (parakeet_result*)calloc(1, sizeof(parakeet_result));

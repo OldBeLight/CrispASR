@@ -210,6 +210,12 @@ def remap_name(nemo_name: str) -> str | None:
     if n == "joint.joint_net.2.bias":
         return "joint.out.bias"
 
+    # ---- CTC head (hybrid TDT+CTC models like parakeet-tdt_ctc-*) ----
+    if n == "ctc_decoder.decoder_layers.0.weight":
+        return "ctc.weight"
+    if n == "ctc_decoder.decoder_layers.0.bias":
+        return "ctc.bias"
+
     # Unmapped: print a clear warning so any extra structure (e.g. a
     # t_norm or extra joint Linear that the runtime doesn't know about)
     # cannot be silently dropped during conversion.
@@ -357,6 +363,15 @@ def convert(nemo_path: Path, out_path: Path) -> None:
     writer.add_array("parakeet.tdt_durations", tdt_durations)
     # frame_dur_cs is in centiseconds: 0.01 s stride × 8× subsampling = 8 cs (80 ms)
     writer.add_uint32("parakeet.frame_dur_cs", int(round(wst * subsampling_factor * 100)))
+
+    # Check if CTC head is present (hybrid TDT+CTC models).
+    has_ctc = "ctc_decoder.decoder_layers.0.weight" in sd
+    writer.add_bool("parakeet.has_ctc", has_ctc)
+    if has_ctc:
+        ctc_w = sd["ctc_decoder.decoder_layers.0.weight"]
+        ctc_vocab = ctc_w.shape[0]
+        writer.add_uint32("parakeet.ctc_vocab_size", ctc_vocab)
+        print(f"  CTC head: vocab_size={ctc_vocab}")
 
     writer.add_array("tokenizer.ggml.tokens", vocab)
 
