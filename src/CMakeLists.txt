@@ -513,6 +513,30 @@ if(GGML_CUDA)
 endif()
 
 # ---------------------------------------------------------------------------
+# FunASR — FunAudioLLM/Fun-ASR-Nano-2512 (SANM encoder + Transformer adaptor
+#          + Qwen3-0.6B LLM decoder)
+# ---------------------------------------------------------------------------
+add_library(funasr STATIC
+            funasr.h
+            funasr.cpp
+            )
+target_include_directories(funasr PUBLIC . ../include)
+target_compile_features   (funasr PUBLIC cxx_std_17)
+set_target_properties(funasr PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (funasr PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+if(NOT MSVC)
+    target_compile_options(funasr PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(funasr PRIVATE GGML_USE_METAL)
+    target_link_libraries(funasr PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(funasr PRIVATE GGML_USE_CUDA)
+    target_link_libraries(funasr PUBLIC ggml-cuda)
+endif()
+
+# ---------------------------------------------------------------------------
 # Voxtral — mistralai/Voxtral-Mini-3B-2507 (Whisper encoder + Llama 3 LLM)
 # ---------------------------------------------------------------------------
 add_library(voxtral STATIC

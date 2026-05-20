@@ -181,7 +181,11 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
                 txt = res[0][0]["text"] if isinstance(res[0], list) else res[0]["text"]
             except Exception:
                 pass
-            out["generated_text"] = np.frombuffer(txt.encode("utf-8"), dtype=np.uint8).copy()
+            # Routed into the GGUF metadata KV table (not a tensor) — the
+            # dump_reference top-level scans for str-typed captures and
+            # moves them there, where the C++ diff harness reads it via
+            # Ref.meta("generated_text").
+            out["generated_text"] = txt
             print(f"  generated_text: {txt!r}")
         except Exception as e:
             print(f"  WARN: inference() failed: {e}; skipping generated_text")

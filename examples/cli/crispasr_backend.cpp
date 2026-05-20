@@ -34,6 +34,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_streaming_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_gemma4_e2b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_omniasr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_mimo_asr_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_funasr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_voxcpm2_tts_backend();
 
 #include "ggml.h"
@@ -118,6 +119,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_omniasr_backend();
     if (name == "mimo-asr" || name == "mimo_asr" || name == "mimoasr")
         return crispasr_make_mimo_asr_backend();
+    if (name == "funasr" || name == "fun-asr" || name == "fun-asr-nano" || name == "fun-asr-mlt-nano")
+        return crispasr_make_funasr_backend();
 
     fprintf(stderr, "crispasr: error: unknown backend '%s'\n", name.c_str());
     return nullptr;
@@ -171,6 +174,8 @@ std::vector<std::string> crispasr_list_backends() {
         "omniasr-llm",
         "omniasr-llm-1b",
         "mimo-asr",
+        "funasr",
+        "fun-asr-mlt-nano",
     };
 }
 
@@ -421,6 +426,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "moonshine-streaming";
     if (contains_ci("moonshine"))
         return "moonshine";
+    if (contains_ci("fun-asr") || contains_ci("funasr") || contains_ci("fun_asr"))
+        return "funasr";
     if (contains_ci("ggml-") && contains_ci(".bin"))
         return "whisper";
 
@@ -505,6 +512,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "fireredpunc";
             else if (a == "mimo_asr" || a == "mimo-asr")
                 result = "mimo-asr";
+            else if (a == "funasr" || a == "fun_asr" || a == "fun-asr")
+                result = "funasr";
             else if (a == "indextts" || a == "indextts-1.5" || a == "indextts_1_5")
                 result = "indextts";
         }

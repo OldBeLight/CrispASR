@@ -23,6 +23,11 @@
 
 namespace core_kaldi {
 
+enum class WindowType {
+    Povey = 0,   // pow(hann, 0.85) — torchaudio fbank default
+    Hamming = 1, // 0.54 - 0.46*cos(2πi/(N-1)) — FunASR WavFrontend default
+};
+
 struct FbankParams {
     int sample_rate = 16000;
     int n_mels = 80;
@@ -34,8 +39,9 @@ struct FbankParams {
     float log_floor = 1.1920929e-7f; // FLT_EPSILON; below clamps log(x)
     bool remove_dc_offset = true;    // subtract per-frame mean before window
     bool int16_scale = false;        // multiply float input by 32768 first
-                                     // (firered_asr trained on int16-scaled features;
+                                     // (firered_asr / funasr trained on int16-scaled features;
                                      //  CAMPPlus / most modern speaker encoders consume raw [-1, 1])
+    WindowType window_type = WindowType::Povey;
 };
 
 // Compute Kaldi-compatible filterbank features for the given 16 kHz mono

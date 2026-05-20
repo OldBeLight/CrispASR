@@ -1,0 +1,1349 @@
+// funasr.cpp — FunAudioLLM/Fun-ASR-Nano-2512 ggml runtime.
+//
+// See funasr.h for the public contract and architecture overview. The
+// stage names exposed via funasr_extract_stage match the reference
+// dumper at tools/reference_backends/funasr.py exactly.
+
+#include "funasr.h"
+
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+#include "ggml.h"
+#include "gguf.h"
+
+#include "core/attention.h"
+#include "core/bpe.h"
+#include "core/ffn.h"
+#include "core/gguf_loader.h"
+#include "core/kaldi_fbank.h"
+#include "core/lfr.h"
+#include "core/sanm.h"
+
+#include <algorithm>
+#include <cassert>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// ===========================================================================
+// Bench instrumentation
+//
+// Enable per-stage timings with `FUNASR_BENCH=1`. Mirrors the granite /
+// voxcpm2 pattern — RAII scope objects that log their elapsed time on
+// destruction. Cost when disabled is one cached env-var read per stage
+// (~1 ns); safe to leave compiled in.
+//
+// Reported stages (per crispasr_transcribe call):
+//   fbank+lfr             frontend (kaldi-fbank + LFR stacking)
+//   enc+ada_compute       SANM encoder + adaptor graph compute
+//   prompt_tokenize       Qwen3 BPE encode for prefix/suffix
+//   embed                 token_embd lookup + splice
+//   kv_init               KV cache allocation (first call only)
+//   llm_prefill           single prefill pass (T_prompt tokens)
+//   llm_decode_total      AR decode loop wall time
+//   decode_step_avg       average per-step time across all decoded tokens
+// ===========================================================================
+
+static bool funasr_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("FUNASR_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct funasr_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit funasr_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~funasr_bench_stage() {
+        if (!funasr_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  funasr_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
+
+// ===========================================================================
+// Hyperparameters
+// ===========================================================================
+
+struct funasr_hparams {
+    // Frontend
+    uint32_t sample_rate = 16000;
+    uint32_t n_mels = 80;
+    uint32_t frame_length_ms = 25;
+    uint32_t frame_shift_ms = 10;
+    uint32_t lfr_m = 7;
+    uint32_t lfr_n = 6;
+
+    // Encoder (SenseVoiceEncoderSmall)
+    uint32_t input_size = 560; // n_mels * lfr_m
+    uint32_t d_model = 512;
+    uint32_t n_heads = 4;
+    uint32_t head_dim = 128;
+    uint32_t ffn_dim = 2048;
+    uint32_t n_blocks_base = 50;
+    uint32_t n_blocks_tp = 20;
+    uint32_t sanm_kernel = 11;
+    float enc_ln_eps = 1e-5f;
+
+    // Audio adaptor (Transformer with downsample_rate=1)
+    uint32_t ada_d_in = 512;
+    uint32_t ada_ffn = 2048;
+    uint32_t ada_d_out = 1024; // = LLM hidden
+    uint32_t ada_n_layers = 2;
+    // Upstream funasr.models.llm_asr.adaptor.Transformer instantiates
+    // MultiHeadedAttention with `kwargs.get("attention_heads", 8)` and the
+    // config.yaml for Fun-ASR-Nano-2512 does NOT pass attention_heads, so
+    // the adaptor's 2 transformer blocks run at 8 heads (head_dim = 128).
+    // The converter wrote 16 into funasr.ada_n_heads by mistake; ignore
+    // that KV here and use the upstream default.
+    uint32_t ada_n_heads = 8;
+    uint32_t ada_head_dim = 128;  // ada_d_out / ada_n_heads
+    uint32_t ada_ffn_inner = 256; // llm_dim // 4 from funasr.models.llm_asr.adaptor.Transformer
+    float ada_ln_eps = 1e-12f;    // funasr.models.transformer.layer_norm.LayerNorm default
+
+    // LLM (Qwen3-0.6B)
+    uint32_t llm_n_layers = 28;
+    uint32_t llm_d_model = 1024;
+    uint32_t llm_n_heads = 16;
+    uint32_t llm_n_kv_heads = 8;
+    uint32_t llm_head_dim = 128;
+    uint32_t llm_ff_dim = 3072;
+    float llm_rope_theta = 1.0e6f;
+    float llm_rms_eps = 1e-6f;
+    uint32_t llm_vocab_size = 151936;
+    uint32_t llm_max_pos = 40960;
+
+    // Special tokens — read from GGUF KVs (with Qwen3 defaults as backup).
+    uint32_t eos_token_id = 151645;
+    uint32_t pad_token_id = 151643;
+
+    // ChatML / FunASR control tokens — Qwen3 added_tokens, looked up by string at load.
+    uint32_t im_start_id = 151644;
+    uint32_t im_end_id = 151645;
+
+    // Adaptor token-budget reduction matches the model.use_low_frame_rate
+    // training flag. With it on, the prompt builder reserves
+    // ((((T_lfr-1)/2+1 -1)/2+1 -1)/2+1 placeholder slots instead of T_lfr —
+    // see fun_asr_nano/model.py:404-409. The C++ runtime mirrors that, and
+    // splices adaptor_out[:fake_token_len] into the slot range.
+    bool use_low_frame_rate = true;
+};
+
+// ===========================================================================
+// Per-block tensor containers
+// ===========================================================================
+
+struct funasr_enc_block {
+    ggml_tensor *norm1_w = nullptr, *norm1_b = nullptr;
+    ggml_tensor *norm2_w = nullptr, *norm2_b = nullptr;
+    ggml_tensor *attn_qkv_w = nullptr, *attn_qkv_b = nullptr;
+    ggml_tensor *attn_out_w = nullptr, *attn_out_b = nullptr;
+    ggml_tensor* attn_fsmn_w = nullptr;
+    ggml_tensor *ffn_l1_w = nullptr, *ffn_l1_b = nullptr;
+    ggml_tensor *ffn_l2_w = nullptr, *ffn_l2_b = nullptr;
+};
+
+struct funasr_adaptor_block {
+    ggml_tensor *norm1_w = nullptr, *norm1_b = nullptr;
+    ggml_tensor *norm2_w = nullptr, *norm2_b = nullptr;
+    ggml_tensor *q_w = nullptr, *q_b = nullptr;
+    ggml_tensor *k_w = nullptr, *k_b = nullptr;
+    ggml_tensor *v_w = nullptr, *v_b = nullptr;
+    ggml_tensor *out_w = nullptr, *out_b = nullptr;
+    ggml_tensor *ffn_l1_w = nullptr, *ffn_l1_b = nullptr;
+    ggml_tensor *ffn_l2_w = nullptr, *ffn_l2_b = nullptr;
+};
+
+struct funasr_llm_block {
+    ggml_tensor* attn_norm_w = nullptr;
+    ggml_tensor* attn_q_w = nullptr;
+    ggml_tensor* attn_k_w = nullptr;
+    ggml_tensor* attn_v_w = nullptr;
+    ggml_tensor* attn_output_w = nullptr;
+    ggml_tensor* attn_q_norm_w = nullptr;
+    ggml_tensor* attn_k_norm_w = nullptr;
+    ggml_tensor* ffn_norm_w = nullptr;
+    ggml_tensor* ffn_gate_w = nullptr;
+    ggml_tensor* ffn_up_w = nullptr;
+    ggml_tensor* ffn_down_w = nullptr;
+};
+
+struct funasr_encoder {
+    std::vector<funasr_enc_block> blocks; // 70 = base + tp
+    ggml_tensor *after_norm_w = nullptr, *after_norm_b = nullptr;
+    ggml_tensor *tp_norm_w = nullptr, *tp_norm_b = nullptr;
+};
+
+struct funasr_adaptor {
+    ggml_tensor *linear1_w = nullptr, *linear1_b = nullptr;
+    ggml_tensor *linear2_w = nullptr, *linear2_b = nullptr;
+    std::vector<funasr_adaptor_block> blocks;
+};
+
+struct funasr_llm {
+    ggml_tensor* token_embd_w = nullptr;
+    ggml_tensor* output_w = nullptr;
+    ggml_tensor* output_norm_w = nullptr;
+    std::vector<funasr_llm_block> blocks;
+};
+
+struct funasr_model {
+    funasr_hparams hparams;
+    funasr_encoder enc;
+    funasr_adaptor ada;
+    funasr_llm llm;
+
+    ggml_context* ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_backend_buffer_t buf_cpu = nullptr;
+    std::map<std::string, ggml_tensor*> tensors;
+
+    // Sinusoidal PE for the encoder, computed once at load. depth = input_size = 560,
+    // length = some max T. row-major (max_T, depth).
+    std::vector<float> enc_pe;
+    int enc_pe_max_T = 0;
+};
+
+struct funasr_vocab {
+    std::vector<std::string> id_to_token;
+    std::unordered_map<std::string, int32_t> token_to_id;
+    std::unordered_map<std::string, int32_t> merge_rank;
+};
+
+struct funasr_context {
+    funasr_context_params params;
+    funasr_model model;
+    funasr_vocab vocab;
+
+    ggml_backend_t backend = nullptr;
+    ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_sched_t sched = nullptr;
+
+    std::vector<uint8_t> compute_meta;
+
+    // KV cache for the LLM body — same layout as qwen3_asr.
+    ggml_context* kv_ctx = nullptr;
+    ggml_backend_buffer_t kv_buf = nullptr;
+    ggml_tensor* kv_k = nullptr;
+    ggml_tensor* kv_v = nullptr;
+    int kv_max_ctx = 0;
+
+    int n_threads = 4;
+
+    // Per-session knobs. Set at init from env vars / params; consumed by
+    // the graph builders below.
+    //   enc_flash_attn — fold the SANM/adaptor attention into one
+    //     ggml_flash_attn_ext kernel (Metal/CUDA). Default ON; disable
+    //     with FUNASR_NO_FA=1 for diffing against a pre-FA reference
+    //     or to dodge a hypothetical backend bug.
+    bool enc_flash_attn = true;
+
+    // Stage-capture state — set by funasr_extract_stage to request a
+    // specific intermediate tensor; consumed by the encoder graph builder
+    // (which wires a named ggml_dup snap at the requested stage so the
+    // sched keeps it alive after compute).
+    std::string requested_stage;
+};
+
+// ===========================================================================
+// Loader
+// ===========================================================================
+
+static ggml_tensor* try_get(funasr_model& m, const char* name) {
+    return core_gguf::try_get(m.tensors, name);
+}
+
+static ggml_tensor* require(funasr_model& m, const char* name) {
+    return core_gguf::require(m.tensors, name, "funasr");
+}
+
+static void compute_encoder_pe(funasr_model& m, int max_T) {
+    // SinusoidalPositionEncoder.encode(positions=1..T, depth=input_size, dtype=f32)
+    //   log_inc = log(10000) / (depth/2 - 1)
+    //   inv_t   = exp(arange(depth/2) * (-log_inc))
+    //   pe[t, :half]   = sin((t+1) * inv_t)            (positions start at 1)
+    //   pe[t, half:]   = cos((t+1) * inv_t)
+    const int D = (int)m.hparams.input_size;
+    const int half = D / 2;
+    const float log_inc = std::log(10000.0f) / (float)(half - 1);
+    std::vector<float> inv_t((size_t)half);
+    for (int i = 0; i < half; i++)
+        inv_t[(size_t)i] = std::exp(-log_inc * (float)i);
+    m.enc_pe.assign((size_t)max_T * (size_t)D, 0.0f);
+    for (int t = 0; t < max_T; t++) {
+        const float pos = (float)(t + 1); // positions = arange(1, T+1)
+        float* row = m.enc_pe.data() + (size_t)t * (size_t)D;
+        for (int i = 0; i < half; i++) {
+            const float a = pos * inv_t[(size_t)i];
+            row[i] = std::sin(a);
+            row[half + i] = std::cos(a);
+        }
+    }
+    m.enc_pe_max_T = max_T;
+}
+
+static bool funasr_load_model(funasr_model& model, funasr_vocab& vocab, const char* path, ggml_backend_t backend,
+                              ggml_backend_t /*backend_cpu*/) {
+    // Pass 1: hparams + vocab
+    {
+        gguf_context* gctx = core_gguf::open_metadata(path);
+        if (!gctx)
+            return false;
+        auto& hp = model.hparams;
+        hp.sample_rate = core_gguf::kv_u32(gctx, "funasr.sample_rate", hp.sample_rate);
+        hp.n_mels = core_gguf::kv_u32(gctx, "funasr.n_mels", hp.n_mels);
+        hp.frame_length_ms = core_gguf::kv_u32(gctx, "funasr.frame_length_ms", hp.frame_length_ms);
+        hp.frame_shift_ms = core_gguf::kv_u32(gctx, "funasr.frame_shift_ms", hp.frame_shift_ms);
+        hp.lfr_m = core_gguf::kv_u32(gctx, "funasr.lfr_m", hp.lfr_m);
+        hp.lfr_n = core_gguf::kv_u32(gctx, "funasr.lfr_n", hp.lfr_n);
+        hp.d_model = core_gguf::kv_u32(gctx, "funasr.d_model", hp.d_model);
+        hp.n_heads = core_gguf::kv_u32(gctx, "funasr.n_heads", hp.n_heads);
+        hp.ffn_dim = core_gguf::kv_u32(gctx, "funasr.ffn_dim", hp.ffn_dim);
+        hp.n_blocks_base = core_gguf::kv_u32(gctx, "funasr.n_blocks_base", hp.n_blocks_base);
+        hp.n_blocks_tp = core_gguf::kv_u32(gctx, "funasr.n_blocks_tp", hp.n_blocks_tp);
+        hp.sanm_kernel = core_gguf::kv_u32(gctx, "funasr.sanm_kernel", hp.sanm_kernel);
+        hp.input_size = hp.n_mels * hp.lfr_m;
+        hp.head_dim = hp.d_model / hp.n_heads;
+
+        hp.ada_d_in = core_gguf::kv_u32(gctx, "funasr.ada_d_in", hp.ada_d_in);
+        hp.ada_ffn = core_gguf::kv_u32(gctx, "funasr.ada_ffn", hp.ada_ffn);
+        hp.ada_d_out = core_gguf::kv_u32(gctx, "funasr.ada_d_out", hp.ada_d_out);
+        hp.ada_n_layers = core_gguf::kv_u32(gctx, "funasr.ada_n_layers", hp.ada_n_layers);
+        // hp.ada_n_heads: deliberately NOT read from GGUF — see comment on
+        // the hparams struct member. The converter wrote 16 but the upstream
+        // adaptor uses the default 8 heads.
+        hp.ada_ffn_inner = core_gguf::kv_u32(gctx, "funasr.ada_ffn_inner", hp.ada_ffn_inner);
+        hp.ada_head_dim = hp.ada_d_out / hp.ada_n_heads;
+
+        hp.llm_n_layers = core_gguf::kv_u32(gctx, "funasr.llm.n_layers", hp.llm_n_layers);
+        hp.llm_d_model = core_gguf::kv_u32(gctx, "funasr.llm.d_model", hp.llm_d_model);
+        hp.llm_n_heads = core_gguf::kv_u32(gctx, "funasr.llm.n_heads", hp.llm_n_heads);
+        hp.llm_n_kv_heads = core_gguf::kv_u32(gctx, "funasr.llm.n_kv_heads", hp.llm_n_kv_heads);
+        hp.llm_head_dim = core_gguf::kv_u32(gctx, "funasr.llm.head_dim", hp.llm_head_dim);
+        hp.llm_ff_dim = core_gguf::kv_u32(gctx, "funasr.llm.ff_dim", hp.llm_ff_dim);
+        hp.llm_rope_theta = core_gguf::kv_f32(gctx, "funasr.llm.rope_theta", hp.llm_rope_theta);
+        hp.llm_rms_eps = core_gguf::kv_f32(gctx, "funasr.llm.rms_norm_eps", hp.llm_rms_eps);
+        hp.llm_vocab_size = core_gguf::kv_u32(gctx, "funasr.llm.vocab_size", hp.llm_vocab_size);
+        hp.llm_max_pos = core_gguf::kv_u32(gctx, "funasr.llm.max_pos", hp.llm_max_pos);
+
+        hp.eos_token_id = core_gguf::kv_u32(gctx, "funasr.eos_token_id", hp.eos_token_id);
+        hp.pad_token_id = core_gguf::kv_u32(gctx, "funasr.pad_token_id", hp.pad_token_id);
+
+        auto tokens = core_gguf::kv_str_array(gctx, "tokenizer.ggml.tokens");
+        if (!tokens.empty()) {
+            vocab.id_to_token = std::move(tokens);
+            vocab.token_to_id.reserve(vocab.id_to_token.size());
+            for (int i = 0; i < (int)vocab.id_to_token.size(); i++) {
+                vocab.token_to_id[vocab.id_to_token[(size_t)i]] = i;
+            }
+        }
+        // Qwen3 specials — written into the GGUF token list as readable
+        // names by the converter, since they're in tokenizer.json's
+        // added_tokens array. Walk the table once to find <|im_start|>
+        // / <|im_end|> so we don't hardcode the IDs.
+        auto find_id = [&](const char* s) {
+            auto it = vocab.token_to_id.find(s);
+            return it == vocab.token_to_id.end() ? -1 : (int)it->second;
+        };
+        const int ims = find_id("<|im_start|>");
+        const int ime = find_id("<|im_end|>");
+        if (ims >= 0)
+            hp.im_start_id = (uint32_t)ims;
+        if (ime >= 0)
+            hp.im_end_id = (uint32_t)ime;
+
+        auto merges = core_gguf::kv_str_array(gctx, "tokenizer.ggml.merges");
+        for (int i = 0; i < (int)merges.size(); i++)
+            vocab.merge_rank[merges[(size_t)i]] = i;
+
+        core_gguf::free_metadata(gctx);
+    }
+
+    // Pass 2: tensor data
+    core_gguf::WeightLoad wl;
+    if (!core_gguf::load_weights(path, backend, "funasr", wl))
+        return false;
+    model.ctx = wl.ctx;
+    model.buf = wl.buf;
+    model.buf_cpu = wl.buf_cpu;
+    model.tensors = std::move(wl.tensors);
+
+    const auto& hp = model.hparams;
+    const int n_enc = (int)(hp.n_blocks_base + hp.n_blocks_tp);
+    model.enc.blocks.resize((size_t)n_enc);
+    for (int i = 0; i < n_enc; i++) {
+        char buf[128];
+        auto& b = model.enc.blocks[(size_t)i];
+        auto get = [&](const char* suf) {
+            std::snprintf(buf, sizeof(buf), "funasr.enc.blk.%d.%s", i, suf);
+            return require(model, buf);
+        };
+        b.norm1_w = get("norm1.w");
+        b.norm1_b = get("norm1.b");
+        b.norm2_w = get("norm2.w");
+        b.norm2_b = get("norm2.b");
+        b.attn_qkv_w = get("attn.qkv.w");
+        b.attn_qkv_b = get("attn.qkv.b");
+        b.attn_out_w = get("attn.out.w");
+        b.attn_out_b = get("attn.out.b");
+        b.attn_fsmn_w = get("attn.fsmn.w");
+        b.ffn_l1_w = get("ffn.l1.w");
+        b.ffn_l1_b = get("ffn.l1.b");
+        b.ffn_l2_w = get("ffn.l2.w");
+        b.ffn_l2_b = get("ffn.l2.b");
+    }
+    model.enc.after_norm_w = require(model, "funasr.enc.after_norm.w");
+    model.enc.after_norm_b = require(model, "funasr.enc.after_norm.b");
+    model.enc.tp_norm_w = require(model, "funasr.enc.tp_norm.w");
+    model.enc.tp_norm_b = require(model, "funasr.enc.tp_norm.b");
+
+    // Adaptor
+    model.ada.linear1_w = require(model, "funasr.adaptor.linear1.w");
+    model.ada.linear1_b = require(model, "funasr.adaptor.linear1.b");
+    model.ada.linear2_w = require(model, "funasr.adaptor.linear2.w");
+    model.ada.linear2_b = require(model, "funasr.adaptor.linear2.b");
+    model.ada.blocks.resize((size_t)hp.ada_n_layers);
+    for (uint32_t i = 0; i < hp.ada_n_layers; i++) {
+        char buf[128];
+        auto& b = model.ada.blocks[(size_t)i];
+        auto get = [&](const char* suf) {
+            std::snprintf(buf, sizeof(buf), "funasr.adaptor.blk.%u.%s", i, suf);
+            return require(model, buf);
+        };
+        b.norm1_w = get("norm1.w");
+        b.norm1_b = get("norm1.b");
+        b.norm2_w = get("norm2.w");
+        b.norm2_b = get("norm2.b");
+        b.q_w = get("attn.q.w");
+        b.q_b = get("attn.q.b");
+        b.k_w = get("attn.k.w");
+        b.k_b = get("attn.k.b");
+        b.v_w = get("attn.v.w");
+        b.v_b = get("attn.v.b");
+        b.out_w = get("attn.out.w");
+        b.out_b = get("attn.out.b");
+        b.ffn_l1_w = get("ffn.l1.w");
+        b.ffn_l1_b = get("ffn.l1.b");
+        b.ffn_l2_w = get("ffn.l2.w");
+        b.ffn_l2_b = get("ffn.l2.b");
+    }
+
+    // LLM (Qwen3-0.6B, llama.cpp tensor naming)
+    model.llm.token_embd_w = require(model, "token_embd.weight");
+    model.llm.output_w = require(model, "output.weight");
+    model.llm.output_norm_w = require(model, "output_norm.weight");
+    model.llm.blocks.resize((size_t)hp.llm_n_layers);
+    for (uint32_t i = 0; i < hp.llm_n_layers; i++) {
+        char buf[128];
+        auto& b = model.llm.blocks[(size_t)i];
+        auto get = [&](const char* suf) {
+            std::snprintf(buf, sizeof(buf), "blk.%u.%s", i, suf);
+            return require(model, buf);
+        };
+        b.attn_norm_w = get("attn_norm.weight");
+        b.attn_q_w = get("attn_q.weight");
+        b.attn_k_w = get("attn_k.weight");
+        b.attn_v_w = get("attn_v.weight");
+        b.attn_output_w = get("attn_output.weight");
+        b.attn_q_norm_w = get("attn_q_norm.weight");
+        b.attn_k_norm_w = get("attn_k_norm.weight");
+        b.ffn_norm_w = get("ffn_norm.weight");
+        b.ffn_gate_w = get("ffn_gate.weight");
+        b.ffn_up_w = get("ffn_up.weight");
+        b.ffn_down_w = get("ffn_down.weight");
+    }
+
+    // Precompute encoder PE for up to 8192 LFR frames (~ 8 minutes).
+    compute_encoder_pe(model, 8192);
+    return true;
+}
+
+// ===========================================================================
+// Frontend — kaldi-fbank + LFR. Matches funasr.frontends.wav_frontend.WavFrontend
+// invoked with window="hamming", upsacle_samples=True, dither=0.0, snip_edges=True.
+// ===========================================================================
+
+static std::vector<float> funasr_compute_features(funasr_context* ctx, const float* pcm, int n_samples, int& T_lfr_out,
+                                                  int& D_lfr_out) {
+    const auto& hp = ctx->model.hparams;
+    core_kaldi::FbankParams fp;
+    fp.sample_rate = (int)hp.sample_rate;
+    fp.n_mels = (int)hp.n_mels;
+    fp.frame_length_ms = (int)hp.frame_length_ms;
+    fp.frame_shift_ms = (int)hp.frame_shift_ms;
+    fp.int16_scale = true;
+    fp.window_type = core_kaldi::WindowType::Hamming;
+
+    int T = 0;
+    std::vector<float> mel = core_kaldi::compute_fbank(pcm, n_samples, fp, T);
+    if (T == 0)
+        return {};
+
+    int T_lfr = 0;
+    std::vector<float> lfr = core_lfr::stack(mel.data(), T, (int)hp.n_mels, (int)hp.lfr_m, (int)hp.lfr_n, T_lfr);
+    T_lfr_out = T_lfr;
+    D_lfr_out = (int)hp.input_size;
+    return lfr;
+}
+
+// ===========================================================================
+// Encoder + adaptor compute graph
+//
+// Built as a single graph from (T_lfr, 560) features → (T_lfr, 1024) adaptor
+// output. The stage-capture mechanism wires a named ggml_dup snap inside
+// the loop so the diff harness can pull intermediate activations back out.
+// ===========================================================================
+
+static ggml_tensor* maybe_snap(ggml_context* ctx0, ggml_cgraph* gf, ggml_tensor* t, const std::string& want,
+                               const char* name) {
+    // Snap = a named contiguous copy that the scheduler can't fold away.
+    // Always emit (cheap on Metal/CPU), so the diff harness gets the same
+    // graph as production.
+    ggml_tensor* s = ggml_dup(ctx0, t);
+    ggml_set_name(s, name);
+    ggml_build_forward_expand(gf, s);
+    (void)want;
+    return t;
+}
+
+static ggml_cgraph* funasr_build_graph_features(funasr_context* ctx, int T_lfr) {
+    const auto& hp = ctx->model.hparams;
+    const int D_in = (int)hp.input_size;
+    const int D = (int)hp.d_model;
+
+    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
+
+    // ---- inputs ----
+    // mel_in: (D_in, T_lfr) F32 — written by the caller from the LFR output.
+    ggml_tensor* mel_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D_in, T_lfr);
+    ggml_set_name(mel_in, "mel_features");
+    ggml_set_input(mel_in);
+
+    // pe_in: (D_in, T_lfr) F32 — written from precomputed model.enc_pe.
+    ggml_tensor* pe_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D_in, T_lfr);
+    ggml_set_name(pe_in, "enc_pe");
+    ggml_set_input(pe_in);
+
+    // Mel + sqrt(d_model) scale + PE.
+    ggml_tensor* cur = ggml_scale(ctx0, mel_in, std::sqrt((float)D));
+    cur = ggml_add(ctx0, cur, pe_in);
+
+    // ---- Encoder blocks 0..69 ----
+    const int n_base = (int)hp.n_blocks_base;
+    const int n_tp = (int)hp.n_blocks_tp;
+    const int K = (int)hp.sanm_kernel;
+    const int n_heads = (int)hp.n_heads;
+    const int hd = (int)hp.head_dim;
+
+    for (int i = 0; i < n_base + n_tp; i++) {
+        const auto& src = ctx->model.enc.blocks[(size_t)i];
+        core_sanm::BlockWeights w;
+        w.norm1_w = src.norm1_w;
+        w.norm1_b = src.norm1_b;
+        w.norm2_w = src.norm2_w;
+        w.norm2_b = src.norm2_b;
+        w.attn_qkv_w = src.attn_qkv_w;
+        w.attn_qkv_b = src.attn_qkv_b;
+        w.attn_out_w = src.attn_out_w;
+        w.attn_out_b = src.attn_out_b;
+        w.attn_fsmn_w = src.attn_fsmn_w;
+        w.ffn_l1_w = src.ffn_l1_w;
+        w.ffn_l1_b = src.ffn_l1_b;
+        w.ffn_l2_w = src.ffn_l2_w;
+        w.ffn_l2_b = src.ffn_l2_b;
+
+        core_sanm::BlockParams p;
+        // Block 0 has in_size=560, all others in_size=512.
+        p.in_size = (i == 0) ? D_in : D;
+        p.size = D;
+        p.n_heads = n_heads;
+        p.head_dim = hd;
+        p.kernel = K;
+        p.ln_eps = hp.enc_ln_eps;
+        p.flash_attn = ctx->enc_flash_attn;
+
+        const bool attn_residual = (p.in_size == p.size);
+        cur = core_sanm::build_block(ctx0, cur, T_lfr, w, p, attn_residual);
+
+        // Stage snap per layer (named "encoder_layer_K").
+        char nm[32];
+        std::snprintf(nm, sizeof(nm), "encoder_layer_%d", i);
+        cur = maybe_snap(ctx0, gf, cur, ctx->requested_stage, nm);
+
+        // After the last base block, apply after_norm — matches
+        // SenseVoiceEncoderSmall.forward.
+        if (i == n_base - 1) {
+            cur = ggml_norm_affine(ctx0, cur, ctx->model.enc.after_norm_w, ctx->model.enc.after_norm_b, hp.enc_ln_eps);
+            cur = maybe_snap(ctx0, gf, cur, ctx->requested_stage, "encoder_main_out");
+        }
+    }
+    // Final tp_norm.
+    cur = ggml_norm_affine(ctx0, cur, ctx->model.enc.tp_norm_w, ctx->model.enc.tp_norm_b, hp.enc_ln_eps);
+    cur = maybe_snap(ctx0, gf, cur, ctx->requested_stage, "encoder_output");
+
+    // ---- audio_adaptor prelude: linear1 + ReLU + linear2 ----
+    const int D_ada = (int)hp.ada_d_out;
+    auto mm_bias = [&](ggml_tensor* W, ggml_tensor* x, ggml_tensor* b) {
+        ggml_tensor* y = ggml_mul_mat(ctx0, W, x);
+        return b ? ggml_add(ctx0, y, b) : y;
+    };
+    cur = mm_bias(ctx->model.ada.linear1_w, cur, ctx->model.ada.linear1_b);
+    cur = ggml_relu(ctx0, cur);
+    cur = mm_bias(ctx->model.ada.linear2_w, cur, ctx->model.ada.linear2_b);
+    // cur is now (D_ada=1024, T_lfr)
+
+    // ---- 2 Transformer blocks (separate Q/K/V, FFN inner=256, LN eps=1e-12) ----
+    for (uint32_t li = 0; li < hp.ada_n_layers; li++) {
+        const auto& b = ctx->model.ada.blocks[(size_t)li];
+        const int ah = (int)hp.ada_n_heads;
+        const int ahd = (int)hp.ada_head_dim;
+        const float ascale = 1.0f / std::sqrt((float)ahd);
+
+        // pre-norm self-attention
+        ggml_tensor* residual = cur;
+        ggml_tensor* x = ggml_norm_affine(ctx0, cur, b.norm1_w, b.norm1_b, hp.ada_ln_eps);
+
+        ggml_tensor* Q = mm_bias(b.q_w, x, b.q_b);
+        ggml_tensor* K_ = mm_bias(b.k_w, x, b.k_b);
+        ggml_tensor* V = mm_bias(b.v_w, x, b.v_b);
+
+        Q = ggml_reshape_3d(ctx0, Q, ahd, ah, T_lfr);
+        K_ = ggml_reshape_3d(ctx0, K_, ahd, ah, T_lfr);
+        V = ggml_reshape_3d(ctx0, V, ahd, ah, T_lfr);
+        Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
+        K_ = ggml_cont(ctx0, ggml_permute(ctx0, K_, 0, 2, 1, 3));
+        V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
+
+        ggml_tensor* attn;
+        if (ctx->enc_flash_attn) {
+            // Same fused kernel as the SANM block — bidirectional encoder
+            // attention, no mask, scale = 1/sqrt(head_dim).
+            attn = ggml_flash_attn_ext(ctx0, Q, K_, V, /*mask*/ nullptr, ascale, 0.0f, 0.0f);
+            attn = ggml_reshape_2d(ctx0, attn, D_ada, T_lfr);
+        } else {
+            ggml_tensor* scores = ggml_mul_mat(ctx0, K_, Q);
+            scores = ggml_soft_max_ext(ctx0, scores, nullptr, ascale, 0.0f);
+            ggml_tensor* V_p = ggml_cont(ctx0, ggml_permute(ctx0, V, 1, 0, 2, 3));
+            attn = ggml_mul_mat(ctx0, V_p, scores);
+            attn = ggml_cont(ctx0, ggml_permute(ctx0, attn, 0, 2, 1, 3));
+            attn = ggml_reshape_2d(ctx0, attn, D_ada, T_lfr);
+        }
+        attn = mm_bias(b.out_w, attn, b.out_b);
+        cur = ggml_add(ctx0, residual, attn);
+
+        // pre-norm FFN
+        ggml_tensor* res2 = cur;
+        x = ggml_norm_affine(ctx0, cur, b.norm2_w, b.norm2_b, hp.ada_ln_eps);
+        x = mm_bias(b.ffn_l1_w, x, b.ffn_l1_b);
+        x = ggml_relu(ctx0, x);
+        x = mm_bias(b.ffn_l2_w, x, b.ffn_l2_b);
+        cur = ggml_add(ctx0, res2, x);
+
+        char nm[32];
+        std::snprintf(nm, sizeof(nm), "audio_adaptor_layer_%u", li);
+        cur = maybe_snap(ctx0, gf, cur, ctx->requested_stage, nm);
+    }
+
+    ggml_set_name(cur, "audio_adaptor_output");
+    ggml_build_forward_expand(gf, cur);
+    ggml_free(ctx0);
+    return gf;
+}
+
+// Run the encoder+adaptor graph and return (T_lfr, ada_d_out) F32 row-major.
+// Stage snaps are pulled out by funasr_extract_stage from the same graph.
+static std::vector<float> funasr_run_encoder_adaptor(funasr_context* ctx, const std::vector<float>& lfr, int T_lfr,
+                                                     int D_lfr, std::vector<float>* stage_out, const char* stage_name) {
+    const auto& hp = ctx->model.hparams;
+    const int D_ada = (int)hp.ada_d_out;
+    if (T_lfr <= 0)
+        return {};
+    if (T_lfr > ctx->model.enc_pe_max_T) {
+        // Lazy-extend PE if a very long clip was supplied.
+        compute_encoder_pe(ctx->model, T_lfr + 256);
+    }
+
+    ggml_cgraph* gf = funasr_build_graph_features(ctx, T_lfr);
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        std::fprintf(stderr, "funasr: failed to alloc encoder graph\n");
+        return {};
+    }
+
+    ggml_tensor* mel_in = ggml_graph_get_tensor(gf, "mel_features");
+    ggml_backend_tensor_set(mel_in, lfr.data(), 0, (size_t)D_lfr * (size_t)T_lfr * sizeof(float));
+    ggml_tensor* pe_in = ggml_graph_get_tensor(gf, "enc_pe");
+    ggml_backend_tensor_set(pe_in, ctx->model.enc_pe.data(), 0, (size_t)D_lfr * (size_t)T_lfr * sizeof(float));
+
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "funasr: encoder graph compute failed\n");
+        return {};
+    }
+
+    if (stage_out && stage_name && std::strcmp(stage_name, "mel_features") == 0) {
+        stage_out->assign(lfr.begin(), lfr.begin() + (ptrdiff_t)D_lfr * T_lfr);
+    } else if (stage_out && stage_name) {
+        ggml_tensor* t = ggml_graph_get_tensor(gf, stage_name);
+        if (t) {
+            const size_t n = ggml_nelements(t);
+            stage_out->assign((size_t)n, 0.0f);
+            ggml_backend_tensor_get(t, stage_out->data(), 0, n * sizeof(float));
+        }
+    }
+
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "audio_adaptor_output");
+    const size_t total = (size_t)D_ada * (size_t)T_lfr;
+    std::vector<float> result((size_t)total, 0.0f);
+    ggml_backend_tensor_get(out, result.data(), 0, total * sizeof(float));
+    return result;
+}
+
+// ===========================================================================
+// Prompt builder
+//
+// The upstream prompt (FunASRNano.inference + data_load_speech +
+// generate_chatml) is:
+//
+//   <|im_start|>system
+//   You are a helpful assistant.<|im_end|>
+//   <|im_start|>user
+//   {get_prompt(hotwords=[], language=None, itn=True)}<|startofspeech|>!!<|endofspeech|><|im_end|>
+//   <|im_start|>assistant
+//
+// where get_prompt(...) returns "语音转写：" (no hotwords, no language
+// specifier, with ITN). The <|startofspeech|>...<|endofspeech|> chunk is
+// STRIPPED before tokenization (regex split keeps the marker as its own
+// segment but data_load_speech replaces the markers with zero placeholder
+// tokens — see fun_asr_nano/model.py:371-413). The final token sequence
+// is:
+//
+//   tokenize("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+//            "<|im_start|>user\n语音转写：")
+//   + [0] * fake_token_len
+//   + tokenize("<|im_end|>\n<|im_start|>assistant\n")
+//
+// fake_token_len comes from use_low_frame_rate=True at training time —
+// three Conv1d(k=3, s=2, p=1) downsamples + a final //2+1, applied to
+// T_lfr. The adaptor itself produces T_lfr frames (downsample_rate=1);
+// only the first fake_token_len are spliced into the prompt.
+// ===========================================================================
+
+static int compute_fake_token_len(int T_lfr, bool use_low_frame_rate) {
+    if (!use_low_frame_rate)
+        return T_lfr;
+    int o = T_lfr;
+    o = (o - 1) / 2 + 1;
+    o = (o - 1) / 2 + 1;
+    o = (o - 1) / 2 + 1;
+    return o;
+}
+// ===========================================================================
+// BPE tokenize (GPT-2 byte-level, Qwen3-compatible). Adapted from
+// qwen3_asr.cpp::qwen3_asr_tokenize but kept local — we don't link in
+// qwen3_asr's context (it requires audio.* tensors we don't ship).
+// ===========================================================================
+
+static std::vector<int32_t> funasr_bpe_encode(const funasr_vocab& v, const std::string& s) {
+    std::vector<int32_t> result;
+    size_t i = 0;
+    while (i < s.size()) {
+        if (s[i] == '<' && i + 1 < s.size() && s[i + 1] == '|') {
+            size_t end = s.find("|>", i + 2);
+            if (end != std::string::npos) {
+                std::string special = s.substr(i, end + 2 - i);
+                auto it = v.token_to_id.find(special);
+                if (it != v.token_to_id.end()) {
+                    result.push_back(it->second);
+                    i = end + 2;
+                    continue;
+                }
+            }
+        }
+        size_t j = i;
+        if (s[j] == '<' && j + 1 < s.size() && s[j + 1] == '|')
+            j++;
+        while (j < s.size()) {
+            if (s[j] == '<' && j + 1 < s.size() && s[j + 1] == '|') {
+                size_t end = s.find("|>", j + 2);
+                if (end != std::string::npos) {
+                    std::string special = s.substr(j, end + 2 - j);
+                    if (v.token_to_id.find(special) != v.token_to_id.end())
+                        break;
+                }
+            }
+            j++;
+        }
+        std::string chunk = s.substr(i, j - i);
+        i = j;
+        if (chunk.empty())
+            continue;
+        size_t k = 0;
+        while (k < chunk.size()) {
+            size_t start = k;
+            if (chunk[k] == ' ' || chunk[k] == '\t' || chunk[k] == '\n')
+                k++;
+            while (k < chunk.size() && chunk[k] != ' ' && chunk[k] != '\t' && chunk[k] != '\n') {
+                k++;
+            }
+            if (k == start)
+                k++;
+            std::string pre(chunk, start, k - start);
+            std::string encoded = core_bpe::bytes_to_unicode(pre.data(), pre.size());
+            core_bpe::bpe_one(v.token_to_id, v.merge_rank, encoded, result);
+        }
+    }
+    return result;
+}
+
+// Decode token IDs back to UTF-8. The GGUF stores Qwen3's vocab in
+// byte-encoded form (the GPT-2 byte→unicode roundtrip), so we reverse
+// that mapping on each codepoint.
+static std::string funasr_decode_token(const funasr_vocab& v, int id) {
+    if (id < 0 || id >= (int)v.id_to_token.size())
+        return "";
+    const std::string& s = v.id_to_token[(size_t)id];
+    // Build the reverse byte_decoder lazily.
+    static thread_local std::unordered_map<int, unsigned char> dec;
+    if (dec.empty()) {
+        const auto& enc = core_bpe::byte_encoder();
+        for (int b = 0; b < 256; b++)
+            dec[enc[b]] = (unsigned char)b;
+    }
+
+    std::string out;
+    out.reserve(s.size());
+    // Decode UTF-8 codepoints in s and look each one up in dec.
+    size_t i = 0;
+    while (i < s.size()) {
+        uint32_t cp = 0;
+        unsigned char c = (unsigned char)s[i];
+        int adv = 1;
+        if (c < 0x80) {
+            cp = c;
+        } else if ((c & 0xE0) == 0xC0 && i + 1 < s.size()) {
+            cp = ((c & 0x1F) << 6) | ((unsigned char)s[i + 1] & 0x3F);
+            adv = 2;
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < s.size()) {
+            cp = ((c & 0x0F) << 12) | (((unsigned char)s[i + 1] & 0x3F) << 6) | ((unsigned char)s[i + 2] & 0x3F);
+            adv = 3;
+        } else if ((c & 0xF8) == 0xF0 && i + 3 < s.size()) {
+            cp = ((c & 0x07) << 18) | (((unsigned char)s[i + 1] & 0x3F) << 12) |
+                 (((unsigned char)s[i + 2] & 0x3F) << 6) | ((unsigned char)s[i + 3] & 0x3F);
+            adv = 4;
+        }
+        auto it = dec.find((int)cp);
+        if (it != dec.end())
+            out.push_back((char)it->second);
+        // Specials and non-roundtripped codepoints (unlikely for valid Qwen3 tokens) are dropped.
+        i += adv;
+    }
+    return out;
+}
+
+// ===========================================================================
+// LLM forward graph (KV-cached). Single-token decode and multi-token prefill
+// share the same builder.
+// ===========================================================================
+
+static ggml_cgraph* funasr_build_graph_llm_kv(funasr_context* ctx, int n_past, int n_tokens) {
+    const auto& m = ctx->model;
+    const auto& hp = m.hparams;
+    const int d = (int)hp.llm_d_model;
+    const int n_q = (int)hp.llm_n_heads;
+    const int n_kv = (int)hp.llm_n_kv_heads;
+    const int hd = (int)hp.llm_head_dim;
+    const int n_kv_grp = n_q / n_kv;
+    const float eps = hp.llm_rms_eps;
+    const float theta = hp.llm_rope_theta;
+    const float attn_scale = 1.0f / std::sqrt((float)hd);
+    const int T = n_tokens;
+    const int Lk = n_past + T;
+
+    GGML_ASSERT(ctx->kv_k && ctx->kv_v);
+    GGML_ASSERT(Lk <= ctx->kv_max_ctx);
+
+    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
+
+    ggml_tensor* embeds = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, T);
+    ggml_set_name(embeds, "inputs_embeds");
+    ggml_set_input(embeds);
+
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_name(positions, "positions");
+    ggml_set_input(positions);
+
+    ggml_tensor* causal_mask = nullptr;
+    if (T > 1) {
+        causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, Lk, T);
+        ggml_set_name(causal_mask, "causal_mask");
+        ggml_set_input(causal_mask);
+    }
+
+    ggml_tensor* cur = embeds;
+
+    const core_attn::KvSelfAttnParams kvp = {
+        /*n_heads*/ n_q,
+        /*n_kv_heads*/ n_kv,
+        /*head_dim*/ hd,
+        /*n_kv_grp*/ n_kv_grp,
+        /*n_ctx_orig*/ (int)hp.llm_max_pos,
+        /*rope_theta*/ theta,
+        /*rope_beta_fast*/ 32.0f,
+        /*rope_beta_slow*/ 1.0f,
+        /*attn_scale*/ attn_scale,
+        /*qk_norm_eps*/ eps,
+        /*gqa_mode*/ core_attn::GQA_MANUAL_CONT,
+    };
+
+    for (uint32_t il = 0; il < hp.llm_n_layers; il++) {
+        const auto& b = m.llm.blocks[il];
+        ggml_tensor* residual = cur;
+
+        ggml_tensor* x = ggml_rms_norm(ctx0, cur, eps);
+        x = ggml_mul(ctx0, x, b.attn_norm_w);
+
+        ggml_tensor* attn = core_attn::kv_self_attn(
+            ctx0, gf, x, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_output_w, b.attn_q_norm_w, b.attn_k_norm_w,
+            positions, (T == 1) ? nullptr : causal_mask, ctx->kv_k, ctx->kv_v, (int)il, n_past, kvp);
+        cur = ggml_add(ctx0, residual, attn);
+
+        residual = cur;
+        x = ggml_rms_norm(ctx0, cur, eps);
+        x = ggml_mul(ctx0, x, b.ffn_norm_w);
+        ggml_tensor* mlp = core_ffn::swiglu(ctx0, x, b.ffn_gate_w, b.ffn_up_w, b.ffn_down_w);
+        cur = ggml_add(ctx0, residual, mlp);
+    }
+
+    cur = ggml_rms_norm(ctx0, cur, eps);
+    cur = ggml_mul(ctx0, cur, m.llm.output_norm_w);
+
+    // Last-token-only lm_head — decode loop only needs next-token logits.
+    if (T > 1) {
+        cur = ggml_view_2d(ctx0, cur, d, 1, cur->nb[1], (size_t)(T - 1) * cur->nb[1]);
+    }
+    cur = ggml_mul_mat(ctx0, m.llm.output_w, cur);
+    ggml_set_name(cur, "logits");
+    ggml_build_forward_expand(gf, cur);
+    ggml_free(ctx0);
+    return gf;
+}
+
+// ===========================================================================
+// Embedding lookup graph — input_ids → (d, T) inputs_embeds via token_embd.
+// ===========================================================================
+
+static ggml_cgraph* funasr_build_graph_embed(funasr_context* ctx, int n_tokens) {
+    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 64, false);
+    ggml_tensor* ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(ids, "input_ids");
+    ggml_set_input(ids);
+    ggml_tensor* out = ggml_get_rows(ctx0, ctx->model.llm.token_embd_w, ids);
+    ggml_set_name(out, "embeds");
+    ggml_build_forward_expand(gf, out);
+    ggml_free(ctx0);
+    return gf;
+}
+
+// ===========================================================================
+// KV-cache init / reset
+// ===========================================================================
+
+static bool funasr_kv_init(funasr_context* ctx, int max_ctx) {
+    if (!ctx || max_ctx <= 0)
+        return false;
+    if (ctx->kv_k && ctx->kv_max_ctx >= max_ctx)
+        return true;
+    if (ctx->kv_buf) {
+        ggml_backend_buffer_free(ctx->kv_buf);
+        ctx->kv_buf = nullptr;
+    }
+    if (ctx->kv_ctx) {
+        ggml_free(ctx->kv_ctx);
+        ctx->kv_ctx = nullptr;
+    }
+    const auto& hp = ctx->model.hparams;
+    const int hd = (int)hp.llm_head_dim;
+    const int n_kv = (int)hp.llm_n_kv_heads;
+    const int n_lay = (int)hp.llm_n_layers;
+
+    ggml_init_params kp = {ggml_tensor_overhead() * 4 + 1024, nullptr, true};
+    ctx->kv_ctx = ggml_init(kp);
+    const auto kv_pair = core_attn::kv_dtype_pair_from_env("funasr");
+    ctx->kv_k = ggml_new_tensor_4d(ctx->kv_ctx, kv_pair.k, hd, max_ctx, n_kv, n_lay);
+    ctx->kv_v = ggml_new_tensor_4d(ctx->kv_ctx, kv_pair.v, hd, max_ctx, n_kv, n_lay);
+    ggml_set_name(ctx->kv_k, "kv_k");
+    ggml_set_name(ctx->kv_v, "kv_v");
+    const size_t kbytes = ggml_nbytes(ctx->kv_k);
+    const size_t vbytes = ggml_nbytes(ctx->kv_v);
+    ggml_backend_t kv_backend = core_attn::kv_backend_from_env(ctx->backend, ctx->backend_cpu, "funasr");
+    ctx->kv_buf = ggml_backend_alloc_buffer(kv_backend, kbytes + vbytes);
+    if (!ctx->kv_buf) {
+        std::fprintf(stderr, "funasr: failed to allocate kv buffer\n");
+        return false;
+    }
+    char* base = (char*)ggml_backend_buffer_get_base(ctx->kv_buf);
+    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_k, base);
+    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_v, base + kbytes);
+    ctx->kv_max_ctx = max_ctx;
+    return true;
+}
+
+// ===========================================================================
+// Run the LLM once. n_past=0 + n_tokens=T_prompt = prefill; subsequent
+// calls with n_tokens=1 are the per-step decode.
+// ===========================================================================
+
+static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* inputs_embeds, int n_tokens,
+                                              int n_past) {
+    const auto& hp = ctx->model.hparams;
+    const int d = (int)hp.llm_d_model;
+    const int vocab = (int)hp.llm_vocab_size;
+    const int Lk = n_past + n_tokens;
+
+    std::vector<int32_t> positions((size_t)n_tokens);
+    for (int i = 0; i < n_tokens; i++)
+        positions[(size_t)i] = n_past + i;
+
+    std::vector<ggml_fp16_t> mask;
+    if (n_tokens > 1) {
+        const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t ninf_h = ggml_fp32_to_fp16(-INFINITY);
+        mask.assign((size_t)Lk * (size_t)n_tokens, zero_h);
+        for (int q = 0; q < n_tokens; q++)
+            for (int k = n_past + q + 1; k < Lk; k++)
+                mask[(size_t)q * Lk + k] = ninf_h;
+    }
+
+    ggml_cgraph* gf = funasr_build_graph_llm_kv(ctx, n_past, n_tokens);
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        std::fprintf(stderr, "funasr: failed to alloc llm graph\n");
+        return {};
+    }
+    ggml_tensor* embeds_in = ggml_graph_get_tensor(gf, "inputs_embeds");
+    ggml_backend_tensor_set(embeds_in, inputs_embeds, 0, (size_t)d * n_tokens * sizeof(float));
+    ggml_tensor* pos_in = ggml_graph_get_tensor(gf, "positions");
+    ggml_backend_tensor_set(pos_in, positions.data(), 0, positions.size() * sizeof(int32_t));
+    if (n_tokens > 1) {
+        ggml_tensor* mask_in = ggml_graph_get_tensor(gf, "causal_mask");
+        ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    }
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "funasr: llm graph compute failed\n");
+        return {};
+    }
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "logits");
+    std::vector<float> result((size_t)vocab, 0.0f);
+    ggml_backend_tensor_get(out, result.data(), 0, (size_t)vocab * sizeof(float));
+    return result;
+}
+
+// Get the inputs_embeds for an arbitrary token sequence via the model's
+// token_embd table (shared with output.weight thanks to Qwen3 tied embeddings).
+static std::vector<float> funasr_embed_tokens(funasr_context* ctx, const std::vector<int32_t>& ids) {
+    const int n = (int)ids.size();
+    const int d = (int)ctx->model.hparams.llm_d_model;
+    ggml_cgraph* gf = funasr_build_graph_embed(ctx, n);
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        std::fprintf(stderr, "funasr: failed to alloc embed graph\n");
+        return {};
+    }
+    ggml_tensor* ids_in = ggml_graph_get_tensor(gf, "input_ids");
+    ggml_backend_tensor_set(ids_in, ids.data(), 0, (size_t)n * sizeof(int32_t));
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "funasr: embed graph compute failed\n");
+        return {};
+    }
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "embeds");
+    std::vector<float> result((size_t)d * (size_t)n, 0.0f);
+    ggml_backend_tensor_get(out, result.data(), 0, (size_t)d * (size_t)n * sizeof(float));
+    return result;
+}
+
+// ===========================================================================
+// High-level pipeline: build prompt, splice audio, run AR decode → text.
+// ===========================================================================
+
+static const char* PROMPT_PREFIX = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
+                                   "\xE8\xAF\xAD\xE9\x9F\xB3\xE8\xBD\xAC\xE5\x86\x99\xEF\xBC\x9A"; // "语音转写："
+static const char* PROMPT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n";
+
+static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm, int n_samples,
+                                          std::vector<float>* stage_out, const char* stage_name) {
+    const auto& hp = ctx->model.hparams;
+
+    int T_lfr = 0, D_lfr = 0;
+    std::vector<float> lfr;
+    {
+        funasr_bench_stage s("fbank+lfr");
+        lfr = funasr_compute_features(ctx, pcm, n_samples, T_lfr, D_lfr);
+    }
+    if (T_lfr <= 0)
+        return "";
+    if (stage_out && stage_name && std::strcmp(stage_name, "mel_features") == 0) {
+        stage_out->assign(lfr.begin(), lfr.begin() + (ptrdiff_t)D_lfr * T_lfr);
+        return ""; // mel-only request — short-circuit
+    }
+
+    std::vector<float> adaptor_out;
+    {
+        funasr_bench_stage s("enc+ada_compute");
+        adaptor_out = funasr_run_encoder_adaptor(ctx, lfr, T_lfr, D_lfr, stage_out, stage_name);
+    }
+    if (adaptor_out.empty())
+        return "";
+    if (stage_out && stage_name &&
+        (std::strncmp(stage_name, "encoder_", 8) == 0 || std::strncmp(stage_name, "audio_adaptor_", 14) == 0)) {
+        return "";
+    }
+
+    // Build the prompt.
+    std::vector<int32_t> prefix_ids;
+    std::vector<int32_t> suffix_ids;
+    {
+        funasr_bench_stage s("prompt_tokenize");
+        prefix_ids = funasr_bpe_encode(ctx->vocab, PROMPT_PREFIX);
+        suffix_ids = funasr_bpe_encode(ctx->vocab, PROMPT_SUFFIX);
+    }
+    const int fake_token_len = compute_fake_token_len(T_lfr, hp.use_low_frame_rate);
+    const int fbank_beg = (int)prefix_ids.size();
+    const int total_prompt = (int)prefix_ids.size() + fake_token_len + (int)suffix_ids.size();
+    std::vector<int32_t> ids((size_t)total_prompt, 0);
+    std::copy(prefix_ids.begin(), prefix_ids.end(), ids.begin());
+    std::copy(suffix_ids.begin(), suffix_ids.end(), ids.begin() + fbank_beg + fake_token_len);
+
+    // Embed the prompt and splice in the (truncated) adaptor output.
+    std::vector<float> inputs_embeds;
+    {
+        funasr_bench_stage s("embed");
+        inputs_embeds = funasr_embed_tokens(ctx, ids);
+        if (inputs_embeds.empty())
+            return "";
+        const int d = (int)hp.llm_d_model;
+        const int D_ada = (int)hp.ada_d_out;
+        GGML_ASSERT(d == D_ada);
+        // adaptor_out is (D_ada, T_lfr) row-major (column-major in PyTorch —
+        // here adaptor_out[t*D_ada + i] is row t, col i). Splice is by row.
+        for (int t = 0; t < fake_token_len && t < T_lfr; t++) {
+            std::memcpy(inputs_embeds.data() + (size_t)(fbank_beg + t) * d, adaptor_out.data() + (size_t)t * D_ada,
+                        (size_t)d * sizeof(float));
+        }
+    }
+    const int d = (int)hp.llm_d_model;
+
+    // KV cache sized for prompt + up to max_new_tokens.
+    const int max_new_tokens = 512;
+    {
+        funasr_bench_stage s("kv_init");
+        if (!funasr_kv_init(ctx, std::max(2048, total_prompt + max_new_tokens + 16))) {
+            std::fprintf(stderr, "funasr: kv_init failed\n");
+            return "";
+        }
+    }
+
+    // Prefill — feed the entire prompt at n_past=0; we get only the last
+    // token's logits back from the slice in build_graph_llm_kv.
+    std::vector<float> logits;
+    {
+        funasr_bench_stage s("llm_prefill");
+        logits = funasr_run_llm_step(ctx, inputs_embeds.data(), total_prompt, 0);
+    }
+    if (logits.empty())
+        return "";
+
+    auto argmax = [](const std::vector<float>& v) {
+        int best = 0;
+        float bv = v[0];
+        for (int i = 1; i < (int)v.size(); i++) {
+            if (v[i] > bv) {
+                bv = v[i];
+                best = i;
+            }
+        }
+        return best;
+    };
+    std::vector<int32_t> generated;
+    int next_id = argmax(logits);
+    int n_past = total_prompt;
+    auto decode_t0 = std::chrono::steady_clock::now();
+    for (int step = 0; step < max_new_tokens && next_id != (int)hp.eos_token_id; step++) {
+        generated.push_back(next_id);
+        std::vector<float> step_embed = funasr_embed_tokens(ctx, {next_id});
+        if (step_embed.empty())
+            break;
+        logits = funasr_run_llm_step(ctx, step_embed.data(), 1, n_past);
+        if (logits.empty())
+            break;
+        n_past += 1;
+        next_id = argmax(logits);
+    }
+    if (funasr_bench_enabled()) {
+        auto decode_t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(decode_t1 - decode_t0).count();
+        const int n_steps = (int)generated.size();
+        std::fprintf(stderr, "  funasr_bench: %-22s %.2f ms  (%d tokens, %.2f ms/tok)\n", "llm_decode_total", ms,
+                     n_steps, n_steps > 0 ? ms / n_steps : 0.0);
+    }
+    (void)d;
+
+    // Detokenize, skipping any special tokens that survived.
+    std::string out;
+    for (int id : generated) {
+        const std::string& tok = ctx->vocab.id_to_token[(size_t)id];
+        // Skip ChatML / special markers — Qwen3's tokenizer.batch_decode does
+        // this with skip_special_tokens=True by default.
+        if (tok.size() >= 2 && tok[0] == '<' && tok[1] == '|')
+            continue;
+        out += funasr_decode_token(ctx->vocab, id);
+    }
+    return out;
+}
+
+// ===========================================================================
+// Public API
+// ===========================================================================
+
+extern "C" funasr_context_params funasr_context_default_params(void) {
+    funasr_context_params p = {};
+    p.n_threads = 4;
+    p.verbosity = 1;
+    p.use_gpu = true;
+    return p;
+}
+
+extern "C" funasr_context* funasr_init_from_file(const char* path, funasr_context_params params) {
+    funasr_context* ctx = new funasr_context();
+    ctx->params = params;
+    ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
+
+    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    if (!ctx->backend)
+        ctx->backend = ggml_backend_cpu_init();
+    ctx->backend_cpu = ggml_backend_cpu_init();
+    if (ctx->backend_cpu)
+        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (ggml_backend_is_cpu(ctx->backend))
+        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+
+    if (!funasr_load_model(ctx->model, ctx->vocab, path, ctx->backend, ctx->backend_cpu)) {
+        delete ctx;
+        return nullptr;
+    }
+
+    {
+        int n_be = 0;
+        ggml_backend_t backends[2];
+        backends[n_be++] = ctx->backend;
+        if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
+            backends[n_be++] = ctx->backend_cpu;
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+    }
+    ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
+
+    // FA opt-out: keep the historical mul_mat + soft_max_ext path for
+    // regression diffing. The default ON path matches the parakeet /
+    // qwen3-asr default; FUNASR_NO_FA=1 reverts to the original kernel
+    // sequence.
+    if (const char* s = std::getenv("FUNASR_NO_FA")) {
+        if (*s && *s != '0')
+            ctx->enc_flash_attn = false;
+    }
+
+    if (params.verbosity >= 1) {
+        std::fprintf(stderr, "funasr: loaded %s  (enc %u blocks + tp %u blocks, adaptor %u, llm %u, vocab %u, fa=%s)\n",
+                     path, ctx->model.hparams.n_blocks_base, ctx->model.hparams.n_blocks_tp,
+                     ctx->model.hparams.ada_n_layers, ctx->model.hparams.llm_n_layers,
+                     (uint32_t)ctx->vocab.id_to_token.size(), ctx->enc_flash_attn ? "on" : "off");
+    }
+    return ctx;
+}
+
+extern "C" void funasr_free(funasr_context* ctx) {
+    if (!ctx)
+        return;
+    if (ctx->sched)
+        ggml_backend_sched_free(ctx->sched);
+    if (ctx->kv_buf)
+        ggml_backend_buffer_free(ctx->kv_buf);
+    if (ctx->kv_ctx)
+        ggml_free(ctx->kv_ctx);
+    if (ctx->model.buf)
+        ggml_backend_buffer_free(ctx->model.buf);
+    if (ctx->model.buf_cpu)
+        ggml_backend_buffer_free(ctx->model.buf_cpu);
+    if (ctx->model.ctx)
+        ggml_free(ctx->model.ctx);
+    if (ctx->backend)
+        ggml_backend_free(ctx->backend);
+    if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
+        ggml_backend_free(ctx->backend_cpu);
+    delete ctx;
+}
+
+extern "C" char* funasr_transcribe(funasr_context* ctx, const float* samples, int n_samples) {
+    if (!ctx || !samples || n_samples <= 0)
+        return nullptr;
+    std::string s = funasr_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr);
+    char* out = (char*)std::malloc(s.size() + 1);
+    if (!out)
+        return nullptr;
+    std::memcpy(out, s.data(), s.size());
+    out[s.size()] = '\0';
+    return out;
+}
+
+extern "C" float* funasr_extract_stage(funasr_context* ctx, const float* samples, int n_samples, const char* stage_name,
+                                       int* n_out) {
+    if (n_out)
+        *n_out = 0;
+    if (!ctx || !samples || n_samples <= 0 || !stage_name)
+        return nullptr;
+    ctx->requested_stage = stage_name;
+
+    if (std::strcmp(stage_name, "generated_text") == 0) {
+        std::string txt = funasr_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr);
+        char* buf = (char*)std::malloc(txt.size() + 1);
+        if (!buf)
+            return nullptr;
+        std::memcpy(buf, txt.data(), txt.size());
+        buf[txt.size()] = '\0';
+        if (n_out)
+            *n_out = (int)txt.size();
+        return (float*)buf; // caller casts back to char*
+    }
+
+    std::vector<float> staged;
+    (void)funasr_transcribe_impl(ctx, samples, n_samples, &staged, stage_name);
+    if (staged.empty())
+        return nullptr;
+    float* out = (float*)std::malloc(staged.size() * sizeof(float));
+    if (!out)
+        return nullptr;
+    std::memcpy(out, staged.data(), staged.size() * sizeof(float));
+    if (n_out)
+        *n_out = (int)staged.size();
+    return out;
+}

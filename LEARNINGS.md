@@ -5426,3 +5426,126 @@ Each commit was small, single-purpose, validated by the diff
 harness before the next one started. If we'd tried to land
 "VAE graph + LocDiT graph + Metal + caching + buckets" in one
 go we'd still be debugging.
+
+---
+
+## voxcpm2 VAE — Python wrapper that captures kwargs without forwarding (May 2026)
+
+This bit hard. The voxcpm `CausalTransposeConv1d` class in
+`audio_vae_v2.py` defines:
+
+```python
+class CausalTransposeConv1d(nn.ConvTranspose1d):
+    def __init__(self, *args, padding: int = 0, output_padding: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.__padding = padding
+        self.__output_padding = output_padding
+
+    def forward(self, x):
+        return super().forward(x)[..., : -(self.__padding * 2 - self.__output_padding)]
+```
+
+The trap: `padding` and `output_padding` are **named keyword args**
+in the subclass `__init__` signature, so Python pulls them out of
+the call's kwargs BEFORE the `**kwargs` capture. They're stored
+into `self.__padding` (name-mangled) and **never passed to
+`super().__init__`**. So PyTorch's `nn.ConvTranspose1d`
+internally uses `padding=0`, `output_padding=0` regardless of what
+the caller passed.
+
+That changes the output length of `super().forward(x)` from "PyTorch
+ConvTranspose1d output with padding P" to "no-padding output,
+`L_std = (T_in - 1)*S + K`". The wrapper then slices `[:-(2P - OP)]`
+from the END, yielding `T_in * S` samples (verified for
+`S ∈ {8, 6, 5, 2}` with `K = 2S, P = ceil(S/2), OP = S%2`).
+
+**What this means for a C++ port.** Don't assume the subclass's
+`__init__` signature lines up with the parent's — read what `*args,
+**kwargs` actually passes through, then trust that. The legacy
+voxcpm2 C++ `causal_transposed_conv1d` used `trim = K - 1` (a
+head-shift), which gives the same OUTPUT LENGTH but a completely
+wrong slice of the no-padding output. Cumulated across 6 upsample
+blocks at increasing sample rates, the audio was shifted by **~46 ms
+vs Python** — and `decoded_audio cos vs Python = 0.008` in the
+diff harness for months.
+
+The correct C++ formula: emit `T_in * S` samples, taking positions
+`[0, T_in * S)` of the standard padding=0 transposed conv output.
+For each output position `ot`:
+
+```
+y[ot] = sum_k w[k] * x[(ot - k) / S]   for k with (ot - k) % S == 0 and (ot - k)/S in [0, T_in)
+```
+
+= a tail-trim of `K - S` samples from the no-padding output. The
+ggml graph version is even simpler — just take the first
+`T_in * S` rows of `ggml_conv_transpose_1d(s, p=0, d=1)`.
+
+Fixed in both legacy CPU `vae_decode` and the new `vae_decode_graph`.
+After the fix: `vae_only cos vs Python = 0.989` (essentially correct),
+`decoded_audio cos = 0.683` (remaining drift is now provably upstream
+— CFM/TSLM precision cascade).
+
+### Isolate the VAE before chasing audio drift
+
+The diff harness's `decoded_audio` cosine compares end-to-end audio
+through ALL of TSLM → RALM → LocDiT → CFM (10 Euler steps × N AR
+steps) → VAE. A failing cosine there could come from any of those.
+
+To isolate the VAE: hook `model.audio_vae.decode` in the Python
+dumper, save the input latent as `generated_latent`, then add a C++
+`vae_only` / `vae_only_graph` stage in `voxcpm2_extract_stage` that
+takes the latent via `ref_samples` and runs **only** vae_decode.
+Comparing the C++ output of that against Python's `decoded_audio`
+directly attributes drift to the VAE without confounding it with
+upstream precision drift. (Implementation: ~50 LOC across the
+backend + dump + diff main.)
+
+This is the same pattern used elsewhere (e.g. chatterbox `s3gen`
+with reference T3 tokens) — feed Python's intermediate as the
+boundary input, run only the segment under test. Cheap to add when
+the upstream is non-deterministic or non-trivial; saves hours of
+"is it the AR or the codec?" guessing.
+
+---
+
+## ggml broadcast hides size-mismatch bugs (May 2026)
+
+When the SR-cond fix went in (`vae_decode_graph` first call), the new
+sr_scale/sr_bias tensors were sized from `it->second->ne[1]` — which
+returned **4** instead of **2048** because GGUF's `scale_embed` is
+stored as ne=[2048, 4] in ggml (C innermost, bucket outer — the
+*opposite* of what I'd assumed). So my init allocated 4-element
+tensors and only wrote 4 scales (the first 4 channels at bucket 3),
+leaving the "broadcast" to fend for itself.
+
+**`ggml_mul(cur ne=[T, 2048], sr_scale ne=[1, 4])` does NOT assert**.
+The op compiled and ran. The output was even close to correct — `cos
+vs Python = 0.967` (vs 0.989 for the legacy CPU path). The first few
+channels got the right scale; the rest got whatever ggml's binary-op
+broadcast read from past the tensor end.
+
+**Why this is dangerous.** A small cos drop reads like "Metal
+floating-point drift" — so I spent multiple iterations trying to
+swap CPU/Metal backends instead of looking at the broadcast input
+shapes. The truth was much simpler: the input tensor was the wrong
+size.
+
+**How to detect.** When debugging a graph-vs-legacy drift:
+
+1. Dump intermediates per-stage and find the first stage where they
+   diverge (here: `block_0_sr` was identical until I added the SR
+   cond step; the snake checkpoint came in already-wrong).
+2. **Always print `ne[]` of every input tensor** to the failing op.
+   I had `C=4` printed in the init trace from the very first run; I
+   just didn't look at it carefully because "obviously ne[1] is the
+   channel dim".
+3. If ggml broadcast looks suspicious, replace it with an explicit
+   `ggml_repeat` to a matching shape — that *does* assert on size
+   mismatch.
+
+**How to apply.** For multi-axis GGUF tensors with ambiguous shape
+order, **take `max(ne[0], ne[1])` for "the non-bucket dim"** instead
+of trusting either dim's position. The legacy CPU loop's pointer
+arithmetic doesn't care about ne order (it just walks raw bytes),
+which is why it kept working through the same ambiguity.

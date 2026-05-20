@@ -102,67 +102,43 @@ depthwise conv needs fixing.
 
 ---
 
-## 43. Fun-ASR-Nano (and Fun-ASR-MLT-Nano)
+## funasr — perf follow-ups (LOW priority, not blocking)
 
-**License resolved (2026-05-20):** Upstream confirmed in issue #99 —
-code is Apache-2.0, weights are under the **FunASR Model License v1.1**
-(Alibaba): commercial use OK with attribution. Compatible with
-`cstr/funasr-*-GGUF` uploads.
+The 2026-05-20 funasr port ships with `ggml_flash_attn_ext` on the
+encoder + adaptor (FA on by default, opt out with `FUNASR_NO_FA=1`)
+and `core_attn::kv_self_attn` on the LLM body. Three opportunistic
+optimisations that didn't make the first cut and are worth ~one bench
+session each when somebody wants to push the numbers:
 
-**Recon + converter + reference dumper landed on `funasr-port`** branch
-(commits `8df4e325` + `b6a2f75f`). Both
-`funasr-nano-2512-f16.gguf` and `funasr-mlt-nano-2512-f16.gguf` exist
-at `/Volumes/backups/ai/crispasr-models/funasr-{nano,mlt-nano}-2512/`
-(1.98 GB each, 1261 tensors).
+1. **Per-step LLM decode graph cache.** On JFK (T_lfr=183, 29 tokens
+   decoded) the decode loop runs at 37.6 ms/token; the unfused
+   memory-bound floor for F16 Qwen3-0.6B on M1 is ~6 ms/token, so
+   ~30 ms is unaccounted-for graph build + sched alloc overhead.
+   Pattern: build the step graph once at `funasr_kv_init` time with
+   `kv_indices` runtime input (so K/V writes go to a runtime slot
+   via `ggml_set_rows` instead of the default static-offset
+   `ggml_cpy`) and `fixed_kv_len = kv_max_ctx` (so topology stays
+   constant). Each decode step then only writes the positions /
+   kv_indices / causal_mask / inputs_embeds inputs and re-runs the
+   cached graph. Expected savings: 5-10 ms/tok ≈ 15-25 % of total
+   decode time. Same pattern qwen3_asr could adopt.
 
-### Critical finding — there is no CTC path in the checkpoint
+2. **Encoder graph cache by T_lfr bucket.** At T_lfr=183 the encoder
+   takes 258 ms; back-to-back calls on similar-length clips pay the
+   graph build cost each time. Bucket to {128, 256, 512, 1024, 2048}
+   like voxcpm2's TSLM (HISTORY 2026-05-19) — pad the inputs to the
+   bucket and emit a static mask that drops the trailing rows. The
+   first call to each bucket pays the build cost; everything after
+   reuses it. Expected savings: 10-20 ms per call once warm.
 
-Upstream config.yaml + `funasr/models/fun_asr_nano/model.py` reference a
-CTC decoder + CTC head; **the published `model.pt` ships only
-`audio_encoder.* + audio_adaptor.* + llm.*`** on BOTH releases. Zero
-CTC weights. Confirmed by directly enumerating the inner state dict on
-both Nano-2512 and MLT-Nano-2512 (1261 tensors, prefixes are
-`audio_adaptor / audio_encoder / llm` only).
+3. **Fused LLM QKV.** Pattern from `qwen3_asr.cpp`: concat the per-block
+   Q/K/V weights along the output axis at load time (byte-concat for
+   F16/Q4_K — no requantization needed) and submit one matmul per
+   layer instead of three. qwen3_asr opts in via
+   `CRISPASR_QWEN3_ASR_FUSED_QKV`; funasr would mirror with
+   `CRISPASR_FUNASR_FUSED_QKV`. Expected savings: 5-10 % on decode.
 
-The only inference path that can produce upstream's reported WER
-numbers is therefore the **LLM-decoder path**:
-`audio → WavFrontend → SenseVoiceEncoderSmall (70 SANM blocks) →
-audio_adaptor (2 transformer blocks @ 1024-dim) → splice into Qwen3-0.6B
-input embeds at <|startofspeech|>/<|endofspeech|> slot of Chinese ChatML
-prompt → Qwen3 AR decode → text`. Do not try to ship a CTC path; it
-isn't there.
-
-### Remaining work (handover at `handover-prompts/funasr-port-runtime.md`)
-
-- `src/funasr.{h,cpp}` runtime (LLM-decoder path). SANM block goes in
-  `src/core/sanm.h` (anticipated reuse by CosyVoice2-0.5B + FunAudioLLM
-  music models). LFR in `src/core/lfr.h`. Hamming-window knob on
-  `src/core/kaldi_fbank.h`. LLM half reuses `src/qwen3_asr.cpp` patterns.
-- `examples/cli/crispasr_backend_funasr.cpp` adapter + register +
-  model-mgr resolver row.
-- `examples/cli/crispasr_diff_main.cpp` per-backend branch comparing
-  the captured stages from `tools/reference_backends/funasr.py`.
-- End-to-end test on EN (`samples/jfk.wav`) + ZH
-  (`<snapshot>/example/zh.mp3`).
-- README + `docs/architecture.md` + `LEARNINGS.md` entries for the
-  no-CTC trap and the SANM block-0 no-attn-residual gotcha.
-
-### Gotchas captured during recon
-
-- `EncoderLayerSANM.forward` drops the attn-branch residual when
-  `in_size != size` — that's block 0 (in=560, out=512) only.
-- WavFrontend uses **Hamming** window, not the Povey default of
-  `core_kaldi::compute_fbank`. Need a window_type knob.
-- WavFrontend has `upsacle_samples=True` (sic — upstream typo); maps
-  to our existing `int16_scale=true` field.
-- SANM forward: `att_out + fsmn_memory` where `fsmn_memory =
-  fsmn_block(pad(v.T)).T + v` — **FSMN has its own residual to V**
-  before joining the attention output.
-- SinusoidalPositionEncoder uses positions `1..T` (NOT `0..T-1`).
-- `xs_pad *= sqrt(d_model)` (≈22.63) before pos encoding.
-- funasr 1.3.1 has a packaging bug in `fun_asr_nano/model.py` —
-  `from ctc import CTC` should be relative. The ref dumper has a
-  sys.path shim; don't try to upstream-fix.
+None of these affect correctness — they're pure throughput pickings.
 
 ---
 
@@ -530,12 +506,57 @@ total synth wall. Block 5 residual gets noisier (transpose cost
 shows up at large T_in with small in_per_grp); future work could
 gate the transpose on `in_per_grp >= 128`.
 
+### Progress (VAE decode ggml graph + transposed-conv fix, 2026-05-20)
+
+Full `vae_decode_graph` shipped — single cgraph over the whole upsample
+stack (input convs, 6 upsample blocks × {SR cond + snake + transposed
+conv + 3 residual units}, final snake/conv/tanh). New helpers
+`snake1d_ggml`, `causal_conv1d_ggml`, `causal_transposed_conv1d_ggml`,
+plus `vae_wn_init_ggml` building a dedicated arena + backend buffer
+for all WN-scaled weights and SR-cond per-bucket slices.
+
+**Two pre-existing bugs fixed (both paths).** (1) `causal_transposed_conv1d`
+used `trim = K - 1` (head-shift) where Python's `CausalTransposeConv1d`
+expects a tail-trim of `K - S` (= take first `T_in * S` of the no-padding
+output — Python's wrapper captures `padding`/`output_padding` as named
+kwargs that are NEVER forwarded to `nn.ConvTranspose1d.__init__`, so
+`super().forward(x)` returns the no-padding result that the wrapper
+then slices `[:-(2P - OP)]` from the END). Legacy head-shift cumulated
+to ~46 ms of audio offset over 6 upsample blocks → `decoded_audio`
+cos=0.008. After fix: cos=0.683 (remaining drift is upstream).
+(2) `vae_wn_init_ggml`'s SR-cond tensors were sized from
+`it->second->ne[1]` (=4 for the bucket dim) instead of channel count
+(=2048). ggml's binary-op broadcast silently mishandled the 4-vs-2048
+mismatch instead of asserting — cos=0.967 instead of cos=0.989 for
+`vae_only_graph`. Fix: take `max(ne[0], ne[1])` for the non-bucket
+dim. Per-block graph output now bit-identical to legacy CPU on every
+channel.
+
+Also aligned CPU `snake1d` to Python's `1/(α + 1e-9)` formula.
+
+Added `vae_only` / `vae_only_graph` diff-harness stages that take
+Python's `generated_latent` as input and run the C++ VAE in
+isolation — backed by a Python-side hook on `model.audio_vae.decode`
+in the reference dumper.
+
+**Validation.**
+
+| Stage              | Before | After |
+| ------------------ | -----: | ----: |
+| decoded_audio      | cos=0.008 FAIL | cos=0.683 (upstream-limited) |
+| vae_only (CPU)     | — | cos=**0.989** |
+| vae_only_graph     | — | cos=**0.989** (Metal + CPU graph both match) |
+| Upstream stages    | 13 PASS | 13 PASS (unchanged) |
+
+ASR roundtrip: EN/DE/ZH all transcribe back exactly through
+parakeet-tdt-v3 / qwen3-asr.
+
 ### Still TODO
 
-- Graph-ify the VAE convs via `ggml_conv_transpose_1d` /
-  `ggml_conv_1d` for Metal-class wins on top of the SIMD baseline.
-- Once all paths are graph, drop the legacy `matmul_mv_ggml` +
-  CPU-only fallback and flip default to `VOXCPM2_USE_GRAPH=1`.
+- Upstream drift bringing `decoded_audio` cos to ~0.95: CFM precision
+  over 10 Euler steps (`cfm_step0_result` cos=0.94 with REF inputs)
+  and TSLM 28-layer F16 accumulation (`tslm_layer_27_out` cos=0.97).
+- Once that closes, flip default to `VOXCPM2_USE_GRAPH=1`.
 
 ---
 

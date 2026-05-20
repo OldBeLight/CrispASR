@@ -62,6 +62,7 @@
 #include "glm_asr.h"
 #include "firered_asr.h"
 #include "voxcpm2_tts.h"
+#include "funasr.h"
 
 #include "common-crispasr.h"
 
@@ -3218,6 +3219,12 @@ int main(int argc, char** argv) {
         auto cp = voxcpm2_context_default_params();
         cp.n_threads = 4;
         cp.verbosity = 0;
+        // Allow forcing the CPU backend for the VAE graph isolation test
+        // (lets us attribute the vae_only_graph cos drop to Metal precision
+        // vs CPU SIMD reordering).
+        if (std::getenv("VOXCPM2_CPU_ONLY")) {
+            cp.use_gpu = false;
+        }
         struct voxcpm2_context* ctx = voxcpm2_init_from_file(model_path.c_str(), cp);
         if (!ctx) {
             fprintf(stderr, "failed to load voxcpm2-tts model\n");
@@ -3241,6 +3248,10 @@ int main(int argc, char** argv) {
         const float COS_TTS_AUDIO = 0.99f;
 
         // Stage list matching the Python dumper's DEFAULT_STAGES order.
+        // `vae_only` / `vae_only_graph` are synthetic stages that feed Python's
+        // `generated_latent` into the C++ VAE (legacy / graph respectively) and
+        // compare the output to Python's `decoded_audio`. They isolate VAE
+        // behaviour from the upstream AR drift (TSLM/RALM/LocDiT/CFM).
         static const char* stages[] = {
             "text_input_ids",
             "locenc_out",
@@ -3250,6 +3261,8 @@ int main(int argc, char** argv) {
             "dit_single_fwd",
             "cfm_step0_result",
             "decoded_audio",
+            "vae_only",
+            "vae_only_graph",
             // Stages not yet implemented in C++ — will gracefully skip:
             "locenc_in",
             "enc_to_lm",
@@ -3263,12 +3276,26 @@ int main(int argc, char** argv) {
         };
 
         for (const char* stage : stages) {
-            // Check if reference has this stage
-            auto ref_shape = ref.shape(stage);
+            // vae_only / vae_only_graph use decoded_audio as their reference
+            // (Python's full VAE-decoded audio) — they need generated_latent
+            // as input AND decoded_audio as ref. Skip if either is missing.
+            const bool is_vae_only = (strcmp(stage, "vae_only") == 0 || strcmp(stage, "vae_only_graph") == 0);
+            const char* ref_key = is_vae_only ? "decoded_audio" : stage;
+            auto ref_shape = ref.shape(ref_key);
             if (ref_shape.empty()) {
                 printf("[SKIP] %-22s (not in reference archive)\n", stage);
                 n_skip++;
                 continue;
+            }
+            if (is_vae_only) {
+                auto lat_shape = ref.shape("generated_latent");
+                if (lat_shape.empty()) {
+                    printf("[SKIP] %-22s (generated_latent not in reference archive — re-dump with that "
+                           "stage)\n",
+                           stage);
+                    n_skip++;
+                    continue;
+                }
             }
 
             int n_out = 0;
@@ -3301,6 +3328,14 @@ int main(int argc, char** argv) {
                     stage_ref_n = (int)seq_pair.second;
                 }
             }
+            if (is_vae_only) {
+                // Feed Python's generated_latent (shape [D=64, T_lat]) as input.
+                auto lat_pair = ref.get_f32("generated_latent");
+                if (lat_pair.first && lat_pair.second > 0) {
+                    stage_ref = lat_pair.first;
+                    stage_ref_n = (int)lat_pair.second;
+                }
+            }
             float* buf = voxcpm2_extract_stage(ctx, syn_text.c_str(), stage_ref, stage_ref_n, stage, &n_out);
             if (!buf || n_out == 0) {
                 printf("[SKIP] %-22s (C++ stage not implemented)\n", stage);
@@ -3311,6 +3346,12 @@ int main(int argc, char** argv) {
             float threshold = COS_THRESHOLD;
             if (strcmp(stage, "decoded_audio") == 0)
                 threshold = COS_TTS_AUDIO;
+            if (is_vae_only) {
+                // VAE-only isolation test: feeding identical Python latent in;
+                // C++ output should match Python's decoded_audio up to small
+                // F16-vs-F32 round-off.
+                threshold = 0.99f;
+            }
             // Stages computed via multi-layer F16-weight forward pass accumulate
             // precision differences (reference runs in F16, C++ in F32).
             // Use cos_mean >= 0.99 (relaxed) for these, strict cos_min >= 0.999 for others.
@@ -3368,7 +3409,16 @@ int main(int argc, char** argv) {
                 free(buf);
                 continue;
             } else {
-                auto rep = ref.compare(stage, buf, (size_t)n_out);
+                // For vae_only stages, compare against decoded_audio reference
+                // (first 48000 samples — that's all Python dumped).
+                size_t cmp_n = (size_t)n_out;
+                if (is_vae_only) {
+                    auto dec_pair = ref.get_f32("decoded_audio");
+                    if (dec_pair.first && dec_pair.second > 0) {
+                        cmp_n = std::min((size_t)n_out, dec_pair.second);
+                    }
+                }
+                auto rep = ref.compare(ref_key, buf, cmp_n);
                 bool pass;
                 if (!rep.found) {
                     pass = false;
@@ -3406,12 +3456,75 @@ int main(int argc, char** argv) {
         }
 
         voxcpm2_free(ctx);
+    } else if (backend_name == "funasr") {
+        funasr_context_params cp = funasr_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        funasr_context* ctx = funasr_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load funasr model\n");
+            return 4;
+        }
+
+        // Stage names emitted by tools/reference_backends/funasr.py.
+        // generated_text is compared byte-wise; everything else is float
+        // cosine. mel_features lives at the post-LFR boundary so it
+        // matches the Python WavFrontend output of (T_lfr, 560).
+        std::vector<std::string> stages;
+        stages.push_back("mel_features");
+        for (int i = 0; i < 70; i++)
+            stages.push_back(std::string("encoder_layer_") + std::to_string(i));
+        stages.push_back("encoder_main_out");
+        stages.push_back("encoder_output");
+        for (int i = 0; i < 2; i++)
+            stages.push_back(std::string("audio_adaptor_layer_") + std::to_string(i));
+        stages.push_back("audio_adaptor_output");
+        stages.push_back("generated_text");
+
+        for (const auto& stage : stages) {
+            int n_out = 0;
+            float* buf = funasr_extract_stage(ctx, samples.data(), (int)samples.size(), stage.c_str(), &n_out);
+            if (!buf || n_out <= 0) {
+                printf("[SKIP] %-22s  funasr_extract_stage returned no data\n", stage.c_str());
+                if (buf)
+                    free(buf);
+                n_skip++;
+                continue;
+            }
+
+            if (stage == "generated_text") {
+                // generated_text is routed into the GGUF metadata KV table
+                // by tools/dump_reference.py (string captures don't go
+                // through the tensor path). Compare via Ref::meta().
+                const std::string ref_s = ref.meta("generated_text");
+                if (ref_s.empty()) {
+                    printf("[SKIP] %-22s  (no generated_text in reference)\n", stage.c_str());
+                    n_skip++;
+                } else {
+                    const char* got = (const char*)buf;
+                    const std::string got_s(got, (size_t)n_out);
+                    const bool exact = (got_s == ref_s);
+                    printf("%s %-22s  got=%s  ref=%s\n", exact ? "[PASS]" : "[FAIL]", stage.c_str(), got_s.c_str(),
+                           ref_s.c_str());
+                    if (exact)
+                        n_pass++;
+                    else
+                        n_fail++;
+                }
+            } else {
+                auto rep = ref.compare(stage.c_str(), buf, (size_t)n_out);
+                print_row(stage.c_str(), rep, COS_THRESHOLD);
+                record(rep);
+            }
+            free(buf);
+        }
+        funasr_free(ctx);
     } else {
         fprintf(stderr,
                 "crispasr-diff: backend '%s' is not recognised. "
                 "Supported: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, granite-4.1, "
                 "granite-nle, parakeet, canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, "
-                "moonshine-streaming, lid-cld3, glm-asr, firered-asr, voxcpm2-tts.\n",
+                "moonshine-streaming, lid-cld3, glm-asr, firered-asr, voxcpm2-tts, funasr.\n",
                 backend_name.c_str());
         return 5;
     }

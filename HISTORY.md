@@ -74,6 +74,159 @@ The new mode runs against the existing single-pass reference dump —
 no per-slice reference re-bake required. Future per-slice bugs in
 any backend can plug into the same flag.
 
+## 2026-05-20 funasr: FunAudioLLM/Fun-ASR-{Nano,MLT-Nano}-2512 port lands
+
+**Change.** First multilingual speech-LLM in the ASR family besides
+qwen3. Runtime is `src/funasr.{h,cpp}` plus three new shared helpers:
+`src/core/sanm.h` (SANM block — fused QKV, FSMN depthwise-conv memory
+branch on V, sum-with-attn, optional flash-attention), `src/core/lfr.h`
+(LFR(m=7,n=6) frame stacker), and a Hamming-window knob on
+`src/core/kaldi_fbank.{h,cpp}` (was hardcoded Povey). The encoder is
+`SenseVoiceEncoderSmall` (1 entry block @ 560→512 + 49 main blocks +
+20 tp blocks, after_norm between, tp_norm at end). The adaptor is
+the 2-block Transformer from `funasr.models.llm_asr.adaptor.Transformer`
+(linear 512→2048→1024 prelude + 2× MHA, head_dim=128 not 64 — see
+note below). The LLM half is Qwen3-0.6B (same body as qwen3-asr-0.6b);
+the converter writes the LLM under llama.cpp-standard tensor names so
+the loader reuses `core_attn::kv_self_attn` directly.
+
+**No-CTC trap.** Upstream `config.yaml` and `fun_asr_nano/model.py`
+declare a CTC decoder + head, but the published `model.pt` ships only
+`audio_encoder.* + audio_adaptor.* + llm.*` — zero CTC weights on
+both Nano and MLT-Nano releases. The LLM-decoder path is the only
+viable inference path; we don't ship a CTC fallback.
+
+**Adaptor heads = 8 (not 16).** The converter wrote
+`funasr.ada_n_heads=16` to the GGUF, but
+`funasr.models.llm_asr.adaptor.Transformer` invokes
+`MultiHeadedAttention(kwargs.get("attention_heads", 8), llm_dim, ...)`
+and the upstream `audio_adaptor_conf` does NOT pass `attention_heads`,
+so the adaptor's two transformer blocks run at 8 heads (head_dim 128).
+The runtime ignores the GGUF KV and forces 8; without this fix the
+diff harness drops to cos~0.6 on the adaptor output (vs cos=1.0 on
+the 70-layer encoder which is bit-near-exact).
+
+**Verification.** `crispasr-diff funasr` is 77/77 PASS,
+byte-identical `generated_text`, on both Chinese (`example/zh.mp3`
+from the snapshot, "开饭时间早上九点至下午五点。") and English
+(`samples/jfk.wav`, "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR
+COUNTRY CAN DO FOR YOU ASK WHAT YOU CAN DO FOR YOUR COUNTRY"). On
+Apple M1 Metal the end-to-end pipeline takes ~620 ms for 5.6 s of
+audio (9.0× realtime); per-stage breakdown via `FUNASR_BENCH=1`:
+
+| Stage              | Time (ms) | Notes |
+| --- | ---: | --- |
+| fbank+lfr          | 10.6      | frontend, single-threaded CPU |
+| enc+ada_compute    | 150.8     | 70 SANM + 2 adaptor blocks, single Metal graph |
+| prompt_tokenize    | 0.5       | Qwen3 BPE on prefix + suffix strings |
+| embed              | 0.4       | token_embd lookup + audio-slot splice |
+| kv_init            | 10.9      | one-shot per session |
+| llm_prefill        | 54.4      | single forward over the full prompt |
+| llm_decode_total   | 393.1     | 11 tokens @ 35.7 ms/tok (≈28 tok/s on M1) |
+
+**Flash-attn on encoder + adaptor.** SANM and adaptor MHA use
+`ggml_flash_attn_ext` by default (opt out with `FUNASR_NO_FA=1`).
+On samples/jfk.wav (T_lfr=183), the FA path is 30 % faster on the
+encoder (258 vs 370 ms) and 7 % faster overall (1.46 vs 1.57 s).
+Crossover sits around T_lfr=100-150 (≈6 s audio); under that, the
+unfused mul_mat + soft_max_ext path wins by ~6 % because the FA
+kernel-launch overhead dominates. Default ON matches typical ASR
+workloads; tight-VAD realtime users may want the opt-out.
+
+**Files.** New `src/funasr.{h,cpp}`, `src/core/sanm.h`,
+`src/core/lfr.h`, `examples/cli/crispasr_backend_funasr.cpp`. Edited
+`src/core/kaldi_fbank.{h,cpp}` (Hamming window),
+`models/convert-funasr-to-gguf.py` (retargeted to LLM-decoder path;
+commit b6a2f75f), `tools/reference_backends/funasr.py` (stage names +
+str-as-meta route for `generated_text`), `examples/cli/crispasr_backend.cpp`
+(dispatch + filename auto-route + GGUF-arch auto-route),
+`examples/cli/crispasr_diff_main.cpp` (funasr branch — float-cosine
+for tensor stages + meta byte-compare for `generated_text`),
+`src/crispasr_model_registry.cpp` (two new entries with explicit
+FunASR Model License v1.1 attribution; dropped the misleading
+hardcoded "(non-commercial)" suffix from the license-note printer
+since the license string already carries authoritative wording),
+`src/CMakeLists.txt` (new `funasr` static lib),
+`examples/cli/CMakeLists.txt` (CLI + diff binary link lists),
+`README.md` (ASR table rows + headline count + capability matrix
+column + native-punctuation table entry + multilingual recipe row).
+
+**HF.** `cstr/funasr-nano-GGUF` and `cstr/funasr-mlt-nano-GGUF`
+uploaded (F16, 1.98 GB each). `hf_readmes/funasr-{nano,mlt-nano}-GGUF.md`
+carry the FunASR Model License v1.1 attribution line and link to the
+upstream model cards. Auto-download via `--backend funasr -m auto`
+works and prints the license note on first download.
+
+## 2026-05-20 voxcpm2-tts: full VAE decode ggml cgraph + transposed-conv fix
+
+**Change.** Added `vae_decode_graph` (gated on `VOXCPM2_USE_GRAPH=1`)
+that emits the full VAE decode pipeline as a single ggml cgraph
+running on `ctx->backend` (Metal on Apple Silicon). New helpers
+`snake1d_ggml`, `causal_conv1d_ggml`, `causal_transposed_conv1d_ggml`,
+plus `vae_wn_init_ggml` which builds a dedicated ggml context +
+backend buffer holding every WN-scaled conv weight, SR-cond per-bucket
+[C] slice, and snake1d `1/(α+1e-9)` reciprocal as `ggml_tensor*`
+keyed by GGUF prefix.
+
+**Two pre-existing bugs uncovered + fixed.**
+
+*(1) `causal_transposed_conv1d` head-shift.* Python's
+`CausalTransposeConv1d` (`audio_vae_v2.py:31-38`) captures `padding`
+/ `output_padding` as named kwargs and **never forwards them to
+`nn.ConvTranspose1d.__init__`** — so PyTorch internally uses
+`padding=0, output_padding=0` and `super().forward(x)` returns length
+`L_std = (T_in - 1) * S + K`. The wrapper then slices `[:-(2P - OP)]`
+from the END, yielding the first `T_in * S` samples. The legacy C++
+used `trim = K - 1` (head-shift) instead, shifting the audio by
+~46 ms across 6 upsample blocks. Long-standing diff-harness regression
+`decoded_audio cos = 0.008` was the symptom. Fix in both paths: take
+the first `T_in * S` samples of the no-padding output (tail-trim of
+`K - S` from end).
+
+*(2) `vae_wn_init_ggml` SR-cond size mismatch.* My init sized the
+sr_scale/sr_bias tensors from `it->second->ne[1]` — which returned
+**4** (the bucket dim) instead of **2048** (the channel dim) because
+GGUF stores `scale_embed` with ne=[2048, 4] (C innermost). ggml's
+binary-op broadcast then **silently mishandled** the 4-vs-2048
+mismatch instead of asserting, producing cos=0.967 instead of
+cos=0.989 for `vae_only_graph`. Fix: take `max(ne[0], ne[1])` for
+the non-bucket dim. After fix: graph output is bit-identical to
+legacy CPU on every per-block trace.
+
+Also aligned CPU `snake1d` to Python's `1/(α + 1e-9)` formula
+(previous `(|α| > 1e-8) ? 1/α : 1` differed only at tiny α; matters
+for parity with the graph's pre-baked `inv_alpha`).
+
+**New diff stages.** `vae_only` / `vae_only_graph` take Python's
+`generated_latent` as input via `ref_samples` and run the C++ VAE
+in isolation — lets us attribute drift directly to the VAE vs
+upstream AR pipeline. Backed by a Python-side hook on
+`model.audio_vae.decode` in the reference dumper.
+
+**Validation.** Diff harness (M1, voxcpm2-q4_k.gguf, voice clone):
+
+| Stage              | Before | After |
+| ------------------ | -----: | ----: |
+| decoded_audio      | cos=0.008 FAIL | cos=0.683 (upstream-limited) |
+| vae_only (CPU)     | —              | cos=**0.989** |
+| vae_only_graph     | —              | cos=**0.989** (Metal + CPU match) |
+| Upstream stages    | 13 PASS / 3 FAIL | 13 PASS (unchanged) |
+
+ASR roundtrip: EN ("Hello world") → parakeet-tdt-0.6b-v3, DE
+("Hallo, wie geht es dir heute?") → parakeet-v3, ZH
+("你好，今天天气真好。") → qwen3-asr — all three languages transcribe
+back exactly through both legacy CPU and the new graph path. Audio
+audibly natural on M1.
+
+The remaining `decoded_audio` drift (cos=0.68) is now provably
+upstream — `cfm_step0_result` cos=0.94 with REF inputs cascading
+across 10 Euler steps, plus `tslm_layer_27_out` cos=0.97 (F16
+accumulation over 28 layers). Tracked as separate work in PLAN #96.
+
+Diagnostic infrastructure (gated on `VOXCPM2_VAE_TRACE=1`) writes
+per-block intermediates to `/tmp/voxcpm2_{l_,g_}<stage>.bin` for
+side-by-side python comparison — kept in tree for future
+graph-vs-legacy investigations.
 ---
 
 ## 2026-05-20 voxcpm2-tts: cache wn_reconstruct across VAE encode/decode calls

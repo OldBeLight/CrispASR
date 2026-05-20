@@ -118,6 +118,17 @@ static std::vector<float> make_povey_window(int N) {
     return w;
 }
 
+// Hamming window: 0.54 - 0.46 * cos(2π i / (N-1)). Matches kaldi's
+// FeatureWindowFunction "hamming" choice — the one FunASR's WavFrontend
+// uses when constructed with window="hamming".
+static std::vector<float> make_hamming_window(int N) {
+    std::vector<float> w((size_t)N);
+    for (int i = 0; i < N; i++) {
+        w[(size_t)i] = 0.54f - 0.46f * std::cos(2.0f * (float)M_PI * (float)i / (float)(N - 1));
+    }
+    return w;
+}
+
 } // namespace
 
 std::vector<float> compute_fbank(const float* pcm, int n_samples, const FbankParams& p, int& T_frames_out) {
@@ -152,9 +163,18 @@ std::vector<float> compute_fbank(const float* pcm, int n_samples, const FbankPar
 
     static thread_local std::vector<float> window;
     static thread_local int window_sig = 0;
-    if (window_sig != win || window.empty()) {
-        window = make_povey_window(win);
-        window_sig = win;
+    const int win_sig = win * 4 + (int)p.window_type;
+    if (window_sig != win_sig || window.empty()) {
+        switch (p.window_type) {
+        case WindowType::Hamming:
+            window = make_hamming_window(win);
+            break;
+        case WindowType::Povey:
+        default:
+            window = make_povey_window(win);
+            break;
+        }
+        window_sig = win_sig;
     }
 
     std::vector<float> features((size_t)T * (size_t)n_mels);
