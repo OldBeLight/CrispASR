@@ -340,6 +340,16 @@ struct voxcpm2_context {
     ggml_cgraph* locdit_gf = nullptr;
     ggml_gallocr_t locdit_galloc = nullptr;
 
+    // Cached LocEnc cgraph. Same constant-topology trick — LocEnc takes
+    // a single patch [feat_dim, P] and emits a CLS hidden state [d_enc].
+    // Voice cloning hits this ~70x in build_prefill_inputs (one call per
+    // reference patch), so amortising the ~250-node graph build across
+    // all of them via gallocr_reserve is a real win on top of Metal.
+    std::vector<uint8_t> locenc_arena_meta;
+    ggml_context* locenc_arena_ctx = nullptr;
+    ggml_cgraph* locenc_gf = nullptr;
+    ggml_gallocr_t locenc_galloc = nullptr;
+
     // Cached TSLM step graphs (qwen3-style multi-bucket pattern). Each
     // bucket is topology-invariant across n_past because Lk is pinned
     // to bucket_lk and positions is passed as runtime kv_indices — the
@@ -1391,6 +1401,242 @@ static std::vector<float> locenc_forward(voxcpm2_context* ctx, const float* patc
     }
 
     return cls_out;
+}
+
+// ---------------------------------------------------------------------------
+// LocEnc — per-call ggml_cgraph variant.
+//
+// Mirrors `build_locdit_graph`'s structure: bidirectional 12-layer
+// transformer with LongRoPE GQA flash-attn + SwiGLU, but simpler —
+// no time/dt embeddings, no mu condition, no cond projection, no
+// final-P slice. Input is a single P=4-frame patch [feat_dim, P];
+// the CLS-prepended sequence is T=5 long; output is just the CLS
+// token at position 0 after the final norm.
+//
+// Gated on `VOXCPM2_USE_GRAPH=1`. The graph topology is constant
+// (T=5, P=4 are model hparams), so it's cacheable with
+// gallocr_reserve in the same one-shot pattern as LocDiT.
+// ---------------------------------------------------------------------------
+
+static ggml_cgraph* build_locenc_graph(voxcpm2_context* ctx, ggml_context* arena_ctx = nullptr) {
+    const vox_hparams& hp = ctx->hp;
+    const vox_weights& W = ctx->weights;
+    const int d = (int)hp.locenc_d_model;
+    const int n_q = (int)hp.locenc_n_heads;
+    const int n_kv = (int)hp.locenc_n_kv;
+    const int hd = (int)hp.locenc_head_dim;
+    const int n_kv_grp = n_q / n_kv;
+    const float eps = hp.rms_norm_eps;
+    const float ascale = 1.0f / std::sqrt((float)hd);
+    const int feat_dim = 64;
+    const int P = (int)hp.patch_frames; // 4
+    const int T = P + 1;                // CLS + P frames
+
+    ggml_context* ctx0 = arena_ctx;
+    if (!ctx0) {
+        ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), /*no_alloc=*/true};
+        ctx0 = ggml_init(ip);
+    }
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
+
+    // ── Inputs ───────────────────────────────────────────────────
+    ggml_tensor* patch_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, feat_dim, P);
+    ggml_set_name(patch_in, "patch_in");
+    ggml_set_input(patch_in);
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_name(positions, "positions");
+    ggml_set_input(positions);
+
+    // ── in_proj on patch frames → [d, P] ─────────────────────────
+    ggml_tensor* patch_proj = ggml_mul_mat(ctx0, W.locenc_in_proj_w, patch_in);
+    if (W.locenc_in_proj_b) {
+        patch_proj = ggml_add(ctx0, patch_proj, W.locenc_in_proj_b);
+    }
+
+    // ── Prepend CLS token (1D [d] → [d, 1]) ──────────────────────
+    // `locenc_cls_token` is stored as a 1D [d] tensor. We view it as
+    // [d, 1] before the concat. If it's absent, the legacy path would
+    // start from zeros at position 0; mirror that with a zero tensor.
+    ggml_tensor* cls_2d = nullptr;
+    if (W.locenc_cls_token) {
+        cls_2d = ggml_reshape_2d(ctx0, W.locenc_cls_token, d, 1);
+    } else {
+        // Build a zero CLS via an explicit input (rare path).
+        cls_2d = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, 1);
+        ggml_set_name(cls_2d, "cls_zero");
+        ggml_set_input(cls_2d);
+    }
+    ggml_tensor* cur = ggml_concat(ctx0, cls_2d, patch_proj, /*dim=*/1); // [d, T=5]
+
+    const float* rope_factors_ptr = nullptr;
+    (void)rope_factors_ptr;
+    ggml_tensor* rope_factors = W.tslm_rope_short; // LocEnc reuses TSLM's LongRoPE factors
+
+    const core_attn::KvSelfAttnParams kvp = {
+        /*n_heads*/ n_q,
+        /*n_kv_heads*/ n_kv,
+        /*head_dim*/ hd,
+        /*n_kv_grp*/ n_kv_grp,
+        /*n_ctx_orig*/ (int)hp.tslm_max_pos,
+        /*rope_theta*/ hp.tslm_rope_theta,
+        /*rope_beta_fast*/ 0.0f,
+        /*rope_beta_slow*/ 0.0f,
+        /*attn_scale*/ ascale,
+        /*qk_norm_eps*/ 0.0f,
+        /*gqa_mode*/ core_attn::GQA_MANUAL_CONT,
+        /*rope_type*/ GGML_ROPE_TYPE_NEOX,
+        /*n_rot*/ 0,
+        /*v_rms_norm*/ false,
+        /*rope_freq_factors*/ rope_factors,
+    };
+
+    // ── 12 bidirectional transformer layers ──────────────────────
+    for (uint32_t il = 0; il < hp.locenc_n_layers; il++) {
+        const vox_enc_layer& L = W.locenc_layers[il];
+        ggml_tensor* residual = cur;
+
+        // Pre-attn RMSNorm + scale (norm1)
+        ggml_tensor* x = ggml_rms_norm(ctx0, cur, eps);
+        x = ggml_mul(ctx0, x, L.norm1_w);
+
+        // Q/K/V projections, reshape, RoPE, GQA expand, permute, flash-attn
+        ggml_tensor* Q = ggml_mul_mat(ctx0, L.attn_q_w, x);
+        ggml_tensor* K = ggml_mul_mat(ctx0, L.attn_k_w, x);
+        ggml_tensor* V = ggml_mul_mat(ctx0, L.attn_v_w, x);
+
+        Q = ggml_reshape_3d(ctx0, Q, hd, n_q, T);
+        K = ggml_reshape_3d(ctx0, K, hd, n_kv, T);
+        V = ggml_reshape_3d(ctx0, V, hd, n_kv, T);
+
+        Q = ggml_rope_ext(ctx0, Q, positions, kvp.rope_freq_factors, hd, GGML_ROPE_TYPE_NEOX, kvp.n_ctx_orig,
+                          kvp.rope_theta, /*freq_scale*/ 1.0f, /*ext_factor*/ 0.0f, /*attn_factor*/ 1.0f, 0.0f, 0.0f);
+        K = ggml_rope_ext(ctx0, K, positions, kvp.rope_freq_factors, hd, GGML_ROPE_TYPE_NEOX, kvp.n_ctx_orig,
+                          kvp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+        if (n_kv_grp > 1) {
+            ggml_tensor* K4 = ggml_reshape_4d(ctx0, K, hd, 1, n_kv, T);
+            ggml_tensor* V4 = ggml_reshape_4d(ctx0, V, hd, 1, n_kv, T);
+            K4 = ggml_repeat_4d(ctx0, K4, hd, n_kv_grp, n_kv, T);
+            V4 = ggml_repeat_4d(ctx0, V4, hd, n_kv_grp, n_kv, T);
+            K = ggml_cont(ctx0, ggml_reshape_3d(ctx0, K4, hd, n_q, T));
+            V = ggml_cont(ctx0, ggml_reshape_3d(ctx0, V4, hd, n_q, T));
+        }
+
+        Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
+        K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
+        V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
+
+        // Bidirectional flash-attn (no mask). PREC_F32 NOT set — Metal
+        // refuses FA ops tagged PREC_F32 (see LocDiT graph for rationale).
+        ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, /*mask=*/nullptr, ascale, /*max_bias*/ 0.0f,
+                                                /*logit_softcap*/ 0.0f);
+        attn = ggml_reshape_2d(ctx0, attn, hd * n_q, T);
+
+        attn = ggml_mul_mat(ctx0, L.attn_o_w, attn);
+        cur = ggml_add(ctx0, residual, attn);
+
+        // Pre-FFN RMSNorm × scale, SwiGLU, residual
+        residual = cur;
+        x = ggml_rms_norm(ctx0, cur, eps);
+        x = ggml_mul(ctx0, x, L.norm2_w);
+        ggml_tensor* mlp = core_ffn::swiglu(ctx0, x, L.ffn_gate_w, L.ffn_up_w, L.ffn_down_w);
+        cur = ggml_add(ctx0, residual, mlp);
+    }
+
+    // ── Final norm + extract CLS (position 0) ────────────────────
+    // cur is [d, T=5]; view position 0 as [d, 1].
+    ggml_tensor* cls_view = ggml_view_2d(ctx0, cur, d, 1, cur->nb[1], /*offset=*/0);
+    ggml_tensor* cls = cls_view;
+    if (W.locenc_norm_w) {
+        cls = ggml_rms_norm(ctx0, cls_view, eps);
+        cls = ggml_mul(ctx0, cls, W.locenc_norm_w);
+    }
+    ggml_set_name(cls, "cls_out");
+    ggml_set_output(cls);
+    ggml_build_forward_expand(gf, cls);
+
+    if (!arena_ctx) {
+        ggml_free(ctx0);
+    }
+    return gf;
+}
+
+static ggml_cgraph* get_or_build_locenc_graph(voxcpm2_context* ctx) {
+    if (ctx->locenc_gf) {
+        return ctx->locenc_gf;
+    }
+    if (!ctx->backend) {
+        return nullptr;
+    }
+    ctx->locenc_arena_meta.assign(ctx->compute_meta.size(), 0);
+    ggml_init_params ip = {ctx->locenc_arena_meta.size(), ctx->locenc_arena_meta.data(), /*no_alloc=*/true};
+    ctx->locenc_arena_ctx = ggml_init(ip);
+    if (!ctx->locenc_arena_ctx) {
+        ctx->locenc_arena_meta.clear();
+        return nullptr;
+    }
+    ctx->locenc_gf = build_locenc_graph(ctx, ctx->locenc_arena_ctx);
+    if (!ctx->locenc_gf) {
+        ggml_free(ctx->locenc_arena_ctx);
+        ctx->locenc_arena_ctx = nullptr;
+        ctx->locenc_arena_meta.clear();
+        return nullptr;
+    }
+    ctx->locenc_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!ctx->locenc_galloc || !ggml_gallocr_reserve(ctx->locenc_galloc, ctx->locenc_gf)) {
+        if (ctx->locenc_galloc) {
+            ggml_gallocr_free(ctx->locenc_galloc);
+            ctx->locenc_galloc = nullptr;
+        }
+        ggml_free(ctx->locenc_arena_ctx);
+        ctx->locenc_arena_ctx = nullptr;
+        ctx->locenc_gf = nullptr;
+        ctx->locenc_arena_meta.clear();
+        return nullptr;
+    }
+    return ctx->locenc_gf;
+}
+
+// Run LocEnc through the graph. Same signature shape as `locenc_forward`
+// (single patch in, CLS hidden state out). Falls back to the legacy CPU
+// path if graph init fails.
+static std::vector<float> locenc_forward_graph(voxcpm2_context* ctx, const float* patch) {
+    const int d = (int)ctx->hp.locenc_d_model;
+    const int feat_dim = 64;
+    const int P = (int)ctx->hp.patch_frames;
+    const int T = P + 1;
+
+    std::vector<float> patch_buf(patch, patch + feat_dim * P);
+    std::vector<int32_t> positions(T);
+    for (int i = 0; i < T; i++)
+        positions[i] = i;
+
+    ggml_cgraph* gf = get_or_build_locenc_graph(ctx);
+    if (!gf) {
+        return locenc_forward(ctx, patch, ctx->backend_cpu);
+    }
+    if (!ggml_gallocr_alloc_graph(ctx->locenc_galloc, gf)) {
+        fprintf(stderr, "voxcpm2: locenc gallocr alloc failed\n");
+        return locenc_forward(ctx, patch, ctx->backend_cpu);
+    }
+
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "patch_in"), patch_buf.data(), 0,
+                            patch_buf.size() * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), positions.data(), 0,
+                            positions.size() * sizeof(int32_t));
+
+    if (ggml_backend_is_cpu(ctx->backend)) {
+        ggml_backend_cpu_set_n_threads(ctx->backend, g_cpu_n_threads);
+    }
+    if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "voxcpm2: locenc graph compute failed\n");
+        return locenc_forward(ctx, patch, ctx->backend_cpu);
+    }
+
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "cls_out");
+    std::vector<float> result(d);
+    ggml_backend_tensor_get(out, result.data(), 0, (size_t)d * sizeof(float));
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -3618,6 +3864,7 @@ static vox_prefill_inputs build_prefill_inputs_impl(voxcpm2_context* ctx, const 
     int d_dit = (int)hp.locdit_d_model;
     int P_frames = (int)hp.patch_frames;
     int feat_dim_vae = 64;
+    const bool use_graph = vox_env_bool("VOXCPM2_USE_GRAPH");
 
     // 1. Tokenise (vox_tokenize already appends audio_start_token).
     std::vector<int32_t> text_tokens = vox_tokenize(ctx->tokenizer, text);
@@ -3666,7 +3913,8 @@ static vox_prefill_inputs build_prefill_inputs_impl(voxcpm2_context* ctx, const 
         if (out.audio_mask_pos[t]) {
             int patch_idx = t - 1;
             const float* patch = out.ref_feat.data() + (size_t)patch_idx * P_frames * feat_dim_vae;
-            std::vector<float> enc_out = locenc_forward(ctx, patch, cpu_be);
+            std::vector<float> enc_out =
+                use_graph ? locenc_forward_graph(ctx, patch) : locenc_forward(ctx, patch, cpu_be);
             if (ctx->weights.enc_to_lm_w && ctx->weights.enc_to_lm_b) {
                 matmul_mv_bias(cpu_be, ctx->weights.enc_to_lm_w, ctx->weights.enc_to_lm_b, enc_out.data(), d_dit,
                                out.feat_embed_pos.data() + (size_t)t * d_tslm, d_tslm);
@@ -3867,7 +4115,8 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
 
         // 1c. LocEnc on predicted patch
         tb = bench ? vox_now_ms() : 0;
-        std::vector<float> enc_out = locenc_forward(ctx, patch_tf.data(), cpu_be);
+        std::vector<float> enc_out =
+            use_graph_tslm ? locenc_forward_graph(ctx, patch_tf.data()) : locenc_forward(ctx, patch_tf.data(), cpu_be);
         if (bench)
             sum_locenc += vox_now_ms() - tb;
 
@@ -4131,6 +4380,14 @@ void voxcpm2_free(struct voxcpm2_context* ctx) {
     if (ctx->locdit_arena_ctx) {
         ggml_free(ctx->locdit_arena_ctx);
         ctx->locdit_arena_ctx = nullptr;
+    }
+    if (ctx->locenc_galloc) {
+        ggml_gallocr_free(ctx->locenc_galloc);
+        ctx->locenc_galloc = nullptr;
+    }
+    if (ctx->locenc_arena_ctx) {
+        ggml_free(ctx->locenc_arena_ctx);
+        ctx->locenc_arena_ctx = nullptr;
     }
     if (ctx->tslm_kv_buf) {
         ggml_backend_buffer_free(ctx->tslm_kv_buf);

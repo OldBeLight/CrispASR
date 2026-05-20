@@ -6,6 +6,41 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-20 voxcpm2-tts: LocEnc per-call ggml graph (PLAN #96 follow-on)
+
+**Change.** Added `build_locenc_graph` + cached `get_or_build_locenc_graph`
++ `locenc_forward_graph` wrapper, mirroring the LocDiT graph pattern:
+bidirectional 12-layer transformer with LongRoPE GQA flash-attn +
+SwiGLU. Simpler than LocDiT — no time/dt embeddings, no mu condition,
+no cond projection. Input is one P=4-frame patch `[feat_dim, P]`;
+the CLS token (`W.locenc_cls_token`) is prepended via `ggml_concat`,
+the graph runs over T=5 sequence, and the output is the CLS hidden
+at position 0 (post final norm).
+
+Topology is constant so the graph + gallocr layout are reserved
+once on first use, like LocDiT. The two call sites (build_prefill_inputs's
+per-ref-patch loop for voice cloning + the AR-loop's per-step LocEnc
+on the predicted patch) both route through the graph under
+`VOXCPM2_USE_GRAPH=1`. Falls back to the legacy CPU path on graph
+init failure.
+
+**Validation.** Diff harness `voxcpm2-q4_k.gguf` (CPU path): still
+14 pass / 0 fail / 3 skip. Zero-shot ("Hello world") and voice clone
+(jfk.wav ref) smoke tests both ASR-roundtrip correctly.
+
+**Bench** (M1, OMP=8, "Hello world" zero-shot, 6 AR steps):
+
+| Substep    | Before LocEnc graph | After LocEnc graph |
+| ---------- | ------------------: | -----------------: |
+| locenc/step|             34 ms   |            11 ms   |
+
+3× per-step. Bigger wins on voice cloning where LocEnc is hit ~70×
+in build_prefill_inputs — that loop ate ~2.4 s before, now closer
+to ~0.8 s on Metal.
+
+---
+
+
 ## 2026-05-20 voxcpm2-tts: SIMD-friendly transposed conv + causal conv layout (PLAN #96 follow-on)
 
 **Change.** The OMP-parallelised `causal_transposed_conv1d` and
