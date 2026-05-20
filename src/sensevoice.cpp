@@ -26,6 +26,7 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #ifndef M_PI
@@ -688,6 +689,113 @@ extern "C" char* sensevoice_transcribe(sensevoice_context* ctx, const float* sam
     std::memcpy(out, s.data(), s.size());
     out[s.size()] = '\0';
     return out;
+}
+
+namespace {
+
+// Peel the leading `<|...|>` markers off a SenseVoice transcript and
+// classify them by content. Upstream emits four markers (language,
+// emotion, audio-event, itn) but their *order* is determined by training,
+// not by the input query-embed order. Content classification is robust
+// to ordering surprises and to the model dropping a marker on degenerate
+// audio.
+struct sv_prefix {
+    std::string language;
+    std::string emotion;
+    std::string audio_event;
+    std::string itn;
+    size_t consumed = 0;
+};
+
+static sv_prefix sv_parse_prefix(const std::string& s) {
+    sv_prefix p;
+    size_t pos = 0;
+    std::vector<std::string> markers;
+    while (pos < s.size() && markers.size() < 4) {
+        while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t'))
+            ++pos;
+        if (pos + 2 > s.size() || s[pos] != '<' || s[pos + 1] != '|')
+            break;
+        size_t end = s.find("|>", pos + 2);
+        if (end == std::string::npos)
+            break;
+        markers.emplace_back(s.substr(pos + 2, end - (pos + 2)));
+        pos = end + 2;
+    }
+    p.consumed = pos;
+
+    static const std::unordered_set<std::string> LANG{"auto", "zh", "en", "yue",      "ja",
+                                                      "ko",   "nl", "de", "nospeech", "unk"};
+    static const std::unordered_set<std::string> EMO{"HAPPY",   "SAD",       "ANGRY",     "NEUTRAL",
+                                                     "FEARFUL", "DISGUSTED", "SURPRISED", "EMO_UNKNOWN"};
+    static const std::unordered_set<std::string> ITN{"withitn", "woitn"};
+
+    for (const auto& m : markers) {
+        if (LANG.count(m))
+            p.language = m;
+        else if (EMO.count(m))
+            p.emotion = m;
+        else if (ITN.count(m))
+            p.itn = m;
+        else
+            // Anything else falls into audio_event (Speech, Music, BGM,
+            // Laughter, Cough, ... — the upstream set is open-ended).
+            p.audio_event = m;
+    }
+    return p;
+}
+
+static char* sv_dup(const std::string& s) {
+    char* out = (char*)std::malloc(s.size() + 1);
+    if (!out)
+        return nullptr;
+    std::memcpy(out, s.data(), s.size());
+    out[s.size()] = '\0';
+    return out;
+}
+
+} // namespace
+
+extern "C" sensevoice_result* sensevoice_transcribe_structured(sensevoice_context* ctx, const float* samples,
+                                                               int n_samples, const char* language, bool use_itn) {
+    if (!ctx || !samples || n_samples <= 0)
+        return nullptr;
+    std::string raw = sensevoice_transcribe_impl(ctx, samples, n_samples, language, use_itn, nullptr, nullptr);
+    sv_prefix pre = sv_parse_prefix(raw);
+
+    std::string text = raw.substr(pre.consumed);
+    // Trim leading whitespace artefact from SentencePiece ▁ on the first
+    // post-prefix token.
+    size_t lead = text.find_first_not_of(" \t");
+    if (lead != std::string::npos && lead > 0)
+        text.erase(0, lead);
+
+    auto* r = (sensevoice_result*)std::calloc(1, sizeof(sensevoice_result));
+    if (!r)
+        return nullptr;
+    r->language = sv_dup(pre.language);
+    r->emotion = sv_dup(pre.emotion);
+    r->audio_event = sv_dup(pre.audio_event);
+    r->itn = sv_dup(pre.itn);
+    r->text = sv_dup(text);
+    r->raw = sv_dup(raw);
+    if (!r->language || !r->emotion || !r->audio_event || !r->itn || !r->text || !r->raw) {
+        sensevoice_result_free(r);
+        return nullptr;
+    }
+    return r;
+}
+
+extern "C" void sensevoice_result_free(sensevoice_result* r) {
+    if (!r)
+        return;
+    std::free(r->language);
+    std::free(r->emotion);
+    std::free(r->audio_event);
+    std::free(r->itn);
+    std::free(r->text);
+    std::free(r->raw);
+    std::free(r);
 }
 
 extern "C" float* sensevoice_extract_stage(sensevoice_context* ctx, const float* samples, int n_samples,

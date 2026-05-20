@@ -1501,9 +1501,33 @@ static void output_json(const std::vector<crispasr_segment>& segs, std::ofstream
         const int64_t t0 = segs[i].t0;
         const int64_t t1 = segs[i].t1;
 
+        // Multi-task ASR metadata (SenseVoice and similar). Emit any
+        // non-empty fields right after `text`. Each one is a flat string
+        // sibling: language / emotion / audio_event / itn_flag.
+        const bool has_lang = !segs[i].lang_id.empty();
+        const bool has_emo = !segs[i].emotion.empty();
+        const bool has_evt = !segs[i].audio_event.empty();
+        const bool has_itn = !segs[i].itn_flag.empty();
+        const bool has_meta = has_lang || has_emo || has_evt || has_itn;
+
         start_obj(nullptr);
         times_o(t0, t1, false);
-        value_s("text", text, !params.diarize && !params.tinydiarize && !full);
+        value_s("text", text, !has_meta && !params.diarize && !params.tinydiarize && !full);
+
+        if (has_meta) {
+            const bool meta_is_last = !full && !params.diarize && !params.tinydiarize;
+            int remaining = (int)has_lang + (int)has_emo + (int)has_evt + (int)has_itn;
+            auto emit = [&](const char* name, const std::string& v, bool present) {
+                if (!present)
+                    return;
+                --remaining;
+                value_s(name, v.c_str(), remaining == 0 && meta_is_last);
+            };
+            emit("language", segs[i].lang_id, has_lang);
+            emit("audio_event", segs[i].audio_event, has_evt);
+            emit("emotion", segs[i].emotion, has_emo);
+            emit("itn_flag", segs[i].itn_flag, has_itn);
+        }
 
         if (full) {
             start_arr("tokens");

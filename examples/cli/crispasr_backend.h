@@ -59,6 +59,12 @@ struct crispasr_segment {
     bool speaker_turn_next = false;     // whisper tinydiarize
     std::vector<crispasr_word> words;   // may be empty
     std::vector<crispasr_token> tokens; // may be empty
+    // Multi-task ASR metadata (SenseVoice and similar). Empty when the
+    // backend doesn't emit them.
+    std::string lang_id;     // e.g. "en", "zh", "ja"
+    std::string emotion;     // e.g. "HAPPY", "NEUTRAL"
+    std::string audio_event; // e.g. "Speech", "Music"
+    std::string itn_flag;    // "withitn" or "woitn"
 };
 
 // ---------------------------------------------------------------------------

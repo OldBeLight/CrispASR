@@ -500,6 +500,16 @@ bool crispasr_write_json(const std::string& path, const std::vector<crispasr_seg
             f << "      \"speaker\": \"" << json_escape(s.speaker) << "\",\n";
         }
         f << "      \"text\":       \"" << json_escape(s.text) << "\"";
+        // Multi-task ASR metadata (SenseVoice and similar). Emit any
+        // non-empty fields after `text`.
+        if (!s.lang_id.empty())
+            f << ",\n      \"language\":   \"" << json_escape(s.lang_id) << "\"";
+        if (!s.audio_event.empty())
+            f << ",\n      \"audio_event\":\"" << json_escape(s.audio_event) << "\"";
+        if (!s.emotion.empty())
+            f << ",\n      \"emotion\":    \"" << json_escape(s.emotion) << "\"";
+        if (!s.itn_flag.empty())
+            f << ",\n      \"itn_flag\":   \"" << json_escape(s.itn_flag) << "\"";
         if (full && !s.words.empty()) {
             f << ",\n      \"words\": [\n";
             for (size_t j = 0; j < s.words.size(); j++) {

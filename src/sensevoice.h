@@ -75,6 +75,26 @@ void sensevoice_free(struct sensevoice_context* ctx);
 char* sensevoice_transcribe(struct sensevoice_context* ctx, const float* samples, int n_samples, const char* language,
                             bool use_itn);
 
+// Structured result. Same forward pass as sensevoice_transcribe() but
+// with the 4-token rich-annotation prefix parsed out into its own
+// fields and removed from `text`. Empty strings mean the model did
+// not emit that token (e.g. degenerate audio). Upstream emits the
+// prefix in fixed order `[language, event, emotion, itn]`.
+struct sensevoice_result {
+    char* language;    // e.g. "en", "zh", "yue", "ja", "ko", "nospeech"
+    char* emotion;     // e.g. "HAPPY", "NEUTRAL", "ANGRY", "SAD", "EMO_UNKNOWN"
+    char* audio_event; // e.g. "Speech", "Music", "BGM", "Laughter", "Cough"
+    char* itn;         // "withitn" or "woitn"
+    char* text;        // transcript with the prefix stripped
+    char* raw;         // original transcribe() output, prefix included
+};
+
+// Caller owns; release with sensevoice_result_free(). nullptr on failure.
+struct sensevoice_result* sensevoice_transcribe_structured(struct sensevoice_context* ctx, const float* samples,
+                                                           int n_samples, const char* language, bool use_itn);
+
+void sensevoice_result_free(struct sensevoice_result* r);
+
 // Pull an intermediate activation for diff testing. Caller free()s.
 // Recognised stage names: see top-of-file comment.
 float* sensevoice_extract_stage(struct sensevoice_context* ctx, const float* samples, int n_samples,

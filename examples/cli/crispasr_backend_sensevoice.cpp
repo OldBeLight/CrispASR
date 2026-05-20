@@ -52,8 +52,9 @@ public:
         if (lspec == "zh" || lspec == "en" || lspec == "yue" || lspec == "ja" || lspec == "ko" || lspec == "nospeech")
             lang = lspec.c_str();
 
-        char* text = sensevoice_transcribe(ctx_, samples, n_samples, lang, /*use_itn*/ params.punctuation);
-        if (!text) {
+        sensevoice_result* r = sensevoice_transcribe_structured(ctx_, samples, n_samples, lang,
+                                                                /*use_itn*/ params.punctuation);
+        if (!r) {
             fprintf(stderr, "crispasr[sensevoice]: transcribe failed\n");
             return out;
         }
@@ -61,8 +62,16 @@ public:
         crispasr_segment seg;
         seg.t0 = t_offset_cs;
         seg.t1 = t_offset_cs + (int64_t)((double)n_samples / 16000.0 * 100.0);
-        seg.text = text;
-        std::free(text);
+        seg.text = r->text ? r->text : "";
+        if (r->language)
+            seg.lang_id = r->language;
+        if (r->emotion)
+            seg.emotion = r->emotion;
+        if (r->audio_event)
+            seg.audio_event = r->audio_event;
+        if (r->itn)
+            seg.itn_flag = r->itn;
+        sensevoice_result_free(r);
 
         while (!seg.text.empty() && (seg.text.front() == ' ' || seg.text.front() == '\n'))
             seg.text.erase(seg.text.begin());
