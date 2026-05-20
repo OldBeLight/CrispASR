@@ -191,6 +191,13 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # `kaldi_native_fbank`. Captures mel_spectrogram (T, 80) Kaldi fbank+CMVN
     # and encoder_output (T_enc, 1280) Conformer encoder.
     "firered-asr": "reference_backends.firered_asr",
+    # FunAudioLLM/Fun-ASR-Nano-2512 (and MLT variant): SenseVoiceEncoderSmall
+    # (70 SANM blocks @ 512-dim) + Transformer adaptor as ctc_decoder (5 blocks)
+    # + CTC head (8749-vocab multilingual). CTC path only — the Qwen3-0.6B
+    # LLM-decoder half is left to a follow-on backend. model_dir = HF id
+    # "FunAudioLLM/Fun-ASR-Nano-2512" / "FunAudioLLM/Fun-ASR-MLT-Nano-2512"
+    # or a local snapshot. Requires `funasr` 1.3.1+.
+    "funasr":     "reference_backends.funasr",
     # VoxCPM2 TTS: diffusion AR TTS with 4 transformer sub-networks.
     # model_dir = openbmb/VoxCPM2 HF snapshot. Audio arg = reference WAV
     # for voice cloning (optional). Synth text from VOXCPM2_SYN_TEXT env.
