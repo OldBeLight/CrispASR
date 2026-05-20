@@ -707,7 +707,8 @@ extern "C" float* sensevoice_extract_stage(sensevoice_context* ctx, const float*
         buf[txt.size()] = '\0';
         if (n_out)
             *n_out = (int)txt.size();
-        return (float*)buf;
+        // cppcheck-suppress invalidPointerCast
+        return (float*)buf; // caller casts back to char* (generated_text path)
     }
 
     std::vector<float> staged;

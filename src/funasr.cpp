@@ -1546,7 +1546,8 @@ extern "C" float* funasr_extract_stage(funasr_context* ctx, const float* samples
         buf[txt.size()] = '\0';
         if (n_out)
             *n_out = (int)txt.size();
-        return (float*)buf; // caller casts back to char*
+        // cppcheck-suppress invalidPointerCast
+        return (float*)buf; // caller casts back to char* (generated_text path)
     }
 
     std::vector<float> staged;

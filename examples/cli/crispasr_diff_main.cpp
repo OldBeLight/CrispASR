@@ -3541,8 +3541,7 @@ int main(int argc, char** argv) {
         for (const auto& stage : stages) {
             int n_out = 0;
             float* buf = sensevoice_extract_stage(ctx, samples.data(), (int)samples.size(),
-                                                   /*language*/ "auto", /*use_itn*/ true,
-                                                   stage.c_str(), &n_out);
+                                                  /*language*/ "auto", /*use_itn*/ true, stage.c_str(), &n_out);
             if (!buf || n_out <= 0) {
                 printf("[SKIP] %-22s  sensevoice_extract_stage returned no data\n", stage.c_str());
                 if (buf)
@@ -3559,8 +3558,8 @@ int main(int argc, char** argv) {
                     const char* got = (const char*)buf;
                     const std::string got_s(got, (size_t)n_out);
                     const bool exact = (got_s == ref_s);
-                    printf("%s %-22s  got=%s  ref=%s\n", exact ? "[PASS]" : "[FAIL]", stage.c_str(),
-                           got_s.c_str(), ref_s.c_str());
+                    printf("%s %-22s  got=%s  ref=%s\n", exact ? "[PASS]" : "[FAIL]", stage.c_str(), got_s.c_str(),
+                           ref_s.c_str());
                     if (exact)
                         n_pass++;
                     else
