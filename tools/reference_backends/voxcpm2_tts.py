@@ -180,28 +180,50 @@ def dump(
         model.base_lm.setup_cache(1, model.config.max_length, device, cache_dtype)
         model.residual_lm.setup_cache(1, model.config.max_length, device, cache_dtype)
 
-        with torch.inference_mode():
-            torch.manual_seed(seed)
-            if use_ref and ref_wav_path:
-                wav = model.generate(
-                    target_text=syn_text,
-                    reference_wav_path=ref_wav_path,
-                    max_len=max_steps,
-                    inference_timesteps=10,
-                    cfg_value=2.0,
-                )
-            else:
-                wav = model.generate(
-                    target_text=syn_text,
-                    max_len=max_steps,
-                    inference_timesteps=10,
-                    cfg_value=2.0,
-                )
+        # Hook the VAE decode to capture the latent that goes IN — that's the
+        # boundary between AR generation (TSLM/RALM/LocDiT/CFM) and VAE. Lets
+        # us isolate VAE drift from upstream drift downstream by feeding the
+        # captured latent into a C++ VAE-only test path.
+        capture_lat = {"val": None}
+        orig_decode = model.audio_vae.decode
 
-            if "decoded_audio" in stages and wav is not None:
-                wav_1d = wav.squeeze()
-                audio_np = wav_1d[:48000].numpy().astype(np.float32)
-                results["decoded_audio"] = audio_np
+        def hook_decode(latent):
+            # latent: torch.Tensor shape [B, D, T_lat]
+            capture_lat["val"] = latent.detach().cpu().float().numpy()
+            return orig_decode(latent)
+
+        model.audio_vae.decode = hook_decode
+
+        try:
+            with torch.inference_mode():
+                torch.manual_seed(seed)
+                if use_ref and ref_wav_path:
+                    wav = model.generate(
+                        target_text=syn_text,
+                        reference_wav_path=ref_wav_path,
+                        max_len=max_steps,
+                        inference_timesteps=10,
+                        cfg_value=2.0,
+                    )
+                else:
+                    wav = model.generate(
+                        target_text=syn_text,
+                        max_len=max_steps,
+                        inference_timesteps=10,
+                        cfg_value=2.0,
+                    )
+
+                if "decoded_audio" in stages and wav is not None:
+                    wav_1d = wav.squeeze()
+                    audio_np = wav_1d[:48000].numpy().astype(np.float32)
+                    results["decoded_audio"] = audio_np
+
+                if "generated_latent" in stages and capture_lat["val"] is not None:
+                    # Saved as [B=1, D=64, T_lat]; drop batch dim → [D, T_lat]
+                    lat = capture_lat["val"][0]
+                    results["generated_latent"] = lat.astype(np.float32)
+        finally:
+            model.audio_vae.decode = orig_decode
 
     # Cleanup temp WAV
     if ref_wav_path:
