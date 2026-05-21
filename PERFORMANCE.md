@@ -1103,3 +1103,91 @@ TDT q8_0) is 8.24× RT vs ONNX CPU's 6.23× RT — see the earlier
 section. The structural-fusion gap is a CPU x86 specific story;
 GPU paths bypass it because compute throughput, not memory
 bandwidth, is what limits them.
+
+---
+
+## Long-audio coverage benchmark — 2026-05-21 (issue #89)
+
+Platform: x86_64 VPS, 4 threads, CPU-only, no GPU. Commit `5e16414`
+(30 s auto-chunk fallback + PR #116 VAD gate fix).
+
+Test audio: first 60 s of the issue #89 reporter's exact YouTube clip
+(`o_9dWkRPYC0`, Japanese podcast, 16 kHz mono PCM). Human estimate:
+100-150 words in the first 60 s of continuous speech.
+
+### Issue #89 fix verification — parakeet-tdt-0.6b-ja
+
+Before the fix (commit `3f4cbe4`, 60 s auto-chunk): **0 chars** output
+on this CPU backend — the TDT decoder emitted blanks due to per-feature
+z-norm drift at 60 s chunk length.
+
+After the fix (30 s auto-chunk):
+
+| settings | chars | first_ts | last_ts | coverage% | gaps | wall_s | rtf |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| auto (30 s chunks) | 195 | 0.16 | 58.02 | 59.7 | 2 | 64.9 | 0.9× |
+| `--vad` (silero) | 281 | 0.36 | 59.87 | 93.1 | 1 | 50.7 | 1.2× |
+| `--vad --vad-model firered` | 238 | 0.28 | 58.01 | 85.1 | 1 | 58.3 | 1.0× |
+| `--chunk-seconds 15` | 203 | 0.00 | 59.90 | 75.6 | 3 | 76.4 | 0.8× |
+| `--chunk-seconds 30` | 195 | 0.16 | 58.02 | 59.7 | 2 | 55.8 | 1.1× |
+| `--chunk-seconds 60` | 294 | 0.16 | 59.84 | 99.5 | 0 | 54.6 | 1.1× |
+
+**Key findings:**
+- `--vad` (silero) gives best balance: 93 % coverage, 281 chars, fewest gaps.
+- `--chunk-seconds 60` gives 99.5 % coverage on CPU but **fails on Vulkan/AMD**
+  (the reporter's hardware) due to z-norm drift. 30 s is the safe default.
+- Shorter chunks (15 s) improve coverage over 30 s (75 % vs 60 %) but add
+  more gaps from chunk boundary artifacts.
+- **Recommendation for long Japanese audio: `--vad` with silero or firered.**
+
+### Multi-backend Japanese comparison (60 s)
+
+All backends on the same 60 s Japanese clip. "chars" counts non-space
+characters (Japanese has no word spaces; "words" column counts
+space-delimited tokens, which undercounts for CJK).
+
+| backend | settings | chars | coverage% | gaps | wall_s | rtf |
+|---|---|---:|---:|---:|---:|---:|
+| cohere-transcribe | `--vad` | 296 | 96.8 | 0 | 169.0 | 0.4× |
+| parakeet-tdt-0.6b-ja | `--vad` | 281 | 93.1 | 1 | 50.7 | 1.2× |
+| parakeet-tdt-0.6b-ja | chunk-60 | 294 | 99.5 | 0 | 54.6 | 1.1× |
+| cohere-transcribe | auto | 242 | 87.4 | 1 | 199.2 | 0.3× |
+| parakeet-tdt-0.6b-ja | `--vad` firered | 238 | 85.1 | 1 | 58.3 | 1.0× |
+| parakeet-tdt-0.6b-ja | chunk-15 | 203 | 75.6 | 3 | 76.4 | 0.8× |
+| parakeet-tdt-0.6b-ja | auto (30 s) | 195 | 59.7 | 2 | 64.9 | 0.9× |
+
+**Quality ranking for 60 s Japanese:**
+1. **Cohere + VAD** — best coverage (96.8 %), zero gaps, proper kanji, but
+   slowest (0.4× RT on CPU).
+2. **Parakeet + VAD silero** — 93 % coverage, 3.3× faster than cohere.
+3. **Parakeet chunk-60** — 99.5 % coverage on CPU, but not safe on all
+   hardware (z-norm drift on Vulkan/AMD, issue #89).
+
+### 300 s Japanese audio
+
+Parakeet-tdt-0.6b-ja on the full 5-minute clip (auto = 30 s chunks):
+- **11 slices**, 3491 chars, full 0-300 s coverage
+- Before fix: 636 chars starting at 58 s (first 58 s completely lost)
+
+### Benchmark framework
+
+Results collected with `tests/benchmark_asr.py`:
+
+```bash
+# Quick single-backend triage:
+python tests/benchmark_asr.py --audio myfile.wav --backend parakeet
+
+# Full matrix across backends and settings:
+python tests/benchmark_asr.py --corpus /mnt/storage/test-audio/corpus.json --all-settings
+
+# Build the test audio corpus (en/de/ja/zh × 4 durations from FLEURS):
+python tests/benchmark_corpus.py
+```
+
+Results are stored in `/mnt/storage/benchmark-results/runs.jsonl` (JSONL,
+one line per run). The framework computes: word count, char count,
+first/last timestamp, time coverage %, gap count/size, wall time, and
+realtime factor. See `tests/benchmark_metrics.py` for the metric
+definitions and `tests/test_benchmark_metrics.py` for 14 pytest unit
+tests that validate the computation (including the issue #89 failure
+signature: <5 % coverage on 300 s audio).
