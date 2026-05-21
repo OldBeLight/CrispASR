@@ -712,12 +712,8 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     ggml_backend_tensor_get(logits, logits_data.data(), 0, logits_data.size() * sizeof(float));
 
     std::string result;
+    bool prev_was_bpe_cont = false;  // true if previous token ended with @@
     for (int n = 0; n < N_tokens; n++) {
-        // logits tensor ne = (V, N). Element [v, n] at offset v + n*V.
-        // Actually: logits tensor ne = (V, N). ggml stores col-major.
-        // Element [v, n] at offset v + n * V.
-        // For token n: argmax over v in [0, V), at positions {v + n*V, v=0..V-1}
-        // = contiguous block starting at offset n * V.
         int best = 0;
         float best_val = -1e30f;
         for (int v = 0; v < V; v++) {
@@ -731,12 +727,28 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         if (best <= 2 || best == V - 1) continue;
         if ((size_t)best < ctx->vocab.size()) {
             std::string tok = ctx->vocab[best];
-            // Handle BPE continuation marker @@
-            if (tok.size() >= 2 && tok.substr(tok.size() - 2) == "@@") {
+            bool is_bpe_cont = (tok.size() >= 2 && tok.substr(tok.size() - 2) == "@@");
+            // Insert space before Latin-script tokens that start a new word.
+            // Paraformer-zh uses character-level Chinese + word-level English
+            // with @@ BPE continuation markers. Space is needed between
+            // consecutive English words (tokens without @@ on either side).
+            if (!result.empty() && !prev_was_bpe_cont) {
+                unsigned char first_byte = (unsigned char)tok[0];
+                unsigned char last_byte = (unsigned char)result.back();
+                bool cur_is_latin = (first_byte >= 'a' && first_byte <= 'z') ||
+                                    (first_byte >= 'A' && first_byte <= 'Z');
+                bool prev_is_latin = (last_byte >= 'a' && last_byte <= 'z') ||
+                                     (last_byte >= 'A' && last_byte <= 'Z');
+                if (cur_is_latin && prev_is_latin) {
+                    result += ' ';
+                }
+            }
+            if (is_bpe_cont) {
                 result += tok.substr(0, tok.size() - 2);
             } else {
                 result += tok;
             }
+            prev_was_bpe_cont = is_bpe_cont;
         }
     }
 
