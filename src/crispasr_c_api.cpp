@@ -966,7 +966,7 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "canary";
     else if (strcmp(arch, "cohere-transcribe") == 0)
         backend = "cohere";
-    else if (strcmp(arch, "qwen3-asr") == 0)
+    else if (strcmp(arch, "qwen3-asr") == 0 || strcmp(arch, "qwen3asr") == 0)
         backend = "qwen3";
     else if (strcmp(arch, "voxtral") == 0)
         backend = "voxtral";

@@ -69,7 +69,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_voxtral_backend();
     if (name == "voxtral4b")
         return crispasr_make_voxtral4b_backend();
-    if (name == "qwen3")
+    if (name == "qwen3" || name == "qwen3-1.7b" || name == "qwen3_1.7b" || name == "qwen3_17b" ||
+        name == "mega-asr" || name == "mega_asr" || name == "megaasr")
         return crispasr_make_qwen3_backend();
     if (name == "fastconformer-ctc")
         return crispasr_make_fastconformer_ctc_backend();
@@ -145,6 +146,8 @@ std::vector<std::string> crispasr_list_backends() {
         "voxtral",
         "voxtral4b",
         "qwen3",
+        "qwen3-1.7b",
+        "mega-asr",
         "fastconformer-ctc",
         "wav2vec2",
         "hubert",
@@ -396,6 +399,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "canary";
     if (contains_ci("cohere"))
         return "cohere";
+    if (contains_ci("mega-asr") || contains_ci("mega_asr") || contains_ci("megaasr"))
+        return "mega-asr";
     if (contains_ci("qwen3") && contains_ci("asr"))
         return "qwen3";
     if (contains_ci("qwen3") && contains_ci("tts"))

@@ -802,7 +802,7 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr, "\ncrispasr backend options (select a non-whisper model):\n");
     fprintf(stderr,
             "  --backend NAME                    [%-7s] backend: "
-            "whisper|parakeet|canary|cohere|qwen3|voxtral|voxtral4b|granite\n",
+            "whisper|parakeet|canary|cohere|qwen3|qwen3-1.7b|mega-asr|voxtral|voxtral4b|granite\n",
             params.backend.c_str());
     fprintf(stderr, "  --list-backends                   list backends compiled into this binary and exit\n");
     fprintf(stderr, "  --list-backends-json              same as --list-backends but JSON-formatted, for tooling\n");

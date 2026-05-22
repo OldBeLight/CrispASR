@@ -62,6 +62,15 @@ constexpr Entry k_registry[] = {
      "~3.2 GB", nullptr, nullptr},
     {"qwen3", "qwen3-asr-0.6b-q4_k.gguf",
      "https://huggingface.co/cstr/qwen3-asr-0.6b-GGUF/resolve/main/qwen3-asr-0.6b-q4_k.gguf", "~500 MB", nullptr, nullptr},
+    {"qwen3-1.7b", "qwen3-asr-1.7b-q4_k.gguf",
+     "https://huggingface.co/cstr/qwen3-asr-1.7b-GGUF/resolve/main/qwen3-asr-1.7b-q4_k.gguf",
+     "~1.3 GB", nullptr, nullptr},
+    // Mega-ASR: Qwen3-ASR-1.7B with the upstream robustness LoRA merged
+    // offline. It uses the standard qwen3 backend at runtime; the upstream
+    // router is not required for this always-on robust path.
+    {"mega-asr", "mega-asr-1.7b-q4_k.gguf",
+     "https://huggingface.co/cstr/mega-asr-GGUF/resolve/main/mega-asr-1.7b-q4_k.gguf",
+     "~1.3 GB", nullptr, nullptr},
     // FunAudioLLM/Fun-ASR-Nano-2512: 70 SANM encoder blocks + 2-block
     // Transformer adaptor + Qwen3-0.6B LLM decoder. zh/yue/en/ja/ko.
     // Only F16 ships today (Q4_K + Q8_0 pending). Upstream code is
