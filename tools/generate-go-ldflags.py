@@ -28,6 +28,11 @@ SKIP = {
 # ggml libraries handled separately at the end of the link line
 GGML_LIBS = ["ggml", "ggml-base", "ggml-cpu"]
 
+# Transitive dependencies that backends link but crispasr doesn't
+# link directly. Must be in the Go link group because Go links all
+# static libs flat (no CMake transitive resolution).
+TRANSITIVE = ["crispasr-core", "crisp_audio"]
+
 
 def extract_libs() -> list[str]:
     """Extract PUBLIC link libraries from CMakeLists.txt."""
@@ -62,6 +67,7 @@ def extract_libs() -> list[str]:
 def format_ldflags(libs: list[str], platform: str) -> str:
     """Format as a CGO LDFLAGS line."""
     flags = [f"-l{lib}" for lib in libs]
+    flags.extend(f"-l{lib}" for lib in TRANSITIVE)
     flags.extend(f"-l{lib}" for lib in GGML_LIBS)
     if platform == "linux":
         return (
