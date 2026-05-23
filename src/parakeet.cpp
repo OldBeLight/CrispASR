@@ -1109,6 +1109,9 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
     const bool sampling = ctx->decode_temperature > 0.0f;
     std::mt19937_64 rng(ctx->decode_seed != 0 ? ctx->decode_seed : (uint64_t)std::random_device{}());
 
+    const bool has_hotwords = !ctx->hotword_trie.empty();
+    core_context_bias::MatchState hw_state;
+
     int t = 0;
     int total_steps = 0;
     while (t < T_enc) {
@@ -1117,6 +1120,11 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
         int n_inner = 0;
         while (n_inner < max_per_step) {
             joint_step(J, proj_e.data(), pred_out.data(), logits);
+
+            // CTC-WS phrase boost on vocab logits (not duration logits)
+            if (has_hotwords)
+                core_context_bias::apply_bias(ctx->hotword_trie, hw_state,
+                                              logits.data(), n_vocab_blk, ctx->hotword_boost);
 
             if (getenv("PARAKEET_DEBUG") && total_steps < 5) {
                 // Show first few logits
@@ -1225,6 +1233,8 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
             // Real token: emit and advance the predictor
             int t_end = std::min(T_enc, t + std::max(0, dur_skip));
             emitted.push_back({tok, t, t_end, tok_p});
+            if (has_hotwords)
+                core_context_bias::advance(ctx->hotword_trie, hw_state, tok);
             predictor_step(W, tok, state, pred_out);
 
             // Diagnostic: dump predictor stats for the first few emissions
