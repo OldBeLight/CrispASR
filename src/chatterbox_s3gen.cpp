@@ -715,6 +715,13 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
     return c;
 }
 
+extern "C" void chatterbox_s3gen_set_seed(struct chatterbox_s3gen_context* ctx, uint32_t seed) {
+    if (!ctx)
+        return;
+    ctx->noise_seed = seed;
+    mt19937_seed(ctx->noise_rng, seed);
+}
+
 // ── Conformer encoder via ggml graph ────────────────────────────
 //
 // UpsampleConformerEncoder from CosyVoice/ESPnet:

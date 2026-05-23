@@ -10,6 +10,7 @@ import (
 )
 
 func TestSetLanguage(t *testing.T) {
+	requireModel(t)
 	assert := assert.New(t)
 
 	model, err := whisper.New(ModelPath)
@@ -28,6 +29,7 @@ func TestSetLanguage(t *testing.T) {
 }
 
 func TestContextModelIsMultilingual(t *testing.T) {
+	requireModel(t)
 	assert := assert.New(t)
 
 	model, err := whisper.New(ModelPath)
@@ -47,6 +49,7 @@ func TestContextModelIsMultilingual(t *testing.T) {
 }
 
 func TestLanguage(t *testing.T) {
+	requireModel(t)
 	assert := assert.New(t)
 
 	model, err := whisper.New(ModelPath)
@@ -66,6 +69,8 @@ func TestLanguage(t *testing.T) {
 }
 
 func TestProcess(t *testing.T) {
+	requireModel(t)
+	requireSample(t)
 	assert := assert.New(t)
 
 	fh, err := os.Open(SamplePath)
@@ -93,6 +98,8 @@ func TestProcess(t *testing.T) {
 }
 
 func TestDetectedLanguage(t *testing.T) {
+	requireModel(t)
+	requireSample(t)
 	assert := assert.New(t)
 
 	fh, err := os.Open(SamplePath)

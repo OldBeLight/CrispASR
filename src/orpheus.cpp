@@ -295,6 +295,7 @@ extern "C" struct orpheus_context_params orpheus_context_default_params(void) {
     // and produces unusable audio; 0.6 is the engine default and what
     // the slice (c) ASR roundtrip was validated against.
     p.temperature = 0.6f;
+    p.seed = 0;
     p.max_audio_tokens = 0;
     p.flash_attn = true;
     return p;
@@ -305,6 +306,7 @@ extern "C" struct orpheus_context* orpheus_init_from_file(const char* path_model
     auto* c = new orpheus_context();
     c->params = params;
     c->n_threads = params.n_threads > 0 ? params.n_threads : 4;
+    c->rng_state = params.seed != 0 ? params.seed : 0xdeadbeefcafebabeULL;
 
     // Pass 1: hparams + vocab.
     {
@@ -426,6 +428,14 @@ extern "C" void orpheus_set_temperature(struct orpheus_context* ctx, float tempe
         temperature = 4.0f;
     }
     ctx->params.temperature = temperature;
+}
+
+extern "C" void orpheus_set_seed(struct orpheus_context* ctx, uint64_t seed) {
+    if (!ctx) {
+        return;
+    }
+    ctx->params.seed = seed;
+    ctx->rng_state = seed != 0 ? seed : 0xdeadbeefcafebabeULL;
 }
 
 extern "C" int orpheus_set_codec_path(struct orpheus_context* ctx, const char* path) {

@@ -169,8 +169,7 @@ public:
                 return {};
             }
         }
-        if (params.seed != 0)
-            chatterbox_set_seed(ctx_, (uint32_t)params.seed);
+        chatterbox_set_seed(ctx_, (uint32_t)params.seed);
         int n = 0;
         float* pcm = chatterbox_synthesize(ctx_, text.c_str(), &n);
         if (!pcm || n <= 0)

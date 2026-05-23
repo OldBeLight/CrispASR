@@ -79,6 +79,7 @@ struct whisper_params {
     int32_t progress_step = 5;
     int32_t max_context = -1;
     int32_t max_len = 0;
+    int32_t max_tokens = 0;
     int32_t best_of = 2;
     int32_t beam_size = -1;
     int32_t audio_ctx = 0;
@@ -87,6 +88,7 @@ struct whisper_params {
     float entropy_thold = 2.40f;
     float logprob_thold = -1.00f;
     float temperature = 0.00f;
+    float frequency_penalty = 0.00f;
     float temperature_inc = 0.20f;
     float no_speech_thold = 0.6f;
 
@@ -641,6 +643,15 @@ void get_req_parameters(const Request& req, whisper_params& params) {
     if (req.has_file("temperature")) {
         params.temperature = std::stof(req.get_file_value("temperature").content);
     }
+    if (req.has_file("max_tokens")) {
+        params.max_tokens = std::stoi(req.get_file_value("max_tokens").content);
+    }
+    if (req.has_file("max_new_tokens")) {
+        params.max_tokens = std::stoi(req.get_file_value("max_new_tokens").content);
+    }
+    if (req.has_file("frequency_penalty")) {
+        params.frequency_penalty = std::stof(req.get_file_value("frequency_penalty").content);
+    }
     if (req.has_file("temperature_inc")) {
         params.temperature_inc = std::stof(req.get_file_value("temperature_inc").content);
     }
@@ -995,6 +1006,7 @@ int main(int argc, char** argv) {
             wparams.beam_search.beam_size = params.beam_size;
 
             wparams.temperature = params.temperature;
+            wparams.max_tokens = params.max_tokens;
             wparams.no_speech_thold = params.no_speech_thold;
             wparams.temperature_inc = params.temperature_inc;
             wparams.entropy_thold = params.entropy_thold;

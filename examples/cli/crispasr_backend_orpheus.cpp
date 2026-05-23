@@ -79,6 +79,7 @@ public:
         if (p.temperature > 0.0f) {
             cp.temperature = p.temperature;
         }
+        cp.seed = p.seed;
         ctx_ = orpheus_init_from_file(p.model.c_str(), cp);
         if (!ctx_) {
             fprintf(stderr, "crispasr[orpheus]: failed to load talker '%s'\n", p.model.c_str());
@@ -122,6 +123,9 @@ public:
         if (!ctx_ || text.empty()) {
             return {};
         }
+        if (params.temperature > 0.0f)
+            orpheus_set_temperature(ctx_, params.temperature);
+        orpheus_set_seed(ctx_, params.seed);
 
         if (!voice_loaded_) {
             std::string spk_name = params.tts_voice;

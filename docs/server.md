@@ -90,6 +90,9 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `prompt` | Initial prompt / context |
 | `response_format` | `json` (default), `verbose_json`, `text`, `srt`, `vtt` |
 | `temperature` | Sampling temperature (default: 0.0) |
+| `max_tokens` | Generated-token cap for supported autoregressive ASR backends |
+| `max_new_tokens` | Alias for `max_tokens` |
+| `frequency_penalty` | Opt-in repeated generated-token penalty for supported autoregressive ASR backends (`0.0` disabled) |
 
 `GET /v1/models` returns an OpenAI-compatible model list with the
 currently loaded model.
@@ -263,7 +266,9 @@ curl http://localhost:8080/health
 curl http://localhost:8080/v1/audio/transcriptions \
   -H "Authorization: Bearer $CRISPASR_API_KEY" \
   -F "file=@audio.wav" \
-  -F "response_format=verbose_json"
+  -F "response_format=verbose_json" \
+  -F "max_tokens=256" \
+  -F "frequency_penalty=0.4"
 ```
 
 By default the compose stack:

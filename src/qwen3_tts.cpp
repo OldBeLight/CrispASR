@@ -4877,6 +4877,12 @@ extern "C" void qwen3_tts_set_temperature(struct qwen3_tts_context* ctx, float t
     ctx->params.temperature = temperature;
 }
 
+extern "C" void qwen3_tts_set_seed(struct qwen3_tts_context* ctx, uint64_t seed) {
+    if (!ctx)
+        return;
+    ctx->params.seed = seed;
+}
+
 static void build_embd_caches(qwen3_tts_context* c) {
     c->token_embd_cache.init(c->talker.token_embd_w);
     auto& cp = c->code_pred;
@@ -5758,11 +5764,13 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
     }
     const int eos = (int)hp.codec_eos_id;
 
-    // PRNG seed — context params take priority, then env, then default 42.
-    uint64_t rng = ctx->params.seed != 0 ? ctx->params.seed : 42;
+    // PRNG seed — explicit request / CLI params take priority, then env, then default 42.
+    uint64_t rng = 42;
     if (const char* s = env_str("QWEN3_TTS_SEED")) {
         rng = (uint64_t)std::strtoull(s, nullptr, 10);
     }
+    if (ctx->params.seed != 0)
+        rng = ctx->params.seed;
 
     // ---- prefill builder: CustomVoice (no ref) or Base ICL (ref WAV) ----
     double t0 = bench ? now_ms() : 0.0;

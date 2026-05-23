@@ -228,6 +228,10 @@ CA_EXPORT void crispasr_params_set_temperature(whisper_full_params* p, float t) 
     if (p)
         p->temperature = t;
 }
+CA_EXPORT void crispasr_params_set_max_tokens(whisper_full_params* p, int n) {
+    if (p)
+        p->max_tokens = n > 0 ? n : 0;
+}
 CA_EXPORT void crispasr_params_set_initial_prompt(whisper_full_params* p, const char* prompt) {
     if (p)
         p->initial_prompt = prompt; // caller owns the string
@@ -1073,6 +1077,8 @@ struct crispasr_session {
     // Best-of-N: run N independent decodes and keep the lowest-perplexity
     // one. Only effective when temperature > 0. Default 1 (no resampling).
     int best_of = 1;
+    int max_new_tokens = 0;
+    float frequency_penalty = 0.0f;
 
     // Beam search width. Default 1 (= greedy, no beam search). When > 1
     // the dispatch path switches whisper into beam-search sampling
@@ -2571,9 +2577,10 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         std::free(logits);
 
         core_greedy_decode::Config dec_cfg;
-        dec_cfg.max_new_tokens = 256;
+        dec_cfg.max_new_tokens = s->max_new_tokens > 0 ? s->max_new_tokens : 256;
         dec_cfg.eos_id = eos_id;
         dec_cfg.vocab_size = vocab;
+        dec_cfg.frequency_penalty = s->frequency_penalty;
         auto dec = core_greedy_decode::run_with_probs(s->qwen3_ctx, first_tok, first_p, (int)ids.size(),
                                                       qwen3_asr_embed_tokens, qwen3_asr_run_llm_kv, dec_cfg);
 
@@ -2633,6 +2640,8 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
     if (s->backend == "cohere" && s->cohere_ctx) {
         // Cohere takes a single `lang` (source); per-call wins, sticky next.
         const std::string src = lang_set ? lang : (!s->source_language.empty() ? s->source_language : "en");
+        cohere_set_max_new_tokens(s->cohere_ctx, s->max_new_tokens);
+        cohere_set_frequency_penalty(s->cohere_ctx, s->frequency_penalty);
         cohere_result* cr = cohere_transcribe_ex(s->cohere_ctx, pcm, n_samples, src.c_str(), 0);
         if (!cr) {
             delete r;
@@ -2772,9 +2781,10 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         std::free(logits);
 
         core_greedy_decode::Config dec_cfg;
-        dec_cfg.max_new_tokens = 200;
+        dec_cfg.max_new_tokens = s->max_new_tokens > 0 ? s->max_new_tokens : 200;
         dec_cfg.eos_id = eos_tok;
         dec_cfg.vocab_size = vocab;
+        dec_cfg.frequency_penalty = s->frequency_penalty;
         auto dec = core_greedy_decode::run_with_probs(s->granite_ctx, first_tok, first_p, total_prompt,
                                                       granite_speech_embed_tokens, granite_speech_run_llm_kv, dec_cfg);
 
@@ -4792,6 +4802,28 @@ CA_EXPORT int crispasr_session_set_best_of(crispasr_session* s, int n) {
     if (!s)
         return -1;
     s->best_of = n > 0 ? n : 1;
+    return 0;
+}
+
+CA_EXPORT int crispasr_session_set_max_new_tokens(crispasr_session* s, int n) {
+    if (!s)
+        return -1;
+    s->max_new_tokens = n > 0 ? n : 0;
+#ifdef CA_HAVE_COHERE
+    if (s->cohere_ctx)
+        cohere_set_max_new_tokens(s->cohere_ctx, s->max_new_tokens);
+#endif
+    return 0;
+}
+
+CA_EXPORT int crispasr_session_set_frequency_penalty(crispasr_session* s, float penalty) {
+    if (!s)
+        return -1;
+    s->frequency_penalty = penalty > 0.0f ? penalty : 0.0f;
+#ifdef CA_HAVE_COHERE
+    if (s->cohere_ctx)
+        cohere_set_frequency_penalty(s->cohere_ctx, s->frequency_penalty);
+#endif
     return 0;
 }
 

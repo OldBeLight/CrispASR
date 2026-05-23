@@ -58,8 +58,10 @@
 #pragma once
 
 #include <cmath>
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -76,6 +78,7 @@ struct Config {
     // the RNG; pass 0 for "non-deterministic" (time-based) or any non-zero
     // value for reproducibility.
     float temperature = 0.0f;
+    float frequency_penalty = 0.0f; // 0 = disabled; subtracts penalty * generated count
     uint64_t seed = 0;
 };
 
@@ -138,6 +141,25 @@ static inline int sample_temp(const float* logits, int vocab, float temperature,
     return vocab - 1;
 }
 
+static inline const float* penalized_logits(const float* logits, int vocab, float frequency_penalty,
+                                            const std::vector<int>& token_counts, std::vector<float>& scratch) {
+    if (frequency_penalty <= 0.0f || token_counts.empty())
+        return logits;
+    scratch.resize((size_t)vocab);
+    std::memcpy(scratch.data(), logits, (size_t)vocab * sizeof(float));
+    const int n = std::min(vocab, (int)token_counts.size());
+    for (int i = 0; i < n; ++i) {
+        if (token_counts[(size_t)i] > 0)
+            scratch[(size_t)i] -= frequency_penalty * (float)token_counts[(size_t)i];
+    }
+    return scratch.data();
+}
+
+static inline void count_generated_token(std::vector<int>& token_counts, int token_id) {
+    if (token_id >= 0 && token_id < (int)token_counts.size())
+        token_counts[(size_t)token_id]++;
+}
+
 // Default "no-op" pre-forward hook. The compiler inlines and prunes
 // the body at call sites that don't need a hook.
 struct NoHook {
@@ -188,6 +210,9 @@ std::vector<int32_t> run(Ctx* ctx, int32_t first_token, int initial_n_past, Embe
     // when we won't sample.
     std::mt19937_64 rng(cfg.seed != 0 ? cfg.seed : (uint64_t)std::random_device{}());
     const bool sampling = cfg.temperature > 0.0f;
+    std::vector<int> token_counts(cfg.frequency_penalty > 0.0f ? (size_t)cfg.vocab_size : 0);
+    std::vector<float> adjusted_logits;
+    count_generated_token(token_counts, first_token);
 
     int n_past = initial_n_past;
     while ((int)gen.size() < cfg.max_new_tokens && gen.back() != cfg.eos_id) {
@@ -211,9 +236,13 @@ std::vector<int32_t> run(Ctx* ctx, int32_t first_token, int initial_n_past, Embe
             break;
         n_past++;
 
-        const int nx = sampling ? sample_temp(lg, cfg.vocab_size, cfg.temperature, rng) : argmax(lg, cfg.vocab_size);
+        const float* pick_logits =
+            penalized_logits(lg, cfg.vocab_size, cfg.frequency_penalty, token_counts, adjusted_logits);
+        const int nx = sampling ? sample_temp(pick_logits, cfg.vocab_size, cfg.temperature, rng)
+                                : argmax(pick_logits, cfg.vocab_size);
         std::free(lg);
         gen.push_back(nx);
+        count_generated_token(token_counts, nx);
     }
 
     return gen;
@@ -246,6 +275,9 @@ inline Result run_with_probs(Ctx* ctx, int32_t first_token, float first_prob, in
 
     std::mt19937_64 rng(cfg.seed != 0 ? cfg.seed : (uint64_t)std::random_device{}());
     const bool sampling = cfg.temperature > 0.0f;
+    std::vector<int> token_counts(cfg.frequency_penalty > 0.0f ? (size_t)cfg.vocab_size : 0);
+    std::vector<float> adjusted_logits;
+    count_generated_token(token_counts, first_token);
 
     int n_past = initial_n_past;
     while ((int)r.tokens.size() < cfg.max_new_tokens && r.tokens.back() != cfg.eos_id) {
@@ -263,18 +295,21 @@ inline Result run_with_probs(Ctx* ctx, int32_t first_token, float first_prob, in
         // Pick next token + compute its softmax probability.
         int nx;
         float nx_lp;
+        const float* pick_logits =
+            penalized_logits(lg, cfg.vocab_size, cfg.frequency_penalty, token_counts, adjusted_logits);
         if (sampling) {
-            nx = sample_temp(lg, cfg.vocab_size, cfg.temperature, rng);
-            nx_lp = lg[nx];
+            nx = sample_temp(pick_logits, cfg.vocab_size, cfg.temperature, rng);
+            nx_lp = pick_logits[nx];
         } else {
-            nx = argmax(lg, cfg.vocab_size);
-            nx_lp = lg[nx];
+            nx = argmax(pick_logits, cfg.vocab_size);
+            nx_lp = pick_logits[nx];
         }
-        const float nx_p = softmax_of(lg, cfg.vocab_size, nx, nx_lp);
+        const float nx_p = softmax_of(pick_logits, cfg.vocab_size, nx, nx_lp);
         std::free(lg);
 
         r.tokens.push_back(nx);
         r.probs.push_back(nx_p);
+        count_generated_token(token_counts, nx);
     }
     return r;
 }
@@ -294,6 +329,9 @@ inline Result run_with_probs(Ctx* ctx, int32_t first_token, float first_prob, in
 
     std::mt19937_64 rng(cfg.seed != 0 ? cfg.seed : (uint64_t)std::random_device{}());
     const bool sampling = cfg.temperature > 0.0f;
+    std::vector<int> token_counts(cfg.frequency_penalty > 0.0f ? (size_t)cfg.vocab_size : 0);
+    std::vector<float> adjusted_logits;
+    count_generated_token(token_counts, first_token);
 
     int n_past = initial_n_past;
     while ((int)r.tokens.size() < cfg.max_new_tokens && r.tokens.back() != cfg.eos_id) {
@@ -316,18 +354,21 @@ inline Result run_with_probs(Ctx* ctx, int32_t first_token, float first_prob, in
 
         int nx;
         float nx_lp;
+        const float* pick_logits =
+            penalized_logits(lg, cfg.vocab_size, cfg.frequency_penalty, token_counts, adjusted_logits);
         if (sampling) {
-            nx = sample_temp(lg, cfg.vocab_size, cfg.temperature, rng);
-            nx_lp = lg[nx];
+            nx = sample_temp(pick_logits, cfg.vocab_size, cfg.temperature, rng);
+            nx_lp = pick_logits[nx];
         } else {
-            nx = argmax(lg, cfg.vocab_size);
-            nx_lp = lg[nx];
+            nx = argmax(pick_logits, cfg.vocab_size);
+            nx_lp = pick_logits[nx];
         }
-        const float nx_p = softmax_of(lg, cfg.vocab_size, nx, nx_lp);
+        const float nx_p = softmax_of(pick_logits, cfg.vocab_size, nx, nx_lp);
         std::free(lg);
 
         r.tokens.push_back(nx);
         r.probs.push_back(nx_p);
+        count_generated_token(token_counts, nx);
     }
     return r;
 }

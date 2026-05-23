@@ -38,12 +38,21 @@ each run can produce a different prosody or phrasing.
     --tts "Good morning." --seed 2 --tts-output variant2.wav
 ```
 
-The seed is wired through every TTS backend that samples: qwen3-tts,
-chatterbox, indextts, orpheus (via temperature), voxcpm2 (CFM noise),
-and vibevoice. It also works for ASR backends with temperature
-sampling (parakeet, canary, cohere, qwen3-asr, voxtral4b, granite,
-glm-asr, kyutai-stt, moonshine). The server API accepts `"seed"` in
-the `/v1/audio/speech` JSON body.
+The seed is wired through the sampling-capable TTS backends:
+qwen3-tts, chatterbox, vibevoice, orpheus, indextts, and voxcpm2. It
+also works for ASR backends with temperature sampling (parakeet,
+canary, cohere, qwen3-asr, voxtral4b, granite, glm-asr, kyutai-stt,
+moonshine). The server API accepts `"seed"` in the `/v1/audio/speech`
+JSON body.
+
+Local live checks on `/Volumes/backups/ai/crispasr` confirmed the visible
+effect on `qwen3-tts-customvoice`, `chatterbox`, `vibevoice-tts`, and
+`vibevoice-1.5b`: same seed = bit-identical WAV, different seed =
+different WAV hash. `IndexTTS` accepts the seed too, but on the tested
+prompt/reference pair the default beam-search path stayed identical
+across seeds, so treat it as a low-visibility knob unless you expose a
+stochastic decode path. `Kokoro` uses `KOKORO_SEED` instead of
+`--seed`.
 
 For HTTP usage, see [`docs/server.md`](server.md) — `POST
 /v1/audio/speech` is the OpenAI-compatible TTS endpoint, available on

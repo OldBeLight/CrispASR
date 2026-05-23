@@ -2954,3 +2954,16 @@ extern "C" void indextts_set_n_threads(struct indextts_context* ctx, int n_threa
         ctx->n_threads = n_threads > 0 ? n_threads : 4;
     }
 }
+
+extern "C" void indextts_set_seed(struct indextts_context* ctx, uint64_t seed) {
+    if (ctx)
+        ctx->rng_state = seed != 0 ? seed : 0xdeadbeefcafebabeULL;
+}
+
+extern "C" void indextts_set_temperature(struct indextts_context* ctx, float temperature) {
+    if (!ctx)
+        return;
+    if (temperature < 0.0f)
+        temperature = 0.0f;
+    ctx->params.temperature = temperature;
+}

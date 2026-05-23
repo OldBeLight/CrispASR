@@ -10,6 +10,7 @@ import (
 func TestNew(t *testing.T) {
 	assert := assert.New(t)
 	t.Run("valid model path", func(t *testing.T) {
+		requireModel(t)
 		model, err := whisper.New(ModelPath)
 		assert.NoError(err)
 		assert.NotNil(model)
@@ -26,6 +27,7 @@ func TestNew(t *testing.T) {
 }
 
 func TestClose(t *testing.T) {
+	requireModel(t)
 	assert := assert.New(t)
 
 	model, err := whisper.New(ModelPath)
@@ -37,6 +39,7 @@ func TestClose(t *testing.T) {
 }
 
 func TestNewContext(t *testing.T) {
+	requireModel(t)
 	assert := assert.New(t)
 
 	model, err := whisper.New(ModelPath)
@@ -50,6 +53,7 @@ func TestNewContext(t *testing.T) {
 }
 
 func TestIsMultilingual(t *testing.T) {
+	requireModel(t)
 	assert := assert.New(t)
 
 	model, err := whisper.New(ModelPath)
@@ -66,6 +70,7 @@ func TestIsMultilingual(t *testing.T) {
 }
 
 func TestLanguages(t *testing.T) {
+	requireModel(t)
 	assert := assert.New(t)
 
 	model, err := whisper.New(ModelPath)

@@ -64,6 +64,8 @@ void indextts_pcm_free(float* pcm);
 
 void indextts_free(struct indextts_context* ctx);
 void indextts_set_n_threads(struct indextts_context* ctx, int n_threads);
+void indextts_set_seed(struct indextts_context* ctx, uint64_t seed);
+void indextts_set_temperature(struct indextts_context* ctx, float temperature);
 
 #ifdef __cplusplus
 }

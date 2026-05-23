@@ -22,6 +22,7 @@ struct vibevoice_context_params {
     int verbosity; // 0=silent 1=normal 2=verbose
     bool use_gpu;
     int tts_steps;   // DPM-Solver++ inference steps (default 20, min 4)
+    uint32_t seed;   // RNG seed for TTS diffusion noise (0 = env/default)
     bool flash_attn; // PLAN #89 plumbing — σ-VAE encoder + Qwen2.5
                      // talker SA blocks.
 };
@@ -38,6 +39,7 @@ void vibevoice_free(struct vibevoice_context* ctx);
 // [4, 100]: below 4 the schedule is degenerate, above 100 you're
 // burning latency for inaudible quality gain.
 void vibevoice_set_tts_steps(struct vibevoice_context* ctx, int steps);
+void vibevoice_set_seed(struct vibevoice_context* ctx, uint32_t seed);
 
 // Transcribe raw 24kHz mono PCM audio.
 // Returns malloc'd UTF-8 string, caller frees with free().

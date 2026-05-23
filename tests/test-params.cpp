@@ -30,6 +30,10 @@ TEST_CASE("whisper_params: max_new_tokens defaults to 512", "[unit]") {
     REQUIRE(kDefaults.max_new_tokens == 512);
 }
 
+TEST_CASE("whisper_params: frequency_penalty disabled by default", "[unit]") {
+    REQUIRE(kDefaults.frequency_penalty == 0.0f);
+}
+
 TEST_CASE("whisper_params: chunk_seconds defaults to 30", "[unit]") {
     REQUIRE(kDefaults.chunk_seconds == 30);
 }

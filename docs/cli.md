@@ -332,8 +332,10 @@ upstream tools like SubtitleEdit.
 | Flag | Meaning |
 |---|---|
 | `-tp F`, `--temperature F` | Sampling temperature. `0` = pure argmax (default, bit-identical). `> 0` enables multinomial sampling for whisper, voxtral, voxtral4b, qwen3, granite |
+| `--seed N` | RNG seed for sampling. `0` = non-deterministic. Used by temperature-sampling ASR backends and TTS backends that sample; CLI values override backend-specific env seeds |
 | `-bs N`, `--beam-size N` | Beam search width (whisper only) |
 | `-tpi F`, `--temperature-inc F` | Whisper temperature-fallback increment |
+| `--frequency-penalty F` | Opt-in repeated generated-token penalty for autoregressive ASR backends (`0.0` disabled). Applied to generated output tokens before greedy/sampling selection. |
 | `--grammar FNAME` | GBNF grammar file (whisper only, including `--backend whisper`) |
 | `--grammar-rule NAME` | Top-level rule name in the grammar |
 | `--prompt STR` | Initial prompt for whisper |
@@ -481,6 +483,7 @@ otherwise they are pyannote-local track IDs.
 |---|---|
 | `-am FNAME`, `--aligner-model FNAME` | CTC aligner GGUF for word-level timestamps |
 | `-n N`, `--max-new-tokens N` | Max tokens the LLM may generate (default 512) |
+| `--frequency-penalty F` | Penalize repeated generated token IDs on supported autoregressive backends. Useful with `-n` as a retry knob after cap-triggered degeneration. |
 
 ## Multi-language / translation
 

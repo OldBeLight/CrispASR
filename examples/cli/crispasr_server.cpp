@@ -208,6 +208,36 @@ static float form_float(const httplib::Request& req, const std::string& key, flo
     }
 }
 
+static int form_int(const httplib::Request& req, const std::string& key, int def) {
+    if (!req.has_file(key) && !req.has_param(key))
+        return def;
+    const std::string v = req.has_file(key) ? req.get_file_value(key).content : req.get_param_value(key);
+    try {
+        size_t pos = 0;
+        int n = std::stoi(v, &pos);
+        if (pos != v.size())
+            return def;
+        return n;
+    } catch (...) {
+        return def;
+    }
+}
+
+static uint64_t form_u64(const httplib::Request& req, const std::string& key, uint64_t def) {
+    if (!req.has_file(key) && !req.has_param(key))
+        return def;
+    const std::string v = req.has_file(key) ? req.get_file_value(key).content : req.get_param_value(key);
+    try {
+        size_t pos = 0;
+        uint64_t n = std::stoull(v, &pos);
+        if (pos != v.size())
+            return def;
+        return n;
+    } catch (...) {
+        return def;
+    }
+}
+
 // JSON error response helper. Shape matches OpenAI's:
 //   { "error": { "message": ..., "type": ..., "code": ..., "param": ... } }
 // `code` is a stable machine-readable enum-string the client can switch on
@@ -514,6 +544,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     //   prompt           (optional) — initial prompt / context
     //   response_format  (optional) — json|verbose_json|text|srt|vtt
     //   temperature      (optional) — sampling temperature
+    //   seed             (optional) — RNG seed for sampling
+    //   max_tokens       (optional) — generated-token cap for AR backends
+    //   max_new_tokens   (optional) — alias for max_tokens
+    //   frequency_penalty (optional) — opt-in repeated-token penalty for AR backends
     //   timestamp_granularities[] (optional) — word|segment (verbose_json)
     // -----------------------------------------------------------------------
     svr.Post("/v1/audio/transcriptions", [&](const Request& req, Response& res) {
@@ -537,6 +571,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         std::string language = form_string(req, "language", params.language);
         std::string prompt = form_string(req, "prompt", "");
         float temperature = form_float(req, "temperature", params.temperature);
+        uint64_t seed = form_u64(req, "seed", params.seed);
+        int max_new_tokens = form_int(req, "max_new_tokens", params.max_new_tokens);
+        max_new_tokens = form_int(req, "max_tokens", max_new_tokens);
+        float frequency_penalty = form_float(req, "frequency_penalty", params.frequency_penalty);
 
         // Validate response_format early.
         if (response_format != "json" && response_format != "verbose_json" && response_format != "text" &&
@@ -551,6 +589,9 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         whisper_params rp = params;
         rp.language = language;
         rp.temperature = temperature;
+        rp.seed = seed;
+        rp.max_new_tokens = max_new_tokens;
+        rp.frequency_penalty = frequency_penalty;
         if (!prompt.empty())
             rp.prompt = prompt;
 

@@ -35,6 +35,7 @@ struct orpheus_context_params {
     int verbosity; // 0=silent, 1=normal, 2=verbose
     bool use_gpu;
     float temperature;    // 0 = greedy
+    uint64_t seed;        // RNG seed for sampling (0 = use default)
     int max_audio_tokens; // upper bound on AR decode steps; 0 = use built-in default (8192)
     bool flash_attn;      // PLAN #89 plumbing — Llama-3.2-3B AR loop.
                           // Highest-impact target for the kernel-level
@@ -103,6 +104,7 @@ void orpheus_set_n_threads(struct orpheus_context* ctx, int n_threads);
 // orpheus_context_default_params). Read on every AR sample, so safe
 // to mutate between synthesize() calls.
 void orpheus_set_temperature(struct orpheus_context* ctx, float temperature);
+void orpheus_set_seed(struct orpheus_context* ctx, uint64_t seed);
 
 #ifdef __cplusplus
 }

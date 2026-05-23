@@ -46,6 +46,7 @@ struct voxcpm2_context* voxcpm2_init_from_file(const char* path_model, struct vo
 void voxcpm2_free(struct voxcpm2_context* ctx);
 
 void voxcpm2_set_n_threads(struct voxcpm2_context* ctx, int n_threads);
+void voxcpm2_set_seed(struct voxcpm2_context* ctx, uint32_t seed);
 
 // Synthesize text → 48 kHz mono float32 PCM (zero-shot, no voice cloning).
 // Returns malloc'd buffer; caller frees with voxcpm2_pcm_free.

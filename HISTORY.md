@@ -6,6 +6,50 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-23 tts: `--seed` parity across sampled TTS backends
+
+**Outcome.** Routed the CLI/server `--seed` knob through the TTS paths
+that actually sample, then verified the behavior on the local backup
+models in `/Volumes/backups/ai/crispasr`.
+
+**What changed.**
+- `qwen3-tts-customvoice` now lets an explicit request/CLI seed win
+  over `QWEN3_TTS_SEED`.
+- Chatterbox now reseeds both the T3 sampler and the S3Gen diffusion
+  noise path from `--seed`.
+- VibeVoice now seeds both the realtime and base TTS paths from
+  `--seed`, while still honoring the env defaults when the CLI seed is
+  zero.
+- IndexTTS, Orpheus, and VoxCPM2 all have seed setters wired through
+  the CLI surface; their visible impact depends on the backend's actual
+  decode path.
+
+**Live verification.**
+- `qwen3-tts-customvoice`: same request seed is bit-identical even when
+  `QWEN3_TTS_SEED=999`; different request seed changes the WAV hash.
+- `chatterbox`: same seed is bit-identical; different seed changes the
+  WAV hash.
+- `vibevoice-tts` and `vibevoice-1.5b`: same seed is bit-identical;
+  different seed changes the WAV hash.
+- `IndexTTS`: the seed is accepted, but the tested prompt/reference
+  produced identical WAVs across seeds, so the default beam-search path
+  is effectively deterministic here.
+- `Orpheus`: live check was blocked by the available local SNAC codec
+  mismatch / runtime cost on this turn.
+- `VoxCPM2`: seed plumbing is present, but there was no local VoxCPM2
+  GGUF in the backup set to exercise it here.
+
+**Files.**
+- `src/qwen3_tts.{cpp,h}`
+- `src/chatterbox.{cpp,h}` / `src/chatterbox_s3gen.{cpp,h}`
+- `src/vibevoice.{cpp,h}`
+- `src/indextts.{cpp,h}`
+- `src/orpheus.{cpp,h}`
+- `src/voxcpm2_tts.{cpp,h}`
+- `examples/cli/crispasr_backend_*.cpp`
+- `docs/cli.md`
+- `docs/tts.md`
+
 ## 2026-05-21 fix(#89): parakeet long-audio NeMo-style streamed pipeline
 
 **Outcome.** The issue #89 reporter's 300 s Japanese YouTube clip

@@ -3643,6 +3643,9 @@ extern "C" void chatterbox_set_seed(struct chatterbox_context* ctx, uint32_t see
     if (!ctx)
         return;
     ctx->rng_seed = seed;
+    mt19937_seed(ctx->rng_state, seed);
+    if (ctx->s3gen_ctx)
+        chatterbox_s3gen_set_seed(ctx->s3gen_ctx, seed);
 }
 
 extern "C" void chatterbox_tokens_free(int32_t* tokens) {

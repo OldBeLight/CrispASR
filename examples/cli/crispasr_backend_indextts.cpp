@@ -120,6 +120,8 @@ public:
         if (!ctx_ || text.empty()) {
             return {};
         }
+        indextts_set_temperature(ctx_, params.temperature);
+        indextts_set_seed(ctx_, params.seed);
 
         // Load reference audio if specified
         const float* ref_pcm = nullptr;

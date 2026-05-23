@@ -27,6 +27,8 @@ int              crispasr_session_set_target_language(CrispasrSession* s, const 
 int              crispasr_session_set_punctuation(CrispasrSession* s, int enable);
 int              crispasr_session_set_translate(CrispasrSession* s, int enable);
 int              crispasr_session_set_temperature(CrispasrSession* s, float temperature, unsigned long long seed);
+int              crispasr_session_set_max_new_tokens(CrispasrSession* s, int max_new_tokens);
+int              crispasr_session_set_frequency_penalty(CrispasrSession* s, float penalty);
 int              crispasr_session_detect_language(CrispasrSession* s, const float* pcm, int n_samples,
                                                   const char* lid_model_path, int method,
                                                   char* out_lang, int out_lang_cap, float* out_prob);
@@ -252,6 +254,26 @@ func (s *CrispasrSession) SetTemperature(temperature float32, seed uint64) error
 	// rc == -2 means no backend in this session honours it — soft no-op.
 	if rc != 0 && rc != -2 {
 		return errors.New("crispasr_session_set_temperature failed")
+	}
+	return nil
+}
+
+// SetMaxNewTokens sets a generated-token cap for autoregressive session
+// backends. Pass <= 0 to clear the override and use the backend default.
+func (s *CrispasrSession) SetMaxNewTokens(maxNewTokens int) error {
+	rc := C.crispasr_session_set_max_new_tokens(s.handle, C.int(maxNewTokens))
+	if rc != 0 {
+		return errors.New("crispasr_session_set_max_new_tokens failed")
+	}
+	return nil
+}
+
+// SetFrequencyPenalty sets an opt-in repeated generated-token penalty for
+// autoregressive session backends. Pass <= 0 to disable it.
+func (s *CrispasrSession) SetFrequencyPenalty(penalty float32) error {
+	rc := C.crispasr_session_set_frequency_penalty(s.handle, C.float(penalty))
+	if rc != 0 {
+		return errors.New("crispasr_session_set_frequency_penalty failed")
 	}
 	return nil
 }

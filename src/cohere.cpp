@@ -518,6 +518,8 @@ struct cohere_context {
     // the bit-identical greedy path; > 0 switches the transformer
     // decoder over to numerically-stable softmax sampling.
     float decode_temperature = 0.0f;
+    float frequency_penalty = 0.0f;
+    int max_new_tokens = 0;
     uint64_t decode_seed = 0;
 };
 
@@ -2441,7 +2443,9 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     ctx->attn_n_heads = hp.dec_n_heads;
 
     const int eos_id = tid("<|endoftext|>");
-    const int max_gen = hp.dec_max_ctx - (int)prompt.size() - 4;
+    int max_gen = hp.dec_max_ctx - (int)prompt.size() - 4;
+    if (ctx->max_new_tokens > 0)
+        max_gen = std::min(max_gen, ctx->max_new_tokens);
 
     // Prompt pass
     auto logits = cohere_decode_step(ctx, T_enc, prompt.data(), (int)prompt.size(), 0);
@@ -2467,37 +2471,48 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     std::vector<float> gen_probs;
     const bool sampling = ctx->decode_temperature > 0.0f;
     std::mt19937_64 rng(ctx->decode_seed != 0 ? ctx->decode_seed : (uint64_t)std::random_device{}());
+    std::vector<int> token_counts(ctx->frequency_penalty > 0.0f ? (size_t)hp.vocab_size : 0);
+    std::vector<float> adjusted_logits;
 
     for (int step = 0; step < max_gen; step++) {
         const int vocab = hp.vocab_size;
         const float* last_logits = (step == 0) ? logits.data() + ((int)prompt.size() - 1) * vocab : logits.data();
+        const float* pick_logits = last_logits;
+        if (ctx->frequency_penalty > 0.0f && !token_counts.empty()) {
+            adjusted_logits.assign(last_logits, last_logits + vocab);
+            for (int v = 0; v < vocab; v++) {
+                if (token_counts[(size_t)v] > 0)
+                    adjusted_logits[(size_t)v] -= ctx->frequency_penalty * (float)token_counts[(size_t)v];
+            }
+            pick_logits = adjusted_logits.data();
+        }
 
-        int next_tok = (int)(std::max_element(last_logits, last_logits + vocab) - last_logits);
+        int next_tok = (int)(std::max_element(pick_logits, pick_logits + vocab) - pick_logits);
 
         // Numerically-stable softmax probability of (initially) the
         // argmax token. We compute the partition function once per
         // step regardless of which path we take, because we need
         // the per-token probability for the gen_probs vector either
         // way.
-        float max_l = last_logits[next_tok];
+        float max_l = pick_logits[next_tok];
         double sum_e = 0.0;
         for (int v = 0; v < vocab; v++)
-            sum_e += std::exp((double)(last_logits[v] - max_l));
+            sum_e += std::exp((double)(pick_logits[v] - max_l));
         float tok_p = (float)(1.0 / sum_e);
 
         if (sampling) {
             // Re-do the partition with logits/T instead of logits.
             const float inv_t = 1.0f / ctx->decode_temperature;
-            float max_lt = last_logits[0] * inv_t;
+            float max_lt = pick_logits[0] * inv_t;
             for (int v = 1; v < vocab; v++) {
-                const float s = last_logits[v] * inv_t;
+                const float s = pick_logits[v] * inv_t;
                 if (s > max_lt)
                     max_lt = s;
             }
             std::vector<double> pr((size_t)vocab);
             double sum_t = 0.0;
             for (int v = 0; v < vocab; v++) {
-                const double e = std::exp((double)(last_logits[v] * inv_t - max_lt));
+                const double e = std::exp((double)(pick_logits[v] * inv_t - max_lt));
                 pr[(size_t)v] = e;
                 sum_t += e;
             }
@@ -2516,10 +2531,10 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
                 // newly-picked token so the JSON-full output reflects
                 // the model's actual confidence in it, not the
                 // temperature-warped value.
-                max_l = last_logits[next_tok];
+                max_l = pick_logits[next_tok];
                 sum_e = 0.0;
                 for (int v = 0; v < vocab; v++) {
-                    sum_e += std::exp((double)(last_logits[v] - max_l));
+                    sum_e += std::exp((double)(pick_logits[v] - max_l));
                 }
                 tok_p = (float)(1.0 / sum_e);
             }
@@ -2533,6 +2548,8 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
 
         generated.push_back(next_tok);
         gen_probs.push_back(tok_p);
+        if (next_tok >= 0 && next_tok < (int)token_counts.size())
+            token_counts[(size_t)next_tok]++;
         offset++;
 
         logits = cohere_decode_step(ctx, T_enc, &next_tok, 1, offset - 1);
@@ -2911,6 +2928,18 @@ void cohere_set_temperature(struct cohere_context* ctx, float temperature, uint6
         return;
     ctx->decode_temperature = temperature;
     ctx->decode_seed = seed;
+}
+
+void cohere_set_max_new_tokens(struct cohere_context* ctx, int max_new_tokens) {
+    if (!ctx)
+        return;
+    ctx->max_new_tokens = max_new_tokens > 0 ? max_new_tokens : 0;
+}
+
+void cohere_set_frequency_penalty(struct cohere_context* ctx, float frequency_penalty) {
+    if (!ctx)
+        return;
+    ctx->frequency_penalty = frequency_penalty > 0.0f ? frequency_penalty : 0.0f;
 }
 
 char* cohere_transcribe(struct cohere_context* ctx, const float* samples, int n_samples, const char* lang) {

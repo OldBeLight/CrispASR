@@ -830,6 +830,30 @@ impl Session {
         Ok(())
     }
 
+    /// Set a generated-token cap for autoregressive session backends.
+    /// Pass `<= 0` to clear the override and use the backend default.
+    pub fn set_max_new_tokens(&self, max_new_tokens: i32) -> Result<(), String> {
+        let rc = unsafe {
+            crispasr_sys::crispasr_session_set_max_new_tokens(self.handle, max_new_tokens)
+        };
+        if rc != 0 {
+            return Err(format!("set_max_new_tokens failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Set an opt-in repeated generated-token penalty for autoregressive
+    /// session backends. Pass `<= 0.0` to disable it.
+    pub fn set_frequency_penalty(&self, penalty: f32) -> Result<(), String> {
+        let rc = unsafe {
+            crispasr_sys::crispasr_session_set_frequency_penalty(self.handle, penalty)
+        };
+        if rc != 0 {
+            return Err(format!("set_frequency_penalty failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
     /// Auto-detect spoken language on raw 16 kHz mono PCM.
     ///
     /// `method`: 0=Whisper, 1=Silero (default), 2=Firered, 3=Ecapa.

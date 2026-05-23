@@ -38,6 +38,8 @@ from crispasr import (
 
 # Transcribe (any of the 24 ASR backends via one session object)
 sess = Session("parakeet-tdt-0.6b-v3-q4_k.gguf")
+sess.set_max_new_tokens(256)       # AR backends; <= 0 clears
+sess.set_frequency_penalty(0.4)    # AR backends; <= 0 disables
 segs = sess.transcribe_vad(pcm, "silero-v5.1.2.bin")  # stitched VAD pass
 
 # Run each shared post-step standalone
@@ -71,6 +73,8 @@ use crispasr::{
 };
 
 let sess = Session::open("cohere-transcribe-q4_k.gguf", 4)?;
+sess.set_max_new_tokens(256)?;
+sess.set_frequency_penalty(0.4)?;
 let segs = sess.transcribe_vad(&pcm, "silero-v5.1.2.bin", None)?;
 
 let entry = registry_lookup("canary")?.unwrap();
@@ -122,6 +126,8 @@ import "github.com/CrispStrobe/CrispASR/bindings/go/crispasr"
 
 sess, _ := crispasr.OpenSession("parakeet.gguf", crispasr.SessionOpts{Threads: 4})
 defer sess.Close()
+_ = sess.SetMaxNewTokens(256)
+_ = sess.SetFrequencyPenalty(0.4)
 segs, _ := sess.Transcribe(pcm, crispasr.TranscribeOpts{Vad: true})
 ```
 
@@ -133,6 +139,8 @@ Module: `bindings/go/crispasr/`.
 import org.crispasr.CrispASR;
 
 try (var sess = CrispASR.openSession("granite-speech.gguf")) {
+    sess.setMaxNewTokens(256);
+    sess.setFrequencyPenalty(0.4f);
     var segs = sess.transcribe(pcm);
 }
 ```

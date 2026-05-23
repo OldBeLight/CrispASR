@@ -469,6 +469,14 @@ extern "C" {
         temperature: c_float,
         seed: u64,
     ) -> c_int;
+    pub fn crispasr_session_set_max_new_tokens(
+        s: *mut CrispasrSession,
+        max_new_tokens: c_int,
+    ) -> c_int;
+    pub fn crispasr_session_set_frequency_penalty(
+        s: *mut CrispasrSession,
+        penalty: c_float,
+    ) -> c_int;
     pub fn crispasr_session_detect_language(
         s: *mut CrispasrSession,
         pcm: *const c_float,

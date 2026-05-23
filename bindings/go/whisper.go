@@ -20,7 +20,17 @@ import (
 // PUBLIC <name>)` block in src/CMakeLists.txt — every backend lib that's
 // PUBLIC-linked into libcrispasr.{so,dylib} for shared builds is also a
 // build-time dep here for static.
-#cgo CFLAGS: -I${SRCDIR}/../../include
+#cgo CFLAGS: -I${SRCDIR}/../../include -I${SRCDIR}/../../ggml/include
+#cgo LDFLAGS: -L${SRCDIR}/../../build-ninja-compile/src -L${SRCDIR}/../../build-ninja-compile/crisp_audio -L${SRCDIR}/../../build-ninja-compile/ggml/src
+#cgo LDFLAGS: -L${SRCDIR}/../../build/src -L${SRCDIR}/../../build/crisp_audio -L${SRCDIR}/../../build/ggml/src
+#cgo LDFLAGS: -L${SRCDIR}/../../build_go/src -L${SRCDIR}/../../build_go/crisp_audio -L${SRCDIR}/../../build_go/ggml/src
+#cgo darwin LDFLAGS: -L${SRCDIR}/../../build-ninja-compile/ggml/src/ggml-blas -L${SRCDIR}/../../build-ninja-compile/ggml/src/ggml-metal
+#cgo darwin LDFLAGS: -L${SRCDIR}/../../build/ggml/src/ggml-blas -L${SRCDIR}/../../build/ggml/src/ggml-metal
+#cgo darwin LDFLAGS: -L${SRCDIR}/../../build_go/ggml/src/ggml-blas -L${SRCDIR}/../../build_go/ggml/src/ggml-metal
+#cgo darwin LDFLAGS: -Wl,-rpath,${SRCDIR}/../../build-ninja-compile/src -Wl,-rpath,${SRCDIR}/../../build/src
+#cgo darwin LDFLAGS: -Wl,-rpath,${SRCDIR}/../../build-ninja-compile/ggml/src -Wl,-rpath,${SRCDIR}/../../build/ggml/src
+#cgo darwin LDFLAGS: -Wl,-rpath,${SRCDIR}/../../build-ninja-compile/ggml/src/ggml-blas -Wl,-rpath,${SRCDIR}/../../build-ninja-compile/ggml/src/ggml-metal
+#cgo darwin LDFLAGS: -Wl,-rpath,${SRCDIR}/../../build/ggml/src/ggml-blas -Wl,-rpath,${SRCDIR}/../../build/ggml/src/ggml-metal
 #cgo linux LDFLAGS: -Wl,--start-group -lcrispasr -lparakeet -lcanary -lcanary_ctc -lqwen3_asr -lcrisp_audio -lcohere -lgranite_speech -lvoxtral -lvoxtral4b -lwav2vec2-ggml -lglm-asr -lkyutai-stt -lfirered-asr -lfirered-vad -lmarblenet-vad -lcrispasr-vad-encdec -lfirered-lid -lomniasr -lvibevoice -lecapa-lid -lmoonshine -lmoonshine_streaming -lmoonshine_tokenizer -lgemma4_e2b -lmimo_tokenizer -lmimo_asr -lqwen3_tts -lorpheus -lkokoro -lchatterbox -lindextts -lm2m100 -lt5_translate -lfireredpunc -lpyannote-seg -lsilero-lid -ltitanet -ltext-lid-dispatch -llid-fasttext -llid-cld3 -lcrispasr-core -lggml -lggml-base -lggml-cpu -Wl,--end-group -lm -lstdc++ -fopenmp
 #cgo darwin LDFLAGS: -lcrispasr -lparakeet -lcanary -lcanary_ctc -lqwen3_asr -lcrisp_audio -lcohere -lgranite_speech -lvoxtral -lvoxtral4b -lwav2vec2-ggml -lglm-asr -lkyutai-stt -lfirered-asr -lfirered-vad -lmarblenet-vad -lcrispasr-vad-encdec -lfirered-lid -lomniasr -lvibevoice -lecapa-lid -lmoonshine -lmoonshine_streaming -lmoonshine_tokenizer -lgemma4_e2b -lmimo_tokenizer -lmimo_asr -lqwen3_tts -lorpheus -lkokoro -lchatterbox -lindextts -lm2m100 -lt5_translate -lfireredpunc -lpyannote-seg -lsilero-lid -ltitanet -ltext-lid-dispatch -llid-fasttext -llid-cld3 -lcrispasr-core -lggml -lggml-base -lggml-cpu -lm -lstdc++
 #cgo darwin LDFLAGS: -lggml-metal -lggml-blas

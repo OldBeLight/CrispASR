@@ -80,6 +80,7 @@ extern "C" {
 struct whisper_context;
 struct whisper_state;
 struct whisper_full_params;
+struct crispasr_session;
 
 typedef int32_t whisper_pos;
 typedef int32_t whisper_token;
@@ -564,6 +565,13 @@ CRISPASR_API struct whisper_context_params whisper_context_default_params(void);
 
 CRISPASR_API struct whisper_full_params* whisper_full_default_params_by_ref(enum whisper_sampling_strategy strategy);
 CRISPASR_API struct whisper_full_params whisper_full_default_params(enum whisper_sampling_strategy strategy);
+CRISPASR_API void crispasr_params_set_max_tokens(struct whisper_full_params* p, int n);
+CRISPASR_API void crispasr_params_set_temperature(struct whisper_full_params* p, float t);
+
+// Unified session decode controls for autoregressive / LLM-style backends.
+// max_new_tokens <= 0 clears the cap override; frequency_penalty <= 0 disables it.
+CRISPASR_API int crispasr_session_set_max_new_tokens(struct crispasr_session* s, int n);
+CRISPASR_API int crispasr_session_set_frequency_penalty(struct crispasr_session* s, float penalty);
 
 // Run the entire model: PCM -> log mel spectrogram -> encoder -> decoder -> text
 // Not thread safe for same context

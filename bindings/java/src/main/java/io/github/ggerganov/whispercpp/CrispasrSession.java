@@ -48,6 +48,8 @@ public final class CrispasrSession implements AutoCloseable {
         int     crispasr_session_set_punctuation(Pointer session, int enable);
         int     crispasr_session_set_translate(Pointer session, int enable);
         int     crispasr_session_set_temperature(Pointer session, float temperature, long seed);
+        int     crispasr_session_set_max_new_tokens(Pointer session, int maxNewTokens);
+        int     crispasr_session_set_frequency_penalty(Pointer session, float penalty);
         int     crispasr_session_detect_language(Pointer session, float[] pcm, int n_samples,
                                                   String lid_model_path, int method,
                                                   byte[] out_lang, int out_lang_cap, float[] out_prob);
@@ -202,6 +204,18 @@ public final class CrispasrSession implements AutoCloseable {
     public void setTemperature(float temperature, long seed) {
         int rc = Lib.INSTANCE.crispasr_session_set_temperature(handle, temperature, seed);
         if (rc != 0 && rc != -2) throw new IllegalStateException("set_temperature failed (rc=" + rc + ")");
+    }
+
+    /** Generated-token cap for autoregressive session backends. Pass <= 0 to clear. */
+    public void setMaxNewTokens(int maxNewTokens) {
+        int rc = Lib.INSTANCE.crispasr_session_set_max_new_tokens(handle, maxNewTokens);
+        if (rc != 0) throw new IllegalStateException("set_max_new_tokens failed (rc=" + rc + ")");
+    }
+
+    /** Opt-in repeated generated-token penalty for autoregressive session backends. Pass <= 0 to disable. */
+    public void setFrequencyPenalty(float penalty) {
+        int rc = Lib.INSTANCE.crispasr_session_set_frequency_penalty(handle, penalty);
+        if (rc != 0) throw new IllegalStateException("set_frequency_penalty failed (rc=" + rc + ")");
     }
 
     /** Auto-detect spoken language on raw 16 kHz mono PCM. method:

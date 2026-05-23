@@ -132,6 +132,7 @@ struct whisper_params {
     // DTW path (no second forward pass, no ~442 MB download).
     bool no_auto_aligner = false;
     int32_t max_new_tokens = 512;
+    float frequency_penalty = 0.0f;
     int32_t chunk_seconds = 30;
     bool chunk_seconds_explicit = false; // true when user passed --chunk-seconds
     float chunk_overlap_seconds = 3.0f;  // overlap context on each side of chunk boundary

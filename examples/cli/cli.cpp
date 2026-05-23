@@ -388,6 +388,8 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.no_auto_aligner = true;
     } else if (arg == "-n" || arg == "--max-new-tokens") {
         params.max_new_tokens = std::stoi(ARGV_NEXT);
+    } else if (arg == "--frequency-penalty") {
+        params.frequency_penalty = std::stof(ARGV_NEXT);
     } else if (arg == "-ck" || arg == "--chunk-seconds") {
         params.chunk_seconds = std::stoi(ARGV_NEXT);
         params.chunk_seconds_explicit = true;
@@ -937,6 +939,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.firered_vad_debug ? "true" : "false");
     fprintf(stderr, "  -n N,      --max-new-tokens N     [%-7d] max new tokens for LLM backends\n",
             params.max_new_tokens);
+    fprintf(stderr, "             --frequency-penalty F  [%-7.2f] penalize repeated generated tokens on AR backends\n",
+            params.frequency_penalty);
     fprintf(stderr, "  -ck N,     --chunk-seconds N      [%-7d] fallback chunk size when VAD is disabled\n",
             params.chunk_seconds);
     fprintf(stderr, "             --chunk-overlap F      [%-7.1f] overlap context (sec) at chunk boundaries\n",

@@ -28,7 +28,8 @@ struct MockCtx {
 
 // Greedy-decode embed callback (unused — greedy helper doesn't call it)
 static float* mock_embed(MockCtx* ctx, const int32_t* ids, int n) {
-    (void)ctx; (void)ids;
+    (void)ctx;
+    (void)ids;
     float* e = (float*)malloc(sizeof(float) * n);
     memset(e, 0, sizeof(float) * n);
     return e;
@@ -36,14 +37,18 @@ static float* mock_embed(MockCtx* ctx, const int32_t* ids, int n) {
 
 // Greedy-decode LLM callback: returns logits with hot_tok dominant,
 // switches to EOS after 3 calls.
-static float* mock_llm(MockCtx* ctx, const float* embeds, int n_tokens,
-                        int n_past, int* out_n, int* out_vocab) {
-    (void)embeds; (void)n_tokens; (void)n_past;
+static float* mock_llm(MockCtx* ctx, const float* embeds, int n_tokens, int n_past, int* out_n, int* out_vocab) {
+    (void)embeds;
+    (void)n_tokens;
+    (void)n_past;
     ctx->call_count++;
-    if (out_n) *out_n = 1;
-    if (out_vocab) *out_vocab = ctx->vocab;
+    if (out_n)
+        *out_n = 1;
+    if (out_vocab)
+        *out_vocab = ctx->vocab;
     float* logits = (float*)malloc(sizeof(float) * ctx->vocab);
-    for (int i = 0; i < ctx->vocab; i++) logits[i] = -10.0f;
+    for (int i = 0; i < ctx->vocab; i++)
+        logits[i] = -10.0f;
     if (ctx->call_count <= 3)
         logits[ctx->hot_tok] = 5.0f;
     else
@@ -53,10 +58,12 @@ static float* mock_llm(MockCtx* ctx, const float* embeds, int n_tokens,
 
 // Beam-decode replay callback (takes ctx as first arg from template)
 static float* mock_replay(MockCtx* ctx, const int32_t* toks, int n_toks, int prompt_len) {
-    (void)toks; (void)prompt_len;
+    (void)toks;
+    (void)prompt_len;
     ctx->call_count++;
     float* logits = (float*)malloc(sizeof(float) * ctx->vocab);
-    for (int i = 0; i < ctx->vocab; i++) logits[i] = -10.0f;
+    for (int i = 0; i < ctx->vocab; i++)
+        logits[i] = -10.0f;
     // Generate hot_tok for first 3 tokens, then EOS
     if (n_toks < 3)
         logits[ctx->hot_tok] = 5.0f;
@@ -95,14 +102,14 @@ TEST_CASE("greedy_decode: run_with_probs produces correct sequence", "[unit][dec
 
     // Simulate prefill: first token is hot_tok=3
     float prefill_logits[8];
-    for (int i = 0; i < 8; i++) prefill_logits[i] = -10.0f;
+    for (int i = 0; i < 8; i++)
+        prefill_logits[i] = -10.0f;
     prefill_logits[3] = 5.0f;
 
     int first_tok = core_greedy_decode::argmax(prefill_logits, 8);
     float first_p = core_greedy_decode::softmax_of(prefill_logits, 8, first_tok, prefill_logits[first_tok]);
 
-    auto result = core_greedy_decode::run_with_probs(&ctx, first_tok, first_p, 0,
-                                                      mock_embed, mock_llm, cfg);
+    auto result = core_greedy_decode::run_with_probs(&ctx, first_tok, first_p, 0, mock_embed, mock_llm, cfg);
 
     // Should produce [3, 3, 3, 5] (3 hot tokens + EOS)
     REQUIRE(result.tokens.size() >= 3);
@@ -111,8 +118,63 @@ TEST_CASE("greedy_decode: run_with_probs produces correct sequence", "[unit][dec
     REQUIRE(result.tokens[2] == 3);
     // EOS should terminate
     bool found_eos = false;
-    for (auto t : result.tokens) if (t == 5) found_eos = true;
+    for (auto t : result.tokens)
+        if (t == 5)
+            found_eos = true;
     REQUIRE(found_eos);
+}
+
+static float* mock_llm_repeat_pair(MockCtx* ctx, const float* embeds, int n_tokens, int n_past, int* out_n,
+                                   int* out_vocab) {
+    (void)embeds;
+    (void)n_tokens;
+    (void)n_past;
+    ctx->call_count++;
+    if (out_n)
+        *out_n = 1;
+    if (out_vocab)
+        *out_vocab = ctx->vocab;
+    float* logits = (float*)malloc(sizeof(float) * ctx->vocab);
+    for (int i = 0; i < ctx->vocab; i++)
+        logits[i] = -10.0f;
+    logits[3] = 5.0f;
+    logits[4] = 4.0f;
+    return logits;
+}
+
+TEST_CASE("greedy_decode: frequency_penalty penalizes generated token ids", "[unit][decode]") {
+    MockCtx ctx;
+    core_greedy_decode::Config cfg;
+    cfg.max_new_tokens = 2;
+    cfg.eos_id = 5;
+    cfg.vocab_size = 8;
+    cfg.frequency_penalty = 2.0f;
+
+    auto result = core_greedy_decode::run_with_probs(&ctx, 3, 1.0f, 0, mock_embed, mock_llm_repeat_pair, cfg);
+
+    REQUIRE(result.tokens.size() == 2);
+    REQUIRE(result.tokens[0] == 3);
+    REQUIRE(result.tokens[1] == 4);
+}
+
+TEST_CASE("greedy_decode: sampling seed is reproducible", "[unit][decode]") {
+    float logits[] = {0.0f, 0.1f, 0.2f, 0.3f, 0.4f};
+
+    std::mt19937_64 rng_a(123);
+    std::mt19937_64 rng_b(123);
+    std::mt19937_64 rng_c(456);
+
+    std::vector<int> a;
+    std::vector<int> b;
+    std::vector<int> c;
+    for (int i = 0; i < 32; ++i) {
+        a.push_back(core_greedy_decode::sample_temp(logits, 5, 1.0f, rng_a));
+        b.push_back(core_greedy_decode::sample_temp(logits, 5, 1.0f, rng_b));
+        c.push_back(core_greedy_decode::sample_temp(logits, 5, 1.0f, rng_c));
+    }
+
+    REQUIRE(a == b);
+    REQUIRE(a != c);
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +184,8 @@ TEST_CASE("greedy_decode: run_with_probs produces correct sequence", "[unit][dec
 TEST_CASE("beam_decode: beam_size=1 behaves like greedy", "[unit][decode]") {
     MockCtx ctx;
     float prefill[8];
-    for (int i = 0; i < 8; i++) prefill[i] = -10.0f;
+    for (int i = 0; i < 8; i++)
+        prefill[i] = -10.0f;
     prefill[3] = 5.0f;
 
     core_beam_decode::Config cfg;
@@ -143,7 +206,8 @@ TEST_CASE("beam_decode: beam_size=1 behaves like greedy", "[unit][decode]") {
 TEST_CASE("beam_decode: beam_size=4 produces valid output", "[unit][decode]") {
     MockCtx ctx;
     float prefill[8];
-    for (int i = 0; i < 8; i++) prefill[i] = -10.0f;
+    for (int i = 0; i < 8; i++)
+        prefill[i] = -10.0f;
     prefill[3] = 5.0f;
 
     core_beam_decode::Config cfg;
@@ -167,18 +231,22 @@ TEST_CASE("beam_decode: beam_size=4 produces valid output", "[unit][decode]") {
 
 TEST_CASE("beam_decode: respects max_new_tokens", "[unit][decode]") {
     // Mock that never produces EOS
-    struct InfCtx { int vocab = 8; };
+    struct InfCtx {
+        int vocab = 8;
+    };
     InfCtx ictx;
 
     auto inf_replay = [](InfCtx* c, const int32_t*, int, int) -> float* {
         float* lg = (float*)malloc(sizeof(float) * c->vocab);
-        for (int i = 0; i < c->vocab; i++) lg[i] = -10.0f;
+        for (int i = 0; i < c->vocab; i++)
+            lg[i] = -10.0f;
         lg[3] = 5.0f; // always token 3, never EOS
         return lg;
     };
 
     float prefill[8];
-    for (int i = 0; i < 8; i++) prefill[i] = -10.0f;
+    for (int i = 0; i < 8; i++)
+        prefill[i] = -10.0f;
     prefill[3] = 5.0f;
 
     core_beam_decode::Config cfg;
@@ -196,7 +264,8 @@ TEST_CASE("beam_decode: respects max_new_tokens", "[unit][decode]") {
 TEST_CASE("beam_decode: multi-EOS stops on any", "[unit][decode]") {
     MockCtx ctx;
     float prefill[8];
-    for (int i = 0; i < 8; i++) prefill[i] = -10.0f;
+    for (int i = 0; i < 8; i++)
+        prefill[i] = -10.0f;
     prefill[3] = 5.0f;
 
     core_beam_decode::Config cfg;
@@ -235,7 +304,8 @@ TEST_CASE("beam_decode: multi-EOS stops on any", "[unit][decode]") {
 TEST_CASE("beam_decode: returned token ids are non-negative", "[unit][decode]") {
     MockCtx ctx;
     float prefill[8];
-    for (int i = 0; i < 8; i++) prefill[i] = -10.0f;
+    for (int i = 0; i < 8; i++)
+        prefill[i] = -10.0f;
     prefill[3] = 5.0f;
 
     core_beam_decode::Config cfg;
@@ -259,7 +329,8 @@ TEST_CASE("beam_decode: token ids match expected hot_tok sequence", "[unit][deco
     // index (not the -1 sentinel left when the assignment is absent).
     MockCtx ctx;
     float prefill[8];
-    for (int i = 0; i < 8; i++) prefill[i] = -10.0f;
+    for (int i = 0; i < 8; i++)
+        prefill[i] = -10.0f;
     prefill[3] = 5.0f;
 
     core_beam_decode::Config cfg;

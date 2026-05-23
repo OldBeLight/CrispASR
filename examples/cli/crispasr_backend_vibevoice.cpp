@@ -119,6 +119,10 @@ public:
     }
 
     std::vector<float> synthesize(const std::string& text, const whisper_params& params) override {
+        if (ctx_) {
+            vibevoice_set_tts_steps(ctx_, params.tts_steps);
+            vibevoice_set_seed(ctx_, (uint32_t)params.seed);
+        }
         // Voice resolution order:
         //   1. Bare-name in --voice-dir: <voice-dir>/<name>.gguf
         //      (matches qwen3-tts post-d35940b — server callers can pass the same

@@ -1474,6 +1474,30 @@ class Session:
         if rc not in (0, -2):
             raise RuntimeError(f"set_temperature failed (rc={rc})")
 
+    def set_max_new_tokens(self, max_new_tokens: int) -> None:
+        """Set a generated-token cap for autoregressive session backends.
+
+        Pass ``<= 0`` to clear the override and use the backend default."""
+        if not hasattr(self._lib, "crispasr_session_set_max_new_tokens"):
+            raise RuntimeError("session-state API not present in this libcrispasr build")
+        self._lib.crispasr_session_set_max_new_tokens.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.crispasr_session_set_max_new_tokens.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_max_new_tokens(self._handle, int(max_new_tokens))
+        if rc != 0:
+            raise RuntimeError(f"set_max_new_tokens failed (rc={rc})")
+
+    def set_frequency_penalty(self, penalty: float) -> None:
+        """Set an opt-in repeated generated-token penalty for AR backends.
+
+        Pass ``<= 0`` to disable it."""
+        if not hasattr(self._lib, "crispasr_session_set_frequency_penalty"):
+            raise RuntimeError("session-state API not present in this libcrispasr build")
+        self._lib.crispasr_session_set_frequency_penalty.argtypes = [ctypes.c_void_p, ctypes.c_float]
+        self._lib.crispasr_session_set_frequency_penalty.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_frequency_penalty(self._handle, float(penalty))
+        if rc != 0:
+            raise RuntimeError(f"set_frequency_penalty failed (rc={rc})")
+
     def detect_language(self, pcm, lid_model_path: str, method: int = 1) -> tuple:
         """Auto-detect spoken language on raw 16 kHz mono PCM.
 

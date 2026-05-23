@@ -75,6 +75,7 @@ public:
     std::vector<float> synthesize(const std::string& text, const whisper_params& params) override {
         if (!ctx_ || text.empty())
             return {};
+        voxcpm2_set_seed(ctx_, (uint32_t)params.seed);
 
         // Voice cloning path: load WAV, resample to 16 kHz mono float32, hand to
         // voxcpm2_synthesize_clone. The encoder pads internally to the patch

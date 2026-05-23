@@ -5183,6 +5183,11 @@ void voxcpm2_set_n_threads(struct voxcpm2_context* ctx, int n_threads) {
         ctx->n_threads = n_threads > 0 ? n_threads : 1;
 }
 
+void voxcpm2_set_seed(struct voxcpm2_context* ctx, uint32_t seed) {
+    if (ctx)
+        ctx->seed = seed;
+}
+
 float* voxcpm2_synthesize(struct voxcpm2_context* ctx, const char* text, int* out_n_samples) {
     return vox_synthesize_internal(ctx, text, nullptr, 0, out_n_samples);
 }

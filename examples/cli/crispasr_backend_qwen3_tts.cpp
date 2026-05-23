@@ -126,6 +126,8 @@ public:
     std::vector<float> synthesize(const std::string& text, const whisper_params& params) override {
         if (!ctx_ || text.empty())
             return {};
+        qwen3_tts_set_temperature(ctx_, params.temperature);
+        qwen3_tts_set_seed(ctx_, params.seed);
 
         // Voice prompt: re-load only when the requested identity changes.
         // Four mutually-exclusive paths (gated by the loaded model variant):

@@ -45,6 +45,8 @@ int cohere_str_to_token(struct cohere_context* ctx, const char* str);
 // transformer decoder. Default 0 keeps the bit-identical greedy path.
 // Sticky on the context until the next call.
 void cohere_set_temperature(struct cohere_context* ctx, float temperature, uint64_t seed);
+void cohere_set_max_new_tokens(struct cohere_context* ctx, int max_new_tokens);
+void cohere_set_frequency_penalty(struct cohere_context* ctx, float frequency_penalty);
 
 // ---- Extended API: per-token confidence and timing ----
 

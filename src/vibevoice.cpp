@@ -122,6 +122,7 @@ extern "C" struct vibevoice_context_params vibevoice_context_default_params(void
     p.verbosity = 1;
     p.use_gpu = true;
     p.tts_steps = 20;
+    p.seed = 0;
     p.flash_attn = true;
     return p;
 }
@@ -286,6 +287,11 @@ extern "C" void vibevoice_set_tts_steps(struct vibevoice_context* ctx, int steps
     if (steps > 100)
         steps = 100;
     ctx->params.tts_steps = steps;
+}
+
+extern "C" void vibevoice_set_seed(struct vibevoice_context* ctx, uint32_t seed) {
+    if (ctx)
+        ctx->params.seed = seed;
 }
 
 extern "C" void vibevoice_free(struct vibevoice_context* ctx) {
@@ -2964,6 +2970,8 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
             if (const char* sv = getenv("VIBEVOICE_TTS_SEED")) {
                 seed = (uint32_t)strtoul(sv, nullptr, 0);
             }
+            if (ctx->params.seed != 0)
+                seed = ctx->params.seed;
             mt19937_seed(rng, seed);
         }
         int speech_frames = 0;
@@ -3943,6 +3951,8 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         if (const char* sv = getenv("VIBEVOICE_TTS_SEED")) {
             seed = (uint32_t)strtoul(sv, nullptr, 0);
         }
+        if (ctx->params.seed != 0)
+            seed = ctx->params.seed;
         mt19937_seed(rng, seed);
     }
 
