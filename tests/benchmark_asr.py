@@ -91,6 +91,18 @@ BACKEND_MODELS = {
         "globs": ["parakeet-ctc-1.1b/parakeet-ctc-1.1b.gguf"],
         "langs": ["en"],
     },
+    "canary": {
+        "globs": ["cache/canary-1b-v2-q4_k.gguf", "canary-1b-v2-q4_k.gguf"],
+        "langs": ["en", "de", "ja", "zh"],
+    },
+    "sensevoice": {
+        "globs": ["cache/sensevoice-small-q4_k.gguf", "sensevoice-small-q4_k.gguf"],
+        "langs": ["en", "de", "ja", "zh"],
+    },
+    "paraformer": {
+        "globs": ["cache/paraformer-zh-q4_k.gguf", "paraformer-zh-q4_k.gguf"],
+        "langs": ["zh"],
+    },
 }
 
 MODELS_DIR = Path(os.environ.get("BENCHMARK_MODELS_DIR", "/mnt/storage"))
