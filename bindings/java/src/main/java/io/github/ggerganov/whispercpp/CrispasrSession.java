@@ -73,21 +73,6 @@ public final class CrispasrSession implements AutoCloseable {
                                                   String lid_model_path, int method,
                                                   byte[] out_lang, int out_lang_cap, float[] out_prob);
 
-        // Text translation (PLAN #59)
-        Pointer crispasr_session_translate_text(Pointer session, String text,
-                                                 String srcLang, String tgtLang, int maxTokens);
-        void    crispasr_session_translate_text_free(Pointer text);
-
-        // Audio enhancement (PLAN #59)
-        int crispasr_enhance_audio_rnnoise(float[] inPcm, int nSamples, float[] outPcm, int outCap);
-
-        // Text LID (PLAN #59)
-        int crispasr_text_detect_language(String text, String modelPath, int nThreads,
-                                          byte[] outLabel, int outLabelCap, float[] outConf);
-
-        // Backend detection from GGUF (PLAN #59)
-        int crispasr_detect_backend_from_gguf(String ggufPath, byte[] outBuf, int outBufLen);
-
         int crispasr_kokoro_resolve_model_for_lang_abi(
                 String modelPath, String lang, byte[] outPath, int outPathLen);
         int crispasr_kokoro_resolve_fallback_voice_abi(
@@ -367,52 +352,10 @@ public final class CrispasrSession implements AutoCloseable {
         return new String(outLang, 0, n, java.nio.charset.StandardCharsets.UTF_8);
     }
 
-    /**
-     * Translate text between languages using the loaded translation model.
-     * Requires a backend that supports text translation (m2m100).
-     */
-    public String translateText(String text, String srcLang, String tgtLang, int maxTokens) {
-        Pointer result = Lib.INSTANCE.crispasr_session_translate_text(handle, text, srcLang, tgtLang, maxTokens);
-        if (result == null) throw new IllegalStateException("translate_text returned null");
-        String out = result.getString(0, "UTF-8");
-        Lib.INSTANCE.crispasr_session_translate_text_free(result);
-        return out;
-    }
-
-    /**
-     * Apply RNNoise audio denoising to 48 kHz mono PCM.
-     * Returns a new array with noise reduced.
-     */
-    public static float[] enhanceAudioRnnoise(float[] pcm) {
-        float[] out = new float[pcm.length];
-        int rc = Lib.INSTANCE.crispasr_enhance_audio_rnnoise(pcm, pcm.length, out, out.length);
-        if (rc != 0) throw new IllegalStateException("enhance_audio_rnnoise failed (rc=" + rc + ")");
-        return out;
-    }
-
-    /**
-     * Detect the language of a text string using a text-LID model.
-     * Returns the language code; confidence is written to outConfidence[0].
-     */
-    public static String textDetectLanguage(String text, String modelPath, int nThreads, float[] outConfidence) {
-        byte[] outLabel = new byte[32];
-        float[] conf = new float[]{ 0.0f };
-        int rc = Lib.INSTANCE.crispasr_text_detect_language(text, modelPath, nThreads, outLabel, outLabel.length, conf);
-        if (rc != 0) throw new IllegalStateException("text_detect_language failed (rc=" + rc + ")");
-        if (outConfidence != null && outConfidence.length >= 1) outConfidence[0] = conf[0];
-        return nullTerminated(outLabel);
-    }
-
-    /**
-     * Detect which CrispASR backend a GGUF file belongs to.
-     * Returns the backend name (e.g. "parakeet", "cohere").
-     */
-    public static String detectBackendFromGguf(String ggufPath) {
-        byte[] out = new byte[64];
-        int rc = Lib.INSTANCE.crispasr_detect_backend_from_gguf(ggufPath, out, out.length);
-        if (rc != 0) throw new IllegalStateException("detect_backend_from_gguf failed (rc=" + rc + ")");
-        return nullTerminated(out);
-    }
+    // PLAN #59: translateText, enhanceAudioRnnoise, textDetectLanguage,
+    // detectBackendFromGguf — deferred to a separate PR after JNA ABI
+    // testing. The JNA interface eagerly resolves all declared symbols,
+    // and type mismatches cause "Invalid memory access" at load time.
 
     /**
      * Load a separate codec GGUF. Required for qwen3-tts (12 Hz tokenizer)
