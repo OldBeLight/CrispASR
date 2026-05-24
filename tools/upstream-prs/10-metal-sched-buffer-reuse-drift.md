@@ -1,138 +1,128 @@
-**Title:** `ggml-backend : sched-internal CPU→GPU input copy delivers stale data in long mixed-residency graphs`
+**Title:** `ggml-backend : sched mutates user gf src pointers in place, leaving dangling pointers across alloc_graph calls`
 
 ---
 
-Bug report. A long F32 graph with mixed CPU+Metal weight residency
-produces structurally wrong output (and NaN under certain
-`set_output` layouts) on the Metal backend. The root cause is that
-the scheduler's auto-copy of `GGML_TENSOR_FLAG_INPUT` tensors from
-the CPU backend to the consuming Metal split's backend silently
-delivers stale data — the Metal kernel reads whatever was at the
-destination offset before the copy ran, rather than the data the
-user uploaded via `ggml_backend_tensor_set`.
+`ggml_backend_sched_split_graph` rewires `node->src[j]` of the user's
+graph to point at internal `input_cpy` tensors it allocates in
+`sched->ctx`. Those tensors live until the *next* call to
+`ggml_backend_sched_split_graph`, which begins with
+`ggml_free(sched->ctx); sched->ctx = ggml_init(params)` and
+invalidates them. Between sched calls, the user's `gf->nodes[i]->src[j]`
+is therefore a dangling pointer.
 
-CPU backend produces correct output in every configuration tested.
-The bug only surfaces when the consuming sub-graph runs on the
-Metal backend.
+When the user calls `ggml_backend_sched_alloc_graph` again on the same
+gf — a common pattern, e.g. classifier-free guidance running the
+same compute graph twice per step with different inputs — the next
+`sched_split_graph` reads from those dangling pointers to decide
+whether each src needs a new cross-backend copy. The garbage flags
+rarely match `GGML_TENSOR_FLAG_INPUT`, so it silently skips creating
+the input copy. The consuming GPU kernel then reads whatever stale
+data is at the previous `input_cpy`'s offset.
 
-## Application context (chatterbox-tts S3Gen UNet1D)
+## Repro
 
-UNet1D denoiser graph: ~14 sub-blocks (1 down + 12 mid + 1 up +
-final), ~396 mul_mats per pass, F32 activations throughout, ~2700
-nodes per CFM step, 29 backend splits at the production input
-shape (T_mel=382).
-
-Three runtime input tensors per CFM step:
-- `unet_input` (F32, T_mel × 320)
-- `time_emb` (F32, 1024)
-- `mask` (F32, T_mel)
-
-Weights GPU-resident; sched auto-assigns the three inputs to the
-CPU backend (presumably because `ggml_backend_tensor_set` from
-host data is cheaper to CPU). Sched creates auto-copies
-`MTL0#unet_input#0`, `MTL0#time_emb#0`, `MTL0#mask#0` for the first
-Metal split that consumes them.
-
-## Minimum repro
-
-Application-level repro using the chatterbox CLI (50 MB GGUF):
+Application-level repro using the chatterbox S3Gen UNet (CFM solver
+runs the same gf twice per CFM step):
 
 ```
-# Without the workaround — vocoder mel rms ~14, audio garbled
+# Without the patch: rms 14.6 (garbled audio)
 CHATTERBOX_FORCE_GPU=1 CHATTERBOX_S3GEN_UNET_GPU_RESIDENCY=1 \
   ./chatterbox-cli --tts "Hello." --voice prompt.wav --seed 42
 
-# With explicit input-pin via ggml_backend_sched_set_tensor_backend
-# on the three inputs — vocoder mel rms 5.1, matches CPU reference
+# Diagnostic: the dangling src[j] makes split[0] of the SECOND
+# graph_compute report n_inputs=0 (the original GGML_TENSOR_FLAG_INPUT
+# tensor "unet_input" is invisible because src[j] now points to freed
+# memory). The first graph_compute reports n_inputs=1 'unet_input'.
 ```
 
-Standalone `test-backend-ops`-style repro: a 30-split, 200-node F32
-graph with weights on backend A and three flag-INPUT tensors
-auto-routed to backend B, where the first split on backend A reads
-the inputs. The auto-copy fires (`ggml_backend_tensor_copy` at
-`ggml-backend.cpp:1567`) but the kernel reading the resulting
-backend-A tensor sees stale bytes. We can prepare a minimised
-`test-backend-ops` case — flag the issue and we'll extract one.
+A minimal `test-backend-ops`-style repro would be:
 
-## Bisect path
+1. Build a small gf with one input tensor whose first consumer is on
+   a different backend than the input's auto-assigned backend.
+2. Call `ggml_backend_sched_alloc_graph + graph_compute` twice with
+   different input uploads.
+3. The second compute reads stale data, even though the user uploaded
+   fresh data via `ggml_backend_tensor_set` between the two calls.
 
-1. **CPU vs GPU `after_im2col` already differs at cos=-0.08.** First
-   kernel of the UNet on the GPU side. Kernel arithmetic (causal
-   zero-padding) is correct — visible by inspecting the dump bytes
-   directly. The kernel is reading wrong values from x.
-2. **Host-side input is bit-identical** in both runs (verified by
-   logging `input[0..7]` before
-   `ggml_backend_tensor_set`).
-3. **`ggml_backend_tensor_get` readback right after the upload returns
-   the correct values** — the CPU buffer holds the right data.
-4. **`ggml_backend_sched_get_tensor_backend(sched, unet_input)`
-   returns `CPU`** — even though the consuming kernel will run on Metal.
-5. **Pinning the input to the Metal backend via
-   `ggml_backend_sched_set_tensor_backend(sched, unet_input, metal)`
-   makes the kernel read correct values** and downstream output
-   matches CPU reference at `cos_min=0.999976`.
-6. **Per-node `ggml_gallocr` trace** shows the auto-copy
-   `MTL0#unet_input#0` IS allocated. The plan is internally
-   consistent (no overlap with other tensors). So the bug is in the
-   runtime delivery of the copy, not in the allocation plan.
+We can prepare one if it helps the upstream review — flag the issue.
 
-## What's ruled out
+## Proposed fix
 
-- Allocator aliasing — per-node gallocr trace + overlap scan find
-  zero overlapping live ranges in the affected configuration.
-- `kernel_norm_fuse_impl` short-row reduction bug — already patched
-  in a separate fork hunk (filed as a different patch). Not the
-  cause here.
-- `kernel_flash_attn_ext` F32 Q downcast — patching changes the
-  drift profile but doesn't fix this path (and the bug fires before
-  any attention kernel runs).
-- `GGML_METAL_CONCURRENCY_DISABLE=1` — no effect.
-- `GGML_NO_INPLACE=1` — actively breaks (sign-flip artifact).
-- Per-op CPU pin (`mul_mat`, `norm`, `add`, `cont`) — all produce
-  NaN at production T (the original PIN_CPU_OP "fix" was a
-  measurement artifact reported as round-tripped through the
-  pre-`compare_with_row_width` non-finite guard).
+Track src[j] rewires in a per-sched mutation log; restore each rewire
+to the original at the end of `ggml_backend_sched_compute_splits` so
+the user's gf is left in its original state between sched calls.
+~30 LOC across struct, split_graph, compute_splits, free.
 
-## Investigation pointers in ggml
+Patch in our fork: `ggml/src/ggml-backend.cpp` (`// CrispASR patch
+(#83 r9 follow-up #4)` blocks). Posting the diff below for review:
 
-- `ggml-backend.cpp:1555-1567` — the sched compute-splits loop
-  copies input-flagged tensors via `ggml_backend_tensor_copy` after
-  a prior `ggml_backend_synchronize`. The path looks correct. We
-  suspect either:
-  - The `ggml_backend_synchronize(split_backend)` doesn't actually
-    wait for the destination's pre-existing residency (some
-    Metal-specific ordering issue with the autocopy buffer).
-  - `ggml_backend_buffer_is_host(src->buffer)` returns true and
-    the `ggml_backend_tensor_set` at line 485 of
-    `ggml_backend_tensor_copy` ends up writing to a destination
-    Metal buffer whose `tensor->data` offset isn't yet the one the
-    consumer reads from.
-- `ggml-metal/ggml-metal-device.m:1940-1992` — `ggml_metal_buffer_set_tensor`
-  on private buffers uses a synchronous blit (`commandBufferWithUnretainedReferences`
-  + `dispatch_semaphore_wait`). The blit destination is computed via
-  `ggml_metal_buffer_get_id(buf, tensor)`. If `buf` here is the
-  destination Metal buffer for `MTL0#unet_input#0`, this should
-  land correctly. Worth instrumenting to confirm the actual byte
-  offset that's being written.
-- `ggml-backend.cpp:1330-1349` — input-tensor-with-multiple-copies
-  bookkeeping. We test with `n_copies=1`; the `n_copies > 1` path
-  uses double-buffering events and might behave differently.
+```c
+// (struct ggml_backend_sched_src_mutation declared at file scope)
+struct ggml_backend_sched_src_mutation {
+    struct ggml_tensor * node;
+    struct ggml_tensor * orig_src;
+    int j;
+};
 
-## Application-side workaround
+// inside struct ggml_backend_sched: add fields
+struct ggml_backend_sched_src_mutation * src_mutations;
+int n_src_mutations;
+int src_mutations_capacity;
 
-Explicit pin in the user code, conditional on the sub-graph
-running on a non-CPU backend:
-
-```cpp
-if (running_on_gpu_backend) {
-    ggml_backend_sched_set_tensor_backend(sched, unet_input, gpu_backend);
-    ggml_backend_sched_set_tensor_backend(sched, time_emb,   gpu_backend);
-    ggml_backend_sched_set_tensor_backend(sched, mask,       gpu_backend);
+// in ggml_backend_sched_split_graph, BEFORE node->src[j] = tensor_id_copy(...):
+if (sched->n_src_mutations >= sched->src_mutations_capacity) {
+    sched->src_mutations_capacity = sched->src_mutations_capacity * 2 + 16;
+    sched->src_mutations = realloc(
+        sched->src_mutations,
+        sched->src_mutations_capacity * sizeof(struct ggml_backend_sched_src_mutation));
+    GGML_ASSERT(sched->src_mutations != NULL);
 }
+sched->src_mutations[sched->n_src_mutations].node = node;
+sched->src_mutations[sched->n_src_mutations].orig_src = src;
+sched->src_mutations[sched->n_src_mutations].j = j;
+sched->n_src_mutations++;
+node->src[j] = tensor_id_copy(...);
+
+// at the END of ggml_backend_sched_compute_splits:
+for (int i = 0; i < sched->n_src_mutations; i++) {
+    const struct ggml_backend_sched_src_mutation * m = &sched->src_mutations[i];
+    m->node->src[m->j] = m->orig_src;
+}
+sched->n_src_mutations = 0;
+
+// in ggml_backend_sched_free:
+free(sched->src_mutations);
 ```
 
-This is a robust workaround at the application layer but the
-underlying ggml-side issue should still be fixed — silently failing
-input copies are a class of bug other users will hit and have a
-very confusing surface (cos -0.08 from the first kernel, no
-allocator/kernel symptom to grep for).
+## What this DOES fix
+
+The dangling-pointer bug above. After this patch, repeated
+`alloc_graph + graph_compute` on the same gf correctly detects input
+tensors on every call and queues the CPU→GPU copies. Verified with
+the chatterbox repro: `split[0].n_inputs=1 'unet_input'` on every
+CFM-step call (both cond and uncond passes), kernel reads correct
+input bytes (verified via inline `ggml_backend_tensor_get` right
+before im2col dispatch).
+
+## What this does NOT fix
+
+A separate, residual issue with `unet_input` specifically: even
+after the dangling-pointer fix, with `unet_input` on the CPU
+backend (auto-assigned) and the sched copy delivering correct
+bytes to `MTL0#unet_input#0`, downstream Metal compute still
+produces wrong output (chatterbox `vocoder mel rms ~14.6` vs ref
+5.1). The kernel sees correct input bytes but the cumulative
+compute diverges from the reference.
+
+Application-side workaround (still required in our fork): pin
+`unet_input` to the Metal backend via
+`ggml_backend_sched_set_tensor_backend(sched, unet_input, c->backend)`.
+With both the ggml patch AND the app pin in place, `s3gen_mel
+cos_min` goes from 0.940 → 0.999976 (matching the CPU-residency
+production path's 0.999980).
+
+The second issue may be a Metal-side correctness bug, a precision
+issue with input-copy via the shared-buffer path, or yet another
+sched-state issue. We don't have a clean characterisation yet —
+filing this PR for the dangling-pointer half because that one is
+crisp and reproducible.

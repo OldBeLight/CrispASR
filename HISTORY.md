@@ -6,82 +6,118 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
-## 2026-05-24 PLAN #83 Round 9 follow-up #4 — S3Gen UNet GPU drift root cause: input sched copy
+## 2026-05-24 PLAN #83 Round 9 follow-up #4 — S3Gen UNet GPU drift: TWO bugs in tandem
 
 Three rounds of bisect (#83 R9 follow-ups #1–#3) had ruled out gallocr,
 per-op pin workarounds, the GGML_PREC_F32 hint on conv1d, Metal
 concurrency, every flash-attn variant, and concluded the bug was
 "at the Metal kernel layer, address-dependent, no in-tree workaround."
-Follow-up #4 found the root cause was much simpler.
+Follow-up #4 found the actual root cause(s) — there are TWO independent
+bugs that both have to be fixed to make GPU-residency UNet work.
 
 **Method.** Captured CPU vs GPU bytes at every probe point in the first
 `causal_block1d` (`s3.fd.db.0.0.b1`) via `CRISPASR_S3GEN_UNET_PROBE_BLOCK1=0
 + CRISPASR_S3GEN_DUMP_UNET=<tag> + CRISPASR_S3GEN_DUMP_UNET_NO_AUTO_MARK=1`.
 `tools/compare_probe_dumps.py` showed `after_im2col` already at
-cos=-0.085 between CPU and GPU — i.e. the very first GPU kernel of the
+cos=-0.085 between CPU and GPU — the very first GPU kernel of the
 UNet was producing structurally wrong output. `tools/inspect_im2col_dump.py`
 confirmed the kernel logic (causal zero-padding) was correct, but it
-was reading the wrong values from x. A small `CRISPASR_S3GEN_LOG_INPUT=1`
-diagnostic logged host-side `unet_input[0..7]` and a `ggml_backend_tensor_get`
-readback after upload: both bit-identical between CPU and GPU runs, so the
-upload itself was fine. `ggml_backend_sched_get_tensor_backend(c->sched, ui)`
-returned `CPU` for `unet_input` even with `CRISPASR_S3GEN_UNET_GPU_RESIDENCY=1`;
-the existing gallocr trace had already captured `MTL0#unet_input#0` as a
-sched-internal copy.
+was reading the wrong values from x.
 
-**Root cause.** With weights GPU-resident, the three runtime inputs
-(`unet_input`, `time_emb`, `mask`) get auto-assigned to the CPU
-backend. Sched creates a copy node `MTL0#unet_input#0` for the first
-Metal split that consumes them. The copy is supposed to run before
-any Metal kernel reads the input, but in this graph it doesn't fire
-correctly — the Metal kernel reads stale data at the destination
-offset, giving structurally wrong values from the very first dispatch.
-Under certain `set_output` layouts (the 2-mark trigger documented in
-follow-ups #1–#3), the wrongness pushes into IEEE-754 territory and
-produces NaN.
+A small `CRISPASR_S3GEN_LOG_INPUT=1` diagnostic + an inline
+`ggml_backend_tensor_get` right before im2col dispatch and an
+`fprintf` in `ggml_backend_sched_compute_splits` confirmed:
 
-**Fix.** `cfm_euler_solve::run_denoiser` now pins `unet_input`,
-`time_emb`, `mask` to `c->backend` via
-`ggml_backend_sched_set_tensor_backend` whenever
-`c->unet_on_gpu` is true. One Bool field on the context tracks
-the residency mode. No new env vars. Production CPU-residency path
-(the default) is unchanged.
+- On the FIRST call per CFM step (the CFG conditional pass), sched
+  detects `unet_input` as a split input and copies CPU→Metal correctly.
+- On the SECOND call (the CFG unconditional pass), `split[0].n_inputs`
+  is 0 — sched fails to detect `unet_input` as needing a copy. The
+  Metal kernel reads stale data left over from a previous compute.
 
-**Verification.**
+**Root cause #1 — sched src[j] dangling pointer across alloc_graph calls.**
+In `ggml_backend_sched_split_graph`, the input-detection loop walks
+each node's `src[j]` and, when crossing backends, rewires
+`node->src[j] = tensor_id_copy(...)`. This mutates the user's graph
+in place. The input_cpy tensors live in `sched->ctx`, which is freed
+and re-initialised at the top of the very NEXT split_graph call
+(`ggml_free(sched->ctx); sched->ctx = ggml_init(params)`). So after
+the cond call's compute returns, the user's `gf->nodes[i]->src[j]`
+points at memory that the next split_graph will reclaim. The uncond
+call's split_graph then walks the user's graph, reads dangling src
+pointers, and silently skips creating new input copies because the
+garbage flags rarely match `GGML_TENSOR_FLAG_INPUT`.
 
-| Config | Before fix | After fix |
+Patch: `ggml/src/ggml-backend.cpp` keeps a mutation log of every
+`node->src[j]` rewire; `ggml_backend_sched_compute_splits` restores
+the originals at the end of compute so the user's graph is left
+exactly as they built it. `MUST RE-APPLY` after ggml bumps.
+
+**Root cause #2 — `unet_input` needs to live on the consuming backend
+under GPU residency, regardless of #1.** Even with the dangling-pointer
+bug fixed, the sched-copy-on-every-call path still produced wrong
+output (`rms ~16` vs ref 5.1) for unet_input specifically. The
+kernel reads correct bytes (verified by inline `ggml_backend_tensor_get`
+right before im2col dispatch), but downstream compute diverges in
+a way that depends on whether unet_input lives on Metal directly or
+on CPU+sched-copy. We did not chase the second bug to its kernel-
+level cause; it is sidestepped by placing unet_input on the consuming
+backend (`ggml_backend_sched_set_tensor_backend(sched, unet_input,
+c->backend)` in `cfm_euler_solve::run_denoiser`).
+
+Bisect findings on which inputs to pin:
+
+| Pinned to GPU | Smoke `vocoder mel rms` | Verdict |
 | - | - | - |
-| baseline GPU residency, `--tts "Hello."` | `vocoder mel rms=13.938` | `rms=5.143` (ref 5.115) |
-| 2-mark NaN trigger (`MARK_DB_RESNET=1 + MARK_MB_OUT_INDEX=0`) | `rms=NaN` | `rms=5.143` |
+| (none) | 14.6 | broken |
+| `unet_input` only | **5.14** | works ✓ |
+| `time_emb` only | 14.4 | broken |
+| `mask` only | 16.0 | broken |
+| `unet_input` + `time_emb` | 209 | catastrophic |
+| `unet_input` + `mask` | 5.14 | works ✓ |
+| all three | 5.14 | works ✓ |
+
+Pinning `time_emb` forces `mish` onto Metal which changes the
+resnet block's cross-backend topology in a way that interacts badly
+with the rest of the graph. Pinning just `unet_input` is the
+minimal correct fix.
+
+**Verification (M1 Metal):**
+
+| Config | Before | After |
+| - | - | - |
+| baseline GPU residency, `--tts "Hello."` | `rms=13.938` | `rms=5.143` (ref 5.115) |
+| 2-mark NaN trigger | `rms=NaN` | `rms=5.291` |
 | diff harness `s3gen_mel` | `cos_min=0.940` | `cos_min=0.999976` |
 | long text (~9 s) | `rms=13.045` | `rms=4.741` |
 | production CPU residency (default) | `rms=5.139` | `rms=5.139` (no change) |
 
 `s3gen_mel cos_min=0.999976` matches the production weight-residency
-split (0.999980); the residual ~1e-2 max_abs is FP16/F32 round-off, not
-a bug. The GPU-residency path is now correct and roughly 30% faster
-than the CPU-residency split on M1 — but we keep CPU residency as the
-default until the underlying ggml sched bug is also fixed upstream
-(see updated `tools/upstream-prs/10`).
+split (0.999980); the residual ~1e-2 max_abs is FP16/F32 round-off.
+The GPU-residency path is now correct AND ~30% faster than the
+CPU-residency split on M1.
 
 **Lessons replacing R9 follow-up #3's 2''':**
 
 2''''. **A backend-pin diagnostic ("does forcing input to GPU fix it?")
 should be tried before declaring a Metal kernel bug.** Three rounds
-chased shader-level address-dependence; the fix was a one-line pin.
-When CPU vs GPU bytes differ at the FIRST kernel, the suspect chain
-is: host upload → sched input placement → sched copy → kernel
-dispatch. Verify each step's outputs before assuming kernel correctness
-is at fault — even if the kernel reads the WRONG buffer, its
-arithmetic on those wrong bytes can still produce "structurally wrong"
-output that looks like a kernel bug.
+chased shader-level address-dependence; the fix was a one-line pin
+plus a small ggml sched patch. When CPU vs GPU bytes differ at the
+FIRST kernel, the suspect chain is: host upload → sched input
+placement → sched copy → kernel dispatch. Verify each step's outputs
+before assuming kernel correctness is at fault.
 
-5. **For GPU-resident sub-graphs, pin runtime inputs explicitly.**
-The ggml scheduler's auto-placement for tensors with
-`GGML_TENSOR_FLAG_INPUT` and no weight constraints prefers CPU
-(cheap host upload). The auto-generated CPU→GPU copy works on most
-graphs, but in long F32 graphs with mixed weight residencies it can
-silently fail. Pinning is a one-liner and removes the failure mode.
+5. **ggml sched mutates the user's graph in place and depends on the
+mutations persisting across alloc_graph calls — but doesn't.** The
+implicit contract "you give me a fresh gf each call, I rewire it"
+breaks when the same gf is reused (e.g. CFG's cond+uncond passes).
+Always restore mutations at end of compute. The patched
+`ggml-backend.cpp` does this via a mutation log.
+
+6. **For long, mixed-residency GPU sub-graphs, the input-pinning
+choice is non-obvious.** Pinning everything to the consuming backend
+isn't always right — pinning `time_emb` to GPU here was actively
+catastrophic. Pin minimally (just the inputs that need to live on
+the consuming side) and verify with end-to-end diff.
 
 ---
 

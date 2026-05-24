@@ -6585,19 +6585,56 @@ content at the destination offset. Under certain `set_output`
 layouts (the 2-mark trigger from follow-ups #1–#3) the stale
 values turn into NaN.
 
-**Fix.** One conditional pin in `cfm_euler_solve::run_denoiser`:
+**Fix has two parts** (both required; one without the other still produces wrong output):
+
+**Part A — ggml-side patch** for `ggml_backend_sched_compute_splits`
+(ggml-backend.cpp). On every call, sched_split_graph mutates
+`gf->nodes[i]->src[j]` to point at fresh `MTL0#input#0` tensors it
+just created in `sched->ctx`. Those tensors live until the NEXT
+call's `ggml_free(sched->ctx); sched->ctx = ggml_init(...)`, which
+happens at the top of the next sched_split_graph. So between calls,
+the user's `gf->nodes[i]->src[j]` is a DANGLING POINTER. The next
+call's sched_split_graph reads from that dangling pointer to decide
+whether an input copy is needed — and the garbage flags rarely match
+`GGML_TENSOR_FLAG_INPUT`, so it skips creating new copies. The
+consuming Metal kernel then reads stale content at the previous
+input_cpy's offset.
+
+Fix: keep a mutation log in sched, and restore each `node->src[j]`
+to its original at end of `ggml_backend_sched_compute_splits`. The
+user's gf is left untouched between sched calls; the next call sees
+the real `GGML_TENSOR_FLAG_INPUT` tensors and creates fresh copies.
+Marked `// CrispASR patch (#83 r9 follow-up #4)` with MUST RE-APPLY.
+
+**Part B — application-side pin of `unet_input` only**. Even with
+Part A, the sched copy of `unet_input` (CPU buffer → MTL0#unet_input#0)
+produces correct bytes at the kernel (verified by inline
+`ggml_backend_tensor_get` right before dispatch) yet downstream
+compute diverges. Cause not fully traced; sidestepped by placing
+`unet_input` on the consuming Metal backend so no copy is needed.
 
 ```cpp
 if (c->unet_on_gpu) {
-    ggml_backend_sched_set_tensor_backend(c->sched, unet_input, c->backend);
-    ggml_backend_sched_set_tensor_backend(c->sched, time_emb,   c->backend);
-    ggml_backend_sched_set_tensor_backend(c->sched, mask,       c->backend);
+    ggml_tensor* ui = ggml_graph_get_tensor(gf, "unet_input");
+    if (ui) ggml_backend_sched_set_tensor_backend(c->sched, ui, c->backend);
 }
 ```
 
-`c->unet_on_gpu` is set once at init from the
-`CRISPASR_S3GEN_UNET_GPU_RESIDENCY` env. Production CPU-residency
-path is unchanged.
+**Bisect of which inputs to pin (all under Part A in place):**
+
+| Pinned to GPU | smoke rms | result |
+| - | - | - |
+| (none) | 14.6 | broken |
+| `unet_input` only | **5.14** | works ✓ |
+| `time_emb` only | 14.4 | broken |
+| `mask` only | 16.0 | broken |
+| `unet_input` + `time_emb` | 209 | catastrophic |
+| `unet_input` + `mask` | 5.14 | works ✓ |
+| all three | 5.14 | works ✓ |
+
+Pinning `time_emb` forces `mish` onto Metal (its input now lives on
+GPU), which changes the resnet block's cross-backend topology and
+interacts badly with the rest of the graph. **Pin minimally**.
 
 **Verification matrix (M1 Metal):**
 
@@ -6643,14 +6680,14 @@ then diff `dump_probe_after_im2col.bin` between CPU and GPU runs.
 If cos<<1 from the very first probe, look at sched, not at
 shaders.
 
-**Upstream story.** The bug is in `ggml_backend_sched_compute_splits`'s
-copy of input-flagged tensors at `ggml-backend.cpp:1555-1567`. The
-copy is supposed to be synchronous (`ggml_backend_tensor_copy` with
-a prior `ggml_backend_synchronize`), but in this graph topology
-(29 splits, ~2700 nodes, mixed CPU+Metal residency, F32 throughout)
-something doesn't honour the synchronisation. Doesn't reproduce
-in short graphs. Upstream PR draft updated at
-`tools/upstream-prs/10`.
+**Upstream story.** The dangling-pointer bug (Part A) is a real
+ggml-side issue that affects any user code which calls
+`ggml_backend_sched_alloc_graph + graph_compute` twice on the same
+gf — the second call silently loses input copies. Filed at
+`tools/upstream-prs/10`. The Part B "pin unet_input only" issue
+needs more investigation to characterise upstream (we couldn't pin
+down the downstream divergence point), so it remains an
+application-side workaround for now.
 
 `tools/compare_probe_dumps.py` + `tools/inspect_im2col_dump.py`
 are the diagnostic scripts.

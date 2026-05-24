@@ -262,13 +262,11 @@ struct chatterbox_s3gen_context {
     bool unet_pin_mm_cpu = false;
 
     // True when the UNet weights are GPU-resident (opt-in via
-    // CRISPASR_S3GEN_UNET_GPU_RESIDENCY=1). In that mode the entire UNet
-    // sub-graph runs on the GPU backend, so the three runtime inputs
-    // (unet_input, time_emb, mask) are also pinned to that backend.
-    // Without the pin the inputs land on CPU and the sched-internal
-    // CPU→GPU copy reads stale data on the first kernel of every CFM
-    // step, producing structurally wrong (and NaN under certain layouts)
-    // GPU output. See LEARNINGS round 9 follow-up #4.
+    // CRISPASR_S3GEN_UNET_GPU_RESIDENCY=1). In that mode the cfm_euler_solve
+    // run_denoiser path also pins `unet_input` to the GPU backend (see the
+    // PLAN #83 r9 follow-up #4 comment there). The ggml-side mutation log
+    // patch in ggml-backend.cpp handles the related src[j] dangling-pointer
+    // issue for any other inputs that cross backends.
     bool unet_on_gpu = false;
 
     ggml_backend_t backend = nullptr;
@@ -2051,23 +2049,23 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
             ggml_backend_sched_reset(c->sched);
             s3gen_maybe_pin_graph_to_cpu(c, gf, s3gen_subgraph::unet);
             // PLAN #83 r9 follow-up #4: when the UNet runs GPU-resident, pin
-            // the three runtime inputs (unet_input, time_emb, mask) to the
-            // GPU backend so the scheduler skips the CPU→GPU copy. Without
-            // the pin, sched places the inputs on CPU and the auto-generated
-            // copy node feeds stale data to the first Metal kernel of every
-            // CFM step, producing structurally wrong (and NaN under certain
-            // set_output layouts) output. Reproducible diff cos_min lifts
-            // from 0.94 to 0.999976 with the pin.
+            // ONLY `unet_input` to the GPU backend. Bisect findings (cf.
+            // LEARNINGS):
+            //   - Pinning unet_input alone: cos_min 0.940 → 0.999976.
+            //   - Pinning time_emb is ACTIVELY HARMFUL — forces mish onto
+            //     GPU and changes the resnet block's cross-backend topology
+            //     in a way that produces rms ~209 nonsense.
+            //   - Pinning mask: no effect.
+            // The companion ggml-side patch (mutation log restoring src[j]
+            // pointers in ggml_backend_sched_compute_splits) is also
+            // required: without it, the SECOND graph_compute per CFM step
+            // (the CFG uncond pass) silently fails to redeliver remaining
+            // CPU→GPU inputs because their consuming nodes' src[j] points
+            // at freed input_cpy tensors from the previous call.
             if (c->unet_on_gpu) {
                 ggml_tensor* ui = ggml_graph_get_tensor(gf, "unet_input");
-                ggml_tensor* te = ggml_graph_get_tensor(gf, "time_emb");
-                ggml_tensor* mk = ggml_graph_get_tensor(gf, "mask");
                 if (ui)
                     ggml_backend_sched_set_tensor_backend(c->sched, ui, c->backend);
-                if (te)
-                    ggml_backend_sched_set_tensor_backend(c->sched, te, c->backend);
-                if (mk)
-                    ggml_backend_sched_set_tensor_backend(c->sched, mk, c->backend);
             }
             if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
                 fprintf(stderr, "s3gen: failed to alloc UNet1D graph\n");
