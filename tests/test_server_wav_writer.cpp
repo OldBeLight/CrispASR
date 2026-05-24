@@ -129,6 +129,27 @@ TEST_CASE("WAV serializer accepts varied sample rates", "[unit][wav]") {
     }
 }
 
+TEST_CASE("regression #122: WAV header reflects backend's native rate", "[unit][wav][regression]") {
+    // Issue #122: /v1/audio/speech hardcoded 24 kHz in the WAV header,
+    // but voxcpm2-tts emits at 48 kHz natively. A 48 kHz buffer with a
+    // 24 kHz header plays at half speed → audibly distorted. Fix routes
+    // backend->tts_sample_rate() into crispasr_make_wav_int16.
+    //
+    // The writer itself was always correct for arbitrary rates; this
+    // test pins the two values that matter on the wire (qwen3-tts =
+    // 24 kHz, voxcpm2-tts = 48 kHz) so a future "tidy-up" can't drop
+    // sample-rate plumbing without a red test. The matching live
+    // integration coverage lives in tests/test-server-voxcpm2-rate.sh.
+    std::vector<float> samples(48, 0.5f);
+    for (int rate : {24000, 48000}) {
+        std::string wav = crispasr_make_wav_int16(samples.data(), (int)samples.size(), rate);
+        REQUIRE(le_u32(wav, 24) == (uint32_t)rate);
+        REQUIRE(le_u32(wav, 28) == (uint32_t)(rate * 2)); // byte_rate
+        REQUIRE(le_u16(wav, 22) == 1);                    // mono
+        REQUIRE(le_u16(wav, 32) == 2);                    // block_align
+    }
+}
+
 TEST_CASE("WAV serializer handles empty input", "[unit][wav]") {
     // n_samples = 0 should produce a header-only WAV (44 bytes), not
     // crash and not undersize the buffer.

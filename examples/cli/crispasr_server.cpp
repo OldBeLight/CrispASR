@@ -895,6 +895,11 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         auto t0 = std::chrono::steady_clock::now();
         const std::vector<std::string> sentences = crispasr_tts_plan_chunks_for_backend(text, backend->name());
 
+        // Backend-declared output rate. Most TTS backends emit 24 kHz;
+        // voxcpm2-tts emits 48 kHz. Hard-coding 24 kHz here is why
+        // voxcpm2 output played at half speed before this fix (#122).
+        const int sr_out = backend->tts_sample_rate();
+
         std::vector<std::vector<float>> chunks;
         chunks.reserve(sentences.size());
         {
@@ -905,10 +910,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                     chunks.push_back(std::move(chunk));
             }
         }
-        // 200 ms silence at 24 kHz between chunks. Inaudible click
-        // suppression at boundaries; long enough that the listener
-        // perceives a natural sentence pause without dragging.
-        std::vector<float> pcm = crispasr_tts_concat_with_silence(chunks, 4800);
+        // 200 ms silence between chunks (scaled to the backend rate).
+        // Inaudible click suppression at boundaries; long enough that
+        // the listener perceives a natural sentence pause without dragging.
+        std::vector<float> pcm = crispasr_tts_concat_with_silence(chunks, sr_out / 5);
         auto t1 = std::chrono::steady_clock::now();
 
         if (pcm.empty()) {
@@ -936,25 +941,27 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         }
 
         const double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
-        const double audio_s = (double)pcm.size() / 24000.0;
+        const double audio_s = (double)pcm.size() / (double)sr_out;
         fprintf(stderr,
                 "crispasr-server: synthesized %.1fs audio in %.2fs (RTF=%.2f) "
-                "voice='%s' speed=%.2f format=%s model='%s' chunks=%zu\n",
+                "voice='%s' speed=%.2f format=%s model='%s' chunks=%zu sr=%dHz\n",
                 audio_s, elapsed_s, elapsed_s > 0 ? elapsed_s / audio_s : 0.0,
                 voice_name.empty() ? "<startup>" : voice_name.c_str(), speed, response_format.c_str(),
-                requested_model.empty() ? "<unset>" : requested_model.c_str(), chunks.size());
+                requested_model.empty() ? "<unset>" : requested_model.c_str(), chunks.size(), sr_out);
 
         if (response_format == "f32") {
             std::string buf((const char*)pcm.data(), pcm.size() * sizeof(float));
             res.set_content(std::move(buf), "application/octet-stream");
         } else if (response_format == "pcm") {
-            // OpenAI's pcm: 24 kHz signed 16-bit LE mono raw bytes, no
-            // header. Content-Type is documented as audio/pcm; clients
-            // know the rate out-of-band from the spec.
+            // OpenAI's pcm: signed 16-bit LE mono raw bytes, no header.
+            // Spec is 24 kHz; we emit at the backend's native rate
+            // (voxcpm2 = 48 kHz) — clients must know the rate
+            // out-of-band. Use response_format=wav if the client needs
+            // a self-describing container.
             std::string raw = crispasr_make_pcm_int16_le(pcm.data(), (int)pcm.size());
             res.set_content(std::move(raw), "audio/pcm");
         } else {
-            std::string wav = crispasr_make_wav_int16(pcm.data(), (int)pcm.size(), 24000);
+            std::string wav = crispasr_make_wav_int16(pcm.data(), (int)pcm.size(), sr_out);
             res.set_content(std::move(wav), "audio/wav");
         }
     });
