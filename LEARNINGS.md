@@ -6829,8 +6829,77 @@ itself part of the experiment.
 - `CRISPASR_S3GEN_UNET_PROBE_RC_OUT` — dumps rc's residual-conv
   output at `s3.fd.db.0.0` as `dump_rc_out_db00`.
 
-**Bug B remains open.** Workaround is still shipping. Next step
-would be probing the rc kernel's per-thread reads with a custom Metal
-shader replacement that captures `x[offset_src]` to a side buffer, so
-we can see exactly what the GPU thread sees vs what host_get sees at
-the same byte offset.
+**Also eliminated: Metal op fusion.** Set
+`GGML_METAL_FUSION_DISABLE=1` to disable the cross-op fusion
+optimizer; Bug B's smoke is still rms=16.129. So the rc-specific
+divergence isn't an artifact of the fusion code path either.
+
+**Structural difference between b1 (works) and rc (broken):**
+
+Both fire `kernel_im2col_f32` on the same `MTL0#unet_input#0` at
+the same Metal buffer offset 0, inside the SAME sched split
+(SPLIT #0 of the UNet1D graph — verified via `GGML_SCHED_DEBUG=1`,
+which shows just one Metal split with unet_input as its input; all
+subsequent Metal splits consume only the time_proj outputs that
+loop back from CPU). The only mechanical differences are:
+
+| | b1's conv1d | rc's conv1d |
+| - | - | - |
+| `KW` (kernel width) | 3 | 1 |
+| `p0` (left pad) | 2 | 0 |
+| im2col output `ne[0]=CHW` | 960 | 320 |
+| Threads per threadgroup (`ntptg0, KH, KW`) | (1, 1, 3) | (1, 1, 1) |
+| Causal-pad branch enters | yes (for iow=0..1) | never |
+
+So rc dispatches `kernel_im2col_f32` with a 1×1×1 threadgroup — one
+active lane, 31 masked-off SIMD lanes on the M1's 32-wide simdgroup.
+That's an unusual but documented configuration. Whether this
+single-lane threadgroup tickles a driver/compiler bug on M1 specifically
+is a leading hypothesis but unverified. The next experiment would
+either:
+
+**Tested — eliminated: 1×1×1-threadgroup im2col edge case.**
+Added `CRISPASR_S3GEN_RC_AS_MUL_MAT=1` that bypasses `ggml_conv_1d`
+for rc when KW=1 and emits a direct
+`mul_mat(cont(transpose(residual)), reshape_2d(rc_w))` instead. Test
+results on M1:
+
+| Configuration | rms |
+| - | - |
+| Path X (workaround), `RC_AS_MUL_MAT=1` | 5.143 (matches workaround baseline — correctness preserved) |
+| Path Y (Bug B), `RC_AS_MUL_MAT=1` | 16.837 (Bug B still present) |
+
+So the 1×1×1-threadgroup im2col edge case is **NOT** the cause of
+Bug B. Bypassing rc's im2col leaves Bug B intact. Whatever's wrong
+with Path Y's rc compute is also wrong with a mul_mat-only rc compute
+on the same `MTL0#unet_input#0` buffer. The divergence is not in
+the rc kernel itself.
+
+This is a significant negative result — it pushes the bug AWAY from
+rc and suggests the cos=0.022 measurement of `dump_rc_out_db00` may
+be a downstream symptom rather than the causal location. Working
+hypotheses to try next:
+
+- The `dump_rc_out_db00` divergence might be a **dump artifact**
+  itself: `MARK_DB_RESNET=1 + PROBE_BLOCK1=1` already broke the
+  workaround at rms=17.355, so probe-induced offset shifts are
+  measurably destabilising. The rc-output dump landing at a
+  different offset in Path X vs Path Y could mean we're reading
+  different bytes for reasons unrelated to rc's correctness.
+- **Capture per-thread reads via a custom Metal kernel.** Replace
+  `kernel_im2col_f32` with a debug variant that writes
+  `(in*ofs0 + iic*ofs1 + iiw, x[offset_src])` pairs to a side
+  buffer. Compare what GPU thread (iic, iow, ikw) saw vs what
+  host expected.
+- **Probe the SECOND CFM step** specifically. The first step's
+  compute uses freshly memcpy'd data; subsequent steps reuse the
+  same Metal compute buffer offsets with new memcpy contents. If
+  a buffer's state from step N-1 leaks into step N's compute,
+  the divergence might only appear from step 1 onward — and the
+  cumulative compound through 10 steps drives the rms gap.
+- **Pin only `time_emb` or only `mask`** (R9 #4's bisect tested
+  these but didn't try probing per-step compute outputs). The
+  combinations may encode which sched-injected input_cpy is
+  problematic.
+
+**Bug B remains open.** Workaround is still shipping.
