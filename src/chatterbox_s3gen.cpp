@@ -1990,6 +1990,22 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
                                     t_sin.size() * sizeof(float));
             ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mask"), mask_data.data(), 0,
                                     mask_data.size() * sizeof(float));
+            // PLAN #83 r9 follow-up: dump per-node allocator decisions on step 0
+            // so we can diff 1-mark vs 2-mark configs and spot the address
+            // collision that causes Metal NaN. Format: "name @ data_ptr size bytes".
+            if (step == 0) {
+                const char* dump_addr = std::getenv("CRISPASR_S3GEN_DUMP_UNET_ADDR");
+                if (dump_addr && *dump_addr) {
+                    const int n_nodes_addr = ggml_graph_n_nodes(gf);
+                    fprintf(stderr, "s3gen: [DUMP_UNET_ADDR=%s] %d nodes\n", dump_addr, n_nodes_addr);
+                    for (int i = 0; i < n_nodes_addr; ++i) {
+                        ggml_tensor* node = ggml_graph_node(gf, i);
+                        if (!node) continue;
+                        fprintf(stderr, "s3gen: [addr] %4d  %p  %8zu  %s\n",
+                                i, node->data, ggml_nbytes(node), node->name);
+                    }
+                }
+            }
             if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
                 fprintf(stderr, "s3gen: UNet1D compute failed\n");
                 return {};
