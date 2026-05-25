@@ -149,21 +149,62 @@ def step(name: str, **extra) -> None:
     _push_progress_to_hf()
 
 
-# Build-step heartbeat. The bootstrap's line-buffering only covers
-# Python-side stdout/stderr; child subprocess output (cmake/ninja/g++)
-# is pipe-buffered on the child side and gets dropped into Kaggle's
-# log capture in big chunks that may not flush for many minutes. A
-# build that's actually progressing can look identical to a true hang
-# in the kernel UI. Worse, `kaggle kernels output|files|logs` all
-# return empty mid-run, so there's no programmatic way to peek either.
-#
-# Fix: spawn a daemon heartbeat thread for the lifetime of a long
-# subprocess call that emits step("<label>.heartbeat") every 30 s.
-# That advances progress.jsonl + the HF rolling mirror at
-# `cstr/crispasr-kaggle-progress` regardless of compiler chatter, so
-# a real hang is visible within 30 s of going silent.
+# Build-step heartbeat + Popen-based line streamer. Kaggle's log
+# capture buffers parent stdout heavily, and the C++ build's
+# subprocess.check_call lets ninja/g++ output flow through that
+# buffered pipe — fine when the build is fast, invisible when slow.
+# Same pattern as chr1str/qwen3-export (which ran fluently): Popen
+# the child with stdout=PIPE, iterate line-by-line in Python, print
+# each line with explicit flush. The heartbeat thread runs in
+# parallel and writes step("<label>.heartbeat") every 30 s including
+# the latest ninja [X/N] + last TU it observed from the streamed
+# output. So each tick says "compile 208/360 t5_translate.cpp"
+# instead of just an elapsed counter, turning what looked like
+# noise into actual build progress.
 import contextlib
+import re
 import threading
+
+
+_BUILD_PROGRESS: dict = {
+    "last_ninja": None,   # "208/360" once ninja starts emitting
+    "last_tu": None,      # "t5_translate.cpp" — last TU name seen
+    "lines": 0,           # total output lines (loose liveness signal)
+}
+_NINJA_RE = re.compile(r"^\[(\d+)/(\d+)\]")
+_TU_RE = re.compile(r"(\S+\.(?:cpp|cc|cxx|c|cu))(?::|\s|$)")
+
+
+def sh_with_progress(cmd: str, cwd: Path | None = None) -> None:
+    """Like sh() but Popens the command, pipes stdout/stderr, and
+    updates _BUILD_PROGRESS as ninja emits lines. Forwards every
+    line to the parent stdout (with explicit flush) so Kaggle's
+    log capture sees the full build log in near-real-time.
+    Pattern lifted from chr1str/qwen3-export which uses the same
+    Popen+iter approach and runs fluently."""
+    print(f"$ {cmd}", flush=True)
+    proc = subprocess.Popen(
+        cmd, shell=True, cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        bufsize=1, text=True,
+    )
+    assert proc.stdout is not None
+    try:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            _BUILD_PROGRESS["lines"] += 1
+            m = _NINJA_RE.match(line)
+            if m:
+                _BUILD_PROGRESS["last_ninja"] = f"{m.group(1)}/{m.group(2)}"
+            m = _TU_RE.search(line)
+            if m:
+                # Take just the basename so the heartbeat stays short.
+                _BUILD_PROGRESS["last_tu"] = m.group(1).rsplit("/", 1)[-1]
+    finally:
+        rc = proc.wait()
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, cmd)
 
 
 @contextlib.contextmanager
@@ -172,7 +213,9 @@ def build_heartbeat(label: str, interval_s: float = 30.0):
     interval_s seconds until the block exits. Use around long
     subprocess.check_call calls (cmake configure/build, pip install
     of NeMo, etc.) so progress.jsonl + the HF mirror keep advancing
-    even when the child is silent."""
+    even when the child is silent. If sh_with_progress() is running
+    inside the block, the ticker pulls ninja's [X/N] + last TU from
+    _BUILD_PROGRESS so each tick reports concrete build progress."""
     t_start = time.time()
     stop_event = threading.Event()
 
@@ -180,8 +223,13 @@ def build_heartbeat(label: str, interval_s: float = 30.0):
         # First tick after one interval — the calling site already
         # printed the command, no need to duplicate at t=0.
         while not stop_event.wait(interval_s):
-            step(f"{label}.heartbeat",
-                 elapsed_in_block_s=round(time.time() - t_start, 1))
+            extra: dict = {"elapsed_in_block_s":
+                           round(time.time() - t_start, 1)}
+            if _BUILD_PROGRESS["last_ninja"]:
+                extra["ninja"] = _BUILD_PROGRESS["last_ninja"]
+                extra["tu"] = _BUILD_PROGRESS["last_tu"]
+                extra["lines"] = _BUILD_PROGRESS["lines"]
+            step(f"{label}.heartbeat", **extra)
 
     thread = threading.Thread(target=_ticker, daemon=True,
                               name=f"hb-{label}")
@@ -498,8 +546,14 @@ with build_heartbeat("cmake.configure"):
 # instantiations and link). The previous run hung between two
 # `t5_translate.cpp` warning lines for 90+ min with no log update.
 with build_heartbeat("cmake.build"):
-    sh(f"stdbuf -oL -eL cmake --build {BUILD} "
-       f"--target crispasr-cli crispasr-diff -j$(nproc)")
+    # Switched from sh() to sh_with_progress() so ninja's [X/N] +
+    # last TU show up in each heartbeat tick. stdbuf is still useful
+    # at the child side because ninja itself buffers when stdout
+    # isn't a tty; even though we're now reading line-by-line from
+    # the pipe, ninja's own buffer can delay emission of those lines
+    # by tens of seconds without it.
+    sh_with_progress(f"stdbuf -oL -eL cmake --build {BUILD} "
+                     f"--target crispasr-cli crispasr-diff -j$(nproc)")
 
 if HAS_CCACHE:
     print("ccache stats after build:", flush=True)
