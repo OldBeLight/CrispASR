@@ -46,6 +46,10 @@ TEST_CASE("explicit --chunk-seconds with multiple non-VAD slices uses overlap-sa
     REQUIRE(should_use_chunk_context(effective_chunk_seconds, n_slices, chunk_overlap_seconds, false));
 }
 
+TEST_CASE("backend can opt out of external overlap-save context", "[unit][chunk-context][cohere]") {
+    REQUIRE_FALSE(should_use_chunk_context(30, 6, 3.0f, false, false));
+}
+
 TEST_CASE("single slice never gets context", "[unit][chunk-context][issue-114]") {
     REQUIRE_FALSE(should_use_chunk_context(30, 1, 3.0f, false));
     REQUIRE_FALSE(should_use_chunk_context(0, 1, 3.0f, false));
@@ -56,7 +60,7 @@ TEST_CASE("--chunk-overlap 0 disables overlap-save", "[unit][chunk-context][issu
     REQUIRE_FALSE(should_use_chunk_context(30, 10, -1.0f, false));
 }
 
-TEST_CASE("gate is purely a function of its four inputs", "[unit][chunk-context][issue-114]") {
+TEST_CASE("gate is purely a function of its inputs", "[unit][chunk-context][issue-114]") {
     for (int chunk_s : {0, 1, 5, 30, 120}) {
         for (std::size_t n : {std::size_t{0}, std::size_t{1}, std::size_t{2}, std::size_t{56}}) {
             for (float overlap : {-1.0f, 0.0f, 0.1f, 3.0f, 10.0f}) {
