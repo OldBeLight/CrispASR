@@ -346,6 +346,78 @@
       "sample": "samples/jfk.wav",
       "expected_transcript": "PLACEHOLDER — capture from first rebake run",
       "expected_transcript_source": "TODO — capture once rebake produces the ref archive"
+    },
+    {
+      "name": "mimo-audio-tokenizer",
+      "backend_id": "mimo-tokenizer",
+      "skip_diff": true,
+      "_skip_diff_note": "Added 2026-05-25 — rebake-pending. Encoder of the MiMo-Audio tokenizer (32-layer transformer + 8-stage RVQ). The C++ harness branch is wired at examples/cli/crispasr_diff_main.cpp:2161. See handover-prompts/extend-coverage-via-kaggle.md.",
+      "source_model": "XiaomiMiMo/MiMo-Audio-Tokenizer",
+      "source_model_note": "HF id for tools/reference_backends/mimo_tokenizer.py. Set MIMO_TOKENIZER_DIR to point at the local snapshot during rebake.",
+      "gguf": {
+        "repo": "cstr/mimo-audio-tokenizer-GGUF",
+        "revision": "e2e4a8dec8fdc38c5b029971f1f983adf66c6ef5",
+        "file": "mimo-tokenizer.gguf",
+        "approx_size_mb": 1240
+      },
+      "sample": "samples/jfk.wav",
+      "expected_transcript": "PLACEHOLDER — tokenizer outputs RVQ codes, not a transcript; rebake will print a deterministic hash/digest for regression.",
+      "expected_transcript_source": "TODO — capture once rebake produces the ref archive. The transcript field may be repurposed as a codes-hash; confirm convention with the validate script when flipping skip_diff."
+    },
+    {
+      "name": "lid-cld3-f16",
+      "backend_id": "lid-cld3",
+      "skip_diff": true,
+      "_skip_diff_note": "Added 2026-05-25 — rebake-pending. CLD3 is a text language-ID backend; audio arg is unused (input rides in LID_TEXT env var). C++ harness wired at examples/cli/crispasr_diff_main.cpp:3189. See handover-prompts/extend-coverage-via-kaggle.md.",
+      "source_model": "(text-LID; no upstream source weights — GGUF generated from cld3 protobuf by models/convert-cld3-to-gguf.py)",
+      "source_model_note": "tools/reference_backends/lid_cld3.py re-implements CLD3 feature extractors in Python and cross-checks against pycld3. Set LID_TEXT (or CLD3_TEXT) during rebake to control the input string.",
+      "gguf": {
+        "repo": "cstr/cld3-GGUF",
+        "revision": "ce295cc04e4796be10b7a45e82b1513b5d9cc225",
+        "file": "cld3-f16.gguf",
+        "approx_size_mb": 1
+      },
+      "sample": "samples/jfk.wav",
+      "_sample_note": "Audio arg is ignored by the lid-cld3 backend; the LID_TEXT env var carries the actual input. samples/jfk.wav is a placeholder so the existing rebake harness doesn't need a special-case for text-LID backends.",
+      "expected_transcript": "PLACEHOLDER — language-ID output is a label + probability, not a transcript. Rebake will dump the argmax label (expected: 'en' for an English LID_TEXT default).",
+      "expected_transcript_source": "TODO — capture once rebake produces the ref archive."
+    },
+    {
+      "name": "voxcpm2-tts-2b",
+      "backend_id": "voxcpm2-tts",
+      "skip_diff": true,
+      "_skip_diff_note": "Added 2026-05-25 — rebake-pending. VoxCPM2 TTS (LocEnc + TSLM + RALM + DiT + VAE). C++ harness wired at examples/cli/crispasr_diff_main.cpp:3340. Q4_K pinned to keep Kaggle slot under 2 GB; per the handover (open Q on quant choice) we may swap to voxcpm2-f16.gguf (~4.7 GB) once the first diff floor is known and q4_k drift is measured. The dump backend takes a reference WAV for voice cloning + VOXCPM2_SYN_TEXT env var for the phrase to synthesise.",
+      "source_model": "openbmb/VoxCPM2",
+      "source_model_note": "HF id for tools/reference_backends/voxcpm2_tts.py. The dumper expects model_dir to be a local snapshot of openbmb/VoxCPM2 (the voxcpm package is imported from /tmp/voxcpm_src at runtime; rebake needs `pip install voxcpm` + snapshot_download).",
+      "gguf": {
+        "repo": "cstr/voxcpm2-GGUF",
+        "revision": "11c5ad6b0a9b0b0f6876ec18b3c3b555d5b5cb44",
+        "file": "voxcpm2-q4_k.gguf",
+        "approx_size_mb": 1611
+      },
+      "sample": "samples/jfk.wav",
+      "_sample_note": "Reference audio for voice cloning. The synth text comes from VOXCPM2_SYN_TEXT (default in voxcpm2_tts.py).",
+      "expected_transcript": "PLACEHOLDER — TTS output, not a transcript. Rebake will capture a deterministic hash of the decoded audio.",
+      "expected_transcript_source": "TODO — capture once rebake produces the ref archive."
+    },
+    {
+      "name": "chatterbox-turbo-s3gen",
+      "backend_id": "chatterbox_turbo",
+      "skip_diff": true,
+      "_skip_diff_note": "Added 2026-05-25 — rebake-pending. ChatterboxTurbo TTS — T3 (GPT-2) + meanflow S3Gen + HiFT vocoder. Dispatch via the existing chatterbox C++ branch (examples/cli/crispasr_diff_main.cpp:894) which routes based on filename containing 'turbo' (see chatterbox_find_s3gen at line 660). The chatterbox-turbo-s3gen-f16-regen.gguf is the regenerated 2025-Q4 variant; chatterbox-turbo-s3gen-f16.gguf is the legacy file.",
+      "source_model": "ResembleAI/chatterbox-turbo",
+      "source_model_note": "HF id for tools/reference_backends/chatterbox_turbo.py. Imports from chatterbox.tts_turbo.ChatterboxTurboTTS at runtime; rebake needs `pip install chatterbox` + the turbo snapshot.",
+      "gguf": {
+        "repo": "cstr/chatterbox-turbo-GGUF",
+        "revision": "1c7e7f8886aed773fb12970edf4d4f65a67d4b85",
+        "file": "chatterbox-turbo-s3gen-f16-regen.gguf",
+        "approx_size_mb": 627,
+        "_file_note": "F16 GGUF for diff regression. The base ChatterboxTurbo also needs a companion T3 model (chatterbox-turbo-t3-f16.gguf); the chatterbox runtime auto-locates it via chatterbox_find_s3gen-like resolution. Confirm rebake downloads both companions."
+      },
+      "sample": "samples/jfk.wav",
+      "_sample_note": "Reference audio for voice cloning. The synth phrase is fixed inside chatterbox_turbo.py (deterministic seed).",
+      "expected_transcript": "PLACEHOLDER — TTS output, not a transcript. Rebake will capture a deterministic hash of the decoded audio.",
+      "expected_transcript_source": "TODO — capture once rebake produces the ref archive."
     }
   ],
 
