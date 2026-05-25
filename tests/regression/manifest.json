@@ -401,6 +401,46 @@
       "expected_transcript_source": "TODO — capture once rebake produces the ref archive."
     },
     {
+      "name": "indextts-1.5",
+      "backend_id": "indextts",
+      "skip_diff": true,
+      "_skip_diff_note": "Added 2026-05-25 — rebake-pending. IndexTTS-1.5 (GPT + BigVGAN). NOTE: no C++ harness branch yet (docs/diff-harness-coverage.md flags `indextts` as 'harness: no'); a future commit must add an `else if (backend_name == \"indextts\")` block in examples/cli/crispasr_diff_main.cpp before skip_diff can flip to false. The rebake itself only depends on tools/reference_backends/indextts.py, which exists.",
+      "source_model": "IndexTeam/IndexTTS-1.5",
+      "source_model_note": "HF id for tools/reference_backends/indextts.py. The dumper expects model_dir to contain bpe.model + gpt.pth from this repo (snapshot_download during rebake).",
+      "gguf": {
+        "repo": "cstr/indextts-1.5-GGUF",
+        "revision": "6e35d352cc95160054c662489fc7293341a1f0e4",
+        "file": "indextts-gpt.gguf",
+        "approx_size_mb": 2175,
+        "_file_note": "F32 GPT GGUF for diff regression. The runtime needs the companion BigVGAN vocoder (indextts-bigvgan.gguf, 256 MB) at the same path; q8_0 (612 MB) + q4_k (346 MB) variants are also in the repo and may replace the f32 file once the diff floor is calibrated.",
+        "companion_files": [
+          "indextts-bigvgan.gguf"
+        ]
+      },
+      "sample": "samples/jfk.wav",
+      "_sample_note": "Reference audio for voice cloning. The synth phrase is configurable in indextts.py at dump time.",
+      "expected_transcript": "PLACEHOLDER — TTS output, not a transcript. Rebake will capture a deterministic hash of the decoded audio.",
+      "expected_transcript_source": "TODO — capture once rebake produces the ref archive."
+    },
+    {
+      "name": "titanet-large",
+      "backend_id": "titanet",
+      "skip_diff": true,
+      "_skip_diff_note": "Added 2026-05-25 — rebake-pending. NVIDIA TitaNet-Large speaker verification (192-D speaker embedding). NOTE: no C++ harness branch yet (docs/diff-harness-coverage.md flags `titanet` as 'harness: no'); a future commit must add an `else if (backend_name == \"titanet\")` block in examples/cli/crispasr_diff_main.cpp before skip_diff can flip to false. Lower priority per handover (speaker verification, not ASR) but small enough (43 MB) to be cheap.",
+      "source_model": "nvidia/speakerverification_en_titanet_large",
+      "source_model_note": "HF id for tools/reference_backends/titanet.py. Loaded via NeMo's EncDecSpeakerLabelModel.from_pretrained().",
+      "gguf": {
+        "repo": "cstr/titanet-large-GGUF",
+        "revision": "c27e6312bb176e73ee8363982be8d5d25d213d6d",
+        "file": "titanet-large.gguf",
+        "approx_size_mb": 43
+      },
+      "sample": "samples/jfk.wav",
+      "_sample_note": "Single speaker utterance for embedding capture; the per-speaker 192-D vector is what gets dumped.",
+      "expected_transcript": "PLACEHOLDER — speaker-verification output is a 192-D embedding, not a transcript. Rebake will dump the embedding vector; regression compares L2-norm + cosine against the pinned ref.",
+      "expected_transcript_source": "TODO — capture once rebake produces the ref archive."
+    },
+    {
       "name": "chatterbox-turbo-s3gen",
       "backend_id": "chatterbox_turbo",
       "skip_diff": true,
