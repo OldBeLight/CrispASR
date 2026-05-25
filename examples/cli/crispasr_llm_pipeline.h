@@ -402,11 +402,18 @@ std::vector<crispasr_segment> crispasr_run_voxtral_style_pipeline_streamed(typen
         }
     }
 
-    // ---- KV cache: size proportional to prompt + decode budget --------------
-    // Default 4096 is enough for the single-chunk variant but a long-form
-    // prompt blows past it (600 s = 7500 audio tokens + decode). Bump the
-    // budget to T_prompt + max_new_tokens + headroom.
-    const int max_new = params.max_new_tokens > 0 ? params.max_new_tokens : 512;
+    // ---- KV cache + decode budget proportional to audio duration ------------
+    // The single-chunk variant defaults to 512 new tokens, which is plenty
+    // for ≤30 s of Japanese / English speech. The streamed variant decodes
+    // all chunks in one AR pass — for 300 s of speech you need ~2 000
+    // tokens; for 600 s, ~4 000. Default 512 caps the decode mid-sentence
+    // and the user sees a truncated transcript. We scale the default with
+    // audio duration at ~8 tokens / second (generous; Japanese verbatim
+    // dictation runs ~5-6 tok/s, English ~4 tok/s). The user's explicit
+    // `--max-new-tokens N` still overrides if set.
+    const int audio_seconds = (n_samples + kSampleRate - 1) / kSampleRate;
+    const int max_new_default = std::max(512, audio_seconds * 8);
+    const int max_new = params.max_new_tokens > 0 ? params.max_new_tokens : max_new_default;
     const int kv_budget = T_prompt + max_new + 64;
     if (!Ops::kv_init(ctx, kv_budget)) {
         free(text_embeds);
