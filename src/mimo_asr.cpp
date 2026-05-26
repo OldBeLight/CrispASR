@@ -325,13 +325,20 @@ extern "C" struct mimo_asr_context* mimo_asr_init_from_file(const char* path_mod
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
 
-    // PLAN #72: load weights onto the user-picked backend (GPU when
-    // use_gpu=true). Was hardcoded to backend_cpu under the old
-    // assumption that Q4_K CPU SIMD beat the Metal/CUDA path. Today's
-    // GPU Q4_K kernels are mature and dominate CPU on big-enough
-    // models — mimo_asr at 1.4B params is comfortably big enough.
+    // PLAN #115: weights pinned to CPU backend. The PLAN #72 attempt to
+    // load on `ctx->backend` (GPU when use_gpu=true) silently broke the
+    // prefill graph: on M1 Metal the runtime produced exit 0 with no
+    // segments emitted on JFK (11 s) and segfaulted at ~159 s on 5 min
+    // audio. CPU-residency was verified working on Kaggle Linux x86_64
+    // CPU build on 2026-05-26 (JFK transcript matches HISTORY §56
+    // reference verbatim). The deeper GPU graph fix is queued as PLAN
+    // #115 option C; until that lands, mimo runs on CPU even when
+    // --gpu is selected (loses the documented 22% Metal speedup but
+    // restores correctness, which is the higher priority).
     // PLAN #69a: when CRISPASR_N_GPU_LAYERS is set and < total LLM
-    // layers, route model.layers.<il>.* with il >= N onto the CPU backend.
+    // layers, the split loader still works against ctx->backend_cpu —
+    // both halves of the split go to CPU buffers because the GPU half
+    // would hit the same prefill bug.
     core_gguf::WeightLoad wl;
     int n_gpu_layers_env = -1;
     if (const char* s = std::getenv("CRISPASR_N_GPU_LAYERS")) {
@@ -342,16 +349,15 @@ extern "C" struct mimo_asr_context* mimo_asr_init_from_file(const char* path_mod
                           n_gpu_layers_env < total_layers;
     if (do_split) {
         core_gguf::LayerSplitConfig cfg{"model.layers.", n_gpu_layers_env};
-        if (!core_gguf::load_weights_split(path_model, ctx->backend, ctx->backend_cpu,
+        if (!core_gguf::load_weights_split(path_model, ctx->backend_cpu, ctx->backend_cpu,
                                            core_gguf::is_gpu_tensor_with_prefix, &cfg, "mimo_asr", wl)) {
             fprintf(stderr, "mimo_asr: split load failed from '%s'\n", path_model);
             delete ctx;
             return nullptr;
         }
-        fprintf(stderr, "mimo_asr: layer offload: gpu=[0,%d), cpu=[%d,%d) (CRISPASR_N_GPU_LAYERS=%d)\n",
-                n_gpu_layers_env, n_gpu_layers_env, total_layers, n_gpu_layers_env);
+        fprintf(stderr, "mimo_asr: layer offload requested but pinned to CPU (PLAN #115 — GPU path broken)\n");
     } else {
-        if (!core_gguf::load_weights(path_model, ctx->backend, "mimo_asr", wl)) {
+        if (!core_gguf::load_weights(path_model, ctx->backend_cpu, "mimo_asr", wl)) {
             fprintf(stderr, "mimo_asr: failed to load weights from '%s'\n", path_model);
             delete ctx;
             return nullptr;

@@ -3944,7 +3944,13 @@ Considered earlier as Option 1. Rejected because:
 
 ## 115. mimo-asr baseline broken — silent empty on short, segfault on long
 
-**Status (2026-05-25):** found while running `tools/check-overlap-save-bug.sh` (the A/B sweep that surfaced the cohere/gemma4/glm-asr/kyutai-stt/voxtral opt-outs). mimo-asr was flagged `BOTH_EMPTY` because *both* arms produced zero output, so the bug is not in the overlap-save path — it's in the backend itself.
+**Status (2026-05-26):** bisected, partially fixed. The smoking-gun commit is `89111260` ("perf #72: load weights to GPU when use_gpu=true"), which flipped `core_gguf::load_weights(..., ctx->backend_cpu, ...)` to `..., ctx->backend, ...`. The same commit message foresaw the regression — *"If a platform regresses, add a CRISPASR_FORCE_CPU_WEIGHTS=1 escape hatch — none seen yet"*.
+
+**Option A applied 2026-05-26:** reverted the one-line residency swap in `src/mimo_asr.cpp` (both the plain and split-load branches now use `ctx->backend_cpu`). Loses the documented 22 % M1 Metal speedup but restores correctness. CPU-residency verified on Kaggle Linux x86_64 (kernel `chr1str/crispasr-mimo-asr-cpu-validate` on commit `b85698670`): JFK transcript matches HISTORY §56 reference verbatim (`prefill=15.8 s, decode=7.0 s over 26 steps, total_lm=22.8 s`).
+
+**Option C (open):** proper GPU-side fix. The prefill graph silently emits no tokens when weights live on a Metal/CUDA backend; needs investigation in `mimo_asr_build_prefill_graph` (likely a tensor-on-wrong-backend / scheduler placement issue, similar shape to the chatterbox Bug B that took 10 candidate hypotheses to find — see [[project_chatterbox_gpu_bug_s3gen]]). Requires a Kaggle GPU run with the patched binary; currently quota-blocked.
+
+### Original repro (still valid for regression-guarding option C)
 
 ### What we see
 
