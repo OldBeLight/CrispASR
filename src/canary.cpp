@@ -1432,9 +1432,7 @@ extern "C" struct canary_result* canary_transcribe_streamed(struct canary_contex
 
     const auto& hp = ctx->model.hparams;
     const int n_mels = (int)hp.n_mels;
-    const int d_model = (int)hp.d_model;
     const int hop = (int)hp.hop_length;
-    const int sub = (int)hp.subsampling_factor;
     const int SR = (int)hp.sample_rate;
 
     // ---- Pass 1: mel for the full audio (global PerFeatureZ) ----
@@ -1443,14 +1441,21 @@ extern "C" struct canary_result* canary_transcribe_streamed(struct canary_contex
     if (mel_full.empty() || T_mel <= 0)
         return nullptr;
 
-    // ---- Pass 2: chunked encode + concat ----
+    // ---- Pass 2: per-chunk encode + per-chunk AED decode (NeMo
+    // FrameBatchMultiTaskAED analogon). Each chunk re-injects the
+    // <lang> / <task> / <pnc> prompt prefix, so the AED decoder
+    // doesn't treat the chunk boundary as <eos>. Per-chunk results
+    // are concatenated text-wise; token/word timestamps land in the
+    // global time window via per-chunk t_offset arithmetic.
     const int chunk_mel_frames = chunk_seconds * SR / hop;
     const int overlap_mel_frames = overlap_seconds * SR / hop;
     const int shift_mel_frames = chunk_mel_frames - overlap_mel_frames;
-    const int overlap_enc_frames = overlap_mel_frames / sub;
 
-    std::vector<float> enc_all;
-    int T_enc_total = 0;
+    std::string full_text;
+    std::vector<canary_token_data> all_tokens;
+    std::vector<canary_word_data> all_words;
+    int chunks_processed = 0;
+
     for (int mel_offset = 0; mel_offset < T_mel; mel_offset += shift_mel_frames) {
         const int chunk_end = std::min(T_mel, mel_offset + chunk_mel_frames);
         const int chunk_T = chunk_end - mel_offset;
@@ -1458,21 +1463,62 @@ extern "C" struct canary_result* canary_transcribe_streamed(struct canary_contex
             break;
         int T_enc = 0;
         auto enc = canary_encode_mel(ctx, mel_full.data() + (size_t)mel_offset * n_mels, n_mels, chunk_T, &T_enc);
-        if (enc.empty())
+        if (enc.empty() || T_enc <= 0)
             continue;
-        const int skip = (mel_offset > 0 && T_enc > overlap_enc_frames) ? overlap_enc_frames : 0;
-        const int keep = T_enc - skip;
-        if (keep <= 0)
+
+        const int64_t chunk_t_offset_cs = t_offset_cs + (int64_t)mel_offset * hop * 100 / SR;
+        canary_result* part = canary_finish_from_encoder(ctx, enc.data(), T_enc, source_lang, target_lang, punctuation,
+                                                         chunk_t_offset_cs);
+        if (!part)
             continue;
-        enc_all.insert(enc_all.end(), enc.begin() + (size_t)skip * d_model,
-                       enc.begin() + (size_t)(skip + keep) * d_model);
-        T_enc_total += keep;
+
+        // Accumulate text with a space separator between chunks. The AED
+        // decoder doesn't add leading whitespace per chunk because each
+        // chunk's transcript begins with spiece_to_text(first non-prompt
+        // token), which already prepends a space in NeMo's BPE convention.
+        if (part->text && part->text[0]) {
+            if (!full_text.empty() && full_text.back() != ' ' && part->text[0] != ' ')
+                full_text += ' ';
+            full_text += part->text;
+        }
+        for (int i = 0; i < part->n_tokens; i++)
+            all_tokens.push_back(part->tokens[i]);
+        for (int i = 0; i < part->n_words; i++)
+            all_words.push_back(part->words[i]);
+        canary_result_free(part);
+        chunks_processed++;
     }
-    if (enc_all.empty() || T_enc_total <= 0)
+
+    if (chunks_processed == 0 && all_tokens.empty() && full_text.empty())
         return nullptr;
 
-    return canary_finish_from_encoder(ctx, enc_all.data(), T_enc_total, source_lang, target_lang, punctuation,
-                                      t_offset_cs);
+    canary_result* r = (canary_result*)calloc(1, sizeof(canary_result));
+    if (!r)
+        return nullptr;
+    r->text = strdup(full_text.c_str());
+    if (!r->text) {
+        canary_result_free(r);
+        return nullptr;
+    }
+    r->n_tokens = (int)all_tokens.size();
+    r->tokens = (canary_token_data*)calloc(r->n_tokens > 0 ? (size_t)r->n_tokens : 1, sizeof(canary_token_data));
+    if (!r->tokens) {
+        canary_result_free(r);
+        return nullptr;
+    }
+    for (int i = 0; i < r->n_tokens; i++)
+        r->tokens[i] = all_tokens[(size_t)i];
+
+    r->n_words = (int)all_words.size();
+    r->words = (canary_word_data*)calloc(r->n_words > 0 ? (size_t)r->n_words : 1, sizeof(canary_word_data));
+    if (!r->words) {
+        canary_result_free(r);
+        return nullptr;
+    }
+    for (int i = 0; i < r->n_words; i++)
+        r->words[i] = all_words[(size_t)i];
+
+    return r;
 }
 
 static canary_result* canary_finish_from_encoder(canary_context* ctx, const float* enc_data, int T_enc,
