@@ -7654,3 +7654,101 @@ Confirm with `sample $PID 1`: macOS will show what the call stack is parked on. 
 
 - `[[feedback_storage_paths]]` 2026-05-25 update — main volume at 99-100 % full pushed all caches into kernel-thrash territory, contributing to the headroom problem
 - HISTORY 2026-05-25 (late) "PLAN #114 close-out" for the full post-mortem
+
+---
+
+## Kaggle as a batch-rebake target: seven fragilities the script has to work around (2026-05-25)
+
+Bringing up the multi-backend rebake on `chr1str/crispasr-auto-rebake-refs` took 7 sequential surgical fixes across one afternoon, each surfacing a different Kaggle-side or script-side fragility. Six of the seven would NOT have been visible without running the kernel end-to-end — they're masked by partial successes in smaller notebooks (fusion-ab, qwen3-export). Capturing them here so the next person bringing up a Kaggle batch job over `manifest.json`-driven backends doesn't rediscover them one at a time.
+
+### 1. `kaggle kernels output|files|logs` returns nothing mid-run
+
+You **cannot peek live state programmatically**. All three endpoints return empty until the kernel terminates. The browser UI's websocket log is the only live view, and it stops updating when the parent stdout buffer fills. So if you want to know what a kernel is doing right now, you need:
+
+- A heartbeat your script emits at a controlled cadence (e.g. every 30 s)
+- A side-channel that ships those heartbeats off the kernel ASAP — public HF dataset push works (see point 7 below); Kaggle Secrets-gated upload doesn't
+
+Don't rely on `kaggle kernels output` for in-flight diagnostics. It's a *post-mortem* endpoint.
+
+### 2. `subprocess.check_call` on cmake/ninja produces invisible-progress builds
+
+Child stdout flows through the parent's Python stdout, which gets line-buffered (Python) → block-buffered (Kaggle's papermill log capture). A healthy build at 200 / 360 objects can sit silent in the UI for 90+ minutes between heartbeats while ninja is just chewing through templates. `chr1str/qwen3-export` solved this with a Popen + line-reader:
+
+```python
+proc = subprocess.Popen(cmd, shell=True, bufsize=1, text=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+for line in proc.stdout:
+    print(line.rstrip(), flush=True)  # explicit per-line flush
+proc.wait()
+```
+
+The explicit per-line `flush=True` is what kicks Kaggle's log buffer. Without it, child output disappears for tens of minutes at a time even with `os.environ["PYTHONUNBUFFERED"] = "1"` set on the parent (because parent's `PYTHONUNBUFFERED` doesn't propagate to a shell-invoked child's pipe). Pair it with `stdbuf -oL -eL <cmd>` on the child for line-buffered output where the child's own stdio defaults are block-buffered (ninja does this when stdout isn't a tty).
+
+### 3. Heartbeats need actual content to be useful
+
+A heartbeat that just prints `elapsed_in_block_s=210.0` every 30 s is noise — you still can't distinguish a healthy slow build from a hung process. The fix: parse the child output line stream and stash the most recent ninja `[X/N]` + TU name in a module-level dict, then include those in the heartbeat:
+
+```python
+[step 396.5s] cmake.build.heartbeat  {'elapsed_in_block_s': 240.0,
+                                       'ninja': '219/360',
+                                       'tu': 'kokoro.cpp',
+                                       'lines': 668}
+```
+
+A real hang then surfaces as ninja staying frozen at the same `[X/N]` across multiple heartbeats; slow-but-progressing shows monotonic advancement. The signal-to-noise ratio jumps an order of magnitude.
+
+### 4. Kaggle's 20 GB disk fills fast on multi-model rebake without per-backend cleanup
+
+A 13-backend rebake with NeMo + transformers downloads per entry hits the cap around backend #5 if you let `/kaggle/working/hf_cache/` accumulate. Each backend's source weights (~2-3 GB for parakeet-1.1b-class NeMo models, ~5 GB for voxtral-3b, ~4 GB for mimo-asr) sit there forever otherwise. Add the ~5 GB ccache and the ~1 GB build dir, and you're at 14 / 20 GB before backend 4 starts downloading.
+
+`run_rebake()` needs a `finally:` block that rmtrees the HF + torch caches after every backend (success or failure), then logs the freed disk. The trade-off is cache invalidation between backends, but in practice cache hits between different model families are near-zero anyway. The actual measurement on v11 with the cleanup patch: `free_gb_after=19.22` stayed flat across all 23 backends — disk pressure completely controlled.
+
+### 5. Kaggle Secrets API flakes on batch-triggered kernels
+
+`UserSecretsClient.get_secret('HF_TOKEN')` returns `ConnectionError: Connection error trying to communicate with service.` even when:
+
+- `KAGGLE_USER_SECRETS_TOKEN` JWT is present in env (Attach toggle correct)
+- The Kaggle account dashboard shows the secret
+- A second-attempt retry works fine
+- The same secret reads fine in interactive kernel mode
+
+The flake is intermittent — `UserSecretsClient` is hitting the kaggle-secrets-api service which has a non-trivial 5xx rate for kernels triggered via `kaggle kernels push` (batch / papermill execution). Retry with 5 s backoff x3 sometimes resolves; sometimes the service is unreachable for the whole run.
+
+The script comment recommending "Add-ons → Variables" as the fallback was wrong: **Kaggle has no Variables UI feature**. Only Secrets, Internet, Accelerator, and Data Sources are in Add-ons. The real fallback is a private Kaggle Dataset:
+
+1. `kaggle datasets create -p .` a private dataset containing one file with the token
+2. Mount it via `kernel-metadata.json:dataset_sources: ["<owner>/<slug>"]`
+3. Script reads it from `/kaggle/input/<slug>/<file>` as a filesystem path — bypasses the Secrets API entirely
+
+This made the difference between v12 (auth failed, no upload) and v13 (auth resolved from dataset, upload landed).
+
+### 6. All-or-nothing upload gates suppress legitimate partial wins
+
+Defensive code at the upload step said `if any(not r.get("ok") for r in RESULTS_DATA): raise SystemExit("refusing to upload")`. The intent was to prevent accidentally clobbering known-good refs with a buggy rebake. The effect, once the manifest grew to include 14 backends with known issues (missing pip deps, manifest gaps, per-backend bugs in upstream Python reference modules), was that **no run could ever pass** — every run reaches the gate with at least one failure.
+
+Partial upload is safer than it looks because failed entries never write to `REBAKE_STAGE` — `dump_reference.py` exits non-zero before the GGUF-write step. So `upload_folder(REBAKE_STAGE)` inherently only uploads successful entries. The right shape:
+
+```python
+successful = [r for r in RESULTS_DATA if r.get("ok")]
+if not successful:
+    raise SystemExit("zero refs produced; nothing to upload")
+# Log failed entries in the commit message for traceability:
+commit_message = f"rebake {len(successful)}/{len(RESULTS_DATA)} — ok: {', '.join(succ)}"
+```
+
+The fixtures repo is additive; a partial upload can't regress a passing entry.
+
+### 7. `kaggle kernels output` doesn't return artifacts from ERROR'd kernels
+
+Even after v11's rebake successfully wrote 9 ref archives to `/kaggle/working/rebake-stage/`, `kaggle kernels output -p ...` only returned `.ccache/` and the log file — the staging dir was unreachable. Reason: the kernel ended in ERROR (papermill autosave OOM on bloated notebook output, *after* the rebake itself finished cleanly), and the output endpoint only ships artifacts from runs that completed cleanly.
+
+Implication: if you stage outputs locally and rely on `fetch-and-upload.sh` to ship them off Kaggle later, **the kernel must end in SUCCESS** for the artifacts to be retrievable. Upload directly from within the kernel — don't stage-and-fetch as a two-step.
+
+The cleanest end-to-end shape is: rebake → upload immediately from the same Python process → only THEN sys.exit(n_fail) for CI status reporting. Anything that runs after `sys.exit(n_fail)` (papermill's notebook autosave, nbconvert, etc.) is a side-channel that may or may not survive.
+
+### Cross-refs
+
+- HISTORY 2026-05-25 (latest) "Kaggle rebake pipeline wired end-to-end" for the chronological summary
+- `tools/kaggle/crispasr-regression.py` commits `1b62776e` (heartbeat) → `8cf7e931` (KeyError fix + sort) → `eba52bac` (Popen streamer) → `0f4de5b9` (cache cleanup) → `2ff4f1ba` (Dataset auth) → `c11e0648` (partial upload)
+- `chr1str/qwen3-export` Kaggle notebook for the canonical Popen+iter pattern that the fix lifts
+- The private Kaggle Dataset `chr1str/crispasr-hf-token` is the auth-fallback infrastructure

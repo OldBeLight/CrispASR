@@ -6,6 +6,85 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-25 (latest) Kaggle rebake pipeline wired end-to-end — 4 new parakeet refs published; coverage 7 → 11 → 13 manifest entries
+
+Closing out the handover-prompts/extend-coverage-via-kaggle.md initiative. End-of-day state:
+
+### Manifest
+
+13 rebake-pending entries (the handover's "realistic" goal). 7 in by commit `8de7bf66` pre-session; +4 in `ab82dcd0` (mimo-audio-tokenizer, lid-cld3-f16, voxcpm2-tts-2b, chatterbox-turbo-s3gen); +2 in `34db1048` (indextts-1.5, titanet-large). The cohere/granite "fixture exists on HF but manifest doesn't reference it" gap is documented but not closed — the entries need `source_model` added to be re-bakeable.
+
+### Kaggle rebake pipeline
+
+The rebake kernel `chr1str/crispasr-auto-rebake-refs` had been latently broken since the 2026-05-12 rename of `fixture_path` → `fixture_ref_path` (commit `056493a1`). Nobody noticed for 13 days because the rebake didn't run scheduled in that window. v7 of the kernel triggered today hit four cascading issues before producing any output; each surfaced exactly one fix.
+
+| version | symptom | root cause | fix |
+|---|---|---|---|
+| v7 | log frozen at `[208/360]` t5_translate.cpp warning, kernel still RUNNING at +103 min | child stdout heavily-buffered by Kaggle log capture; healthy build invisible | `1b62776e` heartbeat thread + stdbuf wrapper |
+| v8 | (same as v7, immediately) | confirmed by user it's stuck — killed | rolled into v10 |
+| v9 | KeyError `'fixture_path'` on first backend | latent rename bug from 2026-05-12 — rebake path was missed | `8cf7e931` field rename + never-done-first ordering |
+| v10 | disk-full at backend #8 during NeMo source-weight download | `/kaggle/working/hf_cache/` never freed between backends → ~16 GB cumulative across 4 parakeet variants | `0f4de5b9` rmtree HF + torch caches in `finally:` block per backend; print `free_gb_after` in heartbeat |
+| v11 | 9 successful refs, 0 uploaded; WARN downgrade to `UPLOAD=0` | Kaggle Secrets API gave `ConnectionError`; script's "anonymous" path triggered | `2ff4f1ba` 3-tier auth: env → `kaggle_secret()` 3× retry → `kaggle_token_from_dataset()` reading `/kaggle/input/crispasr-hf-token/hf_token.txt` |
+| v12 | HF auth resolved cleanly, but still 0 uploaded; `SystemExit: rebake had failures; refusing to upload` | all-or-nothing upload gate at line 866 blocks every partial run with the 14 known-broken backends | `c11e0648` partial-upload — failed entries never write to `REBAKE_STAGE` so `upload_folder()` only ships successes |
+| v13 | **upload landed** | — | manifest `fixtures.revision` bumped to `b61b03014bc99ecce18ac8f99988d5110c83f2d2` in `e79d1c77` |
+
+Bonus infrastructure: private Kaggle Dataset `chr1str/crispasr-hf-token` created out-of-band as the durable auth-fallback path (Kaggle's UI has no "Add-ons → Variables" option despite older script comments to the contrary — confirmed on the current UI). Mounted via `kernel-metadata.json:dataset_sources`.
+
+### Published refs at `cstr/crispasr-regression-fixtures@b61b03014bc`
+
+**NEW** (4 of the 13 handover backends):
+
+- `parakeet-tdt-1.1b/ref.gguf` 15.4 MB
+- `parakeet-tdt_ctc-1.1b/ref.gguf` 15.4 MB
+- `parakeet-rnnt-0.6b/ref.gguf` 15.4 MB
+- `parakeet-rnnt-1.1b/ref.gguf` 15.4 MB
+
+**REFRESHED** (5 existing):
+
+- `canary-1b-v2/jfk_11s/ref.gguf` 77 MB
+- `moonshine-tiny/jfk_11s/ref.gguf` 1.2 MB
+- `moonshine-base/jfk_11s/ref.gguf` 1.4 MB
+- `parakeet-tdt-0.6b-en/ref.gguf` 15.6 MB
+- `parakeet-tdt-0.6b-ja/reazon_baseball_14s/ref.gguf` 19.6 MB
+
+### Still-broken in the 13 (per v11/v12/v13 SUMMARY)
+
+3 manifest gaps — entries missing `source_model` field; add it and they'll bake next run:
+
+- `cohere-transcribe` — its fixture already exists on HF but the manifest doesn't have the field
+- `granite-speech-4.1-2b` — ditto
+- `moonshine-streaming-tiny` — ditto
+
+8 missing pip deps or Python ref-module bugs in upstream:
+
+- `paraformer-zh` — `ModuleNotFoundError: funasr`
+- `voxtral-mini-3b-2507` — `ImportError` (transformers version)
+- `mimo-asr` — `ModuleNotFoundError: 'src'` (path-import bug in `mimo_asr.py`)
+- `mimo-audio-tokenizer` — `ModuleNotFoundError: mimo_audio_tokenizer` (needs from-source install)
+- `voxcpm2-tts-2b` — `ImportError: pip install --no-deps --target=/tmp/voxcpm_src voxcpm`
+- `indextts-1.5` — `OSError: Not found` (model_dir path issue)
+- `titanet-large` — `RuntimeError: Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor` (NeMo upstream)
+- `chatterbox-turbo-s3gen` — `ModuleNotFoundError: chatterbox`
+
+3 fast-fail edge cases needing log inspection:
+
+- `firered-asr2-aed`, `glm-asr-nano`, `lid-cld3-f16` — `dump_reference exit=1` in <1 s; not the standard import error pattern
+
+### What didn't make this commit train
+
+- skip_diff: false flips for the 4 new parakeet refs — needs `fixture_ref_path` set per entry, a transcript captured locally via `crispasr-cli + GGUF`, and `diff_thresholds` calibrated from a local `crispasr-diff` run
+- Per-backend dep fixes for the 8 missing-pip cases — each is a small follow-up but needs an env-spec change in the rebake bootstrap (or a per-backend `tools/reference_envs/<name>/requirements.txt` consulted by the kernel)
+- The `cohere-transcribe` / `granite` / `moonshine-streaming-tiny` `source_model` additions — trivial 3-entry manifest edit
+
+### Cross-refs
+
+- LEARNINGS "Kaggle as a batch-rebake target: seven fragilities the script has to work around" for the deep dive on each fix
+- handover-prompts/extend-coverage-via-kaggle.md for the original initiative scope
+- `tools/kaggle/crispasr-regression.py` is the canonical script (modified across `1b62776e`, `8cf7e931`, `eba52bac`, `0f4de5b9`, `2ff4f1ba`, `c11e0648`)
+- `tools/kaggle/rebake/kernel-metadata.json` now mounts `chr1str/crispasr-hf-token` as the auth fallback
+
+---
+
 ## 2026-05-25 (late) PLAN #114 close-out — voxtral streamed validated at 60 / 120 / 300 s; 600 s hung on M1 memory thrash, not coverage
 
 Closing the day on PLAN #114 with the live test data and the final per-backend status.
