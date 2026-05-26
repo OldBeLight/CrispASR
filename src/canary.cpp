@@ -1379,6 +1379,13 @@ extern "C" int canary_test_encoder(struct canary_context* ctx, int T_mel) {
     return T_enc;
 }
 
+// PLAN #114 P3 second half — post-encode pipeline shared by
+// canary_transcribe_ex (single-pass) and canary_transcribe_streamed
+// (parakeet-style chunked-encode + concat for long audio).
+static canary_result* canary_finish_from_encoder(canary_context* ctx, const float* enc_data, int T_enc,
+                                                 const char* source_lang, const char* target_lang, bool punctuation,
+                                                 int64_t t_offset_cs);
+
 extern "C" struct canary_result* canary_transcribe_ex(struct canary_context* ctx, const float* samples, int n_samples,
                                                       const char* source_lang, const char* target_lang,
                                                       bool punctuation, int64_t t_offset_cs) {
@@ -1397,8 +1404,82 @@ extern "C" struct canary_result* canary_transcribe_ex(struct canary_context* ctx
     if (enc.empty())
         return nullptr;
 
+    return canary_finish_from_encoder(ctx, enc.data(), T_enc, source_lang, target_lang, punctuation, t_offset_cs);
+}
+
+// PLAN #114 P3 second half — parakeet-pattern long-audio port. Computes
+// mel for the FULL audio (so PerFeatureZ uses global statistics; this is
+// the NeMo convention and matches what canary_transcribe_ex does on short
+// audio), then encodes in overlapping mel chunks and concatenates the
+// encoder outputs with `overlap_enc` trimming. Runs the existing AED
+// decode + cross-attention K/V over the concat. Works for the 4 trained
+// languages (en/de/fr/es) — the whitelist in
+// crispasr_backend_canary.cpp::transcribe() refuses other langs before
+// either code path.
+extern "C" struct canary_result* canary_transcribe_streamed(struct canary_context* ctx, const float* samples,
+                                                            int n_samples, const char* source_lang,
+                                                            const char* target_lang, bool punctuation,
+                                                            int64_t t_offset_cs, int chunk_seconds,
+                                                            int overlap_seconds) {
+    if (!ctx || !samples || n_samples <= 0 || !source_lang || !target_lang)
+        return nullptr;
+    if (chunk_seconds <= 0)
+        chunk_seconds = 8;
+    if (overlap_seconds < 0)
+        overlap_seconds = 2;
+    if (overlap_seconds >= chunk_seconds)
+        overlap_seconds = chunk_seconds / 4;
+
+    const auto& hp = ctx->model.hparams;
+    const int n_mels = (int)hp.n_mels;
+    const int d_model = (int)hp.d_model;
+    const int hop = (int)hp.hop_length;
+    const int sub = (int)hp.subsampling_factor;
+    const int SR = (int)hp.sample_rate;
+
+    // ---- Pass 1: mel for the full audio (global PerFeatureZ) ----
+    int T_mel = 0;
+    auto mel_full = canary_compute_mel_impl(ctx, samples, n_samples, T_mel);
+    if (mel_full.empty() || T_mel <= 0)
+        return nullptr;
+
+    // ---- Pass 2: chunked encode + concat ----
+    const int chunk_mel_frames = chunk_seconds * SR / hop;
+    const int overlap_mel_frames = overlap_seconds * SR / hop;
+    const int shift_mel_frames = chunk_mel_frames - overlap_mel_frames;
+    const int overlap_enc_frames = overlap_mel_frames / sub;
+
+    std::vector<float> enc_all;
+    int T_enc_total = 0;
+    for (int mel_offset = 0; mel_offset < T_mel; mel_offset += shift_mel_frames) {
+        const int chunk_end = std::min(T_mel, mel_offset + chunk_mel_frames);
+        const int chunk_T = chunk_end - mel_offset;
+        if (chunk_T <= 0)
+            break;
+        int T_enc = 0;
+        auto enc = canary_encode_mel(ctx, mel_full.data() + (size_t)mel_offset * n_mels, n_mels, chunk_T, &T_enc);
+        if (enc.empty())
+            continue;
+        const int skip = (mel_offset > 0 && T_enc > overlap_enc_frames) ? overlap_enc_frames : 0;
+        const int keep = T_enc - skip;
+        if (keep <= 0)
+            continue;
+        enc_all.insert(enc_all.end(), enc.begin() + (size_t)skip * d_model,
+                       enc.begin() + (size_t)(skip + keep) * d_model);
+        T_enc_total += keep;
+    }
+    if (enc_all.empty() || T_enc_total <= 0)
+        return nullptr;
+
+    return canary_finish_from_encoder(ctx, enc_all.data(), T_enc_total, source_lang, target_lang, punctuation,
+                                      t_offset_cs);
+}
+
+static canary_result* canary_finish_from_encoder(canary_context* ctx, const float* enc_data, int T_enc,
+                                                 const char* source_lang, const char* target_lang, bool punctuation,
+                                                 int64_t t_offset_cs) {
     // 3. Pre-compute cross-attention K/V
-    canary_build_cross_kv(ctx, enc.data(), T_enc);
+    canary_build_cross_kv(ctx, enc_data, T_enc);
 
     // 4. Build prompt
     std::vector<int> prompt = canary_build_prompt(ctx, source_lang, target_lang, punctuation);

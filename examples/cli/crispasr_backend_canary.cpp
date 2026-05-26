@@ -16,7 +16,9 @@
 
 #include "canary.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -128,8 +130,26 @@ public:
             return out;
         }
 
+        // PLAN #114 P3 second half: route to canary_transcribe_streamed
+        // for long audio. Same parakeet pattern — single-pass over a
+        // long buffer lets the bidirectional Conformer attention
+        // amplify acoustic noise past the ~30 s training window.
+        // CANARY_STREAM_THRESHOLD_S overrides the default; 0 = always
+        // streamed (matches the parakeet backend, where streamed is
+        // bit-equivalent to single-pass on short audio).
+        int stream_threshold_s = 30;
+        if (const char* e = std::getenv("CANARY_STREAM_THRESHOLD_S")) {
+            stream_threshold_s = std::max(0, atoi(e));
+        }
+        const int stream_chunk_s = 8;
+        const int stream_overlap_s = 2;
+        const bool use_streamed = stream_threshold_s == 0 || n_samples > stream_threshold_s * 16000;
+
         canary_result* r =
-            canary_transcribe_ex(ctx_, samples, n_samples, src.c_str(), tgt.c_str(), params.punctuation, t_offset_cs);
+            use_streamed ? canary_transcribe_streamed(ctx_, samples, n_samples, src.c_str(), tgt.c_str(),
+                                                      params.punctuation, t_offset_cs, stream_chunk_s, stream_overlap_s)
+                         : canary_transcribe_ex(ctx_, samples, n_samples, src.c_str(), tgt.c_str(), params.punctuation,
+                                                t_offset_cs);
         if (!r)
             return out;
 
