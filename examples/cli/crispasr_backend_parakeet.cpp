@@ -125,13 +125,16 @@ public:
         //   CRISPASR_PARAKEET_STREAM_THRESHOLD : single-pass for audio ≤
         //       this duration (seconds). Default 0 = always streamed.
         //   CRISPASR_PARAKEET_STREAM_CHUNK     : encoder chunk size (s).
-        //       Default 8. Smaller is more stable but more compute.
+        //       Default 0 = let the C library pick per-model: 8 s for the
+        //       JA-only model (vocab=3072), 30 s for the multilingual / v3
+        //       family (vocab=8192). Manual override here for the rare
+        //       case where neither heuristic fits the audio at hand.
         //   CRISPASR_PARAKEET_STREAM_OVERLAP   : encoder overlap (s).
         //       Default 2. Covers FastConformer's receptive field at the
         //       chunk boundary; overlap frames from later chunks are
         //       discarded before decode.
         int stream_threshold_s = 0;
-        int stream_chunk_s = 8;
+        int stream_chunk_s = 0; // 0 = let the C library pick per-model
         int stream_overlap_s = 2;
         if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_THRESHOLD"))
             stream_threshold_s = std::max(0, atoi(e));

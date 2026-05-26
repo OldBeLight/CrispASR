@@ -2014,8 +2014,13 @@ extern "C" struct parakeet_result* parakeet_transcribe_chunked(struct parakeet_c
                                                                int overlap_seconds) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
-    if (chunk_seconds <= 0)
-        chunk_seconds = 8;
+    if (chunk_seconds <= 0) {
+        // Same per-model heuristic as parakeet_transcribe_streamed —
+        // vocab < 4000 ⇒ JA-only model (small chunks work best), else
+        // multilingual / v3 (needs ~30 s of context for the Conformer
+        // encoder to produce in-distribution features).
+        chunk_seconds = (ctx->model.hparams.vocab_size < 4000) ? 8 : 30;
+    }
     if (overlap_seconds < 0)
         overlap_seconds = 2;
     if (overlap_seconds >= chunk_seconds)
@@ -2109,8 +2114,23 @@ extern "C" struct parakeet_result* parakeet_transcribe_streamed(struct parakeet_
                                                                 int overlap_seconds) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
-    if (chunk_seconds <= 0)
-        chunk_seconds = 8;
+    if (chunk_seconds <= 0) {
+        // Per-model default — empirically swept on en/de/ja FLEURS 60s + 300s
+        // (audio_samples/{en,de}/fleurs_*.wav, long-clips/yt_60s.wav). The
+        // small (8 s) chunk-and-overlap that ships well for the JA model
+        // collapses badly on the multilingual v3 model: EN 60 s drops from
+        // 800 chars (c=40) to 186 chars (c=8) — a 4× loss of interior
+        // content. The v3 encoder's Conformer attention needs ~30 s of
+        // context to produce features close to its training distribution;
+        // smaller chunks shift the per-feature statistics enough that the
+        // TDT decoder emits a different (much sparser) token path.
+        //
+        // Heuristic: distinguish the JA-only model (vocab=3072) from the
+        // multilingual / v3 / etc. variants (vocab >= 4096) via vocab_size.
+        // The override env var CRISPASR_PARAKEET_STREAM_CHUNK is honoured
+        // upstream of this default.
+        chunk_seconds = (ctx->model.hparams.vocab_size < 4000) ? 8 : 30;
+    }
     if (overlap_seconds < 0)
         overlap_seconds = 2;
     if (overlap_seconds >= chunk_seconds)
