@@ -59,6 +59,10 @@
 #include "granite_speech.h"
 #define CA_HAVE_GRANITE 1
 #endif
+#if __has_include("granite_nle.h")
+#include "granite_nle.h"
+#define CA_HAVE_GRANITE_NLE 1
+#endif
 #if __has_include("canary_ctc.h")
 #include "canary_ctc.h"
 #define CA_HAVE_CTC 1
@@ -1166,6 +1170,13 @@ struct crispasr_session {
 #ifdef CA_HAVE_GRANITE
     granite_speech_context* granite_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_GRANITE_NLE
+    // granite-speech-4.1-2b-nar — non-autoregressive variant. Different
+    // pipeline (single LLM forward pass + edit-slot greedy decode); the
+    // simpler high-level `granite_nle_transcribe` entry handles it, no
+    // need to mirror the granite_speech multi-step plumbing.
+    granite_nle_context* granite_nle_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_CTC
     // Shared between the fastconformer-ctc and canary-ctc backends — they
     // load different GGUFs but go through the same canary_ctc_* compute
@@ -1517,6 +1528,20 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         p.flash_attn = g_open_flash_attn_tls;
         s->granite_ctx = granite_speech_init_from_file(model_path, p);
         if (!s->granite_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_GRANITE_NLE
+    if (s->backend == "granite-4.1-nar" || s->backend == "granite-nle" || s->backend == "granite_nle") {
+        granite_nle_context_params p = granite_nle_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->granite_nle_ctx = granite_nle_init_from_file(model_path, p);
+        if (!s->granite_nle_ctx) {
             delete s;
             return nullptr;
         }
@@ -1966,7 +1991,13 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
     list += ",gemma4-e2b";
 #endif
 #ifdef CA_HAVE_OMNIASR
-    list += ",omniasr";
+    // The session-open dispatcher uses a prefix match
+    // (`backend.rfind("omniasr", 0) == 0`) so every omniasr-* variant
+    // routes through the same handler. Advertise the variants
+    // CrisperWeaver's catalogue uses so the front-door
+    // available_backends check (which is strict string equality)
+    // accepts them.
+    list += ",omniasr,omniasr-llm,omniasr-llm-unlimited";
 #endif
 #ifdef CA_HAVE_ORPHEUS
     list += ",orpheus";
@@ -3346,6 +3377,20 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
     {
         char* text = nullptr;
         bool need_free = true;
+#ifdef CA_HAVE_GRANITE_NLE
+        if (!text &&
+            (s->backend == "granite-4.1-nar" || s->backend == "granite-nle" ||
+                s->backend == "granite_nle") &&
+            s->granite_nle_ctx) {
+            // granite_nle_transcribe is the single high-level entry point —
+            // returns malloc'd UTF-8, caller frees. Token-prob accessors
+            // aren't exposed on the C-side yet (the LLM editing forward pass
+            // doesn't emit per-token p values the same way greedy decoders
+            // do), so text-only is the right shape for now.
+            text = granite_nle_transcribe(s->granite_nle_ctx, pcm, n_samples);
+            need_free = true;
+        }
+#endif
 #ifdef CA_HAVE_MOONSHINE_STREAMING
         if (!text && s->backend == "moonshine-streaming" && s->moonshine_streaming_ctx) {
             moonshine_streaming_result* msr = moonshine_streaming_transcribe_with_probs(
@@ -4423,6 +4468,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_GRANITE
     if (s->granite_ctx)
         granite_speech_free(s->granite_ctx);
+#endif
+#ifdef CA_HAVE_GRANITE_NLE
+    if (s->granite_nle_ctx)
+        granite_nle_free(s->granite_nle_ctx);
 #endif
 #ifdef CA_HAVE_CTC
     if (s->ctc_ctx)
