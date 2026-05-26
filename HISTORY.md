@@ -6,6 +6,63 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-26 (P114-P3 word-snap + streaming-pattern design notes)
+
+`935ffbee` lands the word-snap heuristic for canary streamed dedup, the
+last documented polish item from PLAN #114 P3. After LCS-prefix-drop, if
+the next surviving token's text doesn't start with a space (sentencepiece
+convention: `▁X` decodes to ` X`, so a leading space marks a word-start),
+extend the drop until the next word-start. Trades a few extra tokens for
+a clean prefix; bounded by `n_tokens` so we never drop the whole chunk.
+
+De-Abwasch (1.3 m DE article) before/after on M1 Metal:
+
+| | Before | After |
+|---|---|---|
+| Length | 1233 chars | 1196 chars |
+| `"umfassen. tuch umfassen"` | mid-word fragment | `"umfassen. umfassen"` ✓ |
+| `"Maitrein. ittels mit"` | mid-word fragment | `"Maitrein. mit"` ✓ |
+| `"irrspülmaschine"` | mid-word fragment | `"Geschirrspülmaschine"` ✓ |
+| `"Gefühl. onär ist"` | mid-word fragment | `"Gefühl. ist"` ✓ |
+
+JFK unchanged. Remaining EN FLEURS 60 s artifacts like `"World's Save for
+You"` duplicating `"world's say for you"` are model-retokenization (the
+AED emits different token ids on the same audio because of capitalization
+shift), out of scope for word-snap. Next-level dedup would need
+case-insensitive LCS or beam-over-chunks.
+
+**Also banked: streaming-pattern design notes** in PLAN #114 (new section
+just before "Decision: don't blanket-VAD everyone"). Two upstream patterns:
+
+- **NeMo `BatchedFrameASRTDT` / `FrameBatchMultiTaskAED`**: overlap-chunks
+  (8 s + 2 s) → per-chunk encoder → LCS dedup at boundary. Per-chunk
+  decoder reset is mandatory for AED-class decoders (canary's `<eos>`
+  semantics); optional for frame-synchronous decoders (TDT/CTC).
+- **Mistral voxtral `apply_transcription_request`**: disjoint 30 s chunks
+  → per-chunk encoder → audio embeds concatenated → one LLM AR decode.
+  No dedup needed (no duplicated audio in the input). Requires
+  long-context AR LLM.
+
+**Per-backend fit is structural, not configurable:**
+
+- parakeet (TDT/RNN-T/CTC) → currently hybrid (NeMo overlap + single decode); voxtral pattern feasible but no quality upside
+- canary (AED) → NeMo pattern only; voxtral pattern fails by design (`<eos>` at first chunk-boundary)
+- voxtral / qwen3-asr / granite / glm-asr / mimo-asr / gemma4-e2b / kyutai-stt (AR LLM) → voxtral pattern preferred
+
+**What IS a runtime knob today**: per-backend `STREAM_THRESHOLD_S` durations,
+`STREAM_CHUNK_S` overlap sizes (env vars), the `kBlocked` opt-out list in
+`crispasr_chunk_context_gate.h`. **What ISN'T (and probably shouldn't be)**:
+the pattern choice itself. Forcing the wrong pattern via a CLI flag would
+let users misuse the binary with no quality recovery; nothing is gained
+from running canary in voxtral pattern or voxtral in NeMo pattern.
+
+PLAN #114 P3 is now content-correct + cosmetically-clean on canary's four
+trained languages. The remaining `World's Save for You`-class artifacts
+are model-side (AED retokenization across chunks); not addressable from
+the streamed wrapper without restructuring the decode loop.
+
+---
+
 ## 2026-05-26 (P114-P3 validation) canary streamed on real en + de long-form audio
 
 After the six P3 fix commits landed (lang-whitelist → streamed → per-chunk re-injection → LCS dedup → splice-punct cleanup → degenerate-loop guard), the streamed path was only validated on JFK (synthetic-equivalent at 11 s) and the Japanese yt_60s.wav (OOD audio for canary). Pulled real en + de long-form clips from VPS `/mnt/akademie_storage/test-audio/{en,de}/fleurs_*.wav` and `german-samples/De-Abwasch-article.wav` (1.3 m DE article) into `/Volumes/backups/code/audio_samples/` (full inventory + CLAUDE.md in that dir). Comparing streamed (default) vs forced single-pass on canary-1b-v2 Q4_K:
