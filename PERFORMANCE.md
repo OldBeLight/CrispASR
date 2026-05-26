@@ -1853,16 +1853,45 @@ section. Default mode includes the `e1904a1e` per-model chunk default
 | `--chunk-seconds 30 --chunk-overlap 0` (no LCS) | 713 | 689 | 608 | 1413 |
 | `--chunk-seconds 30 --chunk-overlap 3` (LCS) | **755** | 665 | **660** | **1942** |
 
-### Headline finding: dispatcher-side `--chunk-seconds 30 --chunk-overlap 3` wins on 3 of 4 cases
+### Headline finding: dispatcher-side `--chunk-seconds 30 --chunk-overlap 3` wins on 3 of 4 cases — **shipped as the new default in `98381810`**
 
-The internal-streamed-path default that ships today is **not** the
+The internal-streamed-path default that previously shipped was **not** the
 quality-optimal long-form mode. The CLI's dispatcher-side chunking +
 overlap-save context wrap + LCS-merge dedup recovers more content than
-the backend's single-pass-over-concat-encoder design:
+the backend's single-pass-over-concat-encoder design.
 
-- v3 + EN 60s: 755 chars (LCS) vs 520 chars (default) — **+45 %**
-- v3 + JA 60s: 660 chars (LCS) vs 605 chars (default) — **+9 %**
-- ja + JA 60s: 1942 chars (LCS) vs 1674 chars (default) — **+16 %**
+**Shipped as the new default 2026-05-26 (`98381810`)** by dropping
+`CAP_INTERNAL_CHUNKING` from the parakeet backend's capabilities
+declaration. The dispatcher's `should_auto_chunk_long` fallback then
+fires for audio > 30 s — chunking at 30 s, overlap-save 3 s, LCS-merge
+dedup — exactly the matrix's winning mode. Short audio (< 30 s) is
+unaffected: the dispatcher only auto-chunks past the threshold, so the
+11 s JFK case still routes through a single backend call.
+
+After-the-fix matrix (the previous matrix was with `CAP_INTERNAL_CHUNKING`
+declared, blocking the auto-chunk path):
+
+| case | old default | new default | Δ |
+|---|---|---|---|
+| JFK 11s | 109 | 109 | unchanged |
+| v3 + EN 60s | 520 | **755** | **+45 %** |
+| v3 + DE 60s | 679 | 665 | -2 % |
+| v3 + JA 60s | 605 | **660** | +9 % |
+| ja + JA 60s | 1674 | **1942** | **+16 %** |
+| v3 + EN 300s | 1550 | **3865** | **+150 %** |
+| v3 + DE 300s | 3064 | **3288** | +7 % |
+
+The longer the audio, the bigger the win — EN 300 s scales from +45 % at
+60 s to +150 % at 300 s. The internal-streamed-path's quality
+degradation compounds with audio length; the dispatcher chunks scale
+linearly.
+
+Wall time on M1 Metal: 300 s EN now takes ~86 s (was ~30 s) — 3.5×
+realtime. Acceptable for the quality gains; users can still pass
+`CRISPASR_PARAKEET_STREAM_THRESHOLD=99999` to force the older
+single-pass path if the wall-time matters more than coverage.
+
+### Headline finding: dispatcher-side `--chunk-seconds 30 --chunk-overlap 3` wins on 3 of 4 cases (original 4-trial sweep)
 
 Why this works: the dispatcher splits the 60 s input into ~30 s chunks
 with ±3 s acoustic overlap, calls the backend once per chunk (each

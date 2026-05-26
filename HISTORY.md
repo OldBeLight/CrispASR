@@ -6,6 +6,43 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-26 (parakeet drop CAP_INTERNAL_CHUNKING) dispatcher chunk-30 + LCS becomes the default for long audio
+
+After the per-model chunk-size fix `e1904a1e`, the user asked: "should we just make per-model defaults? we can NOT expect users to consult a matrix beforehand and then finetune each cli option." Right.
+
+Full option matrix (the seven knobs and three dispatcher modes) ran on en/de/ja FLEURS 60 s + yt_60s.wav JA. The matrix lived in PERFORMANCE.md (`86465651`). It showed the dispatcher's `--chunk-seconds 30 --chunk-overlap 3` mode beats the backend's internal-streamed default on 3 of 4 cases:
+
+  v3 + EN 60s : 520 → 755 (+45 %)
+  v3 + JA 60s : 605 → 660 (+9 %)
+  ja + JA 60s : 1674 → 1942 (+16 %)
+  v3 + DE 60s : 679 → 665 (-2 %, small)
+
+**Mechanism.** The dispatcher's `should_auto_chunk_long` fallback at `examples/cli/crispasr_run.cpp:413` auto-chunks long audio iff `CAP_UNBOUNDED_INPUT && !CAP_INTERNAL_CHUNKING && !wants_vad && audio > 30 s`. Parakeet was declaring `CAP_INTERNAL_CHUNKING`, which suppressed the auto-chunk. Dropping that flag lets the auto-chunk fire for long audio.
+
+**Why the dispatcher path beats the backend's own streamed path:** the dispatcher splits the audio into ~30 s chunks with ±3 s overlap, calls the backend once per chunk (each call sees 33 s — the v3 encoder's training window), and LCS-merges boundary tokens. The backend's own `parakeet_transcribe_streamed` instead applies global mel-norm then splits the mel into chunks; per-call mel-norm (dispatcher) appears to produce better-conditioned encoder features for the TDT decoder than per-clip-then-split (backend).
+
+**Shipped (`98381810`).** Dropped `CAP_INTERNAL_CHUNKING` from `examples/cli/crispasr_backend_parakeet.cpp::capabilities()`. The empirical regression matrix:
+
+| case | before | after | Δ |
+|---|---|---|---|
+| JFK 11s | 109 | 109 | unchanged (under threshold) |
+| v3 + EN 60s | 520 | **755** | **+45 %** |
+| v3 + DE 60s | 679 | 665 | -2 % |
+| v3 + JA 60s | 605 | **660** | +9 % |
+| ja + JA 60s | 1674 | **1942** | **+16 %** |
+| v3 + EN 300s | 1550 | **3865** | **+150 %** |
+| v3 + DE 300s | 3064 | **3288** | +7 % |
+
+6 of 7 improved, 1 small DE 60 s regression (-2 %). The longer the audio, the bigger the win — EN 300 s scales from +45 % at 60 s to +150 % at 300 s. The internal-streamed-path's quality degradation compounds with audio length; dispatcher chunks scale linearly. JFK 11 s is unchanged because the dispatcher only auto-chunks past 30 s.
+
+**Tradeoff accepted.** Wall time on long audio increases (~30 s → ~86 s for 300 s EN audio on M1 Metal, 3.5× realtime). For users who care more about wallclock than coverage, `CRISPASR_PARAKEET_STREAM_THRESHOLD=99999` still forces the older single-pass path. The CLI flags (`--chunk-seconds`, `--chunk-overlap`, `--vad`, etc.) remain available for users who want to override the auto-chunk decision.
+
+**Architectural note.** The capabilities flag `CAP_INTERNAL_CHUNKING` was *meant* to declare "this backend handles its own long-audio chunking — don't auto-chunk me at the dispatcher level". Parakeet's `parakeet_transcribe_streamed` does technically handle long audio internally, but the empirical data showed the dispatcher's chunking + overlap-save + LCS-merge produces better output than the backend's internal path. So the flag was semantically correct but quality-wise wrong. Dropping it makes the dispatcher's auto-chunk-at-30s the de-facto default for parakeet long audio, while leaving the backend's internal streamed path as a fallback (when the dispatcher hands a per-chunk slice to the backend, the backend's streamed code still runs — but on a 33 s window where it's well-conditioned).
+
+**Methodology.** (1) Asked user the "right" question about defaults vs flags. (2) Built the empirical matrix across all 7 dispatch knobs (PERFORMANCE.md `86465651`). (3) Picked the winning mode. (4) Found the architectural lever (the `CAP_INTERNAL_CHUNKING` flag). (5) Dropped it. (6) Re-ran the 7-fixture regression. (7) Documented the tradeoffs and the override paths so power-users keep their knobs.
+
+---
+
 ## 2026-05-26 (parakeet streamed-chunk default fix) per-model heuristic via vocab_size
 
 The multi-backend long-form comparison in PERFORMANCE.md (commit `b8588bc5`) flagged parakeet truncating on the EN FLEURS 60 s clip — only 217 chars (~25 % coverage), missing 4 of 6 sentences. Other backends covered the same audio cleanly: voxtral 826 chars, cohere 864, canary 735. This was supposed to be the streamed path's home-court advantage (we made it the default in `33f9a162` precisely to fix the issue #89 truncation pattern). Instead parakeet was the worst on real long-form en.
