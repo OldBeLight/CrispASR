@@ -6,6 +6,20 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-26 (P114-P3 LCS dedup) canary streamed boundary-dup polish
+
+`62766dae` lands the LCS-merge dedup inside `canary_transcribe_streamed`. Per-chunk re-injection (`63fdbe46`) closed the AED-boundary `<eos>` bug but left a boundary-duplication artifact (each chunk re-decoded the overlap_seconds of audio in the previous chunk's tail). NeMo handles this in `streaming_utils.longest_common_subsequence_merge`; we already exposed the primitive at `core/crispasr_lcs::lcs_dedup_prefix_count` for voxtral PLAN #114 P2 at the dispatcher layer. Wire it INSIDE the streamed function: for each new chunk, find the longest matching prefix against the previous chunk's tail tokens, drop it, rebuild text from surviving tokens, peel words whose `t1` ≤ surviving-tokens[0].t0.
+
+JFK forced streamed: `"...for you, Country can do for you. Ask…"` → `"...for you, . Ask what you can do for your country."`. The duplication is gone; the leftover `, . ` is a cosmetic punctuation artifact at the splice (LCS match fell between the `,` of chunk 1 and the `.` of chunk 2). 60 s Japanese clip: 18 s wall (3.3× RT, down from 5.3× before dedup; fewer redundant tokens emitted).
+
+**`delay_tokens` heuristic:** `clamp(8, 30, overlap_seconds * 5)`. canary's average emission rate on en/de/fr/es is ~3 tok/s, so 2 s overlap gives ~6 tokens of boundary content. The minimum 8 guards against degenerate cases; the cap of 30 leaves headroom for slower regimes (long compound words, multi-token punctuation runs).
+
+**Promotion status.** `CANARY_STREAM_THRESHOLD_S` default stays at 30 (single-pass on short audio). Flipping to `0` (always streamed, matching parakeet) waits on a punctuation-cleanup pass for the small `, . ` splice artifact. Functionally the long-audio path is correct: no truncation, no duplication, just a cosmetic punctuation oddity.
+
+**Lesson.** The same LCS-merge primitive serves at two architectural layers — the dispatcher (voxtral PLAN #114 P2: across `crispasr_segment` slices from the outer chunk loop) and the backend (canary: across `canary_token_data` slices from the inner streamed loop). Reusing the algorithm at both layers is cleaner than each backend rolling its own; the shared `core/crispasr_lcs` makes that one primitive change once and use it twice.
+
+---
+
 ## 2026-05-26 (P114-P3 NeMo analogon) canary per-chunk prompt re-injection + real long-audio validation
 
 `63fdbe46` replaces the first cut of `canary_transcribe_streamed` (which had the documented AED-boundary truncation) with the NeMo `FrameBatchMultiTaskAED` analogon: per-chunk AED decode with the language/task prompt re-injected, results concatenated text-wise. Closes the boundary-`<eos>` bug because each chunk's decoder sees a fresh prompt and doesn't carry "we just finished an utterance" state across the splice.
