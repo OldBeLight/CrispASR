@@ -6,6 +6,45 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-26 (later) PLAN #125 P0 — mimo-asr regression reattributed; sched src-mutation log hardened
+
+Closer reading of the v0.6.9 → v0.6.10 delta moved the bisect away from `6b492b2b` (FA per-head mask). The FA patch is fully `#ifdef GGML_CUDA_CRISPASR_FA_PERHEAD_MASK`-guarded; the CMake option defaults OFF (`ggml/CMakeLists.txt:211`); no CI or release script sets the flag ON (verified by `grep -rn FA_PERHEAD`). With the macro undefined, the compiled binary is byte-identical to upstream for that path. A self-built `eaee2319` (which is the reporter's binary, `/opt/crispasr-main/build/bin/crispasr`) gets OFF by default. The patch cannot be the cause of a default-build segfault.
+
+The reporter's bisect missed `ggml/src/ggml-backend.cpp` because their grep filtered to `ggml/src/ggml-cuda/` + the mimo backend files. Between v0.6.9 and v0.6.10 there are *two* code-relevant deltas; the second is **`0f0f0793` "fix(#83): ggml sched src-mutation log + UNet input pin — R9 follow-up #4 v2"**. That patch is *unconditional* and adds a `src_mutations[]` log + restore to the generic scheduler, used by every backend including CUDA.
+
+The bug in the original patch:
+
+- The restore loop ran only on the success path of `compute_splits`. If any compute step returned early on non-`GGML_STATUS_SUCCESS`, the mutation log was retained.
+- `split_graph` did not reset `n_src_mutations` at its start. Neither did `sched_reset`.
+- Next call appended new entries on top of stale ones. Then the next successful `compute_splits` walked the stale entries and wrote `m->orig_src` to `m->node->src[m->j]` — but `m->node` was a pointer into the *previous* gf, which mimo-asr (and any multi-step AR decoder) has already re-laid-out. Write to freed memory → UB → plausible segfault on platforms where the freed page gets reused for something tensor-shaped (CUDA allocator on Blackwell fits the profile).
+
+Why mimo-asr in particular: it builds a fresh cgraph per AR-decoded token, so it's the backend most exposed to stale-`m->node` writes. The reporter's verbose log shows the crash lands right after `kv cache 51 MiB`, i.e. early in the LM AR loop — exactly when the second/third compute would hit the stale-restore path if one of the encoder forward calls returned early.
+
+**Hardening shipped: `a5a518c8` "fix(ggml-backend): restore src[j] on every exit path of compute_splits".**
+
+- Extracted the restore loop into `ggml_backend_sched_restore_src_mutations()`.
+- Called on every exit path of `compute_splits` (the two early-error returns + the success path).
+- Called defensively at the start of `split_graph` and inside `sched_reset` to drop any stale entries before `ggml_free(sched->ctx)` runs. The restore writes to the user's gf (`orig_src` pointers were captured before the rewire), not to `sched->ctx`, so it is safe to call before the free.
+- Tightened the realloc-on-grow to assign-after-success.
+- Stripped the `// CrispASR patch (#83 r9 follow-up #4)` and `MUST RE-APPLY` markers per `feedback_strip_local_markers.md` — those should not have been in committed code.
+
+Local M1 Metal verification before pushing:
+
+- `crispasr --backend parakeet -f samples/jfk.wav` — produces the canonical JFK transcript via the hardened scheduler.
+- `crispasr --tts "Hello world test." --tts-output /tmp/tts-smoke.wav -m chatterbox-t3-q8_0-regen.gguf` — CFM solver runs cond+uncond and produces `vocoder mel rms=4.625` (ref rms=5.115; broken-baseline before `0f0f0793` was rms=13.938). The original chatterbox fix the patch was meant to deliver is preserved by the hardening.
+
+Outstanding: we have no Blackwell sm_120 hardware locally, so the end-to-end mimo-asr-on-Blackwell confirmation has to come from the reporter. Ask montvid to rebuild from `95d74455` or later and rerun the mimo-asr JFK case. If the segfault persists after the hardening, next debug step is a `gdb --args` backtrace + a closer look at any non-Metal-only ggml deltas we may still be missing.
+
+**Lessons (for LEARNINGS).**
+
+- A bisect grep restricted to "obviously CUDA-shaped" paths can miss the generic scheduler when an unrelated patch touches it.
+- A behaviour-changing patch in `ggml-backend.cpp` is implicitly multi-backend; "this fix is for chatterbox CFG on Metal" doesn't bound its blast radius. Hardening on all-exit paths from the start is cheaper than learning this from a user report.
+- `// CrispASR patch ... MUST RE-APPLY` markers should not enter committed code — by definition, code that's in `main` *is* the apply, and the marker carries no signal except "remind future-me." Use commit messages and PLAN entries for that, not source markers.
+
+Cross-refs: `0f0f0793` original patch; `a5a518c8` hardening; `feedback_strip_local_markers.md` memory note; PLAN #125 P0.
+
+---
+
 ## 2026-05-26 PLAN #125 logged — montvid's 12-finding bug sweep on v0.6.10
 
 External user `montvid` filed issue #125 with twelve well-attested reports against v0.6.10 commit `eaee2319`, hardware NVIDIA RTX PRO 6000 Blackwell sm_120 + CUDA 12.6, against the 50:47 EN FLAC from issue #89 plus the project's own `samples/jfk.wav`. All twelve cached at `/Volumes/backups/code/issue125-attachments/` and written up as **PLAN #125** with a P0–P6 fix priority. Reference build the reporter bisected against: v0.6.9 `f23d9485` (2026-05-21).
