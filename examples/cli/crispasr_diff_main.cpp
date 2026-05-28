@@ -3780,6 +3780,25 @@ int main(int argc, char** argv) {
             cosyvoice3_tts_free(ctx);
             return 4;
         }
+        // HiFT is optional — only load if present (kept distinct from
+        // flow so phase 4-A diffs work even when the hift GGUF isn't
+        // alongside the LLM/flow GGUFs in the model dir).
+        std::string hift_path;
+        if (const char* env = std::getenv("CV3_HIFT_GGUF"); env && *env) {
+            hift_path = env;
+        } else {
+            hift_path = model_path;
+            const auto p = hift_path.find("llm");
+            if (p != std::string::npos)
+                hift_path.replace(p, 3, "hift");
+        }
+        if (cosyvoice3_tts_init_hift_from_file(ctx, hift_path.c_str()) != 0) {
+            fprintf(stderr,
+                    "cosyvoice3-tts: hift gguf '%s' not loaded; hift_f0 stage will SKIP "
+                    "(set CV3_HIFT_GGUF to override)\n",
+                    hift_path.c_str());
+            // continue without hift — phase 3 stages still work.
+        }
 
         uint32_t dit_dim = 0;
         cosyvoice3_tts_get_flow_hparams(ctx, nullptr, &dit_dim, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -4036,6 +4055,34 @@ int main(int argc, char** argv) {
                 (void)mel_n;
             } else {
                 printf("[SKIP] %-30s  (euler inputs missing in reference)\n", "flow_euler_*");
+                n_skip++;
+            }
+        }
+
+        // ---- Phase 4-A — HiFT F0 predictor ----
+        {
+            auto mel_pair = ref.get_f32("hift_f0_mel_in");
+            uint32_t mel_dim = 0;
+            cosyvoice3_tts_get_flow_hparams(ctx, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &mel_dim,
+                                            nullptr, nullptr, nullptr, nullptr);
+            if (mel_pair.first && mel_dim > 0 && mel_pair.second % mel_dim == 0) {
+                const int T_mel = (int)(mel_pair.second / mel_dim);
+                int n_out = 0;
+                float* buf = cosyvoice3_tts_extract_stage(ctx, "hift_f0", /*ids*/ nullptr, /*n_ids*/ 0, mel_pair.first,
+                                                          /*n_embed_tokens*/ T_mel, &n_out);
+                if (!buf || n_out <= 0) {
+                    printf("[SKIP] %-30s  cosyvoice3_tts_extract_stage returned no data (hift loaded?)\n", "hift_f0");
+                    if (buf)
+                        free(buf);
+                    n_skip++;
+                } else {
+                    auto rep = ref.compare("hift_f0", buf, (size_t)n_out);
+                    print_row("hift_f0", rep, COS_THRESHOLD);
+                    record(rep);
+                    free(buf);
+                }
+            } else {
+                printf("[SKIP] %-30s  (hift_f0 inputs missing in reference)\n", "hift_f0");
                 n_skip++;
             }
         }

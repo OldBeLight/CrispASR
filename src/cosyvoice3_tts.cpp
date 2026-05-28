@@ -167,6 +167,75 @@ struct cv3_flow {
     std::map<std::string, ggml_tensor*> tensors;
 };
 
+// ---------------------------------------------------------------------------
+// Phase 4 — HiFT (CausalHiFTGenerator) hparams + tensor binding
+// ---------------------------------------------------------------------------
+
+struct cv3_hift_hp {
+    uint32_t sample_rate = 24000;
+    uint32_t mel_dim = 80;
+    uint32_t base_channels = 512;
+    uint32_t nb_harmonics = 8;
+    uint32_t istft_n_fft = 16;
+    uint32_t istft_hop = 4;
+    uint32_t n_upsample_stages = 3;
+    // Per-stage upsample rate / kernel (read from upsample_rate.N keys).
+    uint32_t upsample_rates[3] = {8, 5, 3};
+    uint32_t upsample_kernels[3] = {16, 11, 7};
+    float lrelu_slope = 0.1f;
+    float audio_limit = 0.99f;
+    uint32_t conv_pre_look_right = 4;
+};
+
+// One HiFT ResBlock: 3× (Conv1d, Conv1d, Snake-Beta alpha) for c1 + 3× for c2.
+// `c1` is the first conv in each sub-block; `c2` is the second. `a1`/`a2` are
+// the Snake activation alpha parameters (channels-wide).
+struct cv3_hift_resblock {
+    ggml_tensor* c1_w[3] = {nullptr, nullptr, nullptr};
+    ggml_tensor* c1_b[3] = {nullptr, nullptr, nullptr};
+    ggml_tensor* c2_w[3] = {nullptr, nullptr, nullptr};
+    ggml_tensor* c2_b[3] = {nullptr, nullptr, nullptr};
+    ggml_tensor* a1_alpha[3] = {nullptr, nullptr, nullptr};
+    ggml_tensor* a2_alpha[3] = {nullptr, nullptr, nullptr};
+};
+
+struct cv3_hift {
+    bool loaded = false;
+    cv3_hift_hp hp;
+
+    // Top-level convs.
+    ggml_tensor* conv_pre_w = nullptr;
+    ggml_tensor* conv_pre_b = nullptr;
+    ggml_tensor* conv_post_w = nullptr;
+    ggml_tensor* conv_post_b = nullptr;
+
+    // Upsample (ConvTranspose1d) — one per upsample stage.
+    ggml_tensor* ups_w[3] = {nullptr, nullptr, nullptr};
+    ggml_tensor* ups_b[3] = {nullptr, nullptr, nullptr};
+
+    // 9 main ResBlocks (3 per upsample stage × 3 stages).
+    std::vector<cv3_hift_resblock> resblocks; // size = 9
+
+    // 3 source_downs + 3 source ResBlocks.
+    ggml_tensor* src_down_w[3] = {nullptr, nullptr, nullptr};
+    ggml_tensor* src_down_b[3] = {nullptr, nullptr, nullptr};
+    std::vector<cv3_hift_resblock> src_resblocks; // size = 3
+
+    // SineGen / source projection.
+    ggml_tensor* m_source_l_linear_w = nullptr;
+    ggml_tensor* m_source_l_linear_b = nullptr;
+
+    // F0 predictor (CausalConvRNNF0Predictor): 5 condnet convs + classifier.
+    ggml_tensor* f0_condnet_w[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    ggml_tensor* f0_condnet_b[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    ggml_tensor* f0_classifier_w = nullptr;
+    ggml_tensor* f0_classifier_b = nullptr;
+
+    ggml_context* ctx_w = nullptr;
+    ggml_backend_buffer_t buf_w = nullptr;
+    std::map<std::string, ggml_tensor*> tensors;
+};
+
 } // namespace
 
 struct cosyvoice3_tts_context {
@@ -207,6 +276,11 @@ struct cosyvoice3_tts_context {
     // cosyvoice3_tts_init_flow_from_file(). Stays empty if only the
     // LM was loaded (`flow.loaded == false`).
     cv3_flow flow{};
+
+    // Phase 4 — HiFT (CausalHiFTGenerator) vocoder. Populated by
+    // cosyvoice3_tts_init_hift_from_file(). Stays empty if HiFT was
+    // not loaded (`hift.loaded == false`).
+    cv3_hift hift{};
 };
 
 namespace {
@@ -595,6 +669,10 @@ extern "C" void cosyvoice3_tts_free(struct cosyvoice3_tts_context* ctx) {
         ggml_backend_buffer_free(ctx->flow.buf_w);
     if (ctx->flow.ctx_w)
         ggml_free(ctx->flow.ctx_w);
+    if (ctx->hift.buf_w)
+        ggml_backend_buffer_free(ctx->hift.buf_w);
+    if (ctx->hift.ctx_w)
+        ggml_free(ctx->hift.ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
         ggml_backend_free(ctx->backend);
     if (ctx->backend_cpu)
@@ -1043,6 +1121,7 @@ float* cv3_extract_euler_stage(cosyvoice3_tts_context* ctx, const float* mu, int
                                const char* tensor_name);
 float* cv3_run_solve_euler(cosyvoice3_tts_context* ctx, const float* mu, int T_mel, const float* spks_proj,
                            const float* cond, const float* x_init, int n_steps, float cfg_rate, float* dphi_step0_out);
+float* cv3_extract_hift_f0_stage(cosyvoice3_tts_context* ctx, const float* mel, int T_mel);
 } // namespace
 
 extern "C" float* cosyvoice3_tts_extract_stage(struct cosyvoice3_tts_context* ctx, const char* stage_name,
@@ -1315,6 +1394,20 @@ extern "C" float* cosyvoice3_tts_extract_stage(struct cosyvoice3_tts_context* ct
         if (!out)
             return nullptr;
         *out_n = T_mel * mel;
+        return out;
+    }
+    // Phase 4-A — HiFT F0 predictor (CausalConvRNNF0Predictor):
+    //   "hift_f0"    — abs(classifier(condnet(mel))).squeeze(-1)  [T_mel]
+    //
+    // `embeds_in` carries the mel input packed as (T_mel * mel_dim) F32.
+    // n_embed_tokens = T_mel.
+    if (strcmp(stage_name, "hift_f0") == 0) {
+        if (!ctx->hift.loaded || !embeds_in || n_embed_tokens <= 0)
+            return nullptr;
+        float* out = cv3_extract_hift_f0_stage(ctx, embeds_in, n_embed_tokens);
+        if (!out)
+            return nullptr;
+        *out_n = n_embed_tokens;
         return out;
     }
     if (strcmp(stage_name, "flow_inventory") == 0) {
@@ -2673,4 +2766,253 @@ float* cv3_extract_euler_stage(cosyvoice3_tts_context* ctx, const float* mu, int
     return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4-A — HiFT loader + F0 predictor (CausalConvRNNF0Predictor)
+// ---------------------------------------------------------------------------
+//
+// Upstream ref (cosyvoice/hifigan/f0_predictor.py l. 62-103):
+//
+//   condnet = nn.Sequential(
+//     weight_norm(CausalConv1d(80, 512, kernel_size=4, causal_type='right')),
+//     nn.ELU(),
+//     weight_norm(CausalConv1d(512, 512, kernel_size=3, causal_type='left')),
+//     nn.ELU(),
+//     weight_norm(CausalConv1d(512, 512, kernel_size=3, causal_type='left')),
+//     nn.ELU(),
+//     weight_norm(CausalConv1d(512, 512, kernel_size=3, causal_type='left')),
+//     nn.ELU(),
+//     weight_norm(CausalConv1d(512, 512, kernel_size=3, causal_type='left')),
+//     nn.ELU(),
+//   )
+//   classifier = nn.Linear(in_features=512, out_features=1)
+//
+//   def forward(x):                          # x: (B, 80, T_mel)
+//     x = self.condnet[0](x)                 # first conv has right-pad (lookahead)
+//     for i in range(1, len(self.condnet)):
+//       x = self.condnet[i](x)
+//     x = x.transpose(1, 2)                  # (B, T_mel, 512)
+//     return torch.abs(self.classifier(x).squeeze(-1))   # (B, T_mel)
+//
+// The GGUF converter already materialises weight_norm into plain weights
+// via `wn_resolve(g, v) = g * v / ||v||`, so the bindings are bare Conv1d
+// weights/biases — no parametrisation handling needed at runtime.
+
+ggml_cgraph* cv3_build_hift_f0_graph(cosyvoice3_tts_context* ctx, int T_mel) {
+    const auto& h = ctx->hift;
+    const int mel = (int)h.hp.mel_dim;
+
+    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 1024, false);
+
+    ggml_tensor* mel_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, mel, T_mel);
+    ggml_set_input(mel_in);
+    ggml_set_name(mel_in, "hift_f0_mel_in");
+
+    // Transpose to (T, C) for the chatterbox-pattern conv1d helpers.
+    ggml_tensor* x = ggml_cont(ctx0, ggml_transpose(ctx0, mel_in)); // (T, mel)
+
+    // Layer 0: lookahead conv (k=4, right-pad 3) — in=80, out=512.
+    x = cv3_lookahead_conv1d(ctx0, x, h.f0_condnet_w[0], h.f0_condnet_b[0]); // (T, 512)
+    x = ggml_elu(ctx0, x);
+
+    // Layers 1-4: causal conv (k=3, left-pad 2) — in=512, out=512.
+    for (int i = 1; i < 5; i++) {
+        x = cv3_causal_conv1d(ctx0, x, h.f0_condnet_w[i], h.f0_condnet_b[i]);
+        x = ggml_elu(ctx0, x);
+    }
+
+    // Linear classifier(512, 1). x is (T, 512) post-conv-helpers;
+    // ggml_mul_mat(w, x) needs w->ne[0] == x->ne[0]. Transpose x to
+    // (512, T) so the matmul produces (1, T), then squeeze + abs.
+    x = ggml_cont(ctx0, ggml_transpose(ctx0, x));              // (cond_ch, T_mel)
+    ggml_tensor* y = ggml_mul_mat(ctx0, h.f0_classifier_w, x); // (1, T_mel)
+    y = ggml_add(ctx0, y, h.f0_classifier_b);
+    y = ggml_abs(ctx0, y);
+    // Reshape (1, T) → (T,) for the output buffer.
+    y = ggml_reshape_1d(ctx0, y, T_mel);
+    y = ggml_cont(ctx0, y);
+    ggml_set_name(y, "hift_f0_out");
+    ggml_set_output(y);
+    ggml_build_forward_expand(gf, y);
+
+    ggml_free(ctx0);
+    return gf;
+}
+
+float* cv3_extract_hift_f0_stage(cosyvoice3_tts_context* ctx, const float* mel, int T_mel) {
+    if (!ctx || !ctx->hift.loaded || !mel || T_mel <= 0)
+        return nullptr;
+    const int mel_dim = (int)ctx->hift.hp.mel_dim;
+
+    ctx->step_t1_gf = nullptr;
+    ctx->step_t1_fixed_kv_len = 0;
+
+    ggml_cgraph* gf = cv3_build_hift_f0_graph(ctx, T_mel);
+    if (!gf)
+        return nullptr;
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "cosyvoice3_tts: hift_f0 alloc_graph failed\n");
+        return nullptr;
+    }
+    ggml_tensor* in_t = ggml_graph_get_tensor(gf, "hift_f0_mel_in");
+    if (!in_t)
+        return nullptr;
+    ggml_backend_tensor_set(in_t, mel, 0, (size_t)mel_dim * T_mel * sizeof(float));
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "cosyvoice3_tts: hift_f0 compute failed\n");
+        return nullptr;
+    }
+    ggml_tensor* out_t = ggml_graph_get_tensor(gf, "hift_f0_out");
+    if (!out_t)
+        return nullptr;
+    const size_t n = (size_t)ggml_nelements(out_t);
+    float* out = (float*)malloc(n * sizeof(float));
+    if (!out)
+        return nullptr;
+    ggml_backend_tensor_get(out_t, out, 0, n * sizeof(float));
+    return out;
+}
+
 } // namespace
+
+// Phase 4-A — HiFT loader. Binds the 246 hift GGUF tensors into ctx->hift
+// (or specifically: 2 conv_pre, 2 conv_post, 6 ups, 162 main resblocks,
+// 6 source_downs, 54 source resblocks, 2 m_source, 12 f0). The converter
+// already resolved weight_norm so we read plain conv1d weights here.
+extern "C" int cosyvoice3_tts_init_hift_from_file(struct cosyvoice3_tts_context* ctx, const char* path) {
+    if (!ctx || !path) {
+        fprintf(stderr, "cosyvoice3_tts: init_hift: bad args\n");
+        return -1;
+    }
+    if (ctx->hift.loaded) {
+        fprintf(stderr, "cosyvoice3_tts: hift already loaded\n");
+        return 0;
+    }
+
+    // ---- Metadata pass ----
+    ggml_context* gctx_dummy = nullptr;
+    gguf_init_params gp = {/*no_alloc=*/true, &gctx_dummy};
+    gguf_context* gctx = gguf_init_from_file(path, gp);
+    if (!gctx) {
+        fprintf(stderr, "cosyvoice3_tts: init_hift: failed to read GGUF '%s'\n", path);
+        return -1;
+    }
+    auto& hp = ctx->hift.hp;
+    hp.sample_rate = cv3_kv_u32(gctx, "cosyvoice3.hift.sample_rate", hp.sample_rate);
+    hp.mel_dim = cv3_kv_u32(gctx, "cosyvoice3.hift.mel_dim", hp.mel_dim);
+    hp.base_channels = cv3_kv_u32(gctx, "cosyvoice3.hift.base_channels", hp.base_channels);
+    hp.nb_harmonics = cv3_kv_u32(gctx, "cosyvoice3.hift.nb_harmonics", hp.nb_harmonics);
+    hp.istft_n_fft = cv3_kv_u32(gctx, "cosyvoice3.hift.istft_n_fft", hp.istft_n_fft);
+    hp.istft_hop = cv3_kv_u32(gctx, "cosyvoice3.hift.istft_hop", hp.istft_hop);
+    hp.n_upsample_stages = cv3_kv_u32(gctx, "cosyvoice3.hift.n_upsample_stages", hp.n_upsample_stages);
+    for (uint32_t i = 0; i < hp.n_upsample_stages && i < 3; i++) {
+        char key[64];
+        snprintf(key, sizeof(key), "cosyvoice3.hift.upsample_rate.%u", i);
+        hp.upsample_rates[i] = cv3_kv_u32(gctx, key, hp.upsample_rates[i]);
+        snprintf(key, sizeof(key), "cosyvoice3.hift.upsample_kernel.%u", i);
+        hp.upsample_kernels[i] = cv3_kv_u32(gctx, key, hp.upsample_kernels[i]);
+    }
+    gguf_free(gctx);
+
+    // ---- Weight pass ----
+    core_gguf::WeightLoad wl;
+    if (!core_gguf::load_weights(path, ctx->backend, "cosyvoice3_tts:hift", wl)) {
+        fprintf(stderr, "cosyvoice3_tts: init_hift: load_weights failed for '%s'\n", path);
+        return -1;
+    }
+    ctx->hift.ctx_w = wl.ctx;
+    ctx->hift.buf_w = wl.buf;
+    ctx->hift.tensors = std::move(wl.tensors);
+
+    auto require_t = [&](const std::string& name) -> ggml_tensor* {
+        return core_gguf::require(ctx->hift.tensors, name.c_str(), "cosyvoice3_tts:hift");
+    };
+
+    auto& hf = ctx->hift;
+    // Top-level convs.
+    hf.conv_pre_w = require_t("cosyvoice3.hift.conv_pre.w");
+    hf.conv_pre_b = require_t("cosyvoice3.hift.conv_pre.b");
+    hf.conv_post_w = require_t("cosyvoice3.hift.conv_post.w");
+    hf.conv_post_b = require_t("cosyvoice3.hift.conv_post.b");
+
+    // Upsamples (3 stages for cv3).
+    for (uint32_t i = 0; i < 3; i++) {
+        char prefix[48];
+        snprintf(prefix, sizeof(prefix), "cosyvoice3.hift.ups.%u", i);
+        std::string p = prefix;
+        hf.ups_w[i] = require_t(p + ".w");
+        hf.ups_b[i] = require_t(p + ".b");
+    }
+
+    // 9 main ResBlocks.
+    const int n_resblocks = 9;
+    hf.resblocks.resize(n_resblocks);
+    for (int i = 0; i < n_resblocks; i++) {
+        for (int j = 0; j < 3; j++) {
+            char prefix[64];
+            snprintf(prefix, sizeof(prefix), "cosyvoice3.hift.resblocks.%d", i);
+            std::string p = prefix;
+            char idx[8];
+            snprintf(idx, sizeof(idx), ".%d", j);
+            std::string sj = idx;
+            hf.resblocks[i].c1_w[j] = require_t(p + ".c1" + sj + ".w");
+            hf.resblocks[i].c1_b[j] = require_t(p + ".c1" + sj + ".b");
+            hf.resblocks[i].c2_w[j] = require_t(p + ".c2" + sj + ".w");
+            hf.resblocks[i].c2_b[j] = require_t(p + ".c2" + sj + ".b");
+            hf.resblocks[i].a1_alpha[j] = require_t(p + ".a1" + sj + ".alpha");
+            hf.resblocks[i].a2_alpha[j] = require_t(p + ".a2" + sj + ".alpha");
+        }
+    }
+
+    // 3 source_downs + 3 source ResBlocks.
+    hf.src_resblocks.resize(3);
+    for (int i = 0; i < 3; i++) {
+        char prefix[48];
+        snprintf(prefix, sizeof(prefix), "cosyvoice3.hift.source_downs.%d", i);
+        std::string p = prefix;
+        hf.src_down_w[i] = require_t(p + ".w");
+        hf.src_down_b[i] = require_t(p + ".b");
+        for (int j = 0; j < 3; j++) {
+            char prefix2[64];
+            snprintf(prefix2, sizeof(prefix2), "cosyvoice3.hift.src_resblk.%d", i);
+            std::string p2 = prefix2;
+            char idx[8];
+            snprintf(idx, sizeof(idx), ".%d", j);
+            std::string sj = idx;
+            hf.src_resblocks[i].c1_w[j] = require_t(p2 + ".c1" + sj + ".w");
+            hf.src_resblocks[i].c1_b[j] = require_t(p2 + ".c1" + sj + ".b");
+            hf.src_resblocks[i].c2_w[j] = require_t(p2 + ".c2" + sj + ".w");
+            hf.src_resblocks[i].c2_b[j] = require_t(p2 + ".c2" + sj + ".b");
+            hf.src_resblocks[i].a1_alpha[j] = require_t(p2 + ".a1" + sj + ".alpha");
+            hf.src_resblocks[i].a2_alpha[j] = require_t(p2 + ".a2" + sj + ".alpha");
+        }
+    }
+
+    // SineGen source linear projection.
+    hf.m_source_l_linear_w = require_t("cosyvoice3.hift.m_source.l_linear.w");
+    hf.m_source_l_linear_b = require_t("cosyvoice3.hift.m_source.l_linear.b");
+
+    // F0 predictor (CausalConvRNNF0Predictor): 5 condnet convs + classifier.
+    for (int i = 0; i < 5; i++) {
+        char prefix[48];
+        snprintf(prefix, sizeof(prefix), "cosyvoice3.hift.f0.condnet.%d", i);
+        std::string p = prefix;
+        hf.f0_condnet_w[i] = require_t(p + ".w");
+        hf.f0_condnet_b[i] = require_t(p + ".b");
+    }
+    hf.f0_classifier_w = require_t("cosyvoice3.hift.f0.classifier.w");
+    hf.f0_classifier_b = require_t("cosyvoice3.hift.f0.classifier.b");
+
+    hf.loaded = true;
+    if (ctx->params.verbosity >= 1) {
+        fprintf(stderr,
+                "cosyvoice3_tts:hift loaded %zu tensors  sr=%u mel=%u base_ch=%u "
+                "n_fft=%u hop=%u up_stages=%u rates=[%u,%u,%u] kernels=[%u,%u,%u]\n",
+                hf.tensors.size(), hp.sample_rate, hp.mel_dim, hp.base_channels, hp.istft_n_fft, hp.istft_hop,
+                hp.n_upsample_stages, hp.upsample_rates[0], hp.upsample_rates[1], hp.upsample_rates[2],
+                hp.upsample_kernels[0], hp.upsample_kernels[1], hp.upsample_kernels[2]);
+    }
+    return 0;
+}

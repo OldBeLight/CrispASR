@@ -93,6 +93,9 @@ DEFAULT_STAGES = [
     "flow_euler_x_init",        # seeded torch.manual_seed(0) randn  (T_mel, 80)
     "flow_euler_dphi_step0",    # post-CFG dphi_dt at step 1         (T_mel, 80)
     "flow_euler",               # final mel after 10 Euler steps     (T_mel, 80)
+    # Phase 4-A — HiFT F0 predictor
+    "hift_f0_mel_in",           # seeded random mel input             (T_mel, 80)
+    "hift_f0",                  # CausalConvRNNF0Predictor output     (T_mel,)
 ]
 
 # Fixed test-vector parameters for the Phase 3b dumps. Pinned so the
@@ -117,6 +120,12 @@ EULER_T_TOK = 4
 EULER_SPK_SEED = 40404
 EULER_N_STEPS = 10
 EULER_CFG_RATE = 0.7
+
+# Phase 4-A — HiFT F0 predictor fixture. The predictor takes a mel
+# spectrogram of arbitrary length; use a realistic T_mel and an
+# independent seed.
+HIFT_F0_T_MEL = 32
+HIFT_F0_SEED = 7777
 
 # Phase 3c test vector — independent seeded fixture. T_tok small enough
 # to keep dumps fast; T_mel = 2 · T_tok per token_mel_ratio. Mel/spk dims
@@ -810,6 +819,54 @@ def _capture_euler_stages(model_dir: Path, T_tok: int = EULER_T_TOK,
 
 
 # ---------------------------------------------------------------------------
+# Phase 4-A — HiFT F0 predictor (CausalConvRNNF0Predictor) capture
+# ---------------------------------------------------------------------------
+
+def _load_hift_state(model_dir: Path):
+    """Load the hift.pt state dict (raw, weight-norm-parameterised)."""
+    import torch
+    state_path = model_dir / "hift.pt"
+    sd = torch.load(str(state_path), map_location="cpu", weights_only=False)
+    if isinstance(sd, dict) and "state_dict" in sd:
+        sd = sd["state_dict"]
+    return sd
+
+
+def _capture_hift_f0_stages(model_dir: Path, T_mel: int = HIFT_F0_T_MEL,
+                            seed: int = HIFT_F0_SEED) -> Dict[str, "torch.Tensor"]:
+    """Run upstream CausalConvRNNF0Predictor on a seeded random mel and
+    return the named stages (matches the C++ side's hift_f0_*)."""
+    _ensure_upstream_on_path()
+    import torch
+    from cosyvoice.hifigan.f0_predictor import CausalConvRNNF0Predictor
+
+    sd = _load_hift_state(model_dir)
+    f0 = CausalConvRNNF0Predictor(num_class=1, in_channels=MEL_DIM, cond_channels=512)
+    # hift.pt stores the predictor under "f0_predictor." prefix; the
+    # weight-norm parametrisations need to load in-place (PyTorch does this
+    # automatically for nn.utils.weight_norm modules).
+    f0_sd = {k[len("f0_predictor."):]: v
+             for k, v in sd.items() if k.startswith("f0_predictor.")}
+    missing, unexpected = f0.load_state_dict(f0_sd, strict=False)
+    if missing or unexpected:
+        print(f"  f0 load missing={missing} unexpected={unexpected}")
+    f0.eval()
+
+    gen = torch.Generator().manual_seed(seed)
+    mel = torch.randn(1, MEL_DIM, T_mel, generator=gen, dtype=torch.float32)
+    with torch.no_grad():
+        out = f0(mel)              # (1, T_mel) abs(scalar per frame)
+
+    return {
+        # PyTorch (1, mel, T) is channel-first, but the C++ side fills
+        # ne=(mel, T) col-major which matches PyTorch (T, mel) row-major.
+        # Transpose to (T, mel) row-major so the GGUF bytes line up.
+        "mel_in": mel.squeeze(0).transpose(0, 1).contiguous(),  # (T, mel) — byte = ggml (mel, T)
+        "": out.squeeze(0).contiguous(),                         # (T,)
+    }
+
+
+# ---------------------------------------------------------------------------
 # dump_reference.py entry point.
 # ---------------------------------------------------------------------------
 
@@ -873,6 +930,15 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         euler_stages = _capture_euler_stages(model_dir)
         for short, t in euler_stages.items():
             name = "flow_euler" + (("_" + short) if short else "")
+            if name not in requested:
+                continue
+            out[name] = t.detach().cpu().numpy().astype(np.float32)
+
+    # ---- Phase 4-A HiFT F0 predictor ----
+    if any(s.startswith("hift_f0") for s in requested):
+        f0_stages = _capture_hift_f0_stages(model_dir)
+        for short, t in f0_stages.items():
+            name = "hift_f0" + (("_" + short) if short else "")
             if name not in requested:
                 continue
             out[name] = t.detach().cpu().numpy().astype(np.float32)

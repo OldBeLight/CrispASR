@@ -606,9 +606,24 @@ work in 4 phases**.
   - **3e — end-to-end mel diff — landed via 3d-B's
     `flow_euler` stage.** Diff-gate cos ≥ 0.99 PASSES.
 - **Phase 4 — CausalHiFTGenerator + F0 predictor + Snake +
-  iSTFT**. Open. Mostly chatterbox_s3gen helpers + Snake +
-  causal-mode upsample. Diff-gate: waveform cos ≥ 0.95 (vocoders
-  are sensitive; lower bar than mel).
+  iSTFT**. Partial — 4-A landed 2026-05-28; 4-B and 4-C still open.
+  - **4-A (2026-05-28)**: HiFT loader + F0 predictor
+    (`CausalConvRNNF0Predictor`) — binds all 246 hift GGUF tensors
+    (conv_pre/conv_post, ups.0-2, resblocks.0-8, source_downs.0-2,
+    src_resblk.0-2, m_source, f0.condnet.0-4, f0.classifier) and
+    implements the F0 predictor forward (5× CausalConv1d + ELU +
+    Linear(512,1) + abs). Reuses phase 3c's `cv3_lookahead_conv1d`
+    + `cv3_causal_conv1d` helpers. Public API:
+    `cosyvoice3_tts_init_hift_from_file`. Stage `hift_f0` PASS at
+    cos=1.0 max|Δ|=3.7e-1 (Hz units; cos=1.0 = perfect angular
+    alignment).
+  - **4-B (open)**: full HiFT decode forward — conv_pre +
+    SineGen source generation + STFT/iSTFT (n_fft=16, hop=4) + 3-stage
+    upsample chain (`CausalConv1dUpsample`) + 9 main ResBlocks
+    (Snake-Beta activations) + 3 source ResBlocks + conv_post.
+    Diff-gate: waveform cos ≥ 0.95.
+  - **4-C (open)**: end-to-end mel → 24 kHz waveform, gated on the
+    full chain (LM → flow Euler → HiFT decode → audio).
 - **Phase 5 — CLI adapter + model registry + HF upload + docs**.
   Open. Phase-2-then-3-then-4 then this.
 - **Phase 6 (deferred)** — S3Tokenizer V3 for arbitrary-WAV cloning.

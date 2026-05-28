@@ -142,6 +142,12 @@ int32_t* cosyvoice3_tts_generate_tokens_from_embeds(struct cosyvoice3_tts_contex
 
 int cosyvoice3_tts_init_flow_from_file(struct cosyvoice3_tts_context* ctx, const char* path);
 
+// Load the HiFT vocoder GGUF (cosyvoice3-hift-f16.gguf, ~42 MB) into an
+// already-initialised context AFTER the LLM init. Independent of the flow
+// loader (either can be called without the other; both compose for full
+// end-to-end synthesis). Returns 0 on success, -1 on failure.
+int cosyvoice3_tts_init_hift_from_file(struct cosyvoice3_tts_context* ctx, const char* path);
+
 // Read flow-side hparams. Each pointer may be NULL.
 int cosyvoice3_tts_get_flow_hparams(struct cosyvoice3_tts_context* ctx, uint32_t* n_dit_layers, uint32_t* dit_dim,
                                     uint32_t* dit_heads, uint32_t* dit_head_dim, uint32_t* dit_ff_dim,

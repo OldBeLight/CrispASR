@@ -6,6 +6,61 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-28 cosyvoice3: Phase 4-A — HiFT loader + F0 predictor (cos=1.0)
+
+First slice of the HiFT vocoder port: binds all 246 hift GGUF tensors
+(conv_pre/conv_post, 3 upsample stages, 9 main ResBlocks, 3 source
+resblocks, m_source, F0 predictor weights) into the new `cv3_hift`
+struct on the context, and implements the `CausalConvRNNF0Predictor`
+forward.
+
+The F0 predictor is the smallest cohesive sub-module — 5× CausalConv1d
+(first is right-pad k=4 "lookahead"; remaining four are left-pad k=3
+causal) + ELU between each + `Linear(512, 1)` + `abs`. It takes mel
+(B, mel_dim=80, T_mel) and outputs per-frame F0 estimates that feed
+the NSF source generator in the full vocoder.
+
+Implementation:
+
+- `cv3_hift_hp` + `cv3_hift` structs (mirror of `cv3_flow_hp` /
+  `cv3_flow`) plus a `cv3_hift_resblock` for the 12-tensor resblock
+  layout (3× c1, 3× c2, 3× a1.alpha, 3× a2.alpha).
+- `cosyvoice3_tts_init_hift_from_file()` public API. Same
+  load-weights + require-all-tensors pattern as the flow loader.
+  Independent of the flow loader (either can be called without the
+  other).
+- `cv3_build_hift_f0_graph` reuses phase 3c's `cv3_lookahead_conv1d`
+  + `cv3_causal_conv1d` helpers. The classifier matmul transposes
+  the post-conv (T, 512) tensor to (512, T) so `ggml_mul_mat(w, x)`
+  with w ne=(512, 1) lines up.
+- New extract_stage entry `hift_f0` (input layout: T_mel × mel_dim
+  F32 floats in `embeds_in`).
+- Python ref backend `_capture_hift_f0_stages()` runs upstream
+  `CausalConvRNNF0Predictor` on the same seeded mel. The
+  weight-norm parametrisation loads in-place (PyTorch handles it
+  automatically — we don't need to materialise like the GGUF
+  converter does on the C++ side).
+- crispasr-diff cosyvoice3-tts handler picks up hift via
+  `s/llm/hift/` (or `CV3_HIFT_GGUF`); skips the hift_f0 stage
+  gracefully if the hift GGUF isn't present (so phase-3 diffs still
+  pass on hift-less setups).
+
+Per-stage diff (26/26 PASS):
+
+  hift_f0   cos=1.000000   max|Δ|=3.7e-01
+
+The max|Δ|=0.37 looks high in absolute terms but the F0 values are
+in the hundreds (typical Hz range), so cos=1.0 confirms perfect
+angular alignment — the per-element drift is at the F16 weight
+floor relative to signal magnitude.
+
+Remaining phase 4 work: 4-B full HiFT decode forward (conv_pre +
+SineGen source generation + STFT/iSTFT + 3-stage upsample chain
+with Snake-Beta activations + 9 main ResBlocks + 3 source resblocks
++ conv_post); 4-C end-to-end mel → 24 kHz waveform diff gate.
+
+---
+
 ## 2026-05-28 cosyvoice3: Phase 3d-B + 3e — CFM Euler ODE end-to-end (cos=1.0)
 
 The full mel generation path: 10-step cosine-schedule CFM Euler ODE
