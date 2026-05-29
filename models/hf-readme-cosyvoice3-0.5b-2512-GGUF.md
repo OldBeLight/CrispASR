@@ -103,6 +103,8 @@ crispasr -m cosyvoice3-llm-q4_k.gguf \
 The CLI auto-discovers companion GGUFs in this order:
 
 * **Flow** — `cosyvoice3-flow-*.gguf` next to the LLM, or `--codec-model PATH`.
+* **CAMPPlus** — `cosyvoice3-campplus-f16.gguf` next to the LLM, or `COSYVOICE3_CAMPPLUS_PATH` for the native WAV-clone path.
+* **S3Tokenizer** — `cosyvoice3-s3tok-f16.gguf` next to the LLM, or `COSYVOICE3_S3TOK_PATH` for the native WAV-clone path.
 * **HiFT** — `cosyvoice3-hift-*.gguf` next to the LLM, or `COSYVOICE3_HIFT_PATH` env var.
 * **Voices** — `cosyvoice3-voices.gguf` next to the LLM, or `COSYVOICE3_VOICES_PATH` env var.
 

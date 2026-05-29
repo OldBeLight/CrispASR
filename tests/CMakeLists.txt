@@ -101,6 +101,27 @@ if (CRISPASR_FFMPEG)
       -m ${PROJECT_SOURCE_DIR}/models/for-tests-ggml-tiny.en.bin
       -f ${PROJECT_SOURCE_DIR}/samples/jfk.mp3)
     set_tests_properties(${TEST_TARGET} PROPERTIES LABELS "tiny;mp3")
+
+    # ─── test-ffmpeg-transcode — Catch2 unit tests for container decode (issue #129) ─
+    set(FFMPEG_TEST test-ffmpeg-transcode)
+    add_executable(${FFMPEG_TEST} ${FFMPEG_TEST}.cpp)
+    target_include_directories(${FFMPEG_TEST} PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/examples
+        ${FFMPEG_INCLUDE_DIRS}
+    )
+    target_link_libraries(${FFMPEG_TEST} PRIVATE
+        Catch2::Catch2WithMain
+        common
+    )
+    target_compile_definitions(${FFMPEG_TEST} PRIVATE
+        SAMPLES_DIR="${PROJECT_SOURCE_DIR}/samples"
+    )
+    catch_discover_tests(${FFMPEG_TEST}
+        TEST_SPEC "[ffmpeg]"
+        PROPERTIES LABELS "unit;ffmpeg"
+    )
 endif()
 
 #VAD test tests VAD in isolation

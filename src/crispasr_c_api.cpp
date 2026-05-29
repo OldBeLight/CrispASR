@@ -107,6 +107,10 @@
 #include "chatterbox.h"
 #define CA_HAVE_CHATTERBOX 1
 #endif
+#if __has_include("voxcpm2_tts.h")
+#include "voxcpm2_tts.h"
+#define CA_HAVE_VOXCPM2 1
+#endif
 #if __has_include("m2m100.h")
 #include "m2m100.h"
 #define CA_HAVE_M2M100 1
@@ -1012,6 +1016,8 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
     else if (strcmp(arch, "chatterbox") == 0 || strcmp(arch, "chatterbox_turbo") == 0 ||
              strcmp(arch, "kartoffelbox") == 0)
         backend = "chatterbox";
+    else if (strcmp(arch, "voxcpm2") == 0 || strcmp(arch, "voxcpm2-tts") == 0)
+        backend = "voxcpm2-tts";
     else if (strcmp(arch, "m2m100") == 0)
         backend = "m2m100";
 
@@ -1252,6 +1258,9 @@ struct crispasr_session {
 #endif
 #ifdef CA_HAVE_CHATTERBOX
     chatterbox_context* chatterbox_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_VOXCPM2
+    voxcpm2_context* voxcpm2_ctx = nullptr;
 #endif
 #ifdef CA_HAVE_M2M100
     m2m100_context* m2m100_ctx = nullptr;
@@ -1841,6 +1850,25 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_VOXCPM2
+    if (s->backend == "voxcpm2-tts" || s->backend == "voxcpm2" || s->backend == "voxcpm2_tts") {
+        s->backend = "voxcpm2-tts";
+        voxcpm2_context_params p = voxcpm2_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        p.flash_attn = g_open_flash_attn_tls;
+        s->voxcpm2_ctx = voxcpm2_init_from_file(model_path, p);
+        if (!s->voxcpm2_ctx) {
+            delete s;
+            return nullptr;
+        }
+        // Zero-shot synthesis works immediately. Voice cloning
+        // (voxcpm2_synthesize_clone) needs a 16 kHz reference PCM, which
+        // the session API has no decode path for yet — a follow-up.
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_M2M100
     if (s->backend == "m2m100" || s->backend == "m2m-100" || s->backend == "translate") {
         s->backend = "m2m100";
@@ -2074,6 +2102,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_CHATTERBOX
     list += ",chatterbox";
+#endif
+#ifdef CA_HAVE_VOXCPM2
+    list += ",voxcpm2-tts";
 #endif
 #ifdef CA_HAVE_M2M100
     list += ",m2m100";
@@ -4441,6 +4472,33 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
         return chatterbox_synthesize(s->chatterbox_ctx, text, out_n_samples);
     }
 #endif
+#ifdef CA_HAVE_VOXCPM2
+    if (s->voxcpm2_ctx) {
+        // VoxCPM2 synthesises at 48 kHz mono; every other CrispASR TTS
+        // backend (and the Dart `synthesize` contract) emits 24 kHz.
+        // Decimate 2:1 with a pairwise average — a cheap half-band low
+        // pass — so the host's fixed-24 kHz playback path stays correct.
+        int n48 = 0;
+        float* pcm48 = voxcpm2_synthesize(s->voxcpm2_ctx, text, &n48);
+        if (!pcm48 || n48 <= 0) {
+            if (pcm48)
+                voxcpm2_pcm_free(pcm48);
+            return nullptr;
+        }
+        const int n24 = n48 / 2;
+        float* pcm24 = (float*)malloc((size_t)(n24 > 0 ? n24 : 1) * sizeof(float));
+        if (!pcm24) {
+            voxcpm2_pcm_free(pcm48);
+            return nullptr;
+        }
+        for (int i = 0; i < n24; ++i)
+            pcm24[i] = 0.5f * (pcm48[2 * i] + pcm48[2 * i + 1]);
+        voxcpm2_pcm_free(pcm48);
+        if (out_n_samples)
+            *out_n_samples = n24;
+        return pcm24;
+    }
+#endif
     return nullptr;
 }
 
@@ -4656,6 +4714,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_CHATTERBOX
     if (s->chatterbox_ctx)
         chatterbox_free(s->chatterbox_ctx);
+#endif
+#ifdef CA_HAVE_VOXCPM2
+    if (s->voxcpm2_ctx)
+        voxcpm2_free(s->voxcpm2_ctx);
 #endif
 #ifdef CA_HAVE_M2M100
     if (s->m2m100_ctx)
@@ -4924,6 +4986,12 @@ CA_EXPORT int crispasr_session_set_tts_seed(crispasr_session* s, uint64_t seed) 
 #ifdef CA_HAVE_ORPHEUS
     if (s->orpheus_ctx) {
         orpheus_set_seed((orpheus_context*)s->orpheus_ctx, seed);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_VOXCPM2
+    if (s->voxcpm2_ctx) {
+        voxcpm2_set_seed((voxcpm2_context*)s->voxcpm2_ctx, (uint32_t)seed);
         touched++;
     }
 #endif

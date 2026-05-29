@@ -138,6 +138,9 @@ static int read_packet(void *opaque, u8 *buf, int buf_size)
 {
     struct audio_buffer *audio_buf = (audio_buffer*)opaque;
 
+    if (audio_buf->size <= 0)
+        return AVERROR_EOF;
+
 	buf_size = FFMIN(buf_size, audio_buf->size);
 
 	/* copy internal buffer data to buf */
@@ -154,11 +157,15 @@ static void convert_frame(struct SwrContext *swr, AVCodecContext *codec,
 	int nr_samples;
 	s64 delay;
 	u8 *buffer;
+	int in_samples = (frame && !flush) ? frame->nb_samples : 0;
 
 	delay = swr_get_delay(swr, codec->sample_rate);
-	nr_samples = av_rescale_rnd(delay + frame->nb_samples,
+	nr_samples = av_rescale_rnd(delay + in_samples,
 				    WAVE_SAMPLE_RATE, codec->sample_rate,
 				    AV_ROUND_UP);
+	if (nr_samples <= 0)
+		return;
+
 	av_samples_alloc(&buffer, NULL, 1, nr_samples, AV_SAMPLE_FMT_S16, 0);
 
 	/*
@@ -166,21 +173,15 @@ static void convert_frame(struct SwrContext *swr, AVCodecContext *codec,
 	 * conversion buffers...
 	 */
 	nr_samples = swr_convert(swr, &buffer, nr_samples,
-				 !flush ? (const u8 **)frame->data : NULL,
-				 !flush ? frame->nb_samples : 0);
+				 (frame && !flush) ? (const u8 **)frame->data : NULL,
+				 in_samples);
 
-    *data = (s16*)realloc(*data, (*size + nr_samples) * sizeof(s16));
-	memcpy(*data + *size, buffer, nr_samples * sizeof(s16));
-	*size += nr_samples;
+	if (nr_samples > 0) {
+		*data = (s16*)realloc(*data, (*size + nr_samples) * sizeof(s16));
+		memcpy(*data + *size, buffer, nr_samples * sizeof(s16));
+		*size += nr_samples;
+	}
 	av_freep(&buffer);
-}
-
-static bool is_audio_stream(const AVStream *stream)
-{
-	if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
-		return true;
-
-	return false;
 }
 
 // Return non zero on error, 0 on success
@@ -198,7 +199,6 @@ static int decode_audio(struct audio_buffer *audio_buf, s16 **data, int *size)
 	AVFrame *frame;
 	struct SwrContext *swr;
 	u8 *avio_ctx_buffer;
-	unsigned int i;
 	int stream_index = -1;
 	int err;
     const size_t errbuffsize = 1024;
@@ -223,14 +223,8 @@ static int decode_audio(struct audio_buffer *audio_buf, s16 **data, int *size)
         return err;
 	}
 
-	for (i = 0; i < fmt_ctx->nb_streams; i++) {
-		if (is_audio_stream(fmt_ctx->streams[i])) {
-			stream_index = i;
-			break;
-		}
-	}
-
-	if (stream_index == -1) {
+	stream_index = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+	if (stream_index < 0) {
         LOG("Could not retrieve audio stream from buffer\n");
 		return -1;
 	}
@@ -294,16 +288,33 @@ static int decode_audio(struct audio_buffer *audio_buf, s16 **data, int *size)
 	*data = NULL;
 	*size = 0;
 	while (av_read_frame(fmt_ctx, packet) >= 0) {
-		avcodec_send_packet(codec, packet);
-
-		err = avcodec_receive_frame(codec, frame);
-		if (err == AVERROR(EAGAIN))
+		if (packet->stream_index != stream_index) {
+			av_packet_unref(packet);
 			continue;
+		}
 
-		convert_frame(swr, codec, frame, data, size, false);
+		err = avcodec_send_packet(codec, packet);
+		if (err < 0) {
+			av_packet_unref(packet);
+			break;
+		}
+
+		while ((err = avcodec_receive_frame(codec, frame)) >= 0) {
+			convert_frame(swr, codec, frame, data, size, false);
+			av_frame_unref(frame);
+		}
+		av_packet_unref(packet);
 	}
+
+	/* Drain decoder */
+	avcodec_send_packet(codec, NULL);
+	while ((err = avcodec_receive_frame(codec, frame)) >= 0) {
+		convert_frame(swr, codec, frame, data, size, false);
+		av_frame_unref(frame);
+	}
+
 	/* Flush any remaining conversion buffers... */
-	convert_frame(swr, codec, frame, data, size, true);
+	convert_frame(swr, codec, NULL, data, size, true);
 
 	av_packet_free(&packet);
 	av_frame_free(&frame);
