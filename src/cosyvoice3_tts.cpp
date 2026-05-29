@@ -5095,6 +5095,29 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
         return nullptr;
     }
 
+    // ---- 0. Align prompt tokens + ref_mel to token_mel_ratio ----
+    // Upstream frontend trims BOTH the prompt speech tokens and the prompt
+    // mel so that len(ref_mel) == ratio * len(prompt_tokens):
+    //   token_len = min(ref_mel_frames / ratio, n_prompt_tokens)
+    // Skipping this leaves the flow's prompt region (ratio*n_tokens frames)
+    // misaligned with the cond prefix (ref_mel frames), which de-energises
+    // the generated mel — WAV clones from clips where matcha-mel frames !=
+    // ratio*s3tok-tokens (i.e. anything much longer than the ~3 s baked
+    // zero_shot prompt) come out ~14 dB quiet. The baked zero_shot voice is
+    // already aligned (174 == 2*87) so this is a no-op there.
+    const int mel_ratio = (int)ctx->flow.hp.token_mel_ratio;
+    int prompt_token_len = (int)voice->prompt_speech_tokens.size();
+    if (voice->t_ref_mel > 0 && mel_ratio > 0) {
+        const int by_mel = voice->t_ref_mel / mel_ratio;
+        if (by_mel < prompt_token_len)
+            prompt_token_len = by_mel;
+    }
+    if (prompt_token_len < 0)
+        prompt_token_len = 0;
+    const std::vector<int32_t> prompt_tokens(voice->prompt_speech_tokens.begin(),
+                                             voice->prompt_speech_tokens.begin() + prompt_token_len);
+    const int aligned_t_ref_mel = prompt_token_len * mel_ratio;
+
     // ---- 1. Tokenise prompt_text + user_text ----
     std::vector<int32_t> prompt_ids = cv3_tokenise_prompt(ctx->vocab, voice->prompt_text);
     std::vector<int32_t> user_ids = cv3_tokenise_prompt(ctx->vocab, std::string(text));
@@ -5114,7 +5137,7 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
     // ---- 2. Build LM input embeddings + AR-decode speech tokens ----
     std::vector<float> lm_embeds;
     int n_lm = 0;
-    if (!cv3_build_lm_input_embeds(ctx, text_ids, voice->prompt_speech_tokens, lm_embeds, n_lm))
+    if (!cv3_build_lm_input_embeds(ctx, text_ids, prompt_tokens, lm_embeds, n_lm))
         return nullptr;
 
     const int stop_floor = (int)ctx->hp.speech_codebook;
@@ -5151,15 +5174,15 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
 
     // ---- 3. Compose full speech-token sequence + run pre_la + repeat_interleave ----
     std::vector<int32_t> full_tokens;
-    full_tokens.reserve(voice->prompt_speech_tokens.size() + gen_tokens.size());
-    full_tokens.insert(full_tokens.end(), voice->prompt_speech_tokens.begin(), voice->prompt_speech_tokens.end());
+    full_tokens.reserve(prompt_tokens.size() + gen_tokens.size());
+    full_tokens.insert(full_tokens.end(), prompt_tokens.begin(), prompt_tokens.end());
     full_tokens.insert(full_tokens.end(), gen_tokens.begin(), gen_tokens.end());
     std::vector<float> mu = cv3_run_pre_la_and_interleave(ctx, full_tokens);
     if (mu.empty())
         return nullptr;
     const int mel = (int)ctx->flow.hp.mel_dim;
     const int T_mel_total = (int)(full_tokens.size() * (size_t)ctx->flow.hp.token_mel_ratio);
-    const int T_ref_mel = voice->t_ref_mel;
+    const int T_ref_mel = aligned_t_ref_mel;
     if (T_ref_mel > T_mel_total) {
         fprintf(stderr, "cosyvoice3_tts: synth: voice ref_mel (%d) longer than full T_mel (%d) — corrupt voice\n",
                 T_ref_mel, T_mel_total);
