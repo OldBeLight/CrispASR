@@ -111,6 +111,10 @@
 #include "voxcpm2_tts.h"
 #define CA_HAVE_VOXCPM2 1
 #endif
+#if __has_include("cosyvoice3_tts.h")
+#include "cosyvoice3_tts.h"
+#define CA_HAVE_COSYVOICE3 1
+#endif
 #if __has_include("indextts.h")
 #include "indextts.h"
 #define CA_HAVE_INDEXTTS 1
@@ -1026,6 +1030,9 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "chatterbox";
     else if (strcmp(arch, "voxcpm2") == 0 || strcmp(arch, "voxcpm2-tts") == 0)
         backend = "voxcpm2-tts";
+    else if (strcmp(arch, "cosyvoice3-llm") == 0 || strcmp(arch, "cosyvoice3") == 0 ||
+             strcmp(arch, "cosyvoice3-tts") == 0)
+        backend = "cosyvoice3-tts";
     else if (strcmp(arch, "indextts") == 0)
         backend = "indextts";
     else if (strcmp(arch, "m2m100") == 0)
@@ -1274,6 +1281,11 @@ struct crispasr_session {
 #ifdef CA_HAVE_VOXCPM2
     voxcpm2_context* voxcpm2_ctx = nullptr;
     std::vector<float> voxcpm2_ref_pcm; // 16 kHz mono cloning reference
+#endif
+#ifdef CA_HAVE_COSYVOICE3
+    cosyvoice3_tts_context* cosyvoice3_ctx = nullptr;
+    std::string cosyvoice3_voice;    // bank voice name OR *.wav clone path (set_voice)
+    std::string cosyvoice3_ref_text; // ref transcription for *.wav cloning
 #endif
 #ifdef CA_HAVE_INDEXTTS
     indextts_context* indextts_ctx = nullptr;
@@ -1889,6 +1901,74 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_COSYVOICE3
+    if (s->backend == "cosyvoice3-tts" || s->backend == "cosyvoice3" || s->backend == "cosyvoice3-llm") {
+        s->backend = "cosyvoice3-tts";
+        cosyvoice3_tts_context_params p = cosyvoice3_tts_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        p.flash_attn = g_open_flash_attn_tls;
+        // CV3 greedy decode (temperature 0) falls into a documented
+        // silent_tokens loop within ~5 AR steps and emits silence; the RAS
+        // sampler needs temperature > 0. Mirror the CLI's 0->0.8 default.
+        p.temperature = 0.8f;
+        s->cosyvoice3_ctx = cosyvoice3_tts_init_from_file(model_path, p);
+        if (!s->cosyvoice3_ctx) {
+            delete s;
+            return nullptr;
+        }
+        // Companion GGUFs auto-discover as siblings of the LLM (or via
+        // COSYVOICE3_*_PATH env vars). flow/hift/voices are required;
+        // s3tok+campplus are optional (enable native arbitrary-WAV cloning).
+        std::string cv3_dir = model_path;
+        {
+            auto sep = cv3_dir.find_last_of("/\\");
+            cv3_dir = (sep == std::string::npos) ? std::string(".") : cv3_dir.substr(0, sep);
+        }
+        auto cv3_exists = [](const std::string& q) {
+            FILE* f = std::fopen(q.c_str(), "rb");
+            if (f) {
+                std::fclose(f);
+                return true;
+            }
+            return false;
+        };
+        auto cv3_sib = [&](const char* env, std::initializer_list<const char*> names) -> std::string {
+            if (env) {
+                const char* e = std::getenv(env);
+                if (e && *e)
+                    return e;
+            }
+            for (const char* n : names) {
+                std::string q = cv3_dir + "/" + n;
+                if (cv3_exists(q))
+                    return q;
+            }
+            return "";
+        };
+        std::string cv3_flow = cv3_sib(
+            "COSYVOICE3_FLOW_PATH", {"cosyvoice3-flow-f16.gguf", "cosyvoice3-flow-q8_0.gguf", "cosyvoice3-flow.gguf"});
+        std::string cv3_hift = cv3_sib("COSYVOICE3_HIFT_PATH", {"cosyvoice3-hift-f16.gguf", "cosyvoice3-hift.gguf"});
+        std::string cv3_voices = cv3_sib("COSYVOICE3_VOICES_PATH", {"cosyvoice3-voices.gguf", "voices.gguf"});
+        std::string cv3_camp =
+            cv3_sib("COSYVOICE3_CAMPPLUS_PATH", {"cosyvoice3-campplus-f16.gguf", "cosyvoice3-campplus.gguf"});
+        std::string cv3_s3tok =
+            cv3_sib(nullptr, {"cosyvoice3-s3tok-f16.gguf", "cosyvoice3-s3tok-q4_k.gguf", "cosyvoice3-s3tok.gguf"});
+        if (cv3_flow.empty() || cosyvoice3_tts_init_flow_from_file(s->cosyvoice3_ctx, cv3_flow.c_str()) != 0 ||
+            cv3_hift.empty() || cosyvoice3_tts_init_hift_from_file(s->cosyvoice3_ctx, cv3_hift.c_str()) != 0 ||
+            cv3_voices.empty() || cosyvoice3_tts_init_voices_from_file(s->cosyvoice3_ctx, cv3_voices.c_str()) != 0) {
+            cosyvoice3_tts_free(s->cosyvoice3_ctx);
+            delete s;
+            return nullptr;
+        }
+        if (!cv3_camp.empty())
+            cosyvoice3_tts_init_campplus_from_file(s->cosyvoice3_ctx, cv3_camp.c_str());
+        if (!cv3_s3tok.empty())
+            cosyvoice3_tts_init_s3tok_from_file(s->cosyvoice3_ctx, cv3_s3tok.c_str());
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_INDEXTTS
     if (s->backend == "indextts" || s->backend == "indextts-1.5") {
         s->backend = "indextts";
@@ -2170,6 +2250,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_VOXCPM2
     list += ",voxcpm2-tts";
+#endif
+#ifdef CA_HAVE_COSYVOICE3
+    list += ",cosyvoice3-tts";
 #endif
 #ifdef CA_HAVE_INDEXTTS
     list += ",indextts";
@@ -4398,6 +4481,18 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
         return (tail[0] == '.' && (tail[1] == 'w' || tail[1] == 'W') && (tail[2] == 'a' || tail[2] == 'A') &&
                 (tail[3] == 'v' || tail[3] == 'V'));
     };
+#ifdef CA_HAVE_COSYVOICE3
+    if (s->cosyvoice3_ctx) {
+        // `path` is either a baked-bank voice name (e.g. "fleurs-en") or a
+        // *.wav clone reference; for a WAV, ref_text_or_null is required and
+        // is consumed at synthesize time by cosyvoice3_tts_synth_from_wav.
+        s->cosyvoice3_voice = path;
+        s->cosyvoice3_ref_text = ref_text_or_null ? ref_text_or_null : "";
+        if (ends_with_wav(path) && s->cosyvoice3_ref_text.empty())
+            return -2; // WAV cloning needs a reference transcription
+        return 0;
+    }
+#endif
 #ifdef CA_HAVE_VIBEVOICE
     if (s->vibevoice_ctx) {
         if (ends_with_wav(path)) {
@@ -4592,6 +4687,28 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
         *out_n_samples = 0;
     if (!s || !text)
         return nullptr;
+#ifdef CA_HAVE_COSYVOICE3
+    if (s->cosyvoice3_ctx) {
+        // Voice is a bank name (default zero_shot) unless set_voice supplied a
+        // *.wav path, in which case clone from it (needs cosyvoice3_ref_text).
+        // Output is already malloc'd float32 @ 24 kHz mono — the C API contract.
+        const std::string& v = s->cosyvoice3_voice;
+        const bool is_wav =
+            v.size() >= 4 && (v.compare(v.size() - 4, 4, ".wav") == 0 || v.compare(v.size() - 4, 4, ".WAV") == 0);
+        int n = 0;
+        float* pcm = is_wav ? cosyvoice3_tts_synth_from_wav(s->cosyvoice3_ctx, text, v.c_str(),
+                                                            s->cosyvoice3_ref_text.c_str(), &n)
+                            : cosyvoice3_tts_synth(s->cosyvoice3_ctx, text, v.empty() ? nullptr : v.c_str(), &n);
+        if (!pcm || n <= 0) {
+            if (pcm)
+                free(pcm);
+            return nullptr;
+        }
+        if (out_n_samples)
+            *out_n_samples = n;
+        return pcm;
+    }
+#endif
 #ifdef CA_HAVE_VIBEVOICE
     if (s->vibevoice_ctx) {
         return vibevoice_synthesize(s->vibevoice_ctx, text, out_n_samples);
@@ -4632,10 +4749,9 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
         // otherwise fall back to the zero-shot default speaker.
         int n48 = 0;
         float* pcm48 = s->voxcpm2_ref_pcm.empty()
-            ? voxcpm2_synthesize(s->voxcpm2_ctx, text, &n48)
-            : voxcpm2_synthesize_clone(s->voxcpm2_ctx, text,
-                  s->voxcpm2_ref_pcm.data(), (int)s->voxcpm2_ref_pcm.size(),
-                  &n48);
+                           ? voxcpm2_synthesize(s->voxcpm2_ctx, text, &n48)
+                           : voxcpm2_synthesize_clone(s->voxcpm2_ctx, text, s->voxcpm2_ref_pcm.data(),
+                                                      (int)s->voxcpm2_ref_pcm.size(), &n48);
         if (!pcm48 || n48 <= 0) {
             if (pcm48)
                 voxcpm2_pcm_free(pcm48);
@@ -4662,8 +4778,7 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
         // set via set_voice) is passed through; with none, indextts falls
         // back to dummy conditioning. Buffer is malloc'd / crispasr_pcm_free
         // compatible, same convention as kokoro / chatterbox.
-        const float* ref =
-            s->indextts_ref_pcm.empty() ? nullptr : s->indextts_ref_pcm.data();
+        const float* ref = s->indextts_ref_pcm.empty() ? nullptr : s->indextts_ref_pcm.data();
         const int refN = (int)s->indextts_ref_pcm.size();
         return indextts_synthesize(s->indextts_ctx, text, ref, refN, out_n_samples);
     }
@@ -4904,6 +5019,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_VOXCPM2
     if (s->voxcpm2_ctx)
         voxcpm2_free(s->voxcpm2_ctx);
+#endif
+#ifdef CA_HAVE_COSYVOICE3
+    if (s->cosyvoice3_ctx)
+        cosyvoice3_tts_free(s->cosyvoice3_ctx);
 #endif
 #ifdef CA_HAVE_INDEXTTS
     if (s->indextts_ctx)
@@ -5186,6 +5305,12 @@ CA_EXPORT int crispasr_session_set_tts_seed(crispasr_session* s, uint64_t seed) 
 #ifdef CA_HAVE_VOXCPM2
     if (s->voxcpm2_ctx) {
         voxcpm2_set_seed((voxcpm2_context*)s->voxcpm2_ctx, (uint32_t)seed);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_COSYVOICE3
+    if (s->cosyvoice3_ctx) {
+        cosyvoice3_tts_set_seed(s->cosyvoice3_ctx, seed);
         touched++;
     }
 #endif
