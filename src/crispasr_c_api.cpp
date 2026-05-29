@@ -119,6 +119,10 @@
 #include "m2m100.h"
 #define CA_HAVE_M2M100 1
 #endif
+#if __has_include("t5_translate.h")
+#include "t5_translate.h"
+#define CA_HAVE_T5_TRANSLATE 1
+#endif
 #if __has_include("orpheus.h")
 #include "orpheus.h"
 #define CA_HAVE_ORPHEUS 1
@@ -1026,6 +1030,8 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "indextts";
     else if (strcmp(arch, "m2m100") == 0)
         backend = "m2m100";
+    else if (strcmp(arch, "t5") == 0)
+        backend = "madlad";
 
     std::strncpy(out_name, backend, out_cap - 1);
     out_name[out_cap - 1] = '\0';
@@ -1275,6 +1281,9 @@ struct crispasr_session {
 #endif
 #ifdef CA_HAVE_M2M100
     m2m100_context* m2m100_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_T5_TRANSLATE
+    t5_translate_context* t5_translate_ctx = nullptr;
 #endif
 #ifdef CA_HAVE_MIMO_ASR
     mimo_asr_context* mimo_asr_ctx = nullptr;
@@ -1920,6 +1929,25 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_T5_TRANSLATE
+    if (s->backend == "madlad" || s->backend == "t5") {
+        // MADLAD-400 (google/madlad400-3b-mt) is a T5 translator — GGUFs
+        // carry arch="t5". Target language is selected via a "<2xx> " tag
+        // prepended to the source at translate time (see
+        // crispasr_session_translate_text).
+        s->backend = "madlad";
+        t5_translate_context_params p = t5_translate_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->t5_translate_ctx = t5_translate_init_from_file(model_path, p);
+        if (!s->t5_translate_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_MIMO_ASR
     if (s->backend == "mimo-asr" || s->backend == "mimo_asr" || s->backend == "mimo") {
         s->backend = "mimo-asr";
@@ -2151,6 +2179,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
     // support) — advertise it so CrisperWeaver's strict front-door check
     // accepts ModelDefinitions tagged backend='m2m100-wmt21'.
     list += ",m2m100,m2m100-wmt21";
+#endif
+#ifdef CA_HAVE_T5_TRANSLATE
+    list += ",madlad";
 #endif
 #ifdef CA_HAVE_MIMO_ASR
     list += ",mimo-asr";
@@ -4660,6 +4691,23 @@ CA_EXPORT char* crispasr_session_translate_text(crispasr_session* s, const char*
     if (s->m2m100_ctx)
         return m2m100_translate(s->m2m100_ctx, text, src_lang, tgt_lang, max_tokens > 0 ? max_tokens : 200);
 #endif
+#ifdef CA_HAVE_T5_TRANSLATE
+    if (s->t5_translate_ctx) {
+        // MADLAD-400 picks the target language from a "<2xx> " tag
+        // prepended to the source (t5_translate expects the caller to do
+        // this; src_lang is unused — the encoder is language-agnostic).
+        // Guard with t5_has_token so a plain flan-t5/mT5 GGUF, whose vocab
+        // lacks the tag, isn't fed a garbage [▁,<unk>] prefix.
+        std::string in = text;
+        if (tgt_lang && tgt_lang[0]) {
+            std::string tag = std::string("<2") + tgt_lang + ">";
+            if (t5_has_token(s->t5_translate_ctx, tag.c_str()))
+                in = tag + " " + in;
+        }
+        (void)src_lang;
+        return t5_translate(s->t5_translate_ctx, in.c_str(), max_tokens > 0 ? max_tokens : 200);
+    }
+#endif
     (void)max_tokens;
     return nullptr;
 }
@@ -4864,6 +4912,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_M2M100
     if (s->m2m100_ctx)
         m2m100_free(s->m2m100_ctx);
+#endif
+#ifdef CA_HAVE_T5_TRANSLATE
+    if (s->t5_translate_ctx)
+        t5_translate_free(s->t5_translate_ctx);
 #endif
 #ifdef CA_HAVE_MIMO_ASR
     if (s->mimo_asr_ctx)
