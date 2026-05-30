@@ -101,6 +101,12 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     // small to bother quantising (42 MB F16) — the tool will still run on
     // it but the gains are negligible.
     const bool is_cosyvoice3 = (arch.find("cosyvoice3") != std::string::npos);
+    // F5-TTS: DiT flow-matching with 32-step Euler ODE. The conditioning
+    // pathway (AdaLN modulation, timestep MLP, input/output projections,
+    // conv-pos embeddings) must stay at F16 — quantization noise compounds
+    // through 22 layers × 32 steps × 2 (CFG) = 1408 forward passes.
+    // Bulk weight matrices (QKV, FFN, text encoder, Vocos) can be quantized.
+    const bool is_f5tts = (arch.find("f5-tts") != std::string::npos || arch.find("f5tts") != std::string::npos);
     // The granite-speech 4.1 family ("granite_speech" base + plus, "granite_nle"
     // for the non-autoregressive variant) all share the same 16-layer Conformer
     // encoder + Q-Former projector + Granite-1B LLM, so the same quantization
@@ -268,6 +274,15 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
               (sname == "cosyvoice3.speech_embd.weight" || sname == "cosyvoice3.speech_lm_head.weight" ||
                sname == "cosyvoice3.flow.input_embd.w" || sname == "cosyvoice3.flow.spk_affine.w" ||
                sname == "cosyvoice3.s3tok.fsq.proj.w")) &&
+            // F5-TTS: skip quantization entirely. The 32-step iterative
+            // ODE (22 layers × 32 steps × 2 CFG = 1408 forward passes)
+            // compounds any quantization noise catastrophically — even
+            // Q8_0 with conditioning at F32 produces unintelligible output.
+            // F16 is the minimum viable precision. The DiT weights are 95%
+            // of parameters so there's no meaningful savings from quantizing
+            // just the text encoder / Vocos. See handover-prompts/f5-tts-*
+            // for the full analysis.
+            !is_f5tts &&
             // Skip OmniASR-CTC encoder layers in head/tail bands.
             // Names look like "enc.<idx>.attn.*" / "enc.<idx>.ffn.*";
             // skip if idx in [0, head_cutoff) ∪ [tail_cutoff, n_enc).
