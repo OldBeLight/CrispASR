@@ -215,6 +215,11 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # model_dir = FunAudioLLM/Fun-CosyVoice3-0.5B-2512 HF snapshot.
     # Audio arg is unused (the per-block test vector is seeded random).
     "cosyvoice3-tts": "reference_backends.cosyvoice3_tts",
+    # F5-TTS v1 Base: DiT-based flow-matching TTS with Vocos vocoder.
+    # model_dir = /mnt/storage/f5-tts (containing F5TTS_v1_Base/ + vocos/).
+    # Audio arg is a reference voice WAV for cloning (16 kHz); synth text
+    # from F5_TTS_SYN_TEXT env var (default "Hello world.").
+    "f5-tts":     "reference_backends.f5_tts",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import
@@ -427,6 +432,8 @@ def main() -> None:
     for env_key in ("QWEN3_TTS_SYN_TEXT", "QWEN3_TTS_REF_TEXT", "QWEN3_TTS_LANG", "QWEN3_TTS_VOICE",
                     "KOKORO_PHONEMES", "KOKORO_VOICE", "KOKORO_SEED", "CHATTERBOX_SYN_TEXT",
                     "VOXCPM2_SYN_TEXT", "VOXCPM2_USE_REF",
+                    "F5_TTS_SYN_TEXT", "F5_TTS_REF_TEXT", "F5_TTS_SEED",
+                    "F5_TTS_STEPS", "F5_TTS_CFG", "F5_TTS_SWAY",
                     "LID_TEXT", "CLD3_TEXT"):
         val = os.environ.get(env_key)
         if val is not None:

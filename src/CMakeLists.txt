@@ -1010,6 +1010,17 @@ if(NOT CRISPASR_WITH_ESPEAK_NG STREQUAL "OFF")
 endif()
 
 # ---------------------------------------------------------------------------
+# f5-tts — SWivid/F5-TTS DiT-based flow matching TTS (native ggml runtime)
+# ---------------------------------------------------------------------------
+add_library(f5-tts STATIC f5_tts.h f5_tts.cpp)
+set_target_properties(f5-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(f5-tts PUBLIC .)
+target_compile_features   (f5-tts PUBLIC cxx_std_17)
+target_link_libraries     (f5-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(f5-tts PRIVATE -O3)
+endif()
+
 # piper-tts — rhasspy/piper VITS TTS (native ggml runtime)
 # ---------------------------------------------------------------------------
 add_library(piper-tts STATIC piper_tts.h piper_tts.cpp)
@@ -1384,6 +1395,9 @@ if (TARGET cosyvoice3_tts)
 endif()
 if (TARGET kokoro)
     target_link_libraries(crispasr PUBLIC kokoro)
+endif()
+if (TARGET f5-tts)
+    target_link_libraries(crispasr PUBLIC f5-tts)
 endif()
 if (TARGET piper-tts)
     target_link_libraries(crispasr PUBLIC piper-tts)

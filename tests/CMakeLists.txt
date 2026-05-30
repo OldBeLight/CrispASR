@@ -942,6 +942,15 @@ set_tests_properties(benchmark-quick PROPERTIES
     LABELS "benchmark"
     TIMEOUT 600)
 
+# --- test-f5-tts --- standalone F5-TTS DiT+Vocos smoke test
+add_executable(test-f5-tts test-f5-tts.cpp)
+target_include_directories(test-f5-tts PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-f5-tts PRIVATE f5-tts)
+
 # ─── test-piper-tts — standalone Piper VITS TTS smoke test ─────────────────
 add_executable(test-piper-tts test-piper-tts.cpp)
 target_include_directories(test-piper-tts PRIVATE
