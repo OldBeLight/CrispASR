@@ -416,10 +416,17 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
         }
     }
 
-    // Write real metadata
+    // Write real metadata. Re-compute meta_size because gguf_set_tensor_type
+    // may have changed tensor type fields, altering the serialized metadata size.
+    const size_t meta_size_final = gguf_get_meta_size(ctx_out);
+    if (meta_size_final != meta_size) {
+        fprintf(stderr, "warning: metadata size changed %zu -> %zu during quantization, "
+                        "output may be corrupt\n", meta_size, meta_size_final);
+    }
+    meta_data.resize(meta_size_final, 0);
     rewind(fout);
     gguf_get_meta_data(ctx_out, meta_data.data());
-    fwrite(meta_data.data(), 1, meta_size, fout);
+    fwrite(meta_data.data(), 1, meta_size_final, fout);
 
     fclose(fin);
     fclose(fout);

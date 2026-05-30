@@ -472,10 +472,11 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/indextts-1.5-GGUF/resolve/main/indextts-bigvgan.gguf"},
     // OuteTTS 0.3 1B: OLMo-1B LLM + WavTokenizer single-codebook VQ-GAN.
     // 24 kHz output, CC BY 4.0 license. Voice cloning via --voice <speaker.json>.
-    // Two-file setup: OLMo talker (F16, ~2.4 GB) + WavTokenizer decoder (~130 MB).
-    {"outetts", "outetts-0.3-1b-f16.gguf",
-     "https://huggingface.co/cstr/outetts-0.3-1b-GGUF/resolve/main/outetts-0.3-1b-f16.gguf",
-     "~2380 MB",
+    // Two-file setup: OLMo talker (Q8_0, ~1.3 GB) + WavTokenizer decoder (~130 MB).
+    // Also available: F16 (~2.4 GB), Q5_K (~820 MB). Q8_0 recommended.
+    {"outetts", "outetts-0.3-1b-q8_0.gguf",
+     "https://huggingface.co/cstr/outetts-0.3-1b-GGUF/resolve/main/outetts-0.3-1b-q8_0.gguf",
+     "~1270 MB",
      "wavtokenizer-decoder-f16.gguf",
      "https://huggingface.co/cstr/outetts-0.3-1b-GGUF/resolve/main/wavtokenizer-decoder-f16.gguf"},
     // F5-TTS v1 Base: DiT-based flow-matching TTS with zero-shot voice

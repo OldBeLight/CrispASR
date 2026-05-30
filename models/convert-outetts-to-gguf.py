@@ -47,6 +47,7 @@ from pathlib import Path
 import numpy as np
 
 try:
+    import gguf
     from gguf import GGUFWriter, GGMLQuantizationType
 except ImportError:
     sys.exit("pip install gguf")
@@ -195,7 +196,7 @@ def main():
     ap.add_argument("--input", required=True,
                     help="HF model ID (e.g. OuteAI/OuteTTS-0.3-1B) or local dir")
     ap.add_argument("--output", required=True, help="Output GGUF path")
-    ap.add_argument("--outtype", default="f16", choices=["f32", "f16"])
+    ap.add_argument("--outtype", default="f16", choices=["f32", "f16", "q8_0", "q4_k"])
     args = ap.parse_args()
 
     model_dir = load_model_dir(args.input)
@@ -230,8 +231,13 @@ def main():
               "audio_start_token", "audio_end_token", "space_token"]:
         print(f"  {k}: {specials.get(k, '?')}")
 
-    out_dtype = np.float16 if args.outtype == "f16" else np.float32
-    out_qt = GGMLQuantizationType.F16 if args.outtype == "f16" else GGMLQuantizationType.F32
+    quant_map = {
+        "f32": (np.float32, GGMLQuantizationType.F32, None),
+        "f16": (np.float16, GGMLQuantizationType.F16, None),
+        "q8_0": (np.float32, GGMLQuantizationType.F16, GGMLQuantizationType.Q8_0),
+        "q4_k": (np.float32, GGMLQuantizationType.F16, GGMLQuantizationType.Q4_K),
+    }
+    out_dtype, out_qt, quant_type = quant_map[args.outtype]
 
     st_files = sorted(model_dir.glob("*.safetensors"))
     if not st_files:
@@ -336,6 +342,15 @@ def main():
         if t.ndim <= 1:
             t = np.ascontiguousarray(t.astype(np.float32))
             w.add_tensor(gn, t, raw_dtype=GGMLQuantizationType.F32)
+        elif quant_type is not None:
+            t = np.ascontiguousarray(t.astype(np.float32))
+            try:
+                tq = gguf.quantize(t, quant_type)
+                w.add_tensor(gn, tq, raw_dtype=quant_type)
+            except Exception as e:
+                print(f"  [WARN] {gn}: quantize failed ({e}), keeping F16", file=sys.stderr)
+                t = np.ascontiguousarray(t.astype(np.float16))
+                w.add_tensor(gn, t, raw_dtype=GGMLQuantizationType.F16)
         else:
             t = np.ascontiguousarray(t.astype(out_dtype))
             w.add_tensor(gn, t, raw_dtype=out_qt)
