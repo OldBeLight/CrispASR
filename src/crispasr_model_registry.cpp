@@ -482,9 +482,9 @@ constexpr Entry k_registry[] = {
     // cloning. Single GGUF containing DiT (330M) + Vocos vocoder (13M).
     // Character-level tokenization (2545 vocab), 24 kHz output.
     // Voice cloning via --voice <ref.wav> --ref-text "transcript".
-    {"f5-tts", "f5-tts-v1-base-f16.gguf",
-     "https://huggingface.co/cstr/f5-tts-GGUF/resolve/main/f5-tts-v1-base-f16.gguf",
-     "~1337 MB", nullptr, nullptr},
+    {"f5-tts", "f5-tts-v1-base-q8_0.gguf",
+     "https://huggingface.co/cstr/f5-tts-GGUF/resolve/main/f5-tts-v1-base-q8_0.gguf",
+     "~371 MB", nullptr, nullptr},
     // CTC forced aligner — used by `-am auto` to attach word-level
     // timestamps (LLM-decode backends, or any backend when paired
     // with `--force-aligner` / `-fa`). Q4_K is the recommended quant
