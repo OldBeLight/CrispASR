@@ -216,17 +216,17 @@ static void dump_stage(const f5_tts_context* ctx, const char* label, const float
 
 // ── Mini graph helper ────────────────────────────────────────────
 
-struct mini_graph {
+struct f5_mini_graph {
     ggml_context* ctx = nullptr;
     ggml_gallocr_t alloc = nullptr;
     ggml_backend_t backend = nullptr;
 
-    mini_graph(ggml_backend_t be, size_t ctx_size = 32 * 1024 * 1024) : backend(be) {
+    f5_mini_graph(ggml_backend_t be, size_t ctx_size = 32 * 1024 * 1024) : backend(be) {
         struct ggml_init_params params = {ctx_size, nullptr, true};
         ctx = ggml_init(params);
         alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
     }
-    ~mini_graph() {
+    ~f5_mini_graph() {
         if (alloc)
             ggml_gallocr_free(alloc);
         if (ctx)
@@ -330,7 +330,7 @@ static std::vector<float> compute_time_embed(f5_tts_context* ctx, float t_val) {
     }
 
     // MLP: Linear(256→1024) → SiLU → Linear(1024→1024)
-    mini_graph mg(ctx->backend);
+    f5_mini_graph mg(ctx->backend);
     ggml_tensor* inp = ggml_new_tensor_1d(mg.ctx, GGML_TYPE_F32, freq_dim);
     ggml_set_name(inp, "time_sinus");
     ggml_set_input(inp);
@@ -895,7 +895,7 @@ static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, 
 
         // ── Unified ggml graph: AdaLN + QKV + RoPE + Attention + O-proj + FFN ──
         {
-            mini_graph mg(ctx->backend, 128 * 1024 * 1024);
+            f5_mini_graph mg(ctx->backend, 128 * 1024 * 1024);
 
             ggml_tensor* x_in = ggml_new_tensor_2d(mg.ctx, GGML_TYPE_F32, dim, T);
             ggml_set_name(x_in, "blk_in");
@@ -1015,7 +1015,7 @@ static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, 
 
     // ── Final AdaLN + projection ──
     {
-        mini_graph mg(ctx->backend);
+        f5_mini_graph mg(ctx->backend);
         ggml_tensor* x_in = ggml_new_tensor_2d(mg.ctx, GGML_TYPE_F32, dim, T);
         ggml_set_name(x_in, "final_in");
         ggml_set_input(x_in);
