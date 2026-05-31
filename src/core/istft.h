@@ -6,6 +6,22 @@
 //   kokoro.cpp          — Kokoro iSTFTNet   (n_fft=20,   hop=5)
 //   cosyvoice3_tts.cpp  — CosyVoice3 HiFT  (n_fft=16,   hop=4)
 //
+// ---------------------------------------------------------------------------
+// Per-source adoption verdict (audited 2026-05-31):
+//
+//   outetts_wavtok.cpp — FAITHFUL. Defaults match (trim=TRIM_SAME,
+//                        clamp=1.0, win_eps=1e-8, zero_below_eps=false).
+//   kokoro.cpp         — FAITHFUL-WITH-CONFIG. Pass win_eps=1e-11f and
+//                        zero_below_eps=true (kokoro writes 0.0 for
+//                        below-eps window-sum positions instead of the
+//                        un-normalized value).
+//   cosyvoice3_tts.cpp — DIVERGENT, do NOT adopt as-is. CosyVoice3 HiFT
+//                        uses a different output-length contract
+//                        (T_mel*480), front-only trimming, and transposed
+//                        channel-major input. This header does NOT serve
+//                        it without restructuring; listed above only for
+//                        the n_fft/hop reference.
+//
 // Future consumers: Zonos, SpeechT5, any Vocos/HiFi-GAN variant.
 //
 // All three follow the same pattern:
@@ -97,10 +113,17 @@ static inline void hann_periodic(int N, float* out) {
 //                 the trimmed length.
 //   clamp       — if > 0, clamp output samples to [-clamp, +clamp].
 //                 Pass 0 or negative to skip clamping.
+//   win_eps     — window-sum threshold below which a sample is NOT
+//                 normalized (avoids divide-by-tiny). Default 1e-8f
+//                 (faithful to outetts_wavtok). Kokoro uses 1e-11f.
+//   zero_below_eps — if true, write 0.0 for positions whose window-sum is
+//                    <= win_eps (kokoro behavior). If false (default,
+//                    outetts), leave the un-normalized accumulated value.
 //
 // Returns a vector of PCM samples.
 static inline std::vector<float> istft(const float* mag, const float* phase, int n_fft, int hop, int T_frames,
-                                       const float* window = nullptr, TrimMode trim = TRIM_CENTER, float clamp = 0.0f) {
+                                       const float* window = nullptr, TrimMode trim = TRIM_CENTER, float clamp = 0.0f,
+                                       float win_eps = 1e-8f, bool zero_below_eps = false) {
     const int n_freq = n_fft / 2 + 1;
     const int ola_len = (T_frames - 1) * hop + n_fft;
 
@@ -143,10 +166,13 @@ static inline std::vector<float> istft(const float* mag, const float* phase, int
     }
 
     // Normalize by squared-window sum (COLA reconstruction).
-    const float eps = 1e-8f;
     for (int i = 0; i < ola_len; i++) {
-        if (win_sum[i] > eps) {
+        if (win_sum[i] > win_eps) {
             output[i] /= win_sum[i];
+        } else if (zero_below_eps) {
+            // Kokoro writes 0.0 for below-eps positions instead of
+            // leaving the un-normalized accumulated value.
+            output[i] = 0.0f;
         }
     }
 
@@ -194,8 +220,9 @@ static inline std::vector<float> istft(const float* mag, const float* phase, int
 // The caller must free() the returned pointer.
 // Returns nullptr on failure; *out_n is set to the number of samples.
 static inline float* istft_alloc(const float* mag, const float* phase, int n_fft, int hop, int T_frames,
-                                 const float* window, TrimMode trim, float clamp_val, int* out_n) {
-    std::vector<float> pcm = istft(mag, phase, n_fft, hop, T_frames, window, trim, clamp_val);
+                                 const float* window, TrimMode trim, float clamp_val, int* out_n,
+                                 float win_eps = 1e-8f, bool zero_below_eps = false) {
+    std::vector<float> pcm = istft(mag, phase, n_fft, hop, T_frames, window, trim, clamp_val, win_eps, zero_below_eps);
     if (pcm.empty()) {
         if (out_n) {
             *out_n = 0;

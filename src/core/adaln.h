@@ -6,6 +6,23 @@
 //   f5_tts.cpp          — F5-TTS DiT blocks (22 layers + final AdaLN)
 //   cosyvoice3_tts.cpp  — CosyVoice3 flow DiT blocks (same architecture)
 //
+// ---------------------------------------------------------------------------
+// Per-source adoption verdict (audited 2026-05-31):
+//
+//   f5_tts.cpp                        — FAITHFUL. modulate6/modulate2 bake
+//                                       silu(t_emb) internally, matching F5.
+//   cosyvoice3_tts.cpp (DEBUG path)   — FAITHFUL. Same internal-silu form.
+//   cosyvoice3_tts.cpp (PRODUCTION,   — FAITHFUL-WITH-CONFIG. The
+//     cv3_dit_block_apply :2778+)       production path pre-computes
+//                                       silu(t_emb) ONCE upstream and passes
+//                                       it in. Use the *_presilu variants
+//                                       (modulate6_presilu / modulate2_presilu)
+//                                       to AVOID a double-silu.
+//   voxcpm2                           — DIVERGENT, do NOT adopt. voxcpm2 uses
+//                                       RMSNorm + ungated residual, NOT
+//                                       AdaLN-Zero. It is not a consumer of
+//                                       this header.
+//
 // Future consumers: Zonos.
 //
 // The AdaLN-Zero pattern (Peebles & Xie, "Scalable Diffusion Models
@@ -54,16 +71,21 @@ struct Modulation6 {
 
 // Compute the 6-way modulation from a time embedding.
 //
-//   t_emb    — (dim,) time/noise-level embedding.
-//   adaln_w  — (dim, 6*dim) linear weight.
-//   adaln_b  — (6*dim,) linear bias (may be nullptr for bias-free).
+//   t_emb     — (dim,) time/noise-level embedding.
+//   adaln_w   — (dim, 6*dim) linear weight.
+//   adaln_b   — (6*dim,) linear bias (may be nullptr for bias-free).
+//   apply_silu — if true (default), apply silu(t_emb) internally
+//                (f5_tts / cosyvoice3 DEBUG path). Pass false when the
+//                caller has ALREADY applied silu upstream (cosyvoice3
+//                PRODUCTION path) to avoid a double-silu.
 //
 // Returns 6 tensors of shape (dim,) each.
-static inline Modulation6 modulate6(ggml_context* ctx, ggml_tensor* t_emb, ggml_tensor* adaln_w, ggml_tensor* adaln_b) {
+static inline Modulation6 modulate6(ggml_context* ctx, ggml_tensor* t_emb, ggml_tensor* adaln_w, ggml_tensor* adaln_b,
+                                    bool apply_silu = true) {
     const int dim = (int)t_emb->ne[0];
     const size_t fs = sizeof(float);
 
-    ggml_tensor* emb = ggml_silu(ctx, t_emb);
+    ggml_tensor* emb = apply_silu ? ggml_silu(ctx, t_emb) : t_emb;
     emb = ggml_mul_mat(ctx, adaln_w, emb);
     if (adaln_b) {
         emb = ggml_add(ctx, emb, adaln_b);
@@ -115,19 +137,23 @@ struct Modulation2 {
 
 // Compute the 2-way modulation for AdaLN-Final.
 //
-//   t_emb    — (dim,) time embedding.
-//   adaln_w  — (dim, 2*dim) linear weight.
-//   adaln_b  — (2*dim,) linear bias (may be nullptr).
+//   t_emb     — (dim,) time embedding.
+//   adaln_w   — (dim, 2*dim) linear weight.
+//   adaln_b   — (2*dim,) linear bias (may be nullptr).
+//   apply_silu — if true (default), apply silu(t_emb) internally. Pass
+//                false when the caller already applied silu upstream
+//                (cosyvoice3 PRODUCTION path) to avoid a double-silu.
 //
 // Note: F5-TTS uses chunk order (scale, shift) for AdaLN-Final,
 // while CosyVoice3 also uses (scale, shift). This matches both.
 // If a future model uses (shift, scale), the caller can swap the
 // returned fields.
-static inline Modulation2 modulate2(ggml_context* ctx, ggml_tensor* t_emb, ggml_tensor* adaln_w, ggml_tensor* adaln_b) {
+static inline Modulation2 modulate2(ggml_context* ctx, ggml_tensor* t_emb, ggml_tensor* adaln_w, ggml_tensor* adaln_b,
+                                    bool apply_silu = true) {
     const int dim = (int)t_emb->ne[0];
     const size_t fs = sizeof(float);
 
-    ggml_tensor* emb = ggml_silu(ctx, t_emb);
+    ggml_tensor* emb = apply_silu ? ggml_silu(ctx, t_emb) : t_emb;
     emb = ggml_mul_mat(ctx, adaln_w, emb);
     if (adaln_b) {
         emb = ggml_add(ctx, emb, adaln_b);

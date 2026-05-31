@@ -24,10 +24,29 @@
 // backend because the buffer strategy differs (T5 uses per-layer
 // separate tensors, Moonshine uses a shared KV context with both
 // self and cross slots).
+//
+// ---------------------------------------------------------------------------
+// Per-source adoption verdict (audited 2026-05-31):
+//
+//   moonshine_streaming.cpp — FAITHFUL via cross_attn_step (flash path).
+//                             Standard 1/sqrt(head_dim) scale, GQA-free.
+//   t5_translate.cpp        — FAITHFUL-WITH-CONFIG via cross_attn_step_manual:
+//                               * pass apply_scale=false (T5 folds the
+//                                 attention scale into the weights — NO
+//                                 ggml_scale; see t5_translate.cpp:823-825).
+//                               * use_rms=true (T5 RMSNorm pre-norm).
+//                               * rel_bias=nullptr (T5 cross-attn has no
+//                                 position bias).
+//                             The V-multiply uses the transpose-V
+//                             formulation (cont(transpose(cross_V)) then
+//                             mul_mat) matching t5_translate.cpp:827-828.
+// ---------------------------------------------------------------------------
 
 #pragma once
 
 #include "ggml.h"
+
+#include <cmath>   // std::sqrt
 
 namespace core_cross_attn {
 
@@ -142,11 +161,15 @@ static inline ggml_tensor* cross_attn_step(ggml_context* ctx, ggml_tensor* dec_h
 //   - No mask support (cross-attention is always unmasked).
 //   - rel_bias: optional (n_heads, T_dec, T_enc) relative position bias
 //     added to QK^T before softmax. Pass nullptr to skip.
+//   - apply_scale: if true, scale QK^T by 1/sqrt(head_dim). DEFAULT false
+//     because the T5 source (t5_translate.cpp:823-825) applies NO scale —
+//     the attention scale is folded into the T5 projection weights.
+//     Set true for backends that need the explicit softmax temperature.
 static inline ggml_tensor* cross_attn_step_manual(ggml_context* ctx, ggml_tensor* dec_hidden, ggml_tensor* norm_w,
                                                   ggml_tensor* q_proj, ggml_tensor* o_proj, ggml_tensor* cross_K,
                                                   ggml_tensor* cross_V, int head_dim, int n_heads, int n_kv_heads,
                                                   int T_dec, int T_enc, float norm_eps = 1e-5f, bool use_rms = true,
-                                                  ggml_tensor* rel_bias = nullptr) {
+                                                  ggml_tensor* rel_bias = nullptr, bool apply_scale = false) {
     ggml_tensor* cur = dec_hidden;
 
     // Optional pre-norm.
@@ -168,9 +191,12 @@ static inline ggml_tensor* cross_attn_step_manual(ggml_context* ctx, ggml_tensor
     ggml_tensor* qk = ggml_mul_mat(ctx, cross_K, Q);
     ggml_mul_mat_set_prec(qk, GGML_PREC_F32);
 
-    // Scale.
-    float scale = 1.0f / std::sqrt((float)head_dim);
-    qk = ggml_scale(ctx, qk, scale);
+    // Scale — OFF by default (T5 folds the scale into its weights; see
+    // t5_translate.cpp:823-825, which has no ggml_scale here).
+    if (apply_scale) {
+        float scale = 1.0f / std::sqrt((float)head_dim);
+        qk = ggml_scale(ctx, qk, scale);
+    }
 
     // Optional relative position bias.
     if (rel_bias) {
@@ -178,13 +204,15 @@ static inline ggml_tensor* cross_attn_step_manual(ggml_context* ctx, ggml_tensor
     }
 
     // Softmax over the K dimension (ne[0] = T_enc).
-    qk = ggml_soft_max(ctx, qk);
+    qk = ggml_soft_max(ctx, qk); // (T_enc, T_dec, n_heads)
 
-    // QKV: softmax(QK^T) @ V^T → (head_dim, T_dec, n_heads)
-    // cross_V is (head_dim, T_enc, n_kv_heads). ggml_mul_mat treats ne[1]
-    // as the contracting dimension, so we need V transposed: we pass V
-    // directly since ggml_mul_mat(A, B) = A^T @ B when shapes align.
-    ggml_tensor* kqv = ggml_mul_mat(ctx, cross_V, ggml_cont(ctx, ggml_transpose(ctx, qk)));
+    // QKV: softmax(QK^T) @ V → (head_dim, T_dec, n_heads).
+    // cross_V is (head_dim, T_enc, n_kv_heads). Transpose V to
+    // (T_enc, head_dim, n_heads) so ggml_mul_mat contracts the T_enc axis
+    // against qk's ne[0]=T_enc. This matches t5_translate.cpp:827-828
+    // (cv_t = cont(transpose(CV)); ca_kqv = mul_mat(cv_t, ca_kq)).
+    ggml_tensor* cv_t = ggml_cont(ctx, ggml_transpose(ctx, cross_V));
+    ggml_tensor* kqv = ggml_mul_mat(ctx, cv_t, qk);
 
     // Reshape: (head_dim, T_dec, n_heads) → permute to (head_dim, n_heads, T_dec)
     //        → reshape to (n_heads * head_dim, T_dec).

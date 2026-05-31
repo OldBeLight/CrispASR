@@ -37,8 +37,28 @@
 //   - Providing the activation function (since it varies by codec).
 //   - Managing the ggml context, backend, and compute lifecycle.
 
+// ---------------------------------------------------------------------------
+// Per-source adoption verdict (audited 2026-05-31):
+//
+//   SNAC (orpheus_snac.cpp)  — FAITHFUL target. This is the reference
+//                              architecture; the (C,T) layout and crop
+//                              convention match. NOTE: the actual SNAC
+//                              backend has NOT yet been wired to this
+//                              header (dead code), but the ops match.
+//   EnCodec / DAC / Mimi      — FUTURE. Architecturally compatible via
+//                              Config, but unverified — treat as
+//                              FAITHFUL-WITH-CONFIG-pending-audit until a
+//                              real backend diff confirms.
+//
+// ConvTranspose1d cropping is delegated to core_convt::convt1d_crop
+// (src/core/conv.h), which is the proven Kokoro/SNAC implementation.
+// Do NOT re-implement the crop inline — the naive (C,T)↔(T,C) view is
+// easy to get wrong (it crops channels instead of time).
+// ---------------------------------------------------------------------------
+
 #pragma once
 
+#include "conv.h"
 #include "ggml.h"
 
 #include <cstddef>
@@ -181,35 +201,15 @@ static inline ggml_tensor* dw_conv1d(ggml_context* ctx, ggml_tensor* x, ggml_ten
 
 // ConvTranspose1d with symmetric cropping.
 // Weight ne=[K, Cout, Cin] (ggml ConvTranspose1d format).
-// Input (Cin, T) → output (Cout, T * stride).
+// Input (Cin, T) → output (Cout, T_out) where T_out = T*stride - crop_left - crop_right.
+//
+// Delegates to the proven core_convt::convt1d_crop (src/core/conv.h):
+// it correctly crops the TIME axis of the (T_raw, Cout) transpose output
+// (time-innermost) rather than the channel axis. The previous inline
+// re-implementation here was BROKEN — it cropped channels instead of time.
 static inline ggml_tensor* convt1d_crop(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, int stride,
                                         int crop_left, int crop_right) {
-    const int Cin = (int)x->ne[0];
-    const int T = (int)x->ne[1];
-    const int Cout = (int)w->ne[1];
-
-    // Transpose to (T, Cin) for ggml_conv_transpose_1d.
-    ggml_tensor* xt = ggml_cont(ctx, ggml_transpose(ctx, x));
-    ggml_tensor* y = ggml_conv_transpose_1d(ctx, w, xt, stride, 0, 1);
-
-    // y has shape (T_raw, Cout). Crop time dimension.
-    const int T_raw = T * stride + (int)w->ne[0] - stride;
-    const int T_out = T_raw - crop_left - crop_right;
-    if (crop_left > 0 || crop_right > 0) {
-        y = ggml_view_2d(ctx, y, Cout, T_out, y->nb[1], (size_t)crop_left * y->nb[1]);
-        y = ggml_cont(ctx, y);
-    }
-
-    // Transpose back to (Cout, T_out).
-    y = ggml_reshape_2d(ctx, y, Cout, T_out);
-    y = ggml_cont(ctx, ggml_transpose(ctx, y));
-    // Actually the ggml_conv_transpose_1d output is already (Cout, T_out) in
-    // the ne sense; but after view+cont the layout may differ. Ensure (Cout, T_out).
-    y = ggml_reshape_2d(ctx, y, Cout, T_out);
-    if (b) {
-        y = ggml_add(ctx, y, b);
-    }
-    return y;
+    return core_convt::convt1d_crop(ctx, x, w, b, stride, crop_left, crop_right);
 }
 
 // Repeat each time step `factor` times (repeat_interleave along time).

@@ -5,7 +5,21 @@
 //
 //   t5_translate.cpp  — MADLAD-400 T5 translation (tokenize_sp)
 //   indextts.cpp      — IndexTTS speech synthesis  (tokenize_bpe, misnamed)
-//   fireredpunc.cpp   — FireRedPunc punctuation    (tokenize_sp, greedy)
+//
+// ---------------------------------------------------------------------------
+// Per-source adoption verdict (audited 2026-05-31):
+//
+//   t5_translate.cpp — FAITHFUL-WITH-CONFIG. Set
+//                      cfg.merge_consecutive_unk=false and have the caller
+//                      append EOS. cfg.oov_score_default=0.0f (default).
+//   indextts.cpp     — FAITHFUL-WITH-CONFIG. Set
+//                      cfg.oov_score_default=-20.0f (indextts uses -20.0
+//                      for out-of-range token ids, not 0.0).
+//   fireredpunc.cpp  — DIVERGENT, do NOT adopt. fireredpunc.cpp:56 uses a
+//                      DIFFERENT algorithm: greedy longest-prefix WordPiece
+//                      (split on whitespace, per-word ▁ prefix, abort the
+//                      word on first unknown), NOT Viterbi unigram. This
+//                      header does NOT serve it.
 //
 // Future consumers: SpeechT5, Parler.
 //
@@ -57,6 +71,10 @@ struct Config {
     // If true, merge consecutive unknown tokens into a single <unk>.
     // Matches the standard SentencePiece behavior.
     bool merge_consecutive_unk = true;
+
+    // Score used when a found piece's token id is out of range of the
+    // scores[] array. t5_translate uses 0.0f; indextts uses -20.0f.
+    float oov_score_default = 0.0f;
 };
 
 // Tokenize a string using unigram Viterbi best-segmentation.
@@ -120,7 +138,7 @@ static inline std::vector<int32_t> tokenize(const std::string& text,
             auto it = token_to_id.find(sub);
             if (it != token_to_id.end()) {
                 int32_t tid = it->second;
-                float score = (tid >= 0 && tid < (int32_t)scores.size()) ? scores[tid] : 0.0f;
+                float score = (tid >= 0 && tid < (int32_t)scores.size()) ? scores[tid] : cfg.oov_score_default;
                 float cand = dp[i] + score;
                 if (cand > dp[j]) {
                     dp[j] = cand;
