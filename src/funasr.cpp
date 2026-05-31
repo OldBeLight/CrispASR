@@ -1059,6 +1059,17 @@ static ggml_cgraph* funasr_build_graph_llm_kv_impl(funasr_context* ctx, int n_pa
         x = ggml_mul(ctx0, x, b.ffn_norm_w);
         ggml_tensor* mlp = core_ffn::swiglu(ctx0, x, b.ffn_gate_w, b.ffn_up_w, b.ffn_down_w);
         cur = ggml_add(ctx0, residual, mlp);
+
+        // LLM layer snap for FUNASR_DUMP_STAGES — only a few layers to
+        // keep graph overhead low. Named "llm_layer_N" so the post-compute
+        // dump loop can read them back.
+        if (il == 0 || il == hp.llm_n_layers / 2 || il == hp.llm_n_layers - 1) {
+            char nm[32];
+            std::snprintf(nm, sizeof(nm), "llm_layer_%u", il);
+            ggml_tensor* s = ggml_dup(ctx0, cur);
+            ggml_set_name(s, nm);
+            ggml_build_forward_expand(gf, s);
+        }
     }
 
     cur = ggml_rms_norm(ctx0, cur, eps);
@@ -1310,6 +1321,56 @@ static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* 
         std::fprintf(stderr, "funasr: llm graph compute failed\n");
         return {};
     }
+
+    // ---- LLM layer dump (FUNASR_DUMP_STAGES=1, prefill only) ----
+    {
+        static int dump_flag = -1;
+        if (dump_flag < 0) {
+            const char* e = std::getenv("FUNASR_DUMP_STAGES");
+            dump_flag = (e && *e && *e != '0') ? 1 : 0;
+        }
+        if (dump_flag && n_tokens > 1) {
+            const char* names[] = {"llm_layer_0", "llm_layer_12", "llm_layer_23"};
+            std::fprintf(stderr, "funasr_dump: ---- LLM layer stats (n_tokens=%d, n_past=%d) ----\n", n_tokens, n_past);
+            for (const char* nm : names) {
+                ggml_tensor* t = ggml_graph_get_tensor(gf, nm);
+                if (!t) {
+                    std::fprintf(stderr, "funasr_dump: %-28s [not found]\n", nm);
+                    continue;
+                }
+                const size_t n = ggml_nelements(t);
+                std::vector<float> buf(n, 0.0f);
+                ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+                float mn = buf[0], mx = buf[0], sm = 0.0f;
+                int n_nan = 0, n_inf = 0;
+                for (size_t i = 0; i < n; i++) {
+                    float v = buf[i];
+                    if (std::isnan(v)) {
+                        n_nan++;
+                        continue;
+                    }
+                    if (std::isinf(v)) {
+                        n_inf++;
+                        continue;
+                    }
+                    if (v < mn)
+                        mn = v;
+                    if (v > mx)
+                        mx = v;
+                    sm += v;
+                }
+                float mean = (n > 0) ? sm / (float)n : 0.0f;
+                std::fprintf(stderr,
+                             "funasr_dump: %-28s n=%-8zu min=%12.6f max=%12.6f mean=%12.6f nan=%d inf=%d first8=[", nm,
+                             n, mn, mx, mean, n_nan, n_inf);
+                for (size_t i = 0; i < 8 && i < n; i++)
+                    std::fprintf(stderr, "%s%.6f", i ? "," : "", buf[i]);
+                std::fprintf(stderr, "]\n");
+            }
+            std::fprintf(stderr, "funasr_dump: ---- end LLM ----\n");
+        }
+    }
+
     ggml_tensor* out = ggml_graph_get_tensor(gf, "logits");
     std::vector<float> result((size_t)vocab, 0.0f);
     ggml_backend_tensor_get(out, result.data(), 0, (size_t)vocab * sizeof(float));
