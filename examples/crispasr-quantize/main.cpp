@@ -105,7 +105,10 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     // pathway (AdaLN modulation, timestep MLP, input/output projections,
     // conv-pos embeddings) must stay at F16 — quantization noise compounds
     // through 22 layers × 32 steps × 2 (CFG) = 1408 forward passes.
-    // Bulk weight matrices (QKV, FFN, text encoder, Vocos) can be quantized.
+    // DiT bulk weight matrices (QKV, O-proj, FFN) can be quantized. Text
+    // encoder, Vocos, and the AdaLN/timestep/input/final projections are
+    // kept at original precision. Previously this backend was skipped
+    // entirely because read_tensor_f32 couldn't dequantize — that's fixed.
     const bool is_f5tts = (arch.find("f5-tts") != std::string::npos || arch.find("f5tts") != std::string::npos);
     // The granite-speech 4.1 family ("granite_speech" base + plus, "granite_nle"
     // for the non-autoregressive variant) all share the same 16-layer Conformer
@@ -276,12 +279,14 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                sname == "cosyvoice3.s3tok.fsq.proj.w")) &&
             // F5-TTS: skip quantization entirely. The 32-step iterative
             // ODE (22 layers × 32 steps × 2 CFG = 1408 forward passes)
-            // compounds any quantization noise catastrophically — even
-            // Q8_0 with conditioning at F32 produces unintelligible output.
-            // F16 is the minimum viable precision. The DiT weights are 95%
-            // of parameters so there's no meaningful savings from quantizing
-            // just the text encoder / Vocos. See handover-prompts/f5-tts-*
-            // for the full analysis.
+            // compounds quantization noise catastrophically — verified:
+            // Q4_K and Q8_0 both diverge (36s of noise instead of 1.3s
+            // "Hello world"). Even with mixed precision (only DiT attn/FFN
+            // quantized, conditioning at F16), the error accumulation is
+            // too severe. F16 is the minimum viable precision for F5-TTS.
+            // The read_tensor_f32 dequantization fix ensures robustness if
+            // a user manually creates a quantized GGUF, but the quantizer
+            // should not produce them.
             !is_f5tts &&
             // Skip OmniASR-CTC encoder layers in head/tail bands.
             // Names look like "enc.<idx>.attn.*" / "enc.<idx>.ffn.*";

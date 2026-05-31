@@ -400,15 +400,17 @@ static ggml_tensor* group_norm_channels(ggml_context* ctx, ggml_tensor* x, ggml_
     return x;
 }
 
-// ResNet block (pos_net): GroupNorm(32) -> SiLU -> Conv1d -> GroupNorm(32) -> SiLU -> Conv1d -> residual
+// ResNet block (pos_net): GroupNorm(32) -> GELU -> Conv1d -> GroupNorm(32) -> GELU -> Conv1d -> residual
 // Matches the VocosBackbone ResnetBlock (NOT HiFi-GAN ResBlock1).
+// NOTE: upstream WavTokenizer uses GELU, not SiLU. Previously this
+// used ggml_silu which subtly degraded audio quality.
 static ggml_tensor* resnet_block(ggml_context* ctx, ggml_tensor* x, const wavtok_resnet_block& rb) {
     ggml_tensor* residual = x;
     x = group_norm_channels(ctx, x, rb.norm1_w, rb.norm1_b, 32, 1e-6f);
-    x = ggml_silu(ctx, x);
+    x = ggml_gelu(ctx, x);
     x = conv1d_k(ctx, x, rb.conv1_w, rb.conv1_b, 1);
     x = group_norm_channels(ctx, x, rb.norm2_w, rb.norm2_b, 32, 1e-6f);
-    x = ggml_silu(ctx, x);
+    x = ggml_gelu(ctx, x);
     // dropout(0.1) skipped at inference
     x = conv1d_k(ctx, x, rb.conv2_w, rb.conv2_b, 1);
     return ggml_add(ctx, x, residual);

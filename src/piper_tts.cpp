@@ -497,26 +497,22 @@ struct mini_graph {
 // ── Tensor read helper (handles F16→F32 conversion) ───────────────
 
 static void read_tensor_f32(ggml_tensor* t, std::vector<float>& out) {
-    int n = (int)ggml_nelements(t);
+    const int64_t n = ggml_nelements(t);
     out.resize(n);
-    size_t nbytes = ggml_nbytes(t);
+    const size_t nbytes = ggml_nbytes(t);
     if (t->type == GGML_TYPE_F32) {
         ggml_backend_tensor_get(t, out.data(), 0, nbytes);
-    } else if (t->type == GGML_TYPE_F16) {
-        std::vector<uint8_t> raw(nbytes);
-        ggml_backend_tensor_get(t, raw.data(), 0, nbytes);
-        const ggml_fp16_t* src = (const ggml_fp16_t*)raw.data();
-        for (int i = 0; i < n; i++) {
-            out[i] = ggml_fp16_to_fp32(src[i]);
-        }
     } else {
-        // Fallback: try to dequantize
+        // F16 or quantized (Q4_K, Q8_0, etc.) — dequantize via type traits.
         std::vector<uint8_t> raw(nbytes);
         ggml_backend_tensor_get(t, raw.data(), 0, nbytes);
-        // For other quantized types, use ggml_internal_get_type_traits
-        // For now, just zero-fill
-        fprintf(stderr, "piper_tts: unsupported tensor type %d for '%s'\n", (int)t->type, t->name);
-        std::fill(out.begin(), out.end(), 0.0f);
+        const auto to_float = ggml_get_type_traits(t->type)->to_float;
+        if (to_float) {
+            to_float(raw.data(), out.data(), n);
+        } else {
+            fprintf(stderr, "piper_tts: unsupported tensor type %d for '%s'\n", (int)t->type, t->name);
+            std::fill(out.begin(), out.end(), 0.0f);
+        }
     }
 }
 
