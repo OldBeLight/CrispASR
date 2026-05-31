@@ -49,6 +49,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_bark_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_pocket_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_speecht5_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_dia_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_parler_tts_backend();
 
 #include "ggml.h"
 #include "gguf.h"
@@ -160,6 +161,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_speecht5_backend();
     if (name == "dia" || name == "dia-tts" || name == "dia-1.6b" || name == "dia_tts")
         return crispasr_make_dia_backend();
+    if (name == "parler-tts" || name == "parler_tts" || name == "parler" || name == "parlertts")
+        return crispasr_make_parler_tts_backend();
 
     fprintf(stderr, "crispasr: error: unknown backend '%s'\n", name.c_str());
     return nullptr;
@@ -227,6 +230,7 @@ std::vector<std::string> crispasr_list_backends() {
         "bark",
         "bark-tts",
         "speecht5",
+        "parler-tts",
     };
 }
 
@@ -497,6 +501,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "dia";
     if (contains_ci("dia-tts") || contains_ci("dia_tts"))
         return "dia";
+    if (contains_ci("parler") && contains_ci("tts"))
+        return "parler-tts";
     if (contains_ci("ggml-") && contains_ci(".bin"))
         return "whisper";
 
@@ -599,6 +605,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "speecht5";
             else if (a == "dia" || a == "dia-tts" || a == "dia_tts")
                 result = "dia";
+            else if (a == "parler-tts" || a == "parler_tts" || a == "parlertts")
+                result = "parler-tts";
         }
     }
     gguf_free(gctx);
