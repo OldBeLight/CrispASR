@@ -276,6 +276,8 @@ struct pocket_tts_kv_cache {
     int offset = 0; // current write position
 };
 
+} // close anonymous namespace for pocket_tts_context visibility
+
 // ── Context ────────────────────────────────────────────────────────
 
 struct pocket_tts_context {
@@ -301,6 +303,8 @@ struct pocket_tts_context {
 
     int verbosity = 1;
 };
+
+namespace { // reopen anonymous namespace for internal helpers
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -910,9 +914,10 @@ struct pocket_tts_context* pocket_tts_init_from_file(const char* path_model, str
     }
 
     // Load GGUF
+    struct ggml_context* ggml_ctx = nullptr;
     struct gguf_init_params gguf_params = {
         /* .no_alloc = */ false,
-        /* .ctx      = */ nullptr,
+        /* .ctx      = */ &ggml_ctx,
     };
 
     struct gguf_context* meta = gguf_init_from_file(path_model, gguf_params);
@@ -943,8 +948,6 @@ struct pocket_tts_context* pocket_tts_init_from_file(const char* path_model, str
     load_tokenizer(meta, ctx->model);
 
     // Load tensors from the GGML context that was allocated by gguf_init
-    struct ggml_context* ggml_ctx = gguf_params.ctx;
-
     if (!load_flow_lm_tensors(ggml_ctx, ctx->model)) {
         fprintf(stderr, "pocket_tts: failed to load FlowLM tensors\n");
         gguf_free(meta);

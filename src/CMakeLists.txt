@@ -1056,6 +1056,33 @@ target_link_libraries     (parler-tts PUBLIC crispasr-core ggml ggml-base ggml-c
 if(NOT MSVC)
     target_compile_options(parler-tts PRIVATE -O3)
 endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# bark-tts — Suno Bark TTS (native ggml runtime)
+# ---------------------------------------------------------------------------
+add_library(bark-tts STATIC bark_tts.h bark_tts.cpp)
+set_target_properties(bark-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(bark-tts PUBLIC .)
+target_compile_features   (bark-tts PUBLIC cxx_std_17)
+target_link_libraries     (bark-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(bark-tts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
+# dia-tts — Nari Labs Dia TTS (native ggml runtime)
+# ---------------------------------------------------------------------------
+add_library(dia-tts STATIC dia_tts.h dia_tts.cpp)
+set_target_properties(dia-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(dia-tts PUBLIC .)
+target_compile_features   (dia-tts PUBLIC cxx_std_17)
+target_link_libraries     (dia-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(dia-tts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # fastpitch-tts — NVIDIA FastPitch parallel TTS (native ggml runtime)
 # ---------------------------------------------------------------------------
 add_library(fastpitch-tts STATIC fastpitch_tts.h fastpitch_tts.cpp)

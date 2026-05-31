@@ -70,8 +70,8 @@ public:
 
         // Set voice description from --instruct parameter
         const char* desc = DEFAULT_DESCRIPTION;
-        if (!p.instruct_text.empty()) {
-            desc = p.instruct_text.c_str();
+        if (!p.tts_instruct.empty()) {
+            desc = p.tts_instruct.c_str();
         }
         int rc = parler_tts_set_description(ctx_, desc);
         if (rc != 0) {
@@ -91,9 +91,9 @@ public:
         parler_tts_set_seed(ctx_, params.seed);
 
         // If --instruct changed since last call, re-encode description
-        if (!params.instruct_text.empty() && params.instruct_text != last_description_) {
-            parler_tts_set_description(ctx_, params.instruct_text.c_str());
-            last_description_ = params.instruct_text;
+        if (!params.tts_instruct.empty() && params.tts_instruct != last_description_) {
+            parler_tts_set_description(ctx_, params.tts_instruct.c_str());
+            last_description_ = params.tts_instruct;
         }
 
         int n = 0;

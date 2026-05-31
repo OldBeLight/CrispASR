@@ -607,16 +607,16 @@ struct bark_context* bark_init_from_file(const char* path_model, struct bark_con
     ctx->backend = ctx->backend_cpu; // CPU-only for now
 
     // Load GGUF
-    core_gguf::LoadResult lr = core_gguf::load_gguf(path_model, ctx->backend_cpu, ctx->backend);
-    if (!lr.ok) {
+    core_gguf::WeightLoad wl;
+    if (!core_gguf::load_weights(path_model, ctx->backend, "bark", wl)) {
         fprintf(stderr, "bark: failed to load '%s'\n", path_model);
         delete ctx;
         return nullptr;
     }
 
-    ctx->ctx_w = lr.ctx_w;
-    ctx->buf_w = lr.buf_w;
-    ctx->tensors = std::move(lr.tensors);
+    ctx->ctx_w = wl.ctx;
+    ctx->buf_w = wl.buf;
+    ctx->tensors = std::move(wl.tensors);
 
     // Load metadata
     gguf_context* g = gguf_init_from_file(path_model, {/*.no_alloc=*/true, /*.ctx=*/nullptr});
@@ -646,7 +646,7 @@ struct bark_context* bark_init_from_file(const char* path_model, struct bark_con
 
     // Setup scheduler
     ggml_backend_t backends[] = {ctx->backend};
-    ctx->sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false);
+    ctx->sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, false);
 
     if (params.verbosity >= 1) {
         fprintf(stderr, "bark: loaded from '%s'\n", path_model);

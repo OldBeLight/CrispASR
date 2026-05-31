@@ -234,6 +234,8 @@ std::vector<std::string> crispasr_list_backends() {
         "bark",
         "bark-tts",
         "speecht5",
+        "dia",
+        "dia-tts",
         "parler-tts",
     };
 }

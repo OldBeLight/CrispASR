@@ -628,11 +628,11 @@ struct parler_tts_context* parler_tts_init_from_file(const char* path_model, str
     load_metadata(ctx, g);
 
     // Build tensor name map
-    int n_tensors = ggml_ctx_ntensors(ctx->ctx_w);
-    for (int i = 0; i < n_tensors; i++) {
-        ggml_tensor* t = ggml_ctx_get_tensor_by_index(ctx->ctx_w, i);
-        if (t && t->name[0])
+    int n_tensors = 0;
+    for (ggml_tensor* t = ggml_get_first_tensor(ctx->ctx_w); t; t = ggml_get_next_tensor(ctx->ctx_w, t)) {
+        if (t->name[0])
             ctx->tensors[t->name] = t;
+        n_tensors++;
     }
 
     if (params.verbosity >= 1)
@@ -646,7 +646,7 @@ struct parler_tts_context* parler_tts_init_from_file(const char* path_model, str
     ctx->backend = ctx->backend_cpu;
 
     ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
-    ctx->sched = ggml_backend_sched_new(&ctx->backend, &buft, 1, 8192, false);
+    ctx->sched = ggml_backend_sched_new(&ctx->backend, &buft, 1, 8192, false, false);
 
     gguf_free(g);
 
