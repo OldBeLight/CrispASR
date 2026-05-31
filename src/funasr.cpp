@@ -236,6 +236,11 @@ struct funasr_context {
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
+    // Separate single-backend sched for the LLM decoder. On CUDA the
+    // dual-backend [CUDA,CPU] sched produces all-NaN prefill logits
+    // (issue #125); a GPU-only sched avoids the cross-backend split.
+    // On CPU-only builds, llm_sched == sched (no separate instance).
+    ggml_backend_sched_t llm_sched = nullptr;
 
     std::vector<uint8_t> compute_meta;
 
@@ -1321,8 +1326,8 @@ static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* 
     }
 
     ggml_cgraph* gf = funasr_build_graph_llm_kv(ctx, n_past, n_tokens);
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+    ggml_backend_sched_reset(ctx->llm_sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->llm_sched, gf)) {
         std::fprintf(stderr, "funasr: failed to alloc llm graph\n");
         return {};
     }
@@ -1334,7 +1339,7 @@ static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* 
         ggml_tensor* mask_in = ggml_graph_get_tensor(gf, "causal_mask");
         ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_sched_graph_compute(ctx->llm_sched, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "funasr: llm graph compute failed\n");
         return {};
     }
@@ -1431,14 +1436,14 @@ static std::vector<float> funasr_embed_tokens(funasr_context* ctx, const std::ve
     const int n = (int)ids.size();
     const int d = (int)ctx->model.hparams.llm_d_model;
     ggml_cgraph* gf = funasr_build_graph_embed(ctx, n);
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+    ggml_backend_sched_reset(ctx->llm_sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->llm_sched, gf)) {
         std::fprintf(stderr, "funasr: failed to alloc embed graph\n");
         return {};
     }
     ggml_tensor* ids_in = ggml_graph_get_tensor(gf, "input_ids");
     ggml_backend_tensor_set(ids_in, ids.data(), 0, (size_t)n * sizeof(int32_t));
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_sched_graph_compute(ctx->llm_sched, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "funasr: embed graph compute failed\n");
         return {};
     }
@@ -1761,22 +1766,25 @@ extern "C" funasr_context* funasr_init_from_file(const char* path, funasr_contex
     }
 
     {
-        // Use only the primary backend for the scheduler. When CUDA is
-        // the primary, adding a CPU fallback backend causes the sched to
-        // split some LLM ops across GPU↔CPU boundaries, which on certain
-        // architectures (P100 sm_60, Blackwell sm_120) produces all-NaN
-        // prefill logits — the exact funasr CUDA !-loop bug (issue #125).
-        // Single-backend sched keeps everything on CUDA and matches the
-        // cached-step path (which uses ggml_backend_graph_compute directly
-        // and never exhibits the bug).
         int n_be = 0;
         ggml_backend_t backends[2];
         backends[n_be++] = ctx->backend;
-        // Keep CPU as fallback only when the primary is CPU (no-op second
-        // backend would be a waste but harmless).
-        if (ggml_backend_is_cpu(ctx->backend) && ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
+        if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
             backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+
+        // Separate GPU-only sched for the LLM decoder. On CUDA the
+        // dual-backend sched produces all-NaN prefill logits (issue #125,
+        // confirmed on P100 sm_60 + Blackwell sm_120). A single-backend
+        // sched forces every LLM op onto the GPU, matching the
+        // cached-step path which uses ggml_backend_graph_compute(backend)
+        // directly. On CPU-only builds llm_sched == sched.
+        if (!ggml_backend_is_cpu(ctx->backend)) {
+            ggml_backend_t llm_be[1] = {ctx->backend};
+            ctx->llm_sched = ggml_backend_sched_new(llm_be, nullptr, 1, 16384, false, false);
+        } else {
+            ctx->llm_sched = ctx->sched;
+        }
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 
@@ -1814,6 +1822,8 @@ extern "C" funasr_context* funasr_init_from_file(const char* path, funasr_contex
 extern "C" void funasr_free(funasr_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->llm_sched && ctx->llm_sched != ctx->sched)
+        ggml_backend_sched_free(ctx->llm_sched);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->step_galloc)

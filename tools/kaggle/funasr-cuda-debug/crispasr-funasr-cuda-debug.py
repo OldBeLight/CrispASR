@@ -288,44 +288,35 @@ stage_names_ordered = [
 
 for sname in stage_names_ordered:
     cpu_raw = r_cpu["stages"].get(sname, "")
-    cuda_fa_raw = r_cuda_fa["stages"].get(sname, "")
-    cuda_nofa_raw = r_cuda_nofa["stages"].get(sname, "")
+    cuda_raw = r_cuda_fa["stages"].get(sname, "")
 
     cpu_s = parse_stage_stats(cpu_raw)
-    cuda_fa_s = parse_stage_stats(cuda_fa_raw)
-    cuda_nofa_s = parse_stage_stats(cuda_nofa_raw)
+    cuda_s = parse_stage_stats(cuda_raw)
 
-    comp = {"cpu": cpu_s, "cuda_fa": cuda_fa_s, "cuda_nofa": cuda_nofa_s}
+    comp = {"cpu": cpu_s, "cuda": cuda_s}
     comparison[sname] = comp
 
-    # Print comparison
     print(f"\n--- {sname} ---", flush=True)
     for metric in ["min", "max", "mean", "L2", "nan", "inf"]:
         cv = cpu_s.get(metric, "?")
-        fv = cuda_fa_s.get(metric, "?")
-        nv = cuda_nofa_s.get(metric, "?")
+        fv = cuda_s.get(metric, "?")
         flag = ""
         if isinstance(cv, (int, float)) and isinstance(fv, (int, float)):
             if cv != 0 and abs(fv - cv) / max(abs(cv), 1e-10) > 0.01:
                 flag = " *** DIVERGED"
-            if isinstance(fv, float) and (fv != fv):  # NaN
+            if isinstance(fv, float) and (fv != fv):
                 flag = " *** NaN"
-        print(f"  {metric:6s}  cpu={cv!s:>14s}  cuda_fa={fv!s:>14s}  cuda_nofa={nv!s:>14s}{flag}", flush=True)
+        print(f"  {metric:6s}  cpu={cv!s:>14s}  cuda={fv!s:>14s}{flag}", flush=True)
 
-    # Compare first8 values
     cpu_f8 = cpu_s.get("first8", [])
-    cuda_fa_f8 = cuda_fa_s.get("first8", [])
-    cuda_nofa_f8 = cuda_nofa_s.get("first8", [])
-    if cpu_f8 and cuda_fa_f8:
-        max_diff = max(abs(a - b) for a, b in zip(cpu_f8, cuda_fa_f8)) if len(cpu_f8) == len(cuda_fa_f8) else float("inf")
-        print(f"  first8 max|cpu-cuda_fa| = {max_diff:.6f}", flush=True)
-    if cpu_f8 and cuda_nofa_f8:
-        max_diff = max(abs(a - b) for a, b in zip(cpu_f8, cuda_nofa_f8)) if len(cpu_f8) == len(cuda_nofa_f8) else float("inf")
-        print(f"  first8 max|cpu-cuda_nofa| = {max_diff:.6f}", flush=True)
+    cuda_f8 = cuda_s.get("first8", [])
+    if cpu_f8 and cuda_f8:
+        max_diff = max(abs(a - b) for a, b in zip(cpu_f8, cuda_f8)) if len(cpu_f8) == len(cuda_f8) else float("inf")
+        print(f"  first8 max|cpu-cuda| = {max_diff:.6f}", flush=True)
 
 # Also compare argmax for prefill_logits if present
 for sname in ["prefill_logits"]:
-    for label, r in [("cuda_fa", r_cuda_fa), ("cuda_nofa", r_cuda_nofa), ("cpu", r_cpu)]:
+    for label, r in [("cuda", r_cuda_fa), ("cpu", r_cpu)]:
         raw = r["stages"].get(sname, "")
         m = re.search(r"argmax=(\d+)", raw)
         if m:
@@ -357,16 +348,15 @@ for r in results:
     print(f"  {r['label']:20s} -> {status}: {r['transcript'][:80]!r}", flush=True)
 print("=" * 60, flush=True)
 
-# Determine if FA is the culprit
-if r_cuda_fa["degenerated"] and not r_cuda_nofa["degenerated"]:
-    print("\nCONCLUSION: Flash-attention (ggml_flash_attn_ext) is the CUDA culprit.", flush=True)
-    print("Fix: disable FA on CUDA for funasr encoder, or fix the FA CUDA kernel.", flush=True)
-elif r_cuda_fa["degenerated"] and r_cuda_nofa["degenerated"]:
-    print("\nCONCLUSION: Bug persists with FA off. Flash-attention is NOT the sole cause.", flush=True)
-    print("Check stage comparison above for first diverging stage.", flush=True)
+# v7: testing the dual-sched fix (GPU-only llm_sched for the LLM decoder)
+if not r_cuda_fa["degenerated"] and "ask not" in r_cuda_fa["transcript"].lower():
+    print("\nFIX CONFIRMED: CUDA now produces correct JFK transcript.", flush=True)
+    print("Root cause: dual-backend sched [CUDA,CPU] was splitting LLM ops across backends.", flush=True)
 elif not r_cuda_fa["degenerated"]:
-    print("\nSURPRISE: CUDA FA-on did NOT degenerate. Bug may be fixed or intermittent.", flush=True)
+    print("\nCUDA did not degenerate but transcript may be wrong. Check WER.", flush=True)
+elif r_cuda_fa["rc"] != 0:
+    print(f"\nCUDA CRASHED (rc={r_cuda_fa['rc']}). Check stderr for unsupported op.", flush=True)
 else:
-    print("\nUNCLEAR: check logs.", flush=True)
+    print("\nCUDA still degenerates. Dual-sched fix did NOT help.", flush=True)
 
 step("done", all_pass=all(not r["degenerated"] for r in results))
