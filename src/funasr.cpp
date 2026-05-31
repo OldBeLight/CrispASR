@@ -1060,10 +1060,9 @@ static ggml_cgraph* funasr_build_graph_llm_kv_impl(funasr_context* ctx, int n_pa
         ggml_tensor* mlp = core_ffn::swiglu(ctx0, x, b.ffn_gate_w, b.ffn_up_w, b.ffn_down_w);
         cur = ggml_add(ctx0, residual, mlp);
 
-        // LLM layer snap for FUNASR_DUMP_STAGES — only a few layers to
-        // keep graph overhead low. Named "llm_layer_N" so the post-compute
-        // dump loop can read them back.
-        if (il == 0 || il == hp.llm_n_layers / 2 || il == hp.llm_n_layers - 1) {
+        // LLM layer snap for FUNASR_DUMP_STAGES — every layer so the
+        // post-compute dump can binary-search for the first NaN.
+        {
             char nm[32];
             std::snprintf(nm, sizeof(nm), "llm_layer_%u", il);
             ggml_tensor* s = ggml_dup(ctx0, cur);
@@ -1074,6 +1073,13 @@ static ggml_cgraph* funasr_build_graph_llm_kv_impl(funasr_context* ctx, int n_pa
 
     cur = ggml_rms_norm(ctx0, cur, eps);
     cur = ggml_mul(ctx0, cur, m.llm.output_norm_w);
+
+    // Snap the pre-lm_head hidden state for the dump.
+    {
+        ggml_tensor* s = ggml_dup(ctx0, cur);
+        ggml_set_name(s, "llm_pre_lmhead");
+        ggml_build_forward_expand(gf, s);
+    }
 
     // Last-token-only lm_head — decode loop only needs next-token logits.
     if (T > 1) {
@@ -1221,6 +1227,17 @@ static bool funasr_kv_init(funasr_context* ctx, int max_ctx) {
     char* base = (char*)ggml_backend_buffer_get_base(ctx->kv_buf);
     ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_k, base);
     ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_v, base + kbytes);
+    // Zero-fill the KV cache. On CUDA, ggml_backend_alloc_buffer does not
+    // zero memory (cudaMalloc). If the graph scheduler reads a KV slot
+    // before the corresponding ggml_cpy writes it (aliasing-based race in
+    // the same compute graph), uninitialized NaN/Inf values propagate
+    // through flash_attn and poison every downstream tensor. Zeroing is
+    // cheap (~1 MB for the funasr Qwen2-0.6B KV) and prevents this.
+    {
+        std::vector<uint8_t> zeros(std::max(kbytes, vbytes), 0);
+        ggml_backend_tensor_set(ctx->kv_k, zeros.data(), 0, kbytes);
+        ggml_backend_tensor_set(ctx->kv_v, zeros.data(), 0, vbytes);
+    }
     ctx->kv_max_ctx = max_ctx;
     return true;
 }
@@ -1330,9 +1347,12 @@ static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* 
             dump_flag = (e && *e && *e != '0') ? 1 : 0;
         }
         if (dump_flag && n_tokens > 1) {
-            const char* names[] = {"llm_layer_0", "llm_layer_12", "llm_layer_23"};
-            std::fprintf(stderr, "funasr_dump: ---- LLM layer stats (n_tokens=%d, n_past=%d) ----\n", n_tokens, n_past);
-            for (const char* nm : names) {
+            std::fprintf(stderr, "funasr_dump: ---- LLM layer stats (n_tokens=%d, n_past=%d, n_layers=%u) ----\n",
+                         n_tokens, n_past, ctx->model.hparams.llm_n_layers);
+            for (uint32_t li = 0; li < ctx->model.hparams.llm_n_layers; li++) {
+                char nmbuf[32];
+                std::snprintf(nmbuf, sizeof(nmbuf), "llm_layer_%u", li);
+                const char* nm = nmbuf;
                 ggml_tensor* t = ggml_graph_get_tensor(gf, nm);
                 if (!t) {
                     std::fprintf(stderr, "funasr_dump: %-28s [not found]\n", nm);
@@ -1366,6 +1386,34 @@ static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* 
                 for (size_t i = 0; i < 8 && i < n; i++)
                     std::fprintf(stderr, "%s%.6f", i ? "," : "", buf[i]);
                 std::fprintf(stderr, "]\n");
+            }
+            // Also dump the pre-lm_head hidden state.
+            {
+                const char* nm = "llm_pre_lmhead";
+                ggml_tensor* t = ggml_graph_get_tensor(gf, nm);
+                if (t) {
+                    const size_t n = ggml_nelements(t);
+                    std::vector<float> buf(n, 0.0f);
+                    ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+                    float mn = buf[0], mx = buf[0], sm = 0.0f;
+                    int n_nan = 0, n_inf = 0;
+                    for (size_t i = 0; i < n; i++) {
+                        float v = buf[i];
+                        if (std::isnan(v)) {
+                            n_nan++;
+                        } else if (std::isinf(v)) {
+                            n_inf++;
+                        } else {
+                            if (v < mn)
+                                mn = v;
+                            if (v > mx)
+                                mx = v;
+                            sm += v;
+                        }
+                    }
+                    std::fprintf(stderr, "funasr_dump: %-28s n=%-8zu min=%12.6f max=%12.6f mean=%12.6f nan=%d inf=%d\n",
+                                 nm, n, mn, mx, (n > 0) ? sm / (float)n : 0.0f, n_nan, n_inf);
+                }
             }
             std::fprintf(stderr, "funasr_dump: ---- end LLM ----\n");
         }

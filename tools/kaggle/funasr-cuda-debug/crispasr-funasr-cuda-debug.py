@@ -243,19 +243,10 @@ results = []
 r_cuda_fa = run_funasr("cuda_fa_on", {})
 results.append(r_cuda_fa)
 
-# Run B: CUDA with FA off — test if flash-attn is the culprit
-r_cuda_nofa = run_funasr("cuda_fa_off", {"FUNASR_NO_FA": "1"})
-results.append(r_cuda_nofa)
+# v3-v4 proved: FA off and KV_READ_F32 do NOT fix it. LLM layer 0 is fine,
+# NaN appears somewhere in layers 1-27. v5 dumps ALL 28 layers to pinpoint.
 
-# Run B2: CUDA with KV cache read as F32 — test if F16 KV + FA is the issue
-r_cuda_kvf32 = run_funasr("cuda_kv_f32", {"CRISPASR_KV_READ_F32": "1"})
-results.append(r_cuda_kvf32)
-
-# Run B3: CUDA with both FA off AND KV F32 — maximum safety
-r_cuda_safe = run_funasr("cuda_nofa_kvf32", {"FUNASR_NO_FA": "1", "CRISPASR_KV_READ_F32": "1"})
-results.append(r_cuda_safe)
-
-# Run C: CPU forced — ground truth
+# Run B: CPU forced — ground truth
 # Force CPU by setting GGML_CUDA_NO_PEER_COPY and using a trick:
 # Build has CUDA but we can force CPU by setting the backend env.
 # Actually the cleanest way is CUDA_VISIBLE_DEVICES="" to hide GPUs.
