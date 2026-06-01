@@ -239,29 +239,26 @@ def run_funasr(label: str, extra_env: dict, timeout: int = 300) -> dict:
 # ──────────────────────────────────────────────────────────────────────────
 results = []
 
-# Run A: CUDA default (enc GPU, LLM+KV CPU via weight-split workaround)
-r_cuda_fa = run_funasr("cuda_workaround", {})
+# Run A: CUDA default — now all-GPU (fix: block F16 cuBLAS when src1 is F32)
+r_cuda_fa = run_funasr("cuda_default", {})
 results.append(r_cuda_fa)
 
 # Run B: CPU forced — ground truth
 r_cpu = run_funasr("cpu_baseline", {"CUDA_VISIBLE_DEVICES": ""})
 results.append(r_cpu)
 
-# Run C: ALL-GPU (trigger the bug) — force LLM weights + KV on CUDA.
-# Uses only 3 layers + per-node NaN checker to pinpoint exact first bad op.
-r_allgpu = run_funasr("cuda_allgpu_nancheck", {
-    "FUNASR_LLM_GPU": "1",
+# Run C: CUDA with NaN checker (4 layers) — verify no Inf in FFN down proj
+r_allgpu = run_funasr("cuda_nancheck", {
     "FUNASR_NAN_CHECK": "1",
-    "FUNASR_LLM_LAYERS": "4",   # only 4 layers — enough to trigger layer-2 NaN
-    "GGML_SCHED_DEBUG": "1",     # print split assignments (level 1 = concise)
+    "FUNASR_LLM_LAYERS": "4",
 })
 results.append(r_allgpu)
 
-# Run D: ALL-GPU full model (no NaN check, for comparison dump)
-r_allgpu_full = run_funasr("cuda_allgpu_full", {
-    "FUNASR_LLM_GPU": "1",
+# Run D: old workaround path (for regression comparison)
+r_workaround = run_funasr("cuda_workaround", {
+    "FUNASR_LLM_CPU": "1",
 })
-results.append(r_allgpu_full)
+results.append(r_workaround)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -300,7 +297,7 @@ stage_names_ordered = [
 
 for sname in stage_names_ordered:
     cpu_raw = r_cpu["stages"].get(sname, "")
-    cuda_raw = r_allgpu_full["stages"].get(sname, r_cuda_fa["stages"].get(sname, ""))
+    cuda_raw = r_cuda_fa["stages"].get(sname, "")
 
     cpu_s = parse_stage_stats(cpu_raw)
     cuda_s = parse_stage_stats(cuda_raw)
@@ -361,21 +358,31 @@ for r in results:
 print("=" * 60, flush=True)
 
 # Verdict
-allgpu_nan = r_allgpu["stages"].get("prefill_logits", "")
-allgpu_nan_count = 0
-m = re.search(r"nan=(\d+)", allgpu_nan)
-if m:
-    allgpu_nan_count = int(m.group(1))
+cuda_pass = "ask not" in r_cuda_fa["transcript"].lower()
+cpu_pass = "ask not" in r_cpu["transcript"].lower()
+workaround_pass = "ask not" in r_workaround["transcript"].lower()
 
-print(f"\nWorkaround (enc GPU, LLM CPU): {'PASS' if 'ask not' in r_cuda_fa['transcript'].lower() else 'FAIL'}", flush=True)
-print(f"CPU baseline: {'PASS' if 'ask not' in r_cpu['transcript'].lower() else 'FAIL'}", flush=True)
-print(f"All-GPU NaN check: found_nan={r_allgpu.get('stages', {}).get('prefill_logits', 'N/A')}", flush=True)
-print(f"All-GPU full: logits_nan={allgpu_nan_count}", flush=True)
+print(f"\nCUDA default (all-GPU, fix applied): {'PASS' if cuda_pass else 'FAIL'} — {r_cuda_fa['transcript'][:80]!r}", flush=True)
+print(f"CPU baseline:                        {'PASS' if cpu_pass else 'FAIL'}", flush=True)
+print(f"CUDA workaround (LLM CPU):           {'PASS' if workaround_pass else 'FAIL'}", flush=True)
 
-# Print NaN checker output from stderr
-allgpu_stderr = (RESULTS / "cuda_allgpu_nancheck_stderr.txt").read_text()
-for line in allgpu_stderr.splitlines():
-    if "funasr_nan_check:" in line:
-        print(f"  {line.strip()}", flush=True)
+# Print NaN checker output
+nancheck_stderr = (RESULTS / "cuda_nancheck_stderr.txt").read_text()
+nan_lines = [l for l in nancheck_stderr.splitlines() if "nan_check" in l]
+if nan_lines:
+    print(f"\nNaN checker ({len(nan_lines)} nodes checked):", flush=True)
+    # Print last 5 and any BAD
+    for l in nan_lines:
+        if "BAD" in l or "inf=1" in l or "nan=1" in l:
+            print(f"  {l.strip()}", flush=True)
+    print(f"  ... last: {nan_lines[-1].strip()}", flush=True)
 
-step("done", all_pass=all(not r["degenerated"] for r in results))
+if cuda_pass:
+    print("\n*** FIX CONFIRMED: CUDA all-GPU now produces correct JFK transcript. ***", flush=True)
+    print("Root cause: cuBLAS F16 GEMM accumulator overflow in FFN down projection", flush=True)
+    print("on GPUs without DP4A (P100 sm_60). Fixed by blocking F16 cuBLAS path", flush=True)
+    print("when activations are F32.", flush=True)
+else:
+    print("\n*** FIX DID NOT WORK: CUDA still fails. Check NaN checker output. ***", flush=True)
+
+step("done", all_pass=cuda_pass and cpu_pass)

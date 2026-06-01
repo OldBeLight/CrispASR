@@ -412,16 +412,20 @@ static bool funasr_load_model(funasr_model& model, funasr_vocab& vocab, const ch
     }
 
     // Pass 2: tensor data.
-    // On CUDA, the ggml_backend_sched produces all-NaN prefill logits for
-    // the Qwen2-0.6B LLM decoder (issue #125). Workaround: split weights
-    // so the encoder goes to GPU (fast) but the LLM stays on CPU (correct).
-    // FUNASR_LLM_GPU=1 overrides this to put everything on GPU for testing.
+    // Issue #125 root cause: on GPUs without DP4A (P100 sm_60), quantized
+    // MUL_MAT falls through to cuBLAS F16 GEMM whose F16 accumulator
+    // overflows at the FFN down projection (swiglu values reach ~15K,
+    // dot-product partial sums over 3072 elements exceed F16 max 65504).
+    // Fixed in ggml-cuda.cu: block F16 cuBLAS path when src1 is F32.
+    //
+    // FUNASR_LLM_CPU=1 forces the old weight-split workaround (enc GPU,
+    // LLM CPU) for testing or as a safety net.
     core_gguf::WeightLoad wl;
-    const bool force_llm_gpu = []() {
-        const char* s = std::getenv("FUNASR_LLM_GPU");
+    const bool force_llm_cpu = []() {
+        const char* s = std::getenv("FUNASR_LLM_CPU");
         return s && *s && *s != '0';
     }();
-    if (!ggml_backend_is_cpu(backend) && cpu_backend && !force_llm_gpu) {
+    if (!ggml_backend_is_cpu(backend) && cpu_backend && force_llm_cpu) {
         auto is_gpu = [](const char* name, void*) -> bool { return std::strncmp(name, "funasr.", 7) == 0; };
         if (!core_gguf::load_weights_split(path, backend, cpu_backend, is_gpu, nullptr, "funasr", wl))
             return false;

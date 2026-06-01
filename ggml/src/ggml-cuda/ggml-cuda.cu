@@ -1503,16 +1503,29 @@ static void ggml_cuda_op_mul_mat_cublas(
         ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1] &&
         dst->op_params[0] == GGML_PREC_DEFAULT &&
-        // CrispASR patch (issue #38 → CUDA counterpart; MUST RE-APPLY on ggml sync).
-        // F16 weight × F32 activation must NOT take the fp16 cuBLAS path: it
-        // quantizes the F32 activation to F16, which saturates at ±65504. Deep
-        // encoders (funasr SANM, 70 layers) produce activations past that, so they
-        // collapse to ±Inf → NaN → a degenerate single-token "!-loop" on CUDA only
-        // (CPU has the #38 F16×F32 dot-product fix; Metal has a native F16×F32
-        // kernel). Exclude this case so it falls through to the F32 cublasSgemm
-        // path below (dequant weight to F32, keep activation F32). Quantized
-        // weights are unaffected — they take the MMQ/MMVQ path, not this fallback.
-        !(src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32);
+        // CrispASR patch (issue #38 + #125; MUST RE-APPLY on ggml sync).
+        //
+        // The F16 cuBLAS path dequantizes/converts both weight and activation
+        // to F16, then calls cublasHgemm. On GPUs without F32 accumulation
+        // hardware (P100 sm_60, and cuBLAS F16 GEMM on most arches) the dot-
+        // product partial sums are accumulated in F16 (max ±65504). Two
+        // failure modes:
+        //
+        //   1. F16 weight × F32 activation: the F32→F16 conversion saturates
+        //      activations > 65504 to ±Inf. Deep encoders (funasr SANM, 70
+        //      layers) produce activations past that threshold (issue #38).
+        //
+        //   2. Quantized weight × F32 activation on GPUs where MMQ is not
+        //      available (sm_60 lacks DP4A → MMQ disabled → cuBLAS fallback):
+        //      even though individual values fit in F16, the dot-product
+        //      partial sums over 3072 elements can exceed 65504, producing
+        //      Inf. This manifests as 1 Inf at LLM layer 2's FFN down
+        //      projection in funasr's Qwen2-0.6B decoder (issue #125).
+        //
+        // Fix: when src1 is F32, always fall through to the F32 cublasSgemm
+        // path (dequant weight to F32, keep activation F32). This is slightly
+        // slower but numerically correct.
+        !(src1->type == GGML_TYPE_F32);
 
     if (supports_bf16 && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
         ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
