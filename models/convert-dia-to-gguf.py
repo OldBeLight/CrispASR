@@ -142,33 +142,37 @@ def map_encoder_tensor(py_name: str) -> tuple[str, bool]:
 
     Returns (gguf_name, needs_transpose).
     The fused wi_fused tensor is split by the caller.
+    Handles both Jax-style (.kernel/.scale) and PyTorch-style (.weight) naming.
     """
     parts = py_name.split(".")
-    # encoder.embedding.kernel -> dia.encoder.embedding
-    if parts[0] == "embedding":
+    # encoder.embedding.weight/kernel -> dia.encoder.embedding
+    if parts[0] == "embedding" and parts[-1] in ("kernel", "weight"):
         return "dia.encoder.embedding", False
-    if parts[0] == "norm":
+    if parts[0] == "norm" and parts[-1] in ("scale", "weight"):
         return "dia.encoder.norm", False
     if parts[0] == "layers":
         layer_idx = parts[1]
         prefix = f"dia.encoder.layers.{layer_idx}"
         rest = ".".join(parts[2:])
-        if rest == "self_attention.q_proj.kernel":
+        # Handle both .kernel and .weight suffixes
+        rest_norm = rest.replace(".weight", ".kernel").replace(".scale", ".kernel")
+        if rest_norm == "self_attention.q_proj.kernel":
             return f"{prefix}.q_proj", True
-        if rest == "self_attention.k_proj.kernel":
+        if rest_norm == "self_attention.k_proj.kernel":
             return f"{prefix}.k_proj", True
-        if rest == "self_attention.v_proj.kernel":
+        if rest_norm == "self_attention.v_proj.kernel":
             return f"{prefix}.v_proj", True
-        if rest == "self_attention.o_proj.kernel":
+        if rest_norm == "self_attention.o_proj.kernel":
             return f"{prefix}.o_proj", True
-        if rest == "pre_sa_norm.scale":
+        if rest_norm in ("pre_sa_norm.kernel",):
             return f"{prefix}.pre_sa_norm", False
-        if rest == "post_sa_norm.scale":
+        if rest in ("pre_sa_norm.weight", "pre_sa_norm.scale"):
+            return f"{prefix}.pre_sa_norm", False
+        if rest in ("post_sa_norm.weight", "post_sa_norm.scale"):
             return f"{prefix}.post_sa_norm", False
-        if rest == "mlp.wi_fused.kernel":
-            # Fused gate+up -- caller splits dim 1
+        if rest_norm == "mlp.wi_fused.kernel":
             return f"{prefix}.wi_fused", True
-        if rest == "mlp.wo.kernel":
+        if rest_norm == "mlp.wo.kernel":
             return f"{prefix}.wo", True
     return None, False
 
@@ -177,50 +181,52 @@ def map_decoder_tensor(py_name: str) -> tuple[str, bool]:
     """Map decoder PyTorch key to GGUF name.
 
     Returns (gguf_name, needs_transpose).
+    Handles both Jax-style (.kernel/.scale) and PyTorch-style (.weight) naming.
     """
     parts = py_name.split(".")
-    if parts[0] == "embeddings":
+    if parts[0] == "embeddings" and len(parts) >= 2:
         idx = parts[1]
+        # Might have trailing .weight
         return f"dia.decoder.embeddings.{idx}", False
-    if parts[0] == "norm":
+    if parts[0] == "norm" and parts[-1] in ("scale", "weight"):
         return "dia.decoder.norm", False
-    if parts[0] == "logits_dense":
-        # logits_dense.kernel shape: (hidden_size, n_heads, vocab_size)
-        # Split by caller into per-head tensors
+    if parts[0] == "logits_dense" and parts[-1] in ("kernel", "weight"):
         return "dia.decoder.logits_dense", True
     if parts[0] == "layers":
         layer_idx = parts[1]
         prefix = f"dia.decoder.layers.{layer_idx}"
         rest = ".".join(parts[2:])
+        # Normalize suffix
+        rest_norm = rest.replace(".weight", ".kernel").replace(".scale", ".kernel")
         # Self-attention
-        if rest == "self_attention.q_proj.kernel":
+        if rest_norm == "self_attention.q_proj.kernel":
             return f"{prefix}.self_q_proj", True
-        if rest == "self_attention.k_proj.kernel":
+        if rest_norm == "self_attention.k_proj.kernel":
             return f"{prefix}.self_k_proj", True
-        if rest == "self_attention.v_proj.kernel":
+        if rest_norm == "self_attention.v_proj.kernel":
             return f"{prefix}.self_v_proj", True
-        if rest == "self_attention.o_proj.kernel":
+        if rest_norm == "self_attention.o_proj.kernel":
             return f"{prefix}.self_o_proj", True
         # Cross-attention
-        if rest == "cross_attention.q_proj.kernel":
+        if rest_norm == "cross_attention.q_proj.kernel":
             return f"{prefix}.cross_q_proj", True
-        if rest == "cross_attention.k_proj.kernel":
+        if rest_norm == "cross_attention.k_proj.kernel":
             return f"{prefix}.cross_k_proj", True
-        if rest == "cross_attention.v_proj.kernel":
+        if rest_norm == "cross_attention.v_proj.kernel":
             return f"{prefix}.cross_v_proj", True
-        if rest == "cross_attention.o_proj.kernel":
+        if rest_norm == "cross_attention.o_proj.kernel":
             return f"{prefix}.cross_o_proj", True
-        # Norms
-        if rest == "pre_sa_norm.scale":
+        # Norms (handle .weight and .scale)
+        if rest in ("pre_sa_norm.weight", "pre_sa_norm.scale"):
             return f"{prefix}.pre_sa_norm", False
-        if rest == "pre_ca_norm.scale":
+        if rest in ("pre_ca_norm.weight", "pre_ca_norm.scale"):
             return f"{prefix}.pre_ca_norm", False
-        if rest == "pre_mlp_norm.scale":
+        if rest in ("pre_mlp_norm.weight", "pre_mlp_norm.scale"):
             return f"{prefix}.pre_mlp_norm", False
         # MLP
-        if rest == "mlp.wi_fused.kernel":
+        if rest_norm == "mlp.wi_fused.kernel":
             return f"{prefix}.wi_fused", True
-        if rest == "mlp.wo.kernel":
+        if rest_norm == "mlp.wo.kernel":
             return f"{prefix}.wo", True
     return None, False
 
@@ -378,12 +384,19 @@ def convert(model_dir: Path, output_path: str, include_dac: bool = False):
                 if needs_transpose and data.ndim >= 2:
                     # DenseGeneral uses tensordot convention; reshape + transpose
                     # Q/K/V: kernel shape (in_dim, n_heads, head_dim)
-                    #   -> GGUF: (n_heads * head_dim, in_dim) row-major
+                    #   -> GGUF: (in_dim, n_heads * head_dim) for ggml mul_mat
                     # O: kernel shape (n_heads, head_dim, out_dim)
-                    #   -> GGUF: (out_dim, n_heads * head_dim) row-major
+                    #   -> GGUF: (n_heads * head_dim, out_dim) for ggml mul_mat
                     if data.ndim == 3:
-                        # (in_dim, n_heads, head_dim) -> (n_heads*head_dim, in_dim)
-                        data = data.reshape(data.shape[0], -1).T.copy()
+                        is_o_proj = "o_proj" in gguf_name
+                        if is_o_proj:
+                            # O: (n_heads, head_dim, out_dim) -> reshape (n_heads*head_dim, out_dim) -> transpose (out_dim, n_heads*head_dim)
+                            # In ggml: ne[0]=n_heads*head_dim (input), ne[1]=out_dim (output)
+                            data = data.reshape(-1, data.shape[-1]).T.copy()
+                        else:
+                            # Q/K/V: (in_dim, n_heads, head_dim) -> reshape (in_dim, n_heads*head_dim) -> transpose (n_heads*head_dim, in_dim)
+                            # In ggml: ne[0]=in_dim (input), ne[1]=n_heads*head_dim (output)
+                            data = data.reshape(data.shape[0], -1).T.copy()
                     else:
                         data = data.T.copy()
 

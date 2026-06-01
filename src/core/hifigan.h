@@ -86,10 +86,11 @@ static inline ggml_tensor* leaky_relu(ggml_context* ctx, ggml_tensor* x, float s
 static inline ggml_tensor* conv1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weight, ggml_tensor* bias, int stride,
                                   int padding, int dilation) {
     // ggml_conv_1d signature: (a=weight, b=input, stride, padding, dilation)
+    // Input x: (T, C_in), output y: (T_out, C_out)
     ggml_tensor* y = ggml_conv_1d(ctx, weight, x, stride, padding, dilation);
     if (bias) {
-        // bias is (out_ch,). Reshape to (out_ch, 1) for broadcast over T.
-        ggml_tensor* b = ggml_reshape_2d(ctx, bias, (int)bias->ne[0], 1);
+        // bias is (C_out,). Reshape to (1, C_out) for broadcast over T (ne[0]).
+        ggml_tensor* b = ggml_reshape_2d(ctx, bias, 1, (int)bias->ne[0]);
         y = ggml_add(ctx, y, b);
     }
     return y;
@@ -103,9 +104,21 @@ static inline ggml_tensor* conv1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor
 
 static inline ggml_tensor* conv_transpose_1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weight, ggml_tensor* bias,
                                              int stride, int padding) {
-    ggml_tensor* y = ggml_conv_transpose_1d(ctx, weight, x, stride, padding, 1);
+    // ggml_conv_transpose_1d requires padding=0. Apply padding by trimming output.
+    ggml_tensor* y = ggml_conv_transpose_1d(ctx, weight, x, stride, 0 /*p0*/, 1);
+    // Trim padding from both ends: crop from [padding .. T_out - padding]
+    if (padding > 0) {
+        int64_t T_out = y->ne[0];
+        int64_t C_out = y->ne[1];
+        int64_t T_trimmed = T_out - 2 * padding;
+        // Use ggml_view_2d to crop the time dimension
+        y = ggml_view_2d(ctx, y, T_trimmed, C_out,
+                         y->nb[1],                        // row stride (bytes per row)
+                         padding * ggml_element_size(y)); // offset: skip first 'padding' elements
+        y = ggml_cont(ctx, y);
+    }
     if (bias) {
-        ggml_tensor* b = ggml_reshape_2d(ctx, bias, (int)bias->ne[0], 1);
+        ggml_tensor* b = ggml_reshape_2d(ctx, bias, 1, (int)bias->ne[0]);
         y = ggml_add(ctx, y, b);
     }
     return y;
@@ -164,13 +177,15 @@ static inline ggml_tensor* forward(ggml_context* ctx, ggml_tensor* mel,
     ggml_tensor* x = mel;
 
     // Optional normalization: (mel - mean) / scale
+    // Input x is (T, C) in ggml convention. mean/scale are (C,).
     if (hp.normalize_before) {
         ggml_tensor* mean = T(tensors, prefix + ".mean");
         ggml_tensor* scale = T(tensors, prefix + ".scale");
         if (mean && scale) {
-            // mean/scale are (mel_dim,). Reshape to (mel_dim, 1) for broadcast.
-            ggml_tensor* m = ggml_reshape_2d(ctx, mean, (int)mean->ne[0], 1);
-            ggml_tensor* s = ggml_reshape_2d(ctx, scale, (int)scale->ne[0], 1);
+            // Reshape to (1, C) so it broadcasts over T (ne[0]):
+            // sub((T, C), (1, C)) → 1 divides T ✓, C == C ✓
+            ggml_tensor* m = ggml_repeat(ctx, ggml_reshape_2d(ctx, mean, 1, (int)mean->ne[0]), x);
+            ggml_tensor* s = ggml_repeat(ctx, ggml_reshape_2d(ctx, scale, 1, (int)scale->ne[0]), x);
             x = ggml_div(ctx, ggml_sub(ctx, x, m), s);
         }
     }

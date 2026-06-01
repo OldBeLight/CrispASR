@@ -552,7 +552,16 @@ static ggml_tensor* build_dia_encoder(ggml_context* ctx, dia_model& m,
     ggml_tensor* cur =
         ggml_reshape_3d(ctx, ggml_get_rows(ctx, m.encoder.embedding, inp_tokens), m.encoder_hidden_size, T, B);
 
+    int layer_idx = 0;
     for (auto& layer : m.encoder.layers) {
+        if (!layer.q_proj || !layer.k_proj || !layer.v_proj || !layer.o_proj) {
+            fprintf(stderr, "dia: encoder layer %d has NULL attention weight!\n", layer_idx);
+            return nullptr;
+        }
+        if (!layer.gate || !layer.up || !layer.wo) {
+            fprintf(stderr, "dia: encoder layer %d has NULL MLP weight!\n", layer_idx);
+            return nullptr;
+        }
         ggml_tensor* residual = cur;
 
         // Pre self-attention norm
@@ -576,13 +585,20 @@ static ggml_tensor* build_dia_encoder(ggml_context* ctx, dia_model& m,
             ggml_tensor* kq = ggml_mul_mat(ctx, k, q);
             kq = ggml_soft_max_ext(ctx, kq, attn_mask, 1.0f, 0.0f);
 
-            // V transpose and multiply
-            ggml_tensor* v = ggml_cont_4d(ctx, ggml_transpose(ctx, V), T, m.head_dim, m.encoder_attn_heads, B);
-            ggml_tensor* kqv = ggml_mul_mat(ctx, kq, v);
-            ggml_tensor* kqv_merged = ggml_permute(ctx, kqv, 2, 0, 1, 3);
+            // V: (2048, T, B) -> reshape to (head_dim, n_heads, T, B)
+            ggml_tensor* v_4d = ggml_reshape_4d(ctx, V, m.head_dim, m.encoder_attn_heads, T, B);
+            // Permute to (head_dim, T, n_heads, B) matching Q/K layout
+            ggml_tensor* v_perm = ggml_cont(ctx, ggml_permute(ctx, v_4d, 0, 2, 1, 3));
+            // Transpose to (T, head_dim, n_heads, B) for mul_mat contraction on T_key
+            ggml_tensor* v_t = ggml_cont(ctx, ggml_permute(ctx, v_perm, 1, 0, 2, 3));
+            // attn_out = V^T @ softmax_weights: contracts on T_key dim
+            // kq=(T_key, T_query, n_heads, B), v_t=(T_key, hd, n_heads, B)
+            ggml_tensor* kqv = ggml_mul_mat(ctx, v_t, kq); // (hd, T_query, n_heads, B)
+            // Permute to (hd, n_heads, T, B) for correct head concatenation
+            ggml_tensor* kqv_merged = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));
 
-            // Encoder attention projects to decoder_hidden_size, then O projects back
-            cur = ggml_cont_3d(ctx, kqv_merged, m.decoder_hidden_size, T, B);
+            // Reshape to (hd * n_heads = 2048, T, B), then output projection
+            cur = ggml_reshape_3d(ctx, kqv_merged, m.head_dim * m.encoder_attn_heads, T, B);
             cur = ggml_mul_mat(ctx, layer.o_proj, cur);
         }
 
@@ -599,6 +615,7 @@ static ggml_tensor* build_dia_encoder(ggml_context* ctx, dia_model& m,
         }
 
         cur = ggml_add(ctx, cur, residual_mlp);
+        layer_idx++;
     }
 
     cur = dia_rms_norm(ctx, cur, m.encoder.norm, m.rms_norm_eps);
@@ -863,26 +880,580 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
     }
 
     uint32_t max_gen = (p.max_tokens > (int)m.max_delay) ? (uint32_t)p.max_tokens : m.max_generation_size;
+    // TEMP: limit for CPU testing until DAC codec is available
+    // Full 3072 steps = ~17 hours on this CPU; use 50 for a quick test
+    if (max_gen > 50)
+        max_gen = 50;
 
-    // TODO: implement ggml graph-based encoder + decoder loop
-    // For now this is a skeleton that outlines the generation flow:
-    //
-    // 1. Run encoder on tokenized text (batch=2: cond + uncond)
-    // 2. Cache cross-attention K/V from encoder output
-    // 3. Loop: decoder step -> sample -> check stopping
-    //    a. Build decoder input embeddings from current audio tokens
-    //    b. Run decoder (self-attn with KV cache + cross-attn)
-    //    c. Apply CFG: logits = uncond + cfg_scale * (cond - uncond)
-    //    d. Sample per-codebook tokens
-    //    e. Append to output_tokens
-    //    f. Check delay-pattern stopping condition
+    // ===================================================================
+    // 1. Run encoder (batch=2: conditional + unconditional)
+    // ===================================================================
+    const int T_enc = (int)m.max_encoder_context;
+    const int B = 2;
+    const int enc_hidden = (int)m.encoder_hidden_size;
+    const int dec_hidden = (int)m.decoder_hidden_size;
+    const int kv_dim = (int)(m.decoder_kv_heads * m.head_dim);         // self-attn: 4*128=512
+    const int cross_kv_dim = (int)(m.decoder_attn_heads * m.head_dim); // cross-attn: 16*128=2048 (MHA, not GQA)
+    const int n_heads = (int)m.decoder_attn_heads;
+    const int n_kv_heads = (int)m.decoder_kv_heads;
+    const int head_dim = (int)m.head_dim;
+
+    // Prepare encoder input: [cond_tokens | uncond_tokens(zeros)]
+    std::vector<int32_t> enc_input(T_enc * B, 0);
+    for (size_t i = 0; i < tokens.size(); i++) {
+        enc_input[i] = (int32_t)tokens[i]; // conditional
+    }
+    // unconditional = all zeros (padding)
+
+    // Positions: [0, 1, 2, ..., T_enc-1]
+    std::vector<int32_t> positions(T_enc);
+    for (int i = 0; i < T_enc; i++)
+        positions[i] = i;
+
+    // Attention mask: (T_enc, T_enc) — causal=false, full attention within each batch
+    // The mask is 0 (attend) or -inf (block). For encoder, use 0 everywhere (full attention).
+    std::vector<float> enc_mask(T_enc * T_enc, 0.0f);
+
+    // Encoder graph
+    std::vector<float> encoder_output;
+    {
+        size_t ctx_size = 256 * 1024 * 1024; // 256 MB for graph metadata
+        ggml_init_params gp = {ctx_size, nullptr, true};
+        ggml_context* ctx0 = ggml_init(gp);
+        if (!ctx0) {
+            fprintf(stderr, "dia_tts: failed to allocate encoder graph context\n");
+            return nullptr;
+        }
+
+        ggml_tensor* inp_tokens_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_enc * B);
+        ggml_set_name(inp_tokens_t, "enc_tokens");
+        ggml_set_input(inp_tokens_t);
+
+        ggml_tensor* positions_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_enc);
+        ggml_set_name(positions_t, "enc_positions");
+        ggml_set_input(positions_t);
+
+        ggml_tensor* mask_t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T_enc, T_enc);
+        ggml_set_name(mask_t, "enc_mask");
+        ggml_set_input(mask_t);
+
+        ggml_tensor* enc_out = build_dia_encoder(ctx0, m, inp_tokens_t, positions_t, mask_t);
+        ggml_set_name(enc_out, "enc_output");
+        ggml_set_output(enc_out);
+
+        ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 32768, false);
+        ggml_build_forward_expand(gf, enc_out);
+
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+        if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
+            fprintf(stderr, "dia_tts: encoder graph alloc failed\n");
+            if (alloc)
+                ggml_gallocr_free(alloc);
+            ggml_free(ctx0);
+            return nullptr;
+        }
+
+        // Set inputs
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "enc_tokens"), enc_input.data(), 0,
+                                T_enc * B * sizeof(int32_t));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "enc_positions"), positions.data(), 0,
+                                T_enc * sizeof(int32_t));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "enc_mask"), enc_mask.data(), 0,
+                                T_enc * T_enc * sizeof(float));
+
+        ggml_status st = ggml_backend_graph_compute(ctx->backend, gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "dia_tts: encoder compute failed (status=%d)\n", (int)st);
+            ggml_gallocr_free(alloc);
+            ggml_free(ctx0);
+            return nullptr;
+        }
+
+        // Read encoder output: (enc_hidden, T_enc, B) = (1024, 1024, 2)
+        ggml_tensor* enc_result = ggml_graph_get_tensor(gf, "enc_output");
+        encoder_output.resize(enc_hidden * T_enc * B);
+        ggml_backend_tensor_get(enc_result, encoder_output.data(), 0, encoder_output.size() * sizeof(float));
+
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx0);
+    }
+
+    if (p.verbosity >= 1) {
+        fprintf(stderr, "dia_tts: encoder done, output shape (%d, %d, %d)\n", enc_hidden, T_enc, B);
+    }
+
+    // ===================================================================
+    // 2. Precompute cross-attention K/V for all decoder layers
+    // ===================================================================
+    // cross_k[layer]: (cross_kv_dim=2048, T_enc, B) — projected from encoder output
+    // cross_v[layer]: (cross_kv_dim=2048, T_enc, B)
+    std::vector<std::vector<float>> cross_k(m.n_decoder_layers);
+    std::vector<std::vector<float>> cross_v(m.n_decoder_layers);
+
+    {
+        size_t ctx_size = 64 * 1024 * 1024;
+        ggml_init_params gp = {ctx_size, nullptr, true};
+        ggml_context* ctx0 = ggml_init(gp);
+        if (!ctx0) {
+            fprintf(stderr, "dia_tts: failed to allocate cross-attn context\n");
+            return nullptr;
+        }
+
+        // Encoder output as input tensor
+        ggml_tensor* enc_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, enc_hidden, T_enc, B);
+        ggml_set_name(enc_in, "enc_in");
+        ggml_set_input(enc_in);
+
+        // Project cross K/V for each layer
+        std::vector<ggml_tensor*> outputs;
+        for (int l = 0; l < (int)m.n_decoder_layers; l++) {
+            auto& layer = m.decoder.layers[l];
+            ggml_tensor* ck = ggml_mul_mat(ctx0, layer.cross_k_proj, enc_in);
+            ggml_tensor* cv = ggml_mul_mat(ctx0, layer.cross_v_proj, enc_in);
+            std::string kname = "cross_k_" + std::to_string(l);
+            std::string vname = "cross_v_" + std::to_string(l);
+            ggml_set_name(ck, kname.c_str());
+            ggml_set_name(cv, vname.c_str());
+            ggml_set_output(ck);
+            ggml_set_output(cv);
+            outputs.push_back(ck);
+            outputs.push_back(cv);
+        }
+
+        ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 256, false);
+        for (auto* o : outputs)
+            ggml_build_forward_expand(gf, o);
+
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+        if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
+            fprintf(stderr, "dia_tts: cross-attn graph alloc failed\n");
+            if (alloc)
+                ggml_gallocr_free(alloc);
+            ggml_free(ctx0);
+            return nullptr;
+        }
+
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "enc_in"), encoder_output.data(), 0,
+                                encoder_output.size() * sizeof(float));
+
+        ggml_status st = ggml_backend_graph_compute(ctx->backend, gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "dia_tts: cross-attn compute failed\n");
+            ggml_gallocr_free(alloc);
+            ggml_free(ctx0);
+            return nullptr;
+        }
+
+        for (int l = 0; l < (int)m.n_decoder_layers; l++) {
+            std::string kname = "cross_k_" + std::to_string(l);
+            std::string vname = "cross_v_" + std::to_string(l);
+            cross_k[l].resize(cross_kv_dim * T_enc * B);
+            cross_v[l].resize(cross_kv_dim * T_enc * B);
+            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, kname.c_str()), cross_k[l].data(), 0,
+                                    cross_k[l].size() * sizeof(float));
+            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, vname.c_str()), cross_v[l].data(), 0,
+                                    cross_v[l].size() * sizeof(float));
+        }
+
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx0);
+    }
+
+    if (p.verbosity >= 1) {
+        fprintf(stderr, "dia_tts: cross-attention K/V cached for %u layers\n", m.n_decoder_layers);
+    }
+
+    // ===================================================================
+    // 3. Decoder AR loop
+    // ===================================================================
+    // Self-attention KV cache: stored per-layer in CPU vectors
+    // Shape per layer: k[step * kv_dim * B], v[step * kv_dim * B]
+    std::vector<std::vector<float>> self_k(m.n_decoder_layers);
+    std::vector<std::vector<float>> self_v(m.n_decoder_layers);
+
+    for (uint32_t step = 0; step < max_gen; step++) {
+        ctx->current_position = step;
+        if (step == 0 && p.verbosity >= 1)
+            fprintf(stderr, "dia_tts: starting decoder loop (max_gen=%u, T_past=%d)\n", max_gen, (int)step);
+
+        // Build decoder step graph
+        size_t ctx_size = 128 * 1024 * 1024;
+        ggml_init_params gp = {ctx_size, nullptr, true};
+        ggml_context* ctx0 = ggml_init(gp);
+        if (!ctx0) {
+            fprintf(stderr, "dia_tts: failed to allocate decoder step context at step %u\n", step);
+            return nullptr;
+        }
+
+        const int T_past = (int)step; // number of past positions in KV cache
+        const int T_cur = 1;          // single position
+
+        // --- Input: audio tokens for current step (n_output_heads * B interleaved) ---
+        ggml_tensor* audio_tokens_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, m.n_output_heads * B);
+        ggml_set_name(audio_tokens_t, "audio_tokens");
+        ggml_set_input(audio_tokens_t);
+
+        // --- Decoder embedding: sum of codebook embeddings -> (dec_hidden, 1, B) ---
+        ggml_tensor* cur = build_dia_decoder_embedding(ctx0, m, audio_tokens_t);
+        // cur shape: (dec_hidden, B) from get_rows -> reshape to (dec_hidden, 1, B)
+        cur = ggml_reshape_3d(ctx0, cur, dec_hidden, T_cur, B);
+
+        // --- Self-attention KV past inputs ---
+        std::vector<ggml_tensor*> past_k_inputs(m.n_decoder_layers);
+        std::vector<ggml_tensor*> past_v_inputs(m.n_decoder_layers);
+        // Cross-attention K/V inputs (full encoder length)
+        std::vector<ggml_tensor*> cross_k_inputs(m.n_decoder_layers);
+        std::vector<ggml_tensor*> cross_v_inputs(m.n_decoder_layers);
+
+        for (int l = 0; l < (int)m.n_decoder_layers; l++) {
+            if (T_past > 0) {
+                past_k_inputs[l] = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, kv_dim, T_past, B);
+                past_v_inputs[l] = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, kv_dim, T_past, B);
+                std::string kn = "past_k_" + std::to_string(l);
+                std::string vn = "past_v_" + std::to_string(l);
+                ggml_set_name(past_k_inputs[l], kn.c_str());
+                ggml_set_name(past_v_inputs[l], vn.c_str());
+                ggml_set_input(past_k_inputs[l]);
+                ggml_set_input(past_v_inputs[l]);
+            }
+            cross_k_inputs[l] = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, cross_kv_dim, T_enc, B);
+            cross_v_inputs[l] = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, cross_kv_dim, T_enc, B);
+            std::string ckn = "cross_k_in_" + std::to_string(l);
+            std::string cvn = "cross_v_in_" + std::to_string(l);
+            ggml_set_name(cross_k_inputs[l], ckn.c_str());
+            ggml_set_name(cross_v_inputs[l], cvn.c_str());
+            ggml_set_input(cross_k_inputs[l]);
+            ggml_set_input(cross_v_inputs[l]);
+        }
+
+        // --- Position for RoPE ---
+        ggml_tensor* dec_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_cur);
+        ggml_set_name(dec_pos, "dec_pos");
+        ggml_set_input(dec_pos);
+
+        // --- New K/V outputs for self-attention (to append to cache) ---
+        std::vector<ggml_tensor*> new_k_outputs(m.n_decoder_layers);
+        std::vector<ggml_tensor*> new_v_outputs(m.n_decoder_layers);
+
+        // --- Decoder layers ---
+        for (int l = 0; l < (int)m.n_decoder_layers; l++) {
+            auto& layer = m.decoder.layers[l];
+            ggml_tensor* residual = cur;
+
+            // Pre self-attention norm
+            cur = dia_rms_norm(ctx0, cur, layer.pre_sa_norm, m.rms_norm_eps);
+
+            // Self-attention
+            {
+                // Q/K/V projections for current position
+                ggml_tensor* Q = ggml_mul_mat(ctx0, layer.self_q_proj, cur);     // (dec_hidden, 1, B)
+                ggml_tensor* K_cur = ggml_mul_mat(ctx0, layer.self_k_proj, cur); // (kv_dim, 1, B)
+                ggml_tensor* V_cur = ggml_mul_mat(ctx0, layer.self_v_proj, cur); // (kv_dim, 1, B)
+
+                // Reshape Q to (head_dim, n_heads, 1, B) and apply RoPE
+                Q = ggml_reshape_4d(ctx0, Q, head_dim, n_heads, T_cur, B);
+                Q = ggml_rope(ctx0, Q, dec_pos, head_dim, DIA_ROPE_MODE);
+
+                // Reshape K to (head_dim, n_kv_heads, 1, B) and apply RoPE
+                K_cur = ggml_reshape_4d(ctx0, K_cur, head_dim, n_kv_heads, T_cur, B);
+                K_cur = ggml_rope(ctx0, K_cur, dec_pos, head_dim, DIA_ROPE_MODE);
+
+                // Store new K/V for cache (flatten back)
+                ggml_tensor* k_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, K_cur), kv_dim, T_cur, B);
+                ggml_tensor* v_out = V_cur; // already (kv_dim, 1, B)
+                std::string kon = "new_k_" + std::to_string(l);
+                std::string von = "new_v_" + std::to_string(l);
+                ggml_set_name(k_out, kon.c_str());
+                ggml_set_output(k_out);
+                ggml_set_name(v_out, von.c_str());
+                ggml_set_output(v_out);
+                new_k_outputs[l] = k_out;
+                new_v_outputs[l] = v_out;
+
+                // Concatenate past K/V with current for attention
+                // Full K: (head_dim, n_kv_heads, T_past+1, B)
+                ggml_tensor* K_full;
+                ggml_tensor* V_full;
+                if (T_past > 0) {
+                    // past_k: (kv_dim, T_past, B) -> reshape to (head_dim, n_kv_heads, T_past, B)
+                    ggml_tensor* past_k_4d = ggml_reshape_4d(ctx0, past_k_inputs[l], head_dim, n_kv_heads, T_past, B);
+                    // Apply RoPE to past K with past positions - NO, past K already has RoPE applied
+                    // Actually we need to store post-RoPE K in cache. K_cur already has RoPE.
+                    // Concat on T dimension
+                    K_full =
+                        ggml_concat(ctx0, past_k_4d,
+                                    ggml_reshape_4d(ctx0, ggml_cont(ctx0, K_cur), head_dim, n_kv_heads, T_cur, B), 2);
+                    ggml_tensor* past_v_4d = ggml_reshape_4d(ctx0, past_v_inputs[l], head_dim, n_kv_heads, T_past, B);
+                    ggml_tensor* v_cur_4d = ggml_reshape_4d(ctx0, V_cur, head_dim, n_kv_heads, T_cur, B);
+                    V_full = ggml_concat(ctx0, past_v_4d, v_cur_4d, 2);
+                } else {
+                    K_full = ggml_reshape_4d(ctx0, ggml_cont(ctx0, K_cur), head_dim, n_kv_heads, T_cur, B);
+                    V_full = ggml_reshape_4d(ctx0, V_cur, head_dim, n_kv_heads, T_cur, B);
+                }
+
+                // GQA: repeat K/V heads to match Q heads
+                // n_heads=16, n_kv_heads=4 -> repeat 4x
+                int n_rep = n_heads / n_kv_heads;
+                if (n_rep > 1) {
+                    K_full = ggml_repeat_4d(ctx0, K_full, head_dim, n_heads, T_past + T_cur, B);
+                    V_full = ggml_repeat_4d(ctx0, V_full, head_dim, n_heads, T_past + T_cur, B);
+                }
+
+                // Attention: Q @ K^T / sqrt(d)
+                // Q: (head_dim, n_heads, 1, B)
+                // K: (head_dim, n_heads, T_full, B)
+                // Permute Q to (head_dim, 1, n_heads, B) and K to (head_dim, T_full, n_heads, B)
+                ggml_tensor* q_perm = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
+                ggml_tensor* k_perm = ggml_cont(ctx0, ggml_permute(ctx0, K_full, 0, 2, 1, 3));
+                // kq: (T_full, 1, n_heads, B) — dot product contracts on head_dim
+                ggml_tensor* kq = ggml_mul_mat(ctx0, k_perm, q_perm);
+                // Scale by 1/sqrt(head_dim)
+                kq = ggml_scale(ctx0, kq, 1.0f / sqrtf((float)head_dim));
+                // Softmax (no mask needed for causal since we only have past + current)
+                kq = ggml_soft_max(ctx0, kq);
+
+                // V @ attn_weights
+                // V: (head_dim, n_heads, T_full, B) -> permute to (head_dim, T_full, n_heads, B)
+                ggml_tensor* v_perm = ggml_cont(ctx0, ggml_permute(ctx0, V_full, 0, 2, 1, 3));
+                // v_perm transposed: (T_full, head_dim, n_heads, B)
+                ggml_tensor* v_t = ggml_cont(ctx0, ggml_transpose(ctx0, v_perm));
+                // kqv: mul_mat(v_t, kq) contracts on T_full -> (head_dim, 1, n_heads, B)
+                ggml_tensor* kqv = ggml_mul_mat(ctx0, v_t, kq);
+                // Permute to (head_dim, n_heads, 1, B) then reshape to (dec_hidden, 1, B)
+                kqv = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));
+                cur = ggml_reshape_3d(ctx0, kqv, dec_hidden, T_cur, B);
+                cur = ggml_mul_mat(ctx0, layer.self_o_proj, cur);
+            }
+
+            cur = ggml_add(ctx0, cur, residual);
+            residual = cur;
+
+            // Pre cross-attention norm
+            cur = dia_rms_norm(ctx0, cur, layer.pre_ca_norm, m.rms_norm_eps);
+
+            // Cross-attention
+            {
+                // Q from decoder hidden state
+                ggml_tensor* Q = ggml_mul_mat(ctx0, layer.cross_q_proj, cur); // (dec_hidden, 1, B)
+                Q = ggml_reshape_4d(ctx0, Q, head_dim, n_heads, T_cur, B);
+                // No RoPE on cross-attention Q (cross-attn uses absolute position from encoder)
+
+                // K/V from precomputed cross-attention cache
+                // cross_k: (cross_kv_dim=2048, T_enc, B) -> (head_dim, n_heads, T_enc, B)
+                // Cross-attention is MHA (16q, 16kv) — no GQA repeat needed
+                ggml_tensor* K_cross = ggml_reshape_4d(ctx0, cross_k_inputs[l], head_dim, n_heads, T_enc, B);
+                ggml_tensor* V_cross = ggml_reshape_4d(ctx0, cross_v_inputs[l], head_dim, n_heads, T_enc, B);
+
+                // Attention
+                ggml_tensor* q_perm = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
+                ggml_tensor* k_perm = ggml_cont(ctx0, ggml_permute(ctx0, K_cross, 0, 2, 1, 3));
+                ggml_tensor* kq = ggml_mul_mat(ctx0, k_perm, q_perm);
+                kq = ggml_scale(ctx0, kq, 1.0f / sqrtf((float)head_dim));
+                kq = ggml_soft_max(ctx0, kq);
+
+                ggml_tensor* v_perm = ggml_cont(ctx0, ggml_permute(ctx0, V_cross, 0, 2, 1, 3));
+                ggml_tensor* v_t = ggml_cont(ctx0, ggml_transpose(ctx0, v_perm));
+                ggml_tensor* kqv = ggml_mul_mat(ctx0, v_t, kq);
+                kqv = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));
+                cur = ggml_reshape_3d(ctx0, kqv, dec_hidden, T_cur, B);
+                cur = ggml_mul_mat(ctx0, layer.cross_o_proj, cur);
+            }
+
+            cur = ggml_add(ctx0, cur, residual);
+            residual = cur;
+
+            // Pre MLP norm
+            cur = dia_rms_norm(ctx0, cur, layer.pre_mlp_norm, m.rms_norm_eps);
+
+            // MLP: SiLU(gate(x)) * up(x), then down
+            {
+                cur = ggml_mul(ctx0, ggml_silu(ctx0, ggml_mul_mat(ctx0, layer.gate, cur)),
+                               ggml_mul_mat(ctx0, layer.up, cur));
+                cur = ggml_mul_mat(ctx0, layer.wo_mlp, cur);
+            }
+
+            cur = ggml_add(ctx0, cur, residual);
+        }
+
+        // Final norm
+        cur = dia_rms_norm(ctx0, cur, m.decoder.norm, m.rms_norm_eps);
+        // cur: (dec_hidden, 1, B)
+
+        // Project to logits for each codebook head
+        // We need all 9 heads' logits. Output shape: (output_vocab_size * n_output_heads, 1, B)
+        std::vector<ggml_tensor*> head_logits(m.n_output_heads);
+        for (int h = 0; h < (int)m.n_output_heads; h++) {
+            head_logits[h] = ggml_mul_mat(ctx0, m.decoder.heads[h], cur); // (output_vocab_size, 1, B)
+            std::string hn = "logits_" + std::to_string(h);
+            ggml_set_name(head_logits[h], hn.c_str());
+            ggml_set_output(head_logits[h]);
+        }
+
+        // Build and compute graph
+        ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 32768, false);
+        for (int h = 0; h < (int)m.n_output_heads; h++) {
+            ggml_build_forward_expand(gf, head_logits[h]);
+        }
+        for (int l = 0; l < (int)m.n_decoder_layers; l++) {
+            ggml_build_forward_expand(gf, new_k_outputs[l]);
+            ggml_build_forward_expand(gf, new_v_outputs[l]);
+        }
+
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+        if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
+            fprintf(stderr, "dia_tts: decoder step %u graph alloc failed\n", step);
+            if (alloc)
+                ggml_gallocr_free(alloc);
+            ggml_free(ctx0);
+            return nullptr;
+        }
+
+        // Set inputs
+        // Audio tokens: interleaved [head0_cond, head0_uncond, head1_cond, head1_uncond, ...]
+        // Actually from build_dia_decoder_embedding: stride view picks every n_output_heads-th element
+        // So layout is: [cond_h0, cond_h1, ..., cond_h8, uncond_h0, ..., uncond_h8]
+        std::vector<int32_t> audio_input(m.n_output_heads * B);
+        for (int h = 0; h < (int)m.n_output_heads; h++) {
+            audio_input[h] = (int32_t)ctx->current_audio_tokens[h];                    // conditional
+            audio_input[m.n_output_heads + h] = (int32_t)ctx->current_audio_tokens[h]; // unconditional (same tokens)
+        }
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "audio_tokens"), audio_input.data(), 0,
+                                audio_input.size() * sizeof(int32_t));
+
+        // Position
+        int32_t pos_val = (int32_t)step;
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "dec_pos"), &pos_val, 0, sizeof(int32_t));
+
+        // Past self-attention K/V
+        for (int l = 0; l < (int)m.n_decoder_layers; l++) {
+            if (T_past > 0) {
+                std::string kn = "past_k_" + std::to_string(l);
+                std::string vn = "past_v_" + std::to_string(l);
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf, kn.c_str()), self_k[l].data(), 0,
+                                        self_k[l].size() * sizeof(float));
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf, vn.c_str()), self_v[l].data(), 0,
+                                        self_v[l].size() * sizeof(float));
+            }
+            // Cross-attention K/V
+            std::string ckn = "cross_k_in_" + std::to_string(l);
+            std::string cvn = "cross_v_in_" + std::to_string(l);
+            ggml_backend_tensor_set(ggml_graph_get_tensor(gf, ckn.c_str()), cross_k[l].data(), 0,
+                                    cross_k[l].size() * sizeof(float));
+            ggml_backend_tensor_set(ggml_graph_get_tensor(gf, cvn.c_str()), cross_v[l].data(), 0,
+                                    cross_v[l].size() * sizeof(float));
+        }
+
+        // Compute
+        ggml_status st = ggml_backend_graph_compute(ctx->backend, gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "dia_tts: decoder step %u compute failed\n", step);
+            ggml_gallocr_free(alloc);
+            ggml_free(ctx0);
+            return nullptr;
+        }
+
+        // Read new K/V and append to self-attention cache
+        for (int l = 0; l < (int)m.n_decoder_layers; l++) {
+            std::string kon = "new_k_" + std::to_string(l);
+            std::string von = "new_v_" + std::to_string(l);
+            std::vector<float> k_new(kv_dim * T_cur * B);
+            std::vector<float> v_new(kv_dim * T_cur * B);
+            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, kon.c_str()), k_new.data(), 0,
+                                    k_new.size() * sizeof(float));
+            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, von.c_str()), v_new.data(), 0,
+                                    v_new.size() * sizeof(float));
+            self_k[l].insert(self_k[l].end(), k_new.begin(), k_new.end());
+            self_v[l].insert(self_v[l].end(), v_new.begin(), v_new.end());
+        }
+
+        // Read logits and apply CFG, then sample
+        for (int h = 0; h < (int)m.n_output_heads; h++) {
+            std::string hn = "logits_" + std::to_string(h);
+            // Logits shape: (output_vocab_size, 1, B) = (1028, 1, 2)
+            // Batch 0 = conditional, Batch 1 = unconditional
+            std::vector<float> logits_raw(m.output_vocab_size * B);
+            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, hn.c_str()), logits_raw.data(), 0,
+                                    logits_raw.size() * sizeof(float));
+
+            // CFG: final_logits = uncond + cfg_scale * (cond - uncond)
+            std::vector<float> final_logits(m.output_vocab_size);
+            float* cond = logits_raw.data();
+            float* uncond = logits_raw.data() + m.output_vocab_size;
+            for (uint32_t i = 0; i < m.output_vocab_size; i++) {
+                final_logits[i] = uncond[i] + p.cfg_scale * (cond[i] - uncond[i]);
+            }
+
+            // Sample token for this codebook
+            uint32_t token =
+                dia_sample_token(final_logits.data(), m.output_vocab_size, p.temperature, p.top_p, p.top_k, ctx->rng);
+            ctx->current_audio_tokens[h] = token;
+        }
+
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx0);
+
+        // Append current tokens to output
+        for (int h = 0; h < (int)m.n_output_heads; h++) {
+            ctx->output_tokens.push_back(ctx->current_audio_tokens[h]);
+        }
+
+        // Check stopping condition
+        if (dia_check_stopping(*ctx)) {
+            if (p.verbosity >= 1) {
+                fprintf(stderr, "dia_tts: stopped at step %u\n", step + 1);
+            }
+            break;
+        }
+
+        if (p.verbosity >= 2 && (step + 1) % 100 == 0) {
+            fprintf(stderr, "dia_tts: decoder step %u/%u\n", step + 1, max_gen);
+        }
+    }
+
+    if (p.verbosity >= 1) {
+        fprintf(stderr, "dia_tts: generated %zu raw tokens (%zu steps)\n", ctx->output_tokens.size(),
+                ctx->output_tokens.size() / m.n_output_heads);
+    }
+
+    // ===================================================================
     // 4. Revert delay pattern
+    // ===================================================================
+    std::vector<uint32_t> filtered_codes;
+    dia_revert_delay(ctx->output_tokens, filtered_codes, m);
+
+    if (filtered_codes.empty()) {
+        fprintf(stderr, "dia_tts: no valid codes after delay reversal\n");
+        return nullptr;
+    }
+
+    size_t n_frames = filtered_codes.size() / m.n_output_heads;
+    if (p.verbosity >= 1) {
+        fprintf(stderr, "dia_tts: %zu valid code frames after delay reversal\n", n_frames);
+    }
+
+    // ===================================================================
     // 5. Decode via DAC codec
+    // ===================================================================
+    if (!m.has_dac) {
+        fprintf(stderr, "dia_tts: DAC codec not loaded, cannot decode to audio\n");
+        fprintf(stderr, "dia_tts: returning raw codes (set codec path first)\n");
+        return nullptr;
+    }
 
-    fprintf(stderr, "dia_tts: encoder + decoder graph execution not yet implemented\n");
-    fprintf(stderr, "dia_tts: runtime skeleton ready; implement graph building next\n");
+    // DAC decode: codes (9, n_frames) -> PCM at 44.1 kHz
+    // Total samples = n_frames * hop_length (512)
+    int n_samples = (int)(n_frames * m.dac.config.hop_length);
+    float* pcm = (float*)malloc(n_samples * sizeof(float));
+    if (!pcm)
+        return nullptr;
 
-    return nullptr;
+    // TODO: implement DAC decode graph using core_dac helpers
+    // For now, output silence placeholder until DAC graph building is done
+    memset(pcm, 0, n_samples * sizeof(float));
+    fprintf(stderr, "dia_tts: DAC decode not yet implemented, returning %d samples of silence\n", n_samples);
+
+    *out_n_samples = n_samples;
+    return pcm;
 }
 
 void dia_tts_pcm_free(float* pcm) {

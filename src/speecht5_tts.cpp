@@ -224,6 +224,27 @@ struct speecht5_tts_context {
     // Speaker embedding (512-dim x-vector)
     std::vector<float> speaker_emb;
 
+    // Decoder self-attention KV cache.
+    // For each decoder layer, we store accumulated K and V vectors.
+    // Layout: [layer][step * hidden_size ... (step+1) * hidden_size]
+    // At step N, each layer has N entries of hidden_size floats.
+    struct decoder_kv_cache {
+        std::vector<std::vector<float>> k; // [n_layers][steps * hidden_size]
+        std::vector<std::vector<float>> v; // [n_layers][steps * hidden_size]
+        int n_steps = 0;
+
+        void reset(int n_layers) {
+            k.assign(n_layers, std::vector<float>());
+            v.assign(n_layers, std::vector<float>());
+            n_steps = 0;
+        }
+
+        void append(int layer, const std::vector<float>& k_vec, const std::vector<float>& v_vec) {
+            k[layer].insert(k[layer].end(), k_vec.begin(), k_vec.end());
+            v[layer].insert(v[layer].end(), v_vec.begin(), v_vec.end());
+        }
+    } self_kv_cache;
+
     ~speecht5_tts_context() {
         core_gguf::free_weights(wl);
         if (backend && backend != backend_cpu) {
@@ -280,10 +301,17 @@ static std::vector<float> run_encoder(speecht5_tts_context* ctx, const std::vect
 
     ggml_tensor* alpha = W(ts, "enc.pos_alpha");
     if (alpha) {
-        ggml_tensor* alpha_f32 = ggml_cast(gc, alpha, GGML_TYPE_F32);
-        ggml_tensor* scaled_pe = ggml_scale(gc, pe_input, 1.0f); // copy
-        scaled_pe = ggml_mul(gc, scaled_pe,
-                             ggml_repeat(gc, alpha_f32, ggml_new_tensor_2d(gc, GGML_TYPE_F32, hp.hidden_size, T)));
+        // Alpha is a scalar — read its value and use ggml_scale
+        float alpha_val = 1.0f;
+        if (alpha->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(alpha, &alpha_val, 0, sizeof(float));
+        } else {
+            // F16 scalar
+            ggml_fp16_t alpha_f16;
+            ggml_backend_tensor_get(alpha, &alpha_f16, 0, sizeof(ggml_fp16_t));
+            alpha_val = ggml_fp16_to_fp32(alpha_f16);
+        }
+        ggml_tensor* scaled_pe = ggml_scale(gc, pe_input, alpha_val);
         x = ggml_add(gc, x, scaled_pe);
     } else {
         x = ggml_add(gc, x, pe_input);
@@ -313,9 +341,7 @@ static std::vector<float> run_encoder(speecht5_tts_context* ctx, const std::vect
         // Reshape rel_pos_ids to 1D for get_rows, then reshape back
         ggml_tensor* flat_ids = ggml_reshape_1d(gc, rel_pos_ids, T * T);
         ggml_tensor* flat_bias = ggml_get_rows(gc, rel_pos_w, flat_ids);     // (T*T, head_dim)
-        position_bias = ggml_reshape_3d(gc, flat_bias, hp.head_dim(), T, T); // (head_dim, T, T)
-        // Transpose to (T, T, head_dim) for the attention bias computation
-        position_bias = ggml_cont(gc, ggml_permute(gc, position_bias, 0, 2, 1, 3));
+        position_bias = ggml_reshape_3d(gc, flat_bias, hp.head_dim(), T, T); // (head_dim, T_key, T_query)
     }
 
     // Encoder layers
@@ -373,84 +399,38 @@ static std::vector<float> run_encoder(speecht5_tts_context* ctx, const std::vect
         // gives (T, T, n_heads)
         ggml_tensor* attn_w = ggml_mul_mat(gc, k_perm, q_perm); // (T, T, n_heads)
 
-        // Add relative position bias
-        // position_bias is (head_dim, T, T). We need to compute:
-        // rel_pos_bias[h, i, j] = sum_d Q[h, i, d] * position_bias[d, i, j]
-        // This is Q @ position_bias^T per head
+        // Add relative position bias (content-dependent, Q-based)
+        // HF SpeechT5: rel_bias = matmul(Q, position_bias.T) per batch of query positions
+        // In PyTorch: Q is (T, n_heads, hd), position_bias is (T, T, hd)
+        //   matmul((T, n_heads, hd), (T, hd, T)) -> (T, n_heads, T)
+        //
+        // In ggml layout:
+        //   q (pre-permute) is (hd, n_heads, T)
+        //   position_bias is (hd, T_key, T_query) after our permute above
+        //   mul_mat(position_bias, q) contracts on ne[0]=hd for both
+        //   Result: (T_key, n_heads, T_query) — need permute to (T_key, T_query, n_heads)
         if (position_bias) {
-            // For each head h and query position i:
-            //   rel_bias[i, j] = sum_d q[i, d] * pe[d, i, j]
-            // We can compute this as:
-            //   reshape Q to (hd, T*n_heads) and position_bias for each i
-            // But this is complex. Simpler approach: add bias to all heads equally.
-            // Actually, the HF code does:
-            //   reshape_q = (n_heads*bsz, T, hd) -> transpose(0,1) -> (T, n_heads*bsz, hd)
-            //   rel_pos_bias = matmul(reshape_q, position_bias.transpose(-2,-1))
-            //     position_bias is (T, T, hd) -> transpose to (T, hd, T)
-            //   rel_pos_bias shape: (T, n_heads*bsz, T)
-            //   -> transpose(0,1) -> (n_heads*bsz, T, T) -> view as (n_heads, T, T)
-
-            // position_bias: (hd, T, T) -- our layout after permute above
-            // We want: for each query position i, each head h:
-            //   bias[h, i, j] = dot(q[h, i, :], position_bias[:, i, j])
-
-            // Let's just do: for all heads, compute Q_flat @ position_bias
-            // q_perm is (hd, T, n_heads). View as (hd, T*n_heads)
-            (void)q_perm; // q_perm would be used for rel pos bias matmul
-            // position_bias is (hd, T, T). For each j-column, we have (hd, T).
-            // We need: (T*n_heads, hd) @ (hd, T*T) but position_bias is (hd, T, T)
-            // Actually: transpose q_flat to (T*n_heads, hd), then matmul with
-            // position_bias viewed as (hd, T*T) -> gives (T*n_heads, T*T)
-            // That's way too big. Let's do it differently.
-
-            // The HF approach per-head:
-            //   For head h at position i: bias = q[h,i,:] @ PE[i,:,:]^T
-            //   where PE[i,:,:] is (T, hd), so bias is (T,)
-            // Over all heads and positions:
-            //   q: (T, n_heads, hd) and PE: (T_src, T_dst, hd)
-            //   bias[h, i, j] = sum_d q[h, i, d] * PE[j, i, d]
-            //   = sum_d q[h, i, d] * PE[j, i, d]
-
-            // Actually, position_bias from embed_positions is (T, T, hd) in PyTorch.
-            // In our ggml layout after the operations above: (hd, T, T)
-            // Meaning: for position pair (i, j), the bias vector is position_bias[:, i, j]
-            // which has dimension hd.
-
-            // The HF attention code computes:
-            //   reshape_q: (T, n_heads, hd) in PyTorch
-            //   rel_pos_bias = matmul(reshape_q, position_bias.transpose(-2, -1))
-            //   where position_bias is (seq, seq, hd) -> transpose to (seq, hd, seq)
-            //   matmul: (T, n_heads, hd) @ (T, hd, T) -> (T, n_heads, T)
-            //   then reshape to (n_heads, T, T) and add to attn_weights
-
-            // In ggml layout (reversed dims):
-            //   q_for_bias: (hd, n_heads, T) -- same as our q after reshape_3d
-            //   position_bias: (hd, T, T) -- what we have
-            //   We want: for each query position i (last dim of q):
-            //     result[j, h, i] = sum_d q[d, h, i] * pb[d, j, i]
-            //   This is mul_mat over the first dimension.
-
-            // position_bias transposed: (T, hd, T)
-            // Let's compute per query position to keep it manageable:
-            // Actually we can use a batched matmul approach.
-            // For a simpler initial implementation, skip the relative bias for now
-            // and add it in a follow-up when diff-testing reveals the gap.
-            // The model should still produce reasonable output without it
-            // (the attention still works, just without positional information in the bias).
-
-            // TODO(speecht5): add relative position bias to encoder self-attention
-            // For now, the attention weights are computed without position bias.
-            (void)position_bias;
+            ggml_tensor* rel_bias = ggml_mul_mat(gc, position_bias, q); // (T, n_heads, T)
+            // Permute to (T, T, n_heads) to match attn_w layout
+            rel_bias = ggml_cont(gc, ggml_permute(gc, rel_bias, 0, 2, 1, 3));
+            attn_w = ggml_add(gc, attn_w, rel_bias);
         }
 
         // Softmax
         attn_w = ggml_soft_max(gc, attn_w);
 
-        // attn_output = attn_w @ V: (T, T, n_heads) @ (hd, T, n_heads) -> (hd, T, n_heads)
-        // Actually need (T, hd, n_heads) via mul_mat(v_perm, attn_w)
-        ggml_tensor* attn_out = ggml_mul_mat(gc, v_perm, ggml_cont(gc, ggml_permute(gc, attn_w, 1, 0, 2, 3)));
-        // attn_out is (hd, T, n_heads). Reshape to (hidden_size, T)
-        attn_out = ggml_reshape_2d(gc, ggml_cont(gc, attn_out), hp.hidden_size, T);
+        // attn_output = attn_w @ V
+        // attn_w: (T, T, n_heads) — scores per head
+        // v_perm: (hd, T, n_heads) — values per head
+        // We need: output[d, i, h] = sum_j attn_w[j, i, h] * v[d, j, h]
+        // In ggml mul_mat contracts over ne[0], so transpose v to (T, hd, n_heads)
+        ggml_tensor* v_t = ggml_cont(gc, ggml_permute(gc, v_perm, 1, 0, 2, 3)); // (T, hd, n_heads)
+        ggml_tensor* attn_out = ggml_mul_mat(gc, v_t, attn_w);                  // (hd, T, n_heads)
+        // Reshape to (hidden_size, T)
+        // attn_out is (hd, T, n_heads). Need to permute to (hd, n_heads, T) before
+        // reshape to (hidden=hd*n_heads, T), so heads are concatenated correctly.
+        attn_out = ggml_cont(gc, ggml_permute(gc, attn_out, 0, 2, 1, 3)); // (hd, n_heads, T)
+        attn_out = ggml_reshape_2d(gc, attn_out, hp.hidden_size, T);
 
         // Output projection
         ggml_tensor* attn_proj = ggml_mul_mat(gc, o_w, attn_out);
@@ -539,7 +519,10 @@ static std::vector<float> run_encoder(speecht5_tts_context* ctx, const std::vect
             rel_ids_t[j + i * T] = rel_ids[i * T + j];
         }
     }
-    mg.set_input(rel_pos_ids, rel_ids_t.data(), T * T * sizeof(int32_t));
+    // Only set rel_pos_ids if it's actually used in the graph (position bias is TODO)
+    if (rel_pos_ids->buffer) {
+        mg.set_input(rel_pos_ids, rel_ids_t.data(), T * T * sizeof(int32_t));
+    }
 
     // Compute
     ggml_backend_graph_compute(mg.backend, gf);
@@ -619,9 +602,9 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
     ggml_tensor* dec_alpha = W(ts, "dec.pos_alpha");
     ggml_tensor* pe_1d = ggml_reshape_2d(gc, dec_pe, hp.hidden_size, 1);
     if (dec_alpha) {
-        ggml_tensor* alpha_f32 = ggml_cast(gc, dec_alpha, GGML_TYPE_F32);
-        pe_1d =
-            ggml_mul(gc, pe_1d, ggml_repeat(gc, alpha_f32, ggml_new_tensor_2d(gc, GGML_TYPE_F32, hp.hidden_size, 1)));
+        float alpha_val = 1.0f;
+        ggml_backend_tensor_get(dec_alpha, &alpha_val, 0, sizeof(float));
+        pe_1d = ggml_scale(gc, pe_1d, alpha_val);
     }
     x = ggml_add(gc, x, pe_1d);
 
@@ -646,34 +629,149 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
 
     // x is now (hidden_size, 1) -- the decoder input for this step
 
-    // ── Decoder layers (simplified: no KV cache, single-step) ──
-    // For the initial implementation, we run full attention over a
-    // single position. KV caching can be added later for speed.
+    // ── Decoder layers with KV-cached self-attention ──
+    // At step N, self-attention attends to all N+1 positions (including current).
+    // We pass the full KV cache as input tensors and append current K/V after compute.
+    const int T_kv = dec_step + 1; // total positions including current step
+
+    // Create input tensors for past KV (one per layer)
+    // These hold the full K/V including the current step (we'll compute current K/V
+    // in the graph and concatenate with past via an input tensor).
+    // Actually, simpler approach: pass past K/V as inputs, compute current K/V in graph,
+    // concatenate them, then do attention. But ggml_concat requires both tensors in the graph.
+    // Simplest correct approach: pass ALL K/V (past + current) as pre-computed input tensors.
+    // We compute current K/V on the host after graph execution of a "projection-only" pass,
+    // OR we do the full attention with all KV as inputs.
+    //
+    // Strategy: We'll compute Q/K/V projections inside the graph for the current step,
+    // but for past K/V we pass them as input tensors. Then we concatenate.
+    // However this requires dynamic graph sizes. Instead, use the simplest approach:
+    // 1. Each layer's self-attn projects current x -> Q, K_cur, V_cur (in graph)
+    // 2. Past K/V are passed as 2D input tensors (hidden_size, dec_step)
+    // 3. Full K = concat(past_K, K_cur), Full V = concat(past_V, V_cur)
+    // 4. Attend Q (1 position) to Full K/V (T_kv positions)
+    // 5. After compute, read K_cur and V_cur from the graph to append to the cache.
+    //
+    // But reading intermediate tensors after compute is tricky with mini_graph.
+    // Even simpler: compute K_cur and V_cur on the HOST (just matrix multiply),
+    // append to cache BEFORE building the graph, then pass the full cache as input.
+    // The K/V projection is just: K = W_k @ x + b_k, V = W_v @ x + b_v
+    // We can do this with a tiny sub-graph or manually.
+    //
+    // Actually the cleanest approach for correctness:
+    // Pre-compute K and V for each layer on the host before building the main graph.
+    // We need the hidden state 'x' at each layer's self-attention input, but that depends
+    // on the previous layer's output. So we can't pre-compute all layers' K/V at once.
+    //
+    // Final approach: build the graph with past KV as inputs AND current K/V computed
+    // in-graph, concatenated. After compute, we read back the current K/V values
+    // from named output tensors.
+
+    struct layer_kv_tensors {
+        ggml_tensor* past_k_input; // (hidden_size, dec_step) or null if step 0
+        ggml_tensor* past_v_input;
+        ggml_tensor* cur_k_out; // (hidden_size, 1) — named for readback
+        ggml_tensor* cur_v_out;
+    };
+    std::vector<layer_kv_tensors> layer_kv(hp.decoder_layers);
+
     for (int i = 0; i < hp.decoder_layers; i++) {
         std::string pfx = "dec.layer." + std::to_string(i);
 
-        // Self-attention (single position = trivial)
+        // Self-attention with KV cache
         ggml_tensor* residual = x;
         ggml_tensor* sq_w = W(ts, pfx + ".self_attn.q.weight");
         ggml_tensor* sq_b = W(ts, pfx + ".self_attn.q.bias");
-        (void)0; // K not needed for single-position self-attention
+        ggml_tensor* sk_w = W(ts, pfx + ".self_attn.k.weight");
+        ggml_tensor* sk_b = W(ts, pfx + ".self_attn.k.bias");
         ggml_tensor* sv_w = W(ts, pfx + ".self_attn.v.weight");
         ggml_tensor* sv_b = W(ts, pfx + ".self_attn.v.bias");
         ggml_tensor* so_w = W(ts, pfx + ".self_attn.o.weight");
         ggml_tensor* so_b = W(ts, pfx + ".self_attn.o.bias");
 
-        // Single position self-attention: Q @ K^T / sqrt(d) -> softmax -> @ V
-        // With T_dec=1, this is just: output = V (since softmax of single element = 1)
-        ggml_tensor* sq = ggml_mul_mat(gc, sq_w, x);
+        // Project current position -> Q, K_cur, V_cur
+        ggml_tensor* sq = ggml_mul_mat(gc, sq_w, x); // (hidden_size, 1)
         if (sq_b)
             sq = ggml_add(gc, sq, sq_b);
+        sq = ggml_scale(gc, sq, 1.0f / sqrtf((float)hp.head_dim()));
 
-        ggml_tensor* sv = ggml_mul_mat(gc, sv_w, x);
+        ggml_tensor* sk_cur = ggml_mul_mat(gc, sk_w, x); // (hidden_size, 1)
+        if (sk_b)
+            sk_cur = ggml_add(gc, sk_cur, sk_b);
+
+        ggml_tensor* sv_cur = ggml_mul_mat(gc, sv_w, x); // (hidden_size, 1)
         if (sv_b)
-            sv = ggml_add(gc, sv, sv_b);
+            sv_cur = ggml_add(gc, sv_cur, sv_b);
 
-        // For single position, self-attn output = V projected through O
-        ggml_tensor* self_out = ggml_mul_mat(gc, so_w, sv);
+        // Name K_cur and V_cur for readback after compute
+        std::string k_name = "sa_k_" + std::to_string(i);
+        std::string v_name = "sa_v_" + std::to_string(i);
+        ggml_set_name(sk_cur, k_name.c_str());
+        ggml_set_name(sv_cur, v_name.c_str());
+
+        // Build full K and V by concatenating past cache with current
+        ggml_tensor* full_k;
+        ggml_tensor* full_v;
+
+        if (dec_step > 0) {
+            // Past K/V input tensors: (hidden_size, dec_step)
+            ggml_tensor* past_k = ggml_new_tensor_2d(gc, GGML_TYPE_F32, hp.hidden_size, dec_step);
+            std::string pk_name = "past_k_" + std::to_string(i);
+            ggml_set_name(past_k, pk_name.c_str());
+            ggml_set_input(past_k);
+
+            ggml_tensor* past_v = ggml_new_tensor_2d(gc, GGML_TYPE_F32, hp.hidden_size, dec_step);
+            std::string pv_name = "past_v_" + std::to_string(i);
+            ggml_set_name(past_v, pv_name.c_str());
+            ggml_set_input(past_v);
+
+            layer_kv[i].past_k_input = past_k;
+            layer_kv[i].past_v_input = past_v;
+
+            // Concat: past (hidden_size, dec_step) + cur (hidden_size, 1) -> (hidden_size, T_kv)
+            full_k = ggml_concat(gc, past_k, sk_cur, 1); // concat along dim 1 (sequence)
+            full_v = ggml_concat(gc, past_v, sv_cur, 1);
+        } else {
+            // First step: K/V is just current
+            full_k = sk_cur;
+            full_v = sv_cur;
+            layer_kv[i].past_k_input = nullptr;
+            layer_kv[i].past_v_input = nullptr;
+        }
+
+        layer_kv[i].cur_k_out = sk_cur;
+        layer_kv[i].cur_v_out = sv_cur;
+
+        // Multi-head attention: Q (1 pos) attending to full K/V (T_kv pos)
+        int n_heads = hp.decoder_attention_heads;
+        int hd = hp.head_dim();
+
+        // Q: (hidden_size, 1) -> (hd, n_heads, 1)
+        ggml_tensor* q_mh = ggml_reshape_3d(gc, sq, hd, n_heads, 1);
+        // K: (hidden_size, T_kv) -> (hd, n_heads, T_kv)
+        ggml_tensor* k_mh = ggml_reshape_3d(gc, full_k, hd, n_heads, T_kv);
+        // V: (hidden_size, T_kv) -> (hd, n_heads, T_kv)
+        ggml_tensor* v_mh = ggml_reshape_3d(gc, full_v, hd, n_heads, T_kv);
+
+        // Permute for batched matmul: (hd, seq, n_heads)
+        q_mh = ggml_cont(gc, ggml_permute(gc, q_mh, 0, 2, 1, 3)); // (hd, 1, n_heads)
+        k_mh = ggml_cont(gc, ggml_permute(gc, k_mh, 0, 2, 1, 3)); // (hd, T_kv, n_heads)
+        v_mh = ggml_cont(gc, ggml_permute(gc, v_mh, 0, 2, 1, 3)); // (hd, T_kv, n_heads)
+
+        // attn_w = Q @ K^T: mul_mat(K, Q) -> (T_kv, 1, n_heads)
+        ggml_tensor* attn_w = ggml_mul_mat(gc, k_mh, q_mh); // (T_kv, 1, n_heads)
+        attn_w = ggml_soft_max(gc, attn_w);
+
+        // Output: attn_w @ V
+        // V transposed: (T_kv, hd, n_heads)
+        ggml_tensor* v_t = ggml_cont(gc, ggml_permute(gc, v_mh, 1, 0, 2, 3)); // (T_kv, hd, n_heads)
+        ggml_tensor* self_out = ggml_mul_mat(gc, v_t, attn_w);                // (hd, 1, n_heads)
+
+        // Reshape to (hidden_size, 1)
+        self_out = ggml_reshape_2d(gc, ggml_cont(gc, self_out), hp.hidden_size, 1);
+
+        // Output projection
+        self_out = ggml_mul_mat(gc, so_w, self_out);
         if (so_b)
             self_out = ggml_add(gc, self_out, so_b);
 
@@ -714,9 +812,8 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
         if (cv_b)
             cv = ggml_add(gc, cv, cv_b);
 
-        // Multi-head attention
-        int n_heads = hp.decoder_attention_heads;
-        int hd = hp.head_dim();
+        // Multi-head cross-attention
+        // (n_heads and hd already declared above in self-attention)
 
         // Q: (hidden_size, 1) -> (hd, n_heads, 1)
         ggml_tensor* cq_mh = ggml_reshape_3d(gc, cq, hd, n_heads, 1);
@@ -732,15 +829,18 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
         ck_mh = ggml_cont(gc, ggml_permute(gc, ck_mh, 0, 2, 1, 3)); // (hd, T_enc, n_heads)
         cv_mh = ggml_cont(gc, ggml_permute(gc, cv_mh, 0, 2, 1, 3)); // (hd, T_enc, n_heads)
 
-        ggml_tensor* attn_w = ggml_mul_mat(gc, ck_mh, cq_mh); // (T_enc, 1, n_heads)
-        attn_w = ggml_soft_max(gc, attn_w);
+        ggml_tensor* cross_attn_w = ggml_mul_mat(gc, ck_mh, cq_mh); // (T_enc, 1, n_heads)
+        cross_attn_w = ggml_soft_max(gc, cross_attn_w);
 
-        // Output: attn_w @ V = (hd, 1, n_heads)
-        ggml_tensor* cross_out =
-            ggml_mul_mat(gc, cv_mh, ggml_cont(gc, ggml_permute(gc, attn_w, 1, 0, 2, 3))); // (hd, 1, n_heads)
+        // Output: cross_attn_w @ V
+        // cross_attn_w: (T_enc, 1, n_heads), cv_mh: (hd, T_enc, n_heads)
+        // Transpose V to (T_enc, hd, n_heads), then mul_mat contracts on T_enc
+        ggml_tensor* cv_t = ggml_cont(gc, ggml_permute(gc, cv_mh, 1, 0, 2, 3)); // (T_enc, hd, n_heads)
+        ggml_tensor* cross_out = ggml_mul_mat(gc, cv_t, cross_attn_w);          // (hd, 1, n_heads)
 
-        // Reshape to (hidden_size, 1)
-        cross_out = ggml_reshape_2d(gc, ggml_cont(gc, cross_out), hp.hidden_size, 1);
+        // Permute (hd, 1, n_heads) -> (hd, n_heads, 1) then reshape to (hidden, 1)
+        cross_out = ggml_cont(gc, ggml_permute(gc, cross_out, 0, 2, 1, 3));
+        cross_out = ggml_reshape_2d(gc, cross_out, hp.hidden_size, 1);
 
         // Output projection
         cross_out = ggml_mul_mat(gc, co_w, cross_out);
@@ -806,6 +906,11 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
     ggml_cgraph* gf = ggml_new_graph_custom(gc, 32768, false);
     ggml_build_forward_expand(gf, mel_out);
     ggml_build_forward_expand(gf, prob_out);
+    // Also expand K/V output tensors so they get computed
+    for (int i = 0; i < hp.decoder_layers; i++) {
+        ggml_build_forward_expand(gf, layer_kv[i].cur_k_out);
+        ggml_build_forward_expand(gf, layer_kv[i].cur_v_out);
+    }
     if (!ggml_gallocr_alloc_graph(mg.alloc, gf)) {
         fprintf(stderr, "speecht5: decoder graph alloc failed\n");
         return result;
@@ -838,7 +943,27 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
     }
     mg.set_input(dec_pe, dec_pe_step.data(), hp.hidden_size * sizeof(float));
 
+    // Set past KV cache inputs
+    for (int i = 0; i < hp.decoder_layers; i++) {
+        if (dec_step > 0 && layer_kv[i].past_k_input) {
+            mg.set_input(layer_kv[i].past_k_input, ctx->self_kv_cache.k[i].data(),
+                         dec_step * hp.hidden_size * sizeof(float));
+            mg.set_input(layer_kv[i].past_v_input, ctx->self_kv_cache.v[i].data(),
+                         dec_step * hp.hidden_size * sizeof(float));
+        }
+    }
+
     ggml_backend_graph_compute(mg.backend, gf);
+
+    // Read back current K/V and append to cache
+    for (int i = 0; i < hp.decoder_layers; i++) {
+        std::vector<float> k_cur(hp.hidden_size);
+        std::vector<float> v_cur(hp.hidden_size);
+        ggml_backend_tensor_get(layer_kv[i].cur_k_out, k_cur.data(), 0, hp.hidden_size * sizeof(float));
+        ggml_backend_tensor_get(layer_kv[i].cur_v_out, v_cur.data(), 0, hp.hidden_size * sizeof(float));
+        ctx->self_kv_cache.append(i, k_cur, v_cur);
+    }
+    ctx->self_kv_cache.n_steps++;
 
     // Read outputs
     int mel_n = hp.reduction_factor * hp.num_mel_bins;
@@ -868,13 +993,22 @@ static std::vector<float> run_postnet(speecht5_tts_context* ctx,
     mini_graph mg(ctx->backend_cpu);
     auto* gc = mg.ctx;
 
-    // Input: (num_mel_bins, T_mel) -- channel-first for conv1d
+    // Input: (T_mel, num_mel_bins) -- ggml conv_1d expects (T, C_in)
     ggml_tensor* x = ggml_new_tensor_2d(gc, GGML_TYPE_F32, T_mel, hp.num_mel_bins);
     ggml_set_name(x, "postnet_in");
     ggml_set_input(x);
 
-    // Transpose to (num_mel_bins, T_mel) for channel-first conv
-    ggml_tensor* h = ggml_cont(gc, ggml_transpose(gc, x)); // (num_mel_bins, T_mel)
+    // No transpose needed: ggml conv_1d takes (T, C_in) directly
+    ggml_tensor* h = x;
+
+    // Store deferred BN inputs (set after graph alloc)
+    struct bn_deferred {
+        ggml_tensor* scale_t;
+        ggml_tensor* shift_t;
+        std::vector<float> scale_data;
+        std::vector<float> shift_data;
+    };
+    std::vector<bn_deferred> bn_inputs;
 
     // 5-layer conv1d + batch_norm + tanh
     for (int i = 0; i < hp.postnet_layers; i++) {
@@ -893,20 +1027,39 @@ static std::vector<float> run_postnet(speecht5_tts_context* ctx,
         h = ggml_conv_1d(gc, conv_w, h, 1, pad, 1);
 
         // Batch norm: (x - mean) / sqrt(var + eps) * weight + bias
+        // Pre-compute inv_std = weight / sqrt(var + eps) and bias_adj = bias - mean * inv_std
+        // on the host to avoid ggml_new_f32 in no_alloc context.
         if (bn_mean && bn_var && bn_w && bn_b) {
             int C = (int)bn_mean->ne[0];
-            ggml_tensor* m = ggml_reshape_2d(gc, bn_mean, 1, C);
-            ggml_tensor* v = ggml_reshape_2d(gc, bn_var, 1, C);
-            ggml_tensor* w = ggml_reshape_2d(gc, bn_w, 1, C);
-            ggml_tensor* b = ggml_reshape_2d(gc, bn_b, 1, C);
+            // Read BN params from weight tensors
+            std::vector<float> mean_v(C), var_v(C), weight_v(C), bias_v(C);
+            ggml_backend_tensor_get(bn_mean, mean_v.data(), 0, C * sizeof(float));
+            ggml_backend_tensor_get(bn_var, var_v.data(), 0, C * sizeof(float));
+            ggml_backend_tensor_get(bn_w, weight_v.data(), 0, C * sizeof(float));
+            ggml_backend_tensor_get(bn_b, bias_v.data(), 0, C * sizeof(float));
 
-            h = ggml_sub(gc, h, m);
-            // sqrt(var + eps) -- do NOT use inplace add on weight tensor v
-            ggml_tensor* var_eps = ggml_add(gc, v, ggml_new_f32(gc, hp.layer_norm_eps));
-            ggml_tensor* std_dev = ggml_sqrt(gc, var_eps);
-            h = ggml_div(gc, h, std_dev);
-            h = ggml_mul(gc, h, w);
-            h = ggml_add(gc, h, b);
+            // Compute fused BN params: scale = w / sqrt(v + eps), shift = b - mean * scale
+            std::vector<float> scale_v(C), shift_v(C);
+            for (int c = 0; c < C; c++) {
+                float inv_std = 1.0f / sqrtf(var_v[c] + hp.layer_norm_eps);
+                scale_v[c] = weight_v[c] * inv_std;
+                shift_v[c] = bias_v[c] - mean_v[c] * scale_v[c];
+            }
+
+            // Create input tensors for fused BN
+            ggml_tensor* bn_scale_t = ggml_new_tensor_2d(gc, GGML_TYPE_F32, 1, C);
+            ggml_set_name(bn_scale_t, (std::string("bn_scale_") + std::to_string(i)).c_str());
+            ggml_set_input(bn_scale_t);
+            ggml_tensor* bn_shift_t = ggml_new_tensor_2d(gc, GGML_TYPE_F32, 1, C);
+            ggml_set_name(bn_shift_t, (std::string("bn_shift_") + std::to_string(i)).c_str());
+            ggml_set_input(bn_shift_t);
+
+            // h = h * scale + shift (affine transform = fused batch norm)
+            h = ggml_mul(gc, h, bn_scale_t);
+            h = ggml_add(gc, h, bn_shift_t);
+
+            // Defer data setting until after graph alloc
+            bn_inputs.push_back({bn_scale_t, bn_shift_t, std::move(scale_v), std::move(shift_v)});
         }
 
         // Tanh on all layers except the last
@@ -915,10 +1068,7 @@ static std::vector<float> run_postnet(speecht5_tts_context* ctx,
         }
     }
 
-    // Transpose back to (T_mel, num_mel_bins)
-    h = ggml_cont(gc, ggml_transpose(gc, h));
-
-    // Add residual (postnet is residual)
+    // Add residual (postnet is residual) — h and x are both (T_mel, num_mel_bins)
     h = ggml_add(gc, h, x);
 
     ggml_set_name(h, "postnet_out");
@@ -932,6 +1082,12 @@ static std::vector<float> run_postnet(speecht5_tts_context* ctx,
 
     // Set input: mel spectrogram in row-major (T_mel, num_mel_bins)
     mg.set_input(x, mel_spectrogram.data(), T_mel * hp.num_mel_bins * sizeof(float));
+
+    // Set deferred BN inputs
+    for (auto& bn : bn_inputs) {
+        mg.set_input(bn.scale_t, bn.scale_data.data(), bn.scale_data.size() * sizeof(float));
+        mg.set_input(bn.shift_t, bn.shift_data.data(), bn.shift_data.size() * sizeof(float));
+    }
 
     ggml_backend_graph_compute(mg.backend, gf);
 
@@ -952,16 +1108,13 @@ static std::vector<float> run_vocoder(speecht5_tts_context* ctx,
     mini_graph mg(ctx->backend_cpu, 64 * 1024 * 1024);
     auto* gc = mg.ctx;
 
-    // Input mel: (T_mel, num_mel_bins) row-major -> need (num_mel_bins, T_mel) channel-first
+    // Input mel: (T_mel, num_mel_bins) — ggml conv_1d expects (T, C_in) directly
     ggml_tensor* mel_in = ggml_new_tensor_2d(gc, GGML_TYPE_F32, T_mel, vhp.model_in_dim);
     ggml_set_name(mel_in, "voc_mel");
     ggml_set_input(mel_in);
 
-    // Transpose to channel-first
-    ggml_tensor* mel_cf = ggml_cont(gc, ggml_transpose(gc, mel_in)); // (mel_dim, T_mel)
-
-    // Run HiFi-GAN
-    ggml_tensor* waveform = core_hifigan::forward(gc, mel_cf, ts, "voc", vhp);
+    // Run HiFi-GAN — input is (T, C_in) = (T_mel, mel_dim)
+    ggml_tensor* waveform = core_hifigan::forward(gc, mel_in, ts, "voc", vhp);
 
     ggml_set_name(waveform, "waveform");
 
@@ -1140,6 +1293,9 @@ float* speecht5_tts_synthesize(struct speecht5_tts_context* ctx, const char* tex
     int max_steps = ctx->max_len;
     int min_steps = (int)(T_enc * 0.0f / hp.reduction_factor); // minlenratio=0
     std::vector<float> all_mel_frames;                         // accumulated mel frames
+
+    // Reset KV cache for this synthesis
+    ctx->self_kv_cache.reset(hp.decoder_layers);
 
     // Start with zeros
     std::vector<float> prev_mel(hp.num_mel_bins, 0.0f);

@@ -303,10 +303,11 @@ def convert(args):
 
     def add_tensor(name: str, data: torch.Tensor, dtype=GGMLQuantizationType.F16):
         arr = data.detach().float().numpy()
-        if dtype == GGMLQuantizationType.F16:
-            arr = arr.astype(np.float16)
-        else:
+        # Force 1D tensors (biases, norms, scalars) to F32 for ggml compatibility
+        if arr.ndim <= 1 or dtype == GGMLQuantizationType.F32:
             arr = arr.astype(np.float32)
+        else:
+            arr = arr.astype(np.float16)
         writer.add_tensor(name, arr)
 
     n_tensors = 0
