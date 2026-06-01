@@ -411,12 +411,24 @@ static bool funasr_load_model(funasr_model& model, funasr_vocab& vocab, const ch
         core_gguf::free_metadata(gctx);
     }
 
-    // Pass 2: tensor data — all weights on the primary backend.
-    // The CUDA !-loop (issue #125) is fixed by QKV fusion at init time
-    // (see below), so no weight split is needed.
+    // Pass 2: tensor data.
+    // On CUDA, the ggml_backend_sched produces all-NaN prefill logits for
+    // the Qwen2-0.6B LLM decoder (issue #125). Workaround: split weights
+    // so the encoder goes to GPU (fast) but the LLM stays on CPU (correct).
+    // FUNASR_LLM_GPU=1 overrides this to put everything on GPU for testing.
     core_gguf::WeightLoad wl;
-    if (!core_gguf::load_weights(path, backend, "funasr", wl))
-        return false;
+    const bool force_llm_gpu = []() {
+        const char* s = std::getenv("FUNASR_LLM_GPU");
+        return s && *s && *s != '0';
+    }();
+    if (!ggml_backend_is_cpu(backend) && cpu_backend && !force_llm_gpu) {
+        auto is_gpu = [](const char* name, void*) -> bool { return std::strncmp(name, "funasr.", 7) == 0; };
+        if (!core_gguf::load_weights_split(path, backend, cpu_backend, is_gpu, nullptr, "funasr", wl))
+            return false;
+    } else {
+        if (!core_gguf::load_weights(path, backend, "funasr", wl))
+            return false;
+    }
     model.ctx = wl.ctx;
     model.buf = wl.buf;
     model.buf_cpu = wl.buf_cpu;
@@ -1244,7 +1256,11 @@ static bool funasr_kv_init(funasr_context* ctx, int max_ctx) {
     ggml_set_name(ctx->kv_v, "kv_v");
     const size_t kbytes = ggml_nbytes(ctx->kv_k);
     const size_t vbytes = ggml_nbytes(ctx->kv_v);
-    ggml_backend_t kv_backend = core_attn::kv_backend_from_env(ctx->backend, ctx->backend_cpu, "funasr");
+    // When LLM weights are split to CPU (issue #125), KV cache must also
+    // be on CPU so the sched routes the entire LLM to CPU.
+    ggml_backend_t kv_backend = (ctx->model.buf_cpu)
+                                    ? ctx->backend_cpu
+                                    : core_attn::kv_backend_from_env(ctx->backend, ctx->backend_cpu, "funasr");
     ctx->kv_buf = ggml_backend_alloc_buffer(kv_backend, kbytes + vbytes);
     if (!ctx->kv_buf) {
         std::fprintf(stderr, "funasr: failed to allocate kv buffer\n");
