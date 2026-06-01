@@ -1362,21 +1362,50 @@ static bool funasr_nan_check_cb(struct ggml_tensor* t, bool ask, void* user_data
             mn = v;
     }
 
+    // Print every checked node (concise) so we can trace the full sequence.
+    std::fprintf(stderr, "funasr_nan_check: node#%-3d op=%-12s name=%-30s ne=[%lld,%lld,%lld,%lld] min=%.4g max=%.4g nan=%d inf=%d\n",
+                 st->node_idx, ggml_op_name(t->op), t->name, (long long)t->ne[0], (long long)t->ne[1],
+                 (long long)t->ne[2], (long long)t->ne[3], (double)mn, (double)mx, n_nan, n_inf);
+
     if (n_nan > 0 || n_inf > 0) {
-        std::fprintf(stderr,
-                     "funasr_nan_check: FIRST BAD NODE #%d: op=%-12s name=%-30s "
-                     "type=%-4s ne=[%lld,%lld,%lld,%lld] nan=%d inf=%d min=%.6g max=%.6g\n",
-                     st->node_idx, ggml_op_name(t->op), t->name, ggml_type_name(t->type), (long long)t->ne[0],
-                     (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3], n_nan, n_inf, (double)mn,
-                     (double)mx);
-        // Print sources
+        std::fprintf(stderr, "funasr_nan_check: *** FIRST BAD NODE ABOVE ***\n");
+        // Dump source tensor stats by reading them back
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             if (!t->src[j])
                 continue;
-            std::fprintf(stderr, "  src[%d]: op=%-12s name=%-30s type=%-4s ne=[%lld,%lld,%lld,%lld]\n", j,
-                         ggml_op_name(t->src[j]->op), t->src[j]->name, ggml_type_name(t->src[j]->type),
-                         (long long)t->src[j]->ne[0], (long long)t->src[j]->ne[1], (long long)t->src[j]->ne[2],
-                         (long long)t->src[j]->ne[3]);
+            auto* s = t->src[j];
+            size_t sn = ggml_nelements(s);
+            std::vector<float> sb(sn);
+            bool readable = (s->type == GGML_TYPE_F32 || s->type == GGML_TYPE_F16) && s->data;
+            if (readable) {
+                if (s->type == GGML_TYPE_F32) {
+                    ggml_backend_tensor_get(s, sb.data(), 0, sn * sizeof(float));
+                } else {
+                    std::vector<ggml_fp16_t> sh(sn);
+                    ggml_backend_tensor_get(s, sh.data(), 0, sn * sizeof(ggml_fp16_t));
+                    for (size_t i = 0; i < sn; i++)
+                        sb[i] = ggml_fp16_to_fp32(sh[i]);
+                }
+                int snan = 0, sinf = 0;
+                float smx = -1e30f, smn = 1e30f;
+                for (size_t i = 0; i < sn; i++) {
+                    float v = sb[i];
+                    if (std::isnan(v)) { snan++; continue; }
+                    if (std::isinf(v)) { sinf++; continue; }
+                    if (v > smx) smx = v;
+                    if (v < smn) smn = v;
+                }
+                std::fprintf(stderr,
+                             "  src[%d]: op=%-12s name=%-30s type=%-4s ne=[%lld,%lld,%lld,%lld] "
+                             "min=%.6g max=%.6g nan=%d inf=%d\n",
+                             j, ggml_op_name(s->op), s->name, ggml_type_name(s->type), (long long)s->ne[0],
+                             (long long)s->ne[1], (long long)s->ne[2], (long long)s->ne[3], (double)smn,
+                             (double)smx, snan, sinf);
+            } else {
+                std::fprintf(stderr, "  src[%d]: op=%-12s name=%-30s type=%-4s ne=[%lld,%lld,%lld,%lld] [not readable]\n",
+                             j, ggml_op_name(s->op), s->name, ggml_type_name(s->type), (long long)s->ne[0],
+                             (long long)s->ne[1], (long long)s->ne[2], (long long)s->ne[3]);
+            }
         }
         st->found = true;
         return false; // stop processing further
