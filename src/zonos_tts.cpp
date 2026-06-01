@@ -318,6 +318,9 @@ struct zonos_tts_context* zonos_tts_init_from_file(const char* path_model, struc
     }
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
     ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    if (ggml_backend_is_cpu(ctx->backend)) {
+        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    }
     if (!ctx->backend) {
         ctx->backend = ctx->backend_cpu;
     }
@@ -420,9 +423,9 @@ struct zonos_tts_context* zonos_tts_init_from_file(const char* path_model, struc
         if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend) {
             backends[n_be++] = ctx->backend_cpu;
         }
-        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 4096, false, false);
     }
-    ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
+    ctx->compute_meta.resize(ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(4096, false));
 
     return ctx;
 }
@@ -991,7 +994,7 @@ static ggml_cgraph* build_graph_backbone(zonos_tts_context* ctx, int n_past, int
 
     ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
     ggml_context* ctx0 = ggml_init(ip);
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
 
     ggml_tensor* embeds = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, T);
     ggml_set_name(embeds, "inputs_embeds");
@@ -1006,7 +1009,7 @@ static ggml_cgraph* build_graph_backbone(zonos_tts_context* ctx, int n_past, int
         ggml_set_input(causal_mask);
     }
 
-    const core_attn::KvSelfAttnParams kvp = {
+    core_attn::KvSelfAttnParams kvp = {
         /*n_heads*/ n_q,
         /*n_kv_heads*/ n_kv,
         /*head_dim*/ hd,
@@ -1019,6 +1022,8 @@ static ggml_cgraph* build_graph_backbone(zonos_tts_context* ctx, int n_past, int
         /*qk_norm_eps*/ 0.0f,
         /*gqa_mode*/ core_attn::GQA_MANUAL_CONT,
     };
+    // Zonos config: rotary_emb_interleaved=true → consecutive pair RoPE (NORMAL)
+    kvp.rope_type = GGML_ROPE_TYPE_NORMAL;
 
     // Helper to upcast F16 tensors to F32 for elementwise ops
     auto cast_f32 = [&](ggml_tensor* t) -> ggml_tensor* {
@@ -1308,27 +1313,33 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
         return nullptr;
     }
 
-    // Step 3: Prefill with conditioned prefix through the backbone
-    // We run the conditioned prefix through first
-    float* logits_cond = run_backbone(ctx, cond_prefix, cond_len, 0);
+    // Step 3: CFG prefill — run both conditioned and unconditioned prefixes.
+    // For prefix-only CFG, we save the unconditioned prefill logits as a static
+    // bias. The conditioned KV cache is kept for AR decode.
+    float* logits_uncond_static = nullptr;
+    float* logits_cond = nullptr;
+    int n_past = cond_len;
+
+    if (cfg_scale != 1.0f && uncond_prefix) {
+        // First pass: unconditioned prefix → save logits
+        logits_uncond_static = run_backbone(ctx, uncond_prefix, uncond_len, 0);
+        if (!logits_uncond_static) {
+            fprintf(stderr, "zonos_tts: prefill (uncond) failed, disabling CFG\n");
+        }
+        // Clear KV cache and run conditioned prefix (its KV stays for AR)
+        ggml_backend_buffer_clear(ctx->kv_buf, 0);
+    }
+
+    logits_cond = run_backbone(ctx, cond_prefix, cond_len, 0);
     free(cond_prefix);
+    free(uncond_prefix);
+    cond_prefix = nullptr;
+    uncond_prefix = nullptr;
     if (!logits_cond) {
-        free(uncond_prefix);
+        free(logits_uncond_static);
         fprintf(stderr, "zonos_tts: prefill (cond) failed\n");
         return nullptr;
     }
-    int n_past = cond_len;
-
-    // For CFG, we would need a second KV cache for unconditioned path.
-    // For simplicity in this initial implementation, we apply CFG by running
-    // the unconditioned prefix separately and interpolating logits only at
-    // generation time. However, maintaining two KV caches doubles memory.
-    // Instead, we use a simple approximation: apply the unconditioned bias
-    // from the prefix conditioning only (no separate AR pass for uncond).
-    // This matches the "prefix-only CFG" variant that many Zonos users adopt.
-    //
-    // Full dual-stream CFG can be added as a follow-up optimization.
-    free(uncond_prefix);
 
     // Step 4: AR decode loop with delay pattern
     // The delay pattern shifts codebook k by (k+1) positions.
@@ -1344,11 +1355,33 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
     bool eos_reached = false;
     int n_decode_steps = 0;
 
+    // Temporary buffer for CFG-blended logits
+    std::vector<float> cfg_logits_buf((size_t)n_cb * vocab);
+
     for (int step = 0; step < max_steps && !eos_reached; step++) {
-        // Sample from logits for each codebook
+        // Apply CFG: blended = uncond + cfg_scale * (cond - uncond)
+        float* sampling_logits = logits_cond;
+        if (logits_uncond_static && cfg_scale != 1.0f) {
+            for (int i = 0; i < n_cb * vocab; i++) {
+                cfg_logits_buf[i] = logits_uncond_static[i] + cfg_scale * (logits_cond[i] - logits_uncond_static[i]);
+            }
+            // Mask padding tokens (index >= 1025) to -inf
+            for (int k = 0; k < n_cb; k++) {
+                for (int i = (int)hp.head_vocab_size; i < vocab; i++) {
+                    cfg_logits_buf[k * vocab + i] = -INFINITY;
+                }
+            }
+            // Only codebook 0 can predict EOS (upstream: logit_bias[:, 1:, eos] = -inf)
+            for (int k = 1; k < n_cb; k++) {
+                cfg_logits_buf[k * vocab + eos_id] = -INFINITY;
+            }
+            sampling_logits = cfg_logits_buf.data();
+        }
+
+        // Sample from (CFG-blended) logits for each codebook
         std::vector<int32_t> new_tokens(n_cb);
         for (int k = 0; k < n_cb; k++) {
-            const float* cb_logits = &logits_cond[k * vocab];
+            const float* cb_logits = &sampling_logits[k * vocab];
             int tok = sample_with_min_p(cb_logits, vocab, temperature, min_p, &ctx->rng_state);
             new_tokens[k] = tok;
         }
@@ -1412,6 +1445,7 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
     if (logits_cond) {
         free(logits_cond);
     }
+    free(logits_uncond_static);
 
     if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "zonos_tts: AR generated %d delayed steps (eos=%d)\n", n_decode_steps, eos_reached ? 1 : 0);
