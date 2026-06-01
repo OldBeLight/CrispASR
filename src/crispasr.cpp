@@ -197,34 +197,38 @@ static bool ggml_graph_compute_helper(struct ggml_cgraph* graph, int n_threads, 
 // encoder/decoder calls the accumulated mmap/munmap for thread stacks
 // fragments memory and degrades perf 2-5× — the #132 pattern.
 //
-// Created lazily on first use (when n_threads is known), shared by all
-// whisper_state instances, freed at process exit.
-static ggml_threadpool_t g_cpu_threadpool = nullptr;
-static int g_cpu_threadpool_n = 0;
+// Each CPU backend gets its own pool so that multiple whisper_state
+// instances (e.g. Ruby bindings) don't race on shared threadpool fields.
+#include <mutex>
+#include <unordered_map>
+struct cpu_pool_entry {
+    ggml_threadpool_t pool      = nullptr;
+    int               n_threads = 0;
+};
+static std::mutex                                         g_cpu_pools_mtx;
+static std::unordered_map<ggml_backend_t, cpu_pool_entry> g_cpu_pools;
 
 static void whisper_ensure_cpu_threadpool(ggml_backend_sched_t sched, int n_threads) {
-    if (!g_cpu_threadpool || g_cpu_threadpool_n < n_threads) {
+    std::lock_guard<std::mutex> lock(g_cpu_pools_mtx);
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+        if (!ggml_backend_is_cpu(backend)) continue;
+
+        auto& entry = g_cpu_pools[backend];
+        if (entry.pool && entry.n_threads >= n_threads) {
+            ggml_backend_cpu_set_threadpool(backend, entry.pool);
+            continue;
+        }
         // (Re)create with the requested size.
-        if (g_cpu_threadpool) {
-            ggml_threadpool_free(g_cpu_threadpool);
-            g_cpu_threadpool = nullptr;
-            g_cpu_threadpool_n = 0;
+        if (entry.pool) {
+            ggml_backend_cpu_set_threadpool(backend, nullptr);
+            ggml_threadpool_free(entry.pool);
         }
         struct ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
-        g_cpu_threadpool = ggml_threadpool_new(&tpp);
-        if (g_cpu_threadpool) {
-            g_cpu_threadpool_n = n_threads;
-        }
-    }
-
-    // Always (re)attach the pool to every CPU backend in the scheduler.
-    // Backends may have been recreated since the pool was first set.
-    if (g_cpu_threadpool) {
-        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
-            ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
-            if (ggml_backend_is_cpu(backend)) {
-                ggml_backend_cpu_set_threadpool(backend, g_cpu_threadpool);
-            }
+        entry.pool      = ggml_threadpool_new(&tpp);
+        entry.n_threads = entry.pool ? n_threads : 0;
+        if (entry.pool) {
+            ggml_backend_cpu_set_threadpool(backend, entry.pool);
         }
     }
 }
