@@ -471,10 +471,11 @@ constexpr Entry k_registry[] = {
     // interleaved DAC codebooks under a delay pattern, decoded by a 44.1 kHz DAC
     // codec companion. Surfaces as `--backend dia` with CAP_TTS + AUTO_DOWNLOAD +
     // TEMPERATURE. Dialogue style with [S1]/[S2] speaker tags; use >100-char
-    // prompts — Dia is inconsistent on very short inputs. `--model-quant`
-    // selects F16 / Q4_K for the main model; the DAC companion is quant-agnostic.
-    {"dia", "dia-1.6b-q4_k.gguf",
-     "https://huggingface.co/cstr/dia-1.6b-GGUF/resolve/main/dia-1.6b-q4_k.gguf",
+    // prompts — Dia is inconsistent on very short inputs. Ships F16 only for now
+    // (scale=1.0 attention is precision-sensitive; lower-bit quants need an
+    // ASR-roundtrip check before release). The DAC companion is quant-agnostic.
+    {"dia", "dia-1.6b-f16.gguf",
+     "https://huggingface.co/cstr/dia-1.6b-GGUF/resolve/main/dia-1.6b-f16.gguf",
      "~3.0 GB",
      "dac-44khz.gguf",
      "https://huggingface.co/cstr/dia-1.6b-GGUF/resolve/main/dac-44khz.gguf"},
