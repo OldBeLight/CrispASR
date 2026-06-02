@@ -1025,7 +1025,12 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
             mini_graph mg_voc(ctx->backend_cpu);
             auto* gc4 = mg_voc.ctx;
 
-            // Input mel for HiFi-GAN: (T_mel, n_mel) — ggml_conv_1d convention
+            // Input mel for HiFi-GAN vocoder.
+            // Decoder output is ggml (ne[0]=n_mel, ne[1]=T_mel), stored as n_mel
+            // contiguous values per timestep in the flat buffer.
+            // HiFi-GAN (core_hifigan::forward) expects ne[0]=T_mel, ne[1]=n_mel
+            // where ne[0] is the spatial dimension for conv1d.
+            // We must CPU-transpose the data to match.
             ggml_tensor* mel_in = ggml_new_tensor_2d(gc4, GGML_TYPE_F32, T_mel, hp.n_mel_channels);
             ggml_set_name(mel_in, "voc_mel_in");
             ggml_set_input(mel_in);
@@ -1044,9 +1049,18 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
                 return 0;
             }
 
-            // Mel from decoder: ggml (ne[0]=n_mel, ne[1]=T) stores n_mel contiguous values per timestep.
-            // HiFi-GAN expects (T, n_mel) which is the same memory layout — no transpose needed.
-            ggml_backend_tensor_set(mel_in, dec_out_data.data(), 0, dec_out_data.size() * sizeof(float));
+            // Transpose mel from ggml (n_mel, T) to vocoder (T, n_mel) layout.
+            // Source: data[t * n_mel + c] (n_mel contiguous per timestep)
+            // Target: data[c * T_mel + t] (T_mel contiguous per channel for ne[0]=T_mel)
+            {
+                std::vector<float> mel_voc((size_t)hp.n_mel_channels * T_mel);
+                for (int t = 0; t < T_mel; t++) {
+                    for (int c = 0; c < hp.n_mel_channels; c++) {
+                        mel_voc[(size_t)c * T_mel + t] = dec_out_data[(size_t)t * hp.n_mel_channels + c];
+                    }
+                }
+                ggml_backend_tensor_set(mel_in, mel_voc.data(), 0, mel_voc.size() * sizeof(float));
+            }
 
             ggml_backend_graph_compute(ctx->backend_cpu, gf4);
 
