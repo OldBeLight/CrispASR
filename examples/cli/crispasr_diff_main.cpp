@@ -785,17 +785,18 @@ static crispasr_diff::Report compare_with_row_width(const crispasr_diff::Ref& re
 
 int main(int argc, char** argv) {
     if (argc < 5) {
-        fprintf(stderr,
-                "usage: %s <backend> <model.gguf> <reference.gguf> <audio.wav>\n"
-                "\n"
-                "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, "
-                "granite-4.1, "
-                "granite-nle, parakeet, chatterbox, voxcpm2-tts, "
-                "canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, moonshine-streaming, parler-tts\n"
-                "  model.gguf    crispasr-compatible model weights\n"
-                "  reference.gguf  archive produced by tools/dump_reference.py\n"
-                "  audio.wav     16 kHz mono WAV\n",
-                argv[0]);
+        fprintf(
+            stderr,
+            "usage: %s <backend> <model.gguf> <reference.gguf> <audio.wav>\n"
+            "\n"
+            "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, "
+            "granite-4.1, "
+            "granite-nle, parakeet, chatterbox, voxcpm2-tts, "
+            "canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, moonshine-streaming, parler-tts\n"
+            "  model.gguf    crispasr-compatible model weights\n"
+            "  reference.gguf  archive produced by tools/dump_reference.py\n"
+            "  audio.wav     16 kHz mono WAV\n",
+            argv[0]);
         return 1;
     }
     const std::string backend_name = argv[1];
@@ -4530,11 +4531,13 @@ int main(int argc, char** argv) {
         // Build env var overrides from reference IDs
         std::string desc_ids_str, prompt_ids_str;
         for (size_t i = 0; i < ref_desc_n; i++) {
-            if (i > 0) desc_ids_str += ",";
+            if (i > 0)
+                desc_ids_str += ",";
             desc_ids_str += std::to_string((int)ref_desc_data[i]);
         }
         for (size_t i = 0; i < ref_prompt_n; i++) {
-            if (i > 0) prompt_ids_str += ",";
+            if (i > 0)
+                prompt_ids_str += ",";
             prompt_ids_str += std::to_string((int)ref_prompt_data[i]);
         }
         setenv("PARLER_DESC_IDS", desc_ids_str.c_str(), 1);
@@ -4543,7 +4546,7 @@ int main(int argc, char** argv) {
         auto cp = parler_tts_context_default_params();
         cp.n_threads = 4;
         cp.verbosity = 0;
-        cp.temperature = 0.0f;  // greedy for deterministic comparison
+        cp.temperature = 0.0f; // greedy for deterministic comparison
         cp.seed = 42;
 
         parler_tts_context* ctx = parler_tts_init_from_file(model_path.c_str(), cp);
@@ -4562,42 +4565,48 @@ int main(int argc, char** argv) {
             auto [ref_codes_data, ref_codes_n] = ref.get_f32("gen_codes_20");
             if (ref_codes_data && ref_codes_n > 0) {
                 int num_cb = 9;
-                auto ref_shape = ref.shape("gen_codes_20");
-                int n_ref_steps = ref_shape.size() >= 2 ? (int)ref_shape[0] : (int)ref_codes_n / num_cb;
-                int n_cpp_steps = n_codes / num_cb;
-                int n_cmp = std::min({n_ref_steps, n_cpp_steps, 20});
+                int n_ref_frames = (int)ref_codes_n / num_cb;
+                int n_cpp_frames = n_codes / num_cb;
+                int n_cmp = std::min({n_ref_frames, n_cpp_frames, 20});
 
-                // Compare first n_cmp steps token-by-token
+                // Compare first n_cmp frames token-by-token
                 int match = 0, total = 0;
-                printf("  gen_codes comparison (first %d steps):\n", n_cmp);
-                for (int s = 0; s < n_cmp && s < 5; s++) {
-                    printf("    step %2d: ref=[", s);
+                printf("  gen_codes comparison (first %d frames):\n", n_cmp);
+                for (int t = 0; t < n_cmp && t < 5; t++) {
+                    printf("    frame %2d: ref=[", t);
                     for (int k = 0; k < num_cb; k++) {
-                        int ref_tok = (int)ref_codes_data[k * n_ref_steps + s];
+                        int ref_tok = (int)ref_codes_data[t * num_cb + k];
                         printf("%d", ref_tok);
-                        if (k < num_cb - 1) printf(",");
+                        if (k < num_cb - 1)
+                            printf(",");
                     }
                     printf("] cpp=[");
                     for (int k = 0; k < num_cb; k++) {
-                        int cpp_tok = codes[s * num_cb + k];
+                        int cpp_tok = codes[t * num_cb + k];
                         printf("%d", cpp_tok);
-                        if (k < num_cb - 1) printf(",");
+                        if (k < num_cb - 1)
+                            printf(",");
                     }
                     printf("]\n");
                 }
-                for (int s = 0; s < n_cmp; s++) {
+                for (int t = 0; t < n_cmp; t++) {
                     for (int k = 0; k < num_cb; k++) {
-                        int ref_tok = (int)ref_codes_data[k * n_ref_steps + s];
-                        int cpp_tok = codes[s * num_cb + k];
+                        int ref_tok = (int)ref_codes_data[t * num_cb + k];
+                        int cpp_tok = codes[t * num_cb + k];
                         total++;
-                        if (ref_tok == cpp_tok) match++;
+                        if (ref_tok == cpp_tok)
+                            match++;
                     }
                 }
                 float accuracy = total > 0 ? (float)match / total : 0.0f;
-                printf("  gen_codes_20            : %d/%d tokens match (%.1f%%)\n",
-                       match, total, accuracy * 100.0f);
-                if (accuracy >= 0.9f) { n_pass++; printf("  → PASS\n"); }
-                else { n_fail++; printf("  → FAIL (token accuracy %.1f%% < 90%%)\n", accuracy * 100.0f); }
+                printf("  gen_codes_20            : %d/%d tokens match (%.1f%%)\n", match, total, accuracy * 100.0f);
+                if (accuracy >= 0.9f) {
+                    n_pass++;
+                    printf("  → PASS\n");
+                } else {
+                    n_fail++;
+                    printf("  → FAIL (token accuracy %.1f%% < 90%%)\n", accuracy * 100.0f);
+                }
             } else {
                 n_skip++;
                 printf("  gen_codes_20            : SKIP (no reference)\n");

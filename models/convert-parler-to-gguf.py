@@ -441,7 +441,7 @@ def map_dac_tensors(tensors: dict) -> list[tuple[str, np.ndarray]]:
 # ---------------------------------------------------------------------------
 
 
-def load_tokenizer_vocab(model_dir: Path) -> tuple[list[str], list[float]]:
+def load_tokenizer_vocab(model_dir: Path) -> tuple[list[str], list[float], bool]:
     """Load the tokenizer vocabulary and scores.
 
     Parler TTS uses a LLaMA sentencepiece model. We prefer loading from
@@ -472,26 +472,20 @@ def load_tokenizer_vocab(model_dir: Path) -> tuple[list[str], list[float]]:
                 tokens.append(piece)
                 s = sp.GetScore(i)
                 if is_bpe:
-                    # For BPE models, negate scores so Viterbi picks longer
-                    # (higher-rank) pieces, matching BPE merge order.
-                    # But byte-fallback pieces (score < -1e6) and special
-                    # tokens (score = 0, type != normal) must get LOW scores
-                    # so Viterbi only uses them as a last resort.
+                    # For BPE models, use the original sentencepiece score
+                    # (negative merge rank). The C++ BPE tokenizer picks
+                    # the highest-scored merge at each step.
                     p = m.pieces[i]
                     if p.type in (2, 3, 6):
                         # control/user_defined/byte: keep very low
                         scores.append(-100.0)
                     else:
-                        # Use piece LENGTH (in bytes) as the Viterbi score.
-                        # Longer pieces get higher scores → Viterbi prefers
-                        # the longest matching piece at each position,
-                        # approximating BPE merge behavior.
-                        scores.append(float(len(piece.encode('utf-8'))))
+                        scores.append(s)
                 else:
                     scores.append(s)
-            kind = "BPE (scores negated)" if is_bpe else "unigram"
+            kind = "BPE" if is_bpe else "unigram"
             print(f"  loaded sentencepiece .model ({kind}): {len(tokens)} tokens", file=sys.stderr)
-            return tokens, scores
+            return tokens, scores, is_bpe
         except ImportError:
             print("WARNING: sentencepiece not installed, falling back to tokenizer.json", file=sys.stderr)
 
@@ -499,7 +493,7 @@ def load_tokenizer_vocab(model_dir: Path) -> tuple[list[str], list[float]]:
     tok_json = model_dir / "tokenizer.json"
     if not tok_json.exists():
         print("WARNING: tokenizer.json not found, skipping vocab", file=sys.stderr)
-        return [], []
+        return [], [], False
 
     with open(tok_json) as f:
         tok = json.load(f)
@@ -529,9 +523,9 @@ def load_tokenizer_vocab(model_dir: Path) -> tuple[list[str], list[float]]:
                 scores.append(0.0)
         print(f"  loaded unigram vocab from tokenizer.json: {len(tokens)} tokens", file=sys.stderr)
     else:
-        return [], []
+        return [], [], False
 
-    return tokens, scores
+    return tokens, scores, False
 
 
 # ---------------------------------------------------------------------------
@@ -690,10 +684,12 @@ def main():
 
     # ----- Prompt tokenizer -----
     print("Loading prompt tokenizer...", file=sys.stderr)
-    tokens, scores = load_tokenizer_vocab(model_dir)
+    tokens, scores, is_bpe = load_tokenizer_vocab(model_dir)
     if tokens:
         writer.add_token_list(tokens)
         writer.add_token_scores(scores)
+        if is_bpe:
+            writer.add_bool("parler.tokenizer.is_bpe", True)
         print(f"  prompt tokenizer: {len(tokens)} tokens", file=sys.stderr)
 
     # ----- Description tokenizer (T5) -----

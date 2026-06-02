@@ -182,8 +182,9 @@ struct parler_tts_context {
     parler_tts_context_params params;
     parler_model model;
 
-    // Prompt tokenizer (unigram)
+    // Prompt tokenizer (sentencepiece: BPE or unigram)
     parler_tokenizer prompt_tokenizer;
+    bool tokenizer_is_bpe = false; // true = use BPE merge, false = Viterbi unigram
 
     // Description tokenizer (T5 sentencepiece)
     parler_tokenizer desc_tokenizer;
@@ -410,6 +411,9 @@ static void load_metadata(parler_tts_context* c, gguf_context* g) {
         c->prompt_tokenizer.bos_id = 1;
         c->prompt_tokenizer.eos_id = 2;
         c->prompt_tokenizer.unk_id = 0;
+
+        // Check if the tokenizer is BPE (sentencepiece model_type=2)
+        c->tokenizer_is_bpe = get_bool("parler.tokenizer.is_bpe", false);
     }
 
     // Load description tokenizer (T5)
@@ -600,12 +604,25 @@ static std::vector<int32_t> apply_delay_pattern_undelay(const std::vector<int32_
 
 // ── Sampling ────────────────────────────────────────────────────────
 
-static int32_t sample_token(const float* logits, int vocab_size, float temperature, std::mt19937& rng) {
+static int32_t sample_token(const float* logits, int vocab_size, float temperature, std::mt19937& rng, int top_k = 0) {
+    // Optional top-k: keep only the top_k highest logits
+    std::vector<float> filtered(logits, logits + vocab_size);
+    if (top_k > 0 && top_k < vocab_size) {
+        std::vector<float> sorted_logits(filtered.begin(), filtered.end());
+        std::partial_sort(sorted_logits.begin(), sorted_logits.begin() + top_k, sorted_logits.end(),
+                          std::greater<float>());
+        float threshold = sorted_logits[top_k - 1];
+        for (int i = 0; i < vocab_size; i++) {
+            if (filtered[i] < threshold)
+                filtered[i] = -1e30f;
+        }
+    }
+
     if (temperature <= 0.0f || temperature < 1e-6f) {
         // Greedy
         int best = 0;
         for (int i = 1; i < vocab_size; i++) {
-            if (logits[i] > logits[best])
+            if (filtered[i] > filtered[best])
                 best = i;
         }
         return (int32_t)best;
@@ -613,10 +630,10 @@ static int32_t sample_token(const float* logits, int vocab_size, float temperatu
 
     // Temperature-scaled softmax + multinomial sampling
     std::vector<float> probs(vocab_size);
-    float max_logit = *std::max_element(logits, logits + vocab_size);
+    float max_logit = *std::max_element(filtered.begin(), filtered.end());
     float sum = 0.0f;
     for (int i = 0; i < vocab_size; i++) {
-        probs[i] = std::exp((logits[i] - max_logit) / temperature);
+        probs[i] = std::exp((filtered[i] - max_logit) / temperature);
         sum += probs[i];
     }
     for (int i = 0; i < vocab_size; i++)
@@ -636,6 +653,7 @@ struct parler_tts_context_params parler_tts_context_default_params(void) {
         /*.temperature     =*/1.0f,
         /*.seed            =*/0,
         /*.max_audio_tokens=*/0,
+        /*.top_k           =*/0,
         /*.flash_attn      =*/false,
     };
 }
@@ -656,43 +674,36 @@ struct parler_tts_context* parler_tts_init_from_file(const char* path_model, str
     if (params.verbosity >= 1)
         fprintf(stderr, "parler_tts: loading '%s'\n", path_model);
 
-    struct gguf_init_params gip = {
-        /*.no_alloc =*/false,
-        /*.ctx      =*/&ctx->ctx_w,
-    };
-    gguf_context* g = gguf_init_from_file(path_model, gip);
-    if (!g) {
+    // Pass 1: metadata (hyperparameters + vocab)
+    gguf_context* meta = core_gguf::open_metadata(path_model);
+    if (!meta) {
         fprintf(stderr, "parler_tts: failed to open '%s'\n", path_model);
         delete ctx;
         return nullptr;
     }
+    load_metadata(ctx, meta);
+    core_gguf::free_metadata(meta);
 
-    load_metadata(ctx, g);
-
-    // Build tensor name map
-    int n_tensors = 0;
-    for (ggml_tensor* t = ggml_get_first_tensor(ctx->ctx_w); t; t = ggml_get_next_tensor(ctx->ctx_w, t)) {
-        if (t->name[0])
-            ctx->tensors[t->name] = t;
-        n_tensors++;
-    }
-
-    if (params.verbosity >= 1)
-        fprintf(stderr, "parler_tts: loaded %d tensors\n", n_tensors);
-
-    bind_tensors(ctx);
-
-    // Initialize backend
+    // Pass 2: allocate backend buffer and load weights
     ctx->backend_cpu = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
     ctx->backend = ctx->backend_cpu;
 
-    // Note: GGUF loader (no_alloc=false) sets tensor->data but NOT tensor->buffer.
-    // We must NOT use ggml_backend_tensor_get/set on weight tensors directly.
-    // Instead, access tensor->data for CPU-side reads. Graph compute works via
-    // tensor->data on CPU backend regardless of buffer assignment.
+    core_gguf::WeightLoad wl;
+    if (!core_gguf::load_weights(path_model, ctx->backend_cpu, "parler_tts", wl)) {
+        fprintf(stderr, "parler_tts: failed to load weights from '%s'\n", path_model);
+        ggml_backend_free(ctx->backend_cpu);
+        delete ctx;
+        return nullptr;
+    }
+    ctx->ctx_w = wl.ctx;
+    ctx->buf_w = wl.buf;
+    ctx->tensors = std::move(wl.tensors);
 
-    gguf_free(g);
+    if (params.verbosity >= 1)
+        fprintf(stderr, "parler_tts: loaded %zu tensors\n", ctx->tensors.size());
+
+    bind_tensors(ctx);
 
     if (params.verbosity >= 1) {
         auto& dc = ctx->model.dec_cfg;
@@ -833,19 +844,27 @@ int parler_tts_set_description(struct parler_tts_context* ctx, const char* descr
         size_t pos = 0;
         while (pos < s.size()) {
             size_t next = s.find(',', pos);
-            if (next == std::string::npos) next = s.size();
+            if (next == std::string::npos)
+                next = s.size();
             desc_ids.push_back(std::stoi(s.substr(pos, next - pos)));
             pos = next + 1;
         }
         fprintf(stderr, "parler_tts: using PARLER_DESC_IDS override (%zu tokens)\n", desc_ids.size());
     } else if (!ctx->prompt_tokenizer.spm_vocab.empty() && !ctx->prompt_tokenizer.scores.empty()) {
-        // Use sentencepiece Viterbi tokenizer (same tokenizer for desc + prompt)
-        fprintf(stderr, "parler_tts: using core_spm tokenizer (vocab=%zu, scores=%zu)\n",
-                ctx->prompt_tokenizer.spm_vocab.size(), ctx->prompt_tokenizer.scores.size());
+        // Use sentencepiece tokenizer (BPE or Viterbi unigram, same tokenizer for desc + prompt)
+        fprintf(stderr, "parler_tts: using core_spm %s tokenizer (vocab=%zu, scores=%zu)\n",
+                ctx->tokenizer_is_bpe ? "BPE" : "unigram", ctx->prompt_tokenizer.spm_vocab.size(),
+                ctx->prompt_tokenizer.scores.size());
         core_spm::Config cfg;
         cfg.unk_id = ctx->prompt_tokenizer.unk_id;
-        auto ids32 = core_spm::tokenize(description, ctx->prompt_tokenizer.spm_vocab,
-                                         ctx->prompt_tokenizer.scores, cfg, true);
+        std::vector<int32_t> ids32;
+        if (ctx->tokenizer_is_bpe) {
+            ids32 = core_spm::tokenize_bpe(description, ctx->prompt_tokenizer.spm_vocab, ctx->prompt_tokenizer.scores,
+                                           cfg, true);
+        } else {
+            ids32 = core_spm::tokenize(description, ctx->prompt_tokenizer.spm_vocab, ctx->prompt_tokenizer.scores, cfg,
+                                       true);
+        }
         // Prepend BOS
         desc_ids.push_back(ctx->prompt_tokenizer.bos_id);
         for (int32_t id : ids32)
@@ -863,7 +882,8 @@ int parler_tts_set_description(struct parler_tts_context* ctx, const char* descr
         fprintf(stderr, "parler_tts: description tokens (%zu): ", desc_ids.size());
         for (size_t i = 0; i < std::min(desc_ids.size(), (size_t)30); i++)
             fprintf(stderr, "%d ", desc_ids[i]);
-        if (desc_ids.size() > 30) fprintf(stderr, "...");
+        if (desc_ids.size() > 30)
+            fprintf(stderr, "...");
         fprintf(stderr, "\n");
     }
 
@@ -952,8 +972,8 @@ static ggml_tensor* dac_conv1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w
 
 // ConvTranspose1d: x is (C_in, T), w is (K, C_out, C_in) per ggml convention
 // Applies padding by cropping output. Returns (C_out, T_out).
-static ggml_tensor* dac_conv_transpose_1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b,
-                                           int stride, int pad) {
+static ggml_tensor* dac_conv_transpose_1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, int stride,
+                                          int pad) {
     const int Cout = (int)w->ne[1];
     ggml_tensor* xt = ggml_cont(ctx, ggml_transpose(ctx, x)); // (T, C_in)
     ggml_tensor* y = ggml_conv_transpose_1d(ctx, w, xt, stride, 0, 1);
@@ -1299,7 +1319,6 @@ static ggml_cgraph* build_decoder_step_graph(parler_tts_context* c, int T_dec, i
         cur = ggml_gelu(ctx0, ggml_mul_mat(ctx0, l.fc1, cur));
         cur = ggml_mul_mat(ctx0, l.fc2, cur);
         cur = ggml_add(ctx0, cur, residual);
-
     }
 
     // Final LayerNorm
@@ -1344,7 +1363,8 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
         size_t pos = 0;
         while (pos < s.size()) {
             size_t next = s.find(',', pos);
-            if (next == std::string::npos) next = s.size();
+            if (next == std::string::npos)
+                next = s.size();
             prompt_ids.push_back(std::stoi(s.substr(pos, next - pos)));
             pos = next + 1;
         }
@@ -1352,8 +1372,13 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
     } else if (!ctx->prompt_tokenizer.spm_vocab.empty() && !ctx->prompt_tokenizer.scores.empty()) {
         core_spm::Config cfg;
         cfg.unk_id = ctx->prompt_tokenizer.unk_id;
-        auto ids32 = core_spm::tokenize(text, ctx->prompt_tokenizer.spm_vocab,
-                                         ctx->prompt_tokenizer.scores, cfg, true);
+        std::vector<int32_t> ids32;
+        if (ctx->tokenizer_is_bpe) {
+            ids32 =
+                core_spm::tokenize_bpe(text, ctx->prompt_tokenizer.spm_vocab, ctx->prompt_tokenizer.scores, cfg, true);
+        } else {
+            ids32 = core_spm::tokenize(text, ctx->prompt_tokenizer.spm_vocab, ctx->prompt_tokenizer.scores, cfg, true);
+        }
         prompt_ids.push_back(ctx->prompt_tokenizer.bos_id);
         for (int32_t id : ids32)
             prompt_ids.push_back((int)id);
@@ -1364,7 +1389,8 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
         fprintf(stderr, "parler_tts: prompt tokens (%zu): ", prompt_ids.size());
         for (size_t i = 0; i < std::min(prompt_ids.size(), (size_t)15); i++)
             fprintf(stderr, "%d ", prompt_ids[i]);
-        if (prompt_ids.size() > 15) fprintf(stderr, "...");
+        if (prompt_ids.size() > 15)
+            fprintf(stderr, "...");
         fprintf(stderr, "\n");
     }
 
@@ -1372,8 +1398,8 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
     const auto& dc = m.dec_cfg;
     const int D = dc.hidden_size;
     const int num_codebooks = dc.num_codebooks;
-    // Default max_gen: use user param, otherwise model default, capped at 500 to avoid OOM
-    int max_gen = ctx->params.max_audio_tokens > 0 ? ctx->params.max_audio_tokens : std::min(dc.max_generation, 500);
+    // Default max_gen: use user param, otherwise model default (2580 ≈ 30s audio)
+    int max_gen = ctx->params.max_audio_tokens > 0 ? ctx->params.max_audio_tokens : dc.max_generation;
     const int T_enc = ctx->enc_T;
     const int n_layers = dc.num_layers;
     const float temperature = ctx->params.temperature;
@@ -1448,47 +1474,49 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
 
     // Read positional embedding table (handles F32, F16, and quantized types)
     std::vector<float> pos_embed_table;
-    if (m.dec_pos_embed && m.dec_pos_embed->data) {
+    if (m.dec_pos_embed) {
         int pos_dim = (int)m.dec_pos_embed->ne[0]; // D
         int max_pos = (int)m.dec_pos_embed->ne[1]; // max_position_embeddings
         pos_embed_table.resize((size_t)pos_dim * max_pos);
         if (m.dec_pos_embed->type == GGML_TYPE_F32) {
-            memcpy(pos_embed_table.data(), m.dec_pos_embed->data, pos_embed_table.size() * sizeof(float));
+            ggml_backend_tensor_get(m.dec_pos_embed, pos_embed_table.data(), 0, pos_embed_table.size() * sizeof(float));
         } else {
             // Dequantize row by row
             size_t row_bytes = ggml_row_size(m.dec_pos_embed->type, pos_dim);
+            std::vector<uint8_t> row_buf(row_bytes);
             const struct ggml_type_traits* traits = ggml_get_type_traits(m.dec_pos_embed->type);
             for (int r = 0; r < max_pos; r++) {
-                const char* src = (const char*)m.dec_pos_embed->data + (size_t)r * row_bytes;
+                ggml_backend_tensor_get(m.dec_pos_embed, row_buf.data(), (size_t)r * row_bytes, row_bytes);
                 if (m.dec_pos_embed->type == GGML_TYPE_F16) {
-                    const ggml_fp16_t* fp16 = (const ggml_fp16_t*)src;
+                    const ggml_fp16_t* fp16 = (const ggml_fp16_t*)row_buf.data();
                     for (int d = 0; d < pos_dim; d++)
                         pos_embed_table[r * pos_dim + d] = ggml_fp16_to_fp32(fp16[d]);
                 } else if (traits && traits->to_float) {
-                    traits->to_float(src, &pos_embed_table[r * pos_dim], pos_dim);
+                    traits->to_float((const char*)row_buf.data(), &pos_embed_table[r * pos_dim], pos_dim);
                 }
             }
         }
     }
 
-    // Helper: read one embedding row directly from tensor->data (no backend buffer needed)
+    // Helper: read one embedding row via ggml_backend_tensor_get (works with backend buffers)
     // Handles F32, F16, and quantized types (Q8_0, Q4_K, etc.)
     auto read_embed_row = [&](ggml_tensor* emb_table, int token_id, float* out, int dim) {
-        if (!emb_table || !emb_table->data || token_id < 0 || token_id >= (int)emb_table->ne[1]) return;
-        // Use ggml_row_size to get correct stride for quantized types
+        if (!emb_table || token_id < 0 || token_id >= (int)emb_table->ne[1])
+            return;
         size_t row_bytes = ggml_row_size(emb_table->type, dim);
-        const char* src = (const char*)emb_table->data + (size_t)token_id * row_bytes;
+        std::vector<uint8_t> row_buf(row_bytes);
+        ggml_backend_tensor_get(emb_table, row_buf.data(), (size_t)token_id * row_bytes, row_bytes);
         if (emb_table->type == GGML_TYPE_F32) {
-            memcpy(out, src, dim * sizeof(float));
+            memcpy(out, row_buf.data(), dim * sizeof(float));
         } else if (emb_table->type == GGML_TYPE_F16) {
-            const ggml_fp16_t* fp16_src = (const ggml_fp16_t*)src;
+            const ggml_fp16_t* fp16_src = (const ggml_fp16_t*)row_buf.data();
             for (int i = 0; i < dim; i++)
                 out[i] = ggml_fp16_to_fp32(fp16_src[i]);
         } else {
             // Quantized type: dequantize the row
             const struct ggml_type_traits* traits = ggml_get_type_traits(emb_table->type);
             if (traits && traits->to_float) {
-                traits->to_float(src, out, dim);
+                traits->to_float((const char*)row_buf.data(), out, dim);
             } else {
                 // Fallback: zero
                 memset(out, 0, dim * sizeof(float));
@@ -1504,8 +1532,14 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
     // Helper to set graph inputs
     auto safe_set = [&](ggml_cgraph* g, const char* name, const void* data, size_t sz) -> bool {
         ggml_tensor* t = ggml_graph_get_tensor(g, name);
-        if (!t) { fprintf(stderr, "parler_tts: tensor '%s' not found\n", name); return false; }
-        if (!t->buffer) { fprintf(stderr, "parler_tts: tensor '%s' no buffer\n", name); return false; }
+        if (!t) {
+            fprintf(stderr, "parler_tts: tensor '%s' not found\n", name);
+            return false;
+        }
+        if (!t->buffer) {
+            fprintf(stderr, "parler_tts: tensor '%s' no buffer\n", name);
+            return false;
+        }
         ggml_backend_tensor_set(t, data, 0, sz);
         return true;
     };
@@ -1549,7 +1583,8 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
     std::vector<float> causal_mask_data(prefill_len * prefill_len, 0.0f);
     for (int q = 0; q < prefill_len; q++)
         for (int k = 0; k < prefill_len; k++)
-            if (k > q) causal_mask_data[q * prefill_len + k] = -1e9f;
+            if (k > q)
+                causal_mask_data[q * prefill_len + k] = -1e9f;
 
     {
         ggml_cgraph* gf = build_decoder_step_graph(ctx, prefill_len, 0, T_enc);
@@ -1585,17 +1620,15 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
             snprintf(buf, sizeof(buf), "new_k_%d", il);
             float* k_dst = ctx->kv_k.data() + (size_t)il * kv_capacity * D;
             ggml_tensor* kt = ggml_graph_get_tensor(gf, buf);
-            ggml_backend_tensor_get(kt, k_dst, 0,
-                                    (size_t)prefill_len * D * sizeof(float));
+            ggml_backend_tensor_get(kt, k_dst, 0, (size_t)prefill_len * D * sizeof(float));
             snprintf(buf, sizeof(buf), "new_v_%d", il);
             float* v_dst = ctx->kv_v.data() + (size_t)il * kv_capacity * D;
             ggml_tensor* vt = ggml_graph_get_tensor(gf, buf);
-            ggml_backend_tensor_get(vt, v_dst, 0,
-                                    (size_t)prefill_len * D * sizeof(float));
+            ggml_backend_tensor_get(vt, v_dst, 0, (size_t)prefill_len * D * sizeof(float));
 
             if (parler_debug && (il == 0 || il == 23)) {
-                fprintf(stderr, "parler_tts: KV cache layer %d K[:5]=%.4f %.4f %.4f %.4f %.4f data=%p\n",
-                        il, k_dst[0], k_dst[1], k_dst[2], k_dst[3], k_dst[4], (void*)kt->data);
+                fprintf(stderr, "parler_tts: KV cache layer %d K[:5]=%.4f %.4f %.4f %.4f %.4f data=%p\n", il, k_dst[0],
+                        k_dst[1], k_dst[2], k_dst[3], k_dst[4], (void*)kt->data);
             }
         }
 
@@ -1604,8 +1637,7 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
             char buf[64];
             snprintf(buf, sizeof(buf), "logits_%d", k);
             std::vector<float> logits(dc.vocab_size);
-            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, buf), logits.data(), 0,
-                                    dc.vocab_size * sizeof(float));
+            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, buf), logits.data(), 0, dc.vocab_size * sizeof(float));
 
             if (parler_debug && k == 0) {
                 fprintf(stderr, "parler_tts: prefill logits[0,:5] = ");
@@ -1613,7 +1645,8 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
                     fprintf(stderr, "%.4f ", logits[j]);
                 int am = 0;
                 for (int j = 1; j < dc.vocab_size; j++)
-                    if (logits[j] > logits[am]) am = j;
+                    if (logits[j] > logits[am])
+                        am = j;
                 fprintf(stderr, " argmax=%d\n", am);
             }
 
@@ -1621,9 +1654,10 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
             if (k > 0) {
                 delayed_codes.push_back(dc.bos_token_id);
             } else {
-                int32_t tok = sample_token(logits.data(), dc.vocab_size, temperature, ctx->rng);
+                int32_t tok = sample_token(logits.data(), dc.vocab_size, temperature, ctx->rng, ctx->params.top_k);
                 delayed_codes.push_back(tok);
-                if (tok == dc.eos_token_id) eos_reached[0] = true;
+                if (tok == dc.eos_token_id)
+                    eos_reached[0] = true;
             }
         }
 
@@ -1642,6 +1676,11 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
     int past_len = prefill_len; // KV cache now has prefill_len entries
 
     // ── Incremental AR decode loop ──
+    ggml_gallocr_t inc_galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    {
+        ggml_cgraph* max_gf = build_decoder_step_graph(ctx, 1, kv_capacity - 1, T_enc);
+        ggml_gallocr_reserve(inc_galloc, max_gf);
+    }
     for (int gen_step = 1; gen_step < max_gen; gen_step++) {
         // Input embedding: sum of codebook embeddings for previous step's tokens + pos embed
         std::vector<float> inp_embed(D, 0.0f);
@@ -1664,16 +1703,14 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
         }
 
         if (parler_debug && gen_step <= 2) {
-            fprintf(stderr, "parler_tts: step %d inp_embed[:5] = %.6f %.6f %.6f %.6f %.6f pos=%d\n",
-                    gen_step, inp_embed[0], inp_embed[1], inp_embed[2], inp_embed[3], inp_embed[4], pos);
+            fprintf(stderr, "parler_tts: step %d inp_embed[:5] = %.6f %.6f %.6f %.6f %.6f pos=%d\n", gen_step,
+                    inp_embed[0], inp_embed[1], inp_embed[2], inp_embed[3], inp_embed[4], pos);
         }
 
         // Build incremental step graph
         ggml_cgraph* gf = build_decoder_step_graph(ctx, 1, past_len, T_enc);
-        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
-        if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        if (!ggml_gallocr_alloc_graph(inc_galloc, gf)) {
             fprintf(stderr, "parler_tts: gen step %d alloc failed\n", gen_step);
-            ggml_gallocr_free(galloc);
             break;
         }
 
@@ -1682,11 +1719,9 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
         for (int il = 0; il < n_layers; il++) {
             char buf[64];
             snprintf(buf, sizeof(buf), "self_k_%d", il);
-            safe_set(gf, buf, ctx->kv_k.data() + (size_t)il * kv_capacity * D,
-                     (size_t)past_len * D * sizeof(float));
+            safe_set(gf, buf, ctx->kv_k.data() + (size_t)il * kv_capacity * D, (size_t)past_len * D * sizeof(float));
             snprintf(buf, sizeof(buf), "self_v_%d", il);
-            safe_set(gf, buf, ctx->kv_v.data() + (size_t)il * kv_capacity * D,
-                     (size_t)past_len * D * sizeof(float));
+            safe_set(gf, buf, ctx->kv_v.data() + (size_t)il * kv_capacity * D, (size_t)past_len * D * sizeof(float));
             snprintf(buf, sizeof(buf), "cross_k_%d", il);
             safe_set(gf, buf, cross_k_cache[il].data(), (size_t)D * T_enc * sizeof(float));
             snprintf(buf, sizeof(buf), "cross_v_%d", il);
@@ -1695,7 +1730,6 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
 
         if (ggml_backend_graph_compute(ctx->backend_cpu, gf) != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "parler_tts: gen step %d compute failed\n", gen_step);
-            ggml_gallocr_free(galloc);
             break;
         }
 
@@ -1719,13 +1753,12 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
             char buf[64];
             snprintf(buf, sizeof(buf), "logits_%d", k);
             std::vector<float> logits(dc.vocab_size);
-            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, buf), logits.data(), 0,
-                                    dc.vocab_size * sizeof(float));
+            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, buf), logits.data(), 0, dc.vocab_size * sizeof(float));
 
             // Dump step logits for diff-testing
             if (parler_debug && gen_step < 3 && k == 0) {
-                fprintf(stderr, "parler_tts: step %d logits[0,:5] = %.4f %.4f %.4f %.4f %.4f argmax=%d\n",
-                        gen_step, logits[0], logits[1], logits[2], logits[3], logits[4],
+                fprintf(stderr, "parler_tts: step %d logits[0,:5] = %.4f %.4f %.4f %.4f %.4f argmax=%d\n", gen_step,
+                        logits[0], logits[1], logits[2], logits[3], logits[4],
                         (int)(std::max_element(logits.begin(), logits.end()) - logits.begin()));
             }
 
@@ -1736,7 +1769,7 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
             } else if (eos_reached[k]) {
                 step_tokens[k] = dc.eos_token_id;
             } else {
-                int32_t tok = sample_token(logits.data(), dc.vocab_size, temperature, ctx->rng);
+                int32_t tok = sample_token(logits.data(), dc.vocab_size, temperature, ctx->rng, ctx->params.top_k);
                 if (tok == dc.eos_token_id) {
                     eos_reached[k] = true;
                     step_tokens[k] = dc.eos_token_id;
@@ -1756,14 +1789,13 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
             fprintf(stderr, "\n");
         }
 
-        ggml_gallocr_free(galloc);
-
         if (all_eos) {
             if (ctx->params.verbosity >= 1)
                 fprintf(stderr, "parler_tts: all codebooks hit EOS at gen step %d\n", gen_step);
             break;
         }
     }
+    ggml_gallocr_free(inc_galloc);
 
     fprintf(stderr, "parler_tts: decoder loop done. delayed_codes size=%zu\n", delayed_codes.size());
     if (delayed_codes.empty()) {
@@ -1804,10 +1836,12 @@ void parler_tts_free(struct parler_tts_context* ctx) {
         return;
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
-    if (ctx->backend_cpu)
-        ggml_backend_free(ctx->backend_cpu);
+    if (ctx->buf_w)
+        ggml_backend_buffer_free(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
+    if (ctx->backend_cpu)
+        ggml_backend_free(ctx->backend_cpu);
     delete ctx;
 }
 
