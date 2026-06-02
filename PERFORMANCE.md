@@ -1886,7 +1886,8 @@ Both valid; stylistic punctuation variation.
 
 | backend | beam=2 | beam=4 | beam=8 |
 |---|---|---|---|
-| parakeet | ~3 % | ~7 % | ~20 % |
+| parakeet (TDT LSTM) | ~3 % | ~7 % | ~20 % |
+| moonshine-streaming | ~24 % | ~56 % | — |
 | canary | ~35 % | ~84 % | — |
 | cohere | ~18 % | ~30 % | OOM (F16) |
 
