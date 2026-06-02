@@ -1425,6 +1425,31 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
         return nullptr;
     }
 
+    // Dump prefill logits for diff testing
+    {
+        int best = 0;
+        for (int i = 1; i < vocab; i++)
+            if (logits_cond[i] > logits_cond[best])
+                best = i;
+        fprintf(stderr,
+                "zonos_tts: DIFF cond prefill cb0 argmax=%d (%.2f) first5=[%.2f,%.2f,%.2f,%.2f,%.2f]\n", best,
+                logits_cond[best], logits_cond[0], logits_cond[1], logits_cond[2], logits_cond[3], logits_cond[4]);
+        if (logits_uncond) {
+            int best_u = 0;
+            for (int i = 1; i < vocab; i++)
+                if (logits_uncond[i] > logits_uncond[best_u])
+                    best_u = i;
+            fprintf(stderr, "zonos_tts: DIFF uncond prefill cb0 argmax=%d (%.2f)\n", best_u, logits_uncond[best_u]);
+        }
+        FILE* df = fopen("/mnt/storage/zonos-tts/cpp_prefill_logits.bin", "wb");
+        if (df) {
+            int32_t n = (int32_t)(hp.head_vocab_size * hp.n_codebooks);
+            fwrite(&n, sizeof(int32_t), 1, df);
+            fwrite(logits_cond, sizeof(float), n, df);
+            fclose(df);
+        }
+    }
+
     // Step 4: AR decode loop with delay pattern
     // The delay pattern shifts codebook k by (k+1) positions.
     // At each step t, we predict tokens for all 9 codebooks.
