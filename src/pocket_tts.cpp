@@ -27,6 +27,7 @@
 #include "pocket_tts.h"
 
 #include "core/gguf_loader.h"
+#include "core/sentencepiece.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -45,10 +46,11 @@
 #include <unordered_map>
 #include <vector>
 
-// ── SentencePiece minimal decoder ──────────────────────────────────
-// We store the serialized SPM model in the GGUF and decode it at init
-// time using a minimal parser. For now, we use a stub that will be
-// replaced with the real SPM integration.
+// ── SentencePiece tokenizer ───────────────────────────────────────
+// The GGUF stores tokenizer.ggml.tokens + tokenizer.ggml.scores arrays
+// (unigram vocab extracted by the converter from the .model protobuf).
+// At init we load these into token_to_id / scores and use the shared
+// core_spm::tokenize Viterbi segmenter.
 
 namespace {
 
@@ -261,8 +263,11 @@ struct pocket_tts_model {
     ggml_tensor* enc_xfmr_output_proj = nullptr;
     seanet_encoder_weights seanet_enc;
 
-    // SentencePiece tokenizer bytes (base64 decoded)
-    std::vector<uint8_t> spm_model_bytes;
+    // SentencePiece tokenizer (loaded from tokenizer.ggml.tokens/scores)
+    std::unordered_map<std::string, int32_t> token_to_id;
+    std::vector<std::string> id_to_token;
+    std::vector<float> spm_scores;
+    int32_t unk_id = 0;
 };
 
 // ── KV cache for transformer ───────────────────────────────────────
@@ -715,57 +720,37 @@ static bool load_mimi_encoder_tensors(struct ggml_context* ctx, pocket_tts_model
     return true;
 }
 
-// ── SentencePiece tokenizer stub ───────────────────────────────────
-// TODO: integrate real SPM decoding. For now we store model bytes
-// and will add proper tokenization in the next iteration.
+// ── SentencePiece tokenizer loading ───────────────────────────────
+// Load tokenizer.ggml.tokens + tokenizer.ggml.scores arrays from GGUF
+// (standard GGUF vocab pattern, written by the converter).
 
-static bool load_tokenizer(struct gguf_context* meta, struct ggml_context* ggml_ctx, pocket_tts_model& m) {
-    // Try loading tokenizer as a raw tensor (stored as type I8/U8 array)
-    ggml_tensor* tok_tensor = ggml_get_tensor(ggml_ctx, "tokenizer.spm.model");
-    if (tok_tensor) {
-        size_t n = ggml_nbytes(tok_tensor);
-        m.spm_model_bytes.resize(n);
-        memcpy(m.spm_model_bytes.data(), tok_tensor->data, n);
-        return true;
-    }
-
-    // Fallback: try base64 string from KV
-    std::string b64 = gguf_get_str(meta, "pocket_tts.tokenizer.spm_model_b64", "");
-    if (b64.empty()) {
-        fprintf(stderr, "pocket_tts: warning: no tokenizer found in GGUF\n");
+static bool load_tokenizer(struct gguf_context* meta, struct ggml_context* /*ggml_ctx*/, pocket_tts_model& m) {
+    int tidx = gguf_find_key(meta, "tokenizer.ggml.tokens");
+    if (tidx < 0) {
+        fprintf(stderr, "pocket_tts: warning: no tokenizer.ggml.tokens in GGUF\n");
         return false;
     }
+    int n = (int)gguf_get_arr_n(meta, tidx);
+    m.id_to_token.resize(n);
+    for (int i = 0; i < n; i++) {
+        m.id_to_token[i] = gguf_get_arr_str(meta, tidx, i);
+        m.token_to_id[m.id_to_token[i]] = i;
+    }
 
-    // Base64 decode
-    auto b64_decode = [](const std::string& input) -> std::vector<uint8_t> {
-        static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        static int8_t dtable[256];
-        static bool dtable_init = false;
-        if (!dtable_init) {
-            memset(dtable, -1, sizeof(dtable));
-            for (int i = 0; i < 64; i++)
-                dtable[(unsigned char)table[i]] = (int8_t)i;
-            dtable_init = true;
-        }
-        std::vector<uint8_t> out;
-        out.reserve(input.size() * 3 / 4);
-        uint32_t buf = 0;
-        int bits = 0;
-        for (char c : input) {
-            if (c == '=' || dtable[(unsigned char)c] < 0)
-                continue;
-            buf = (buf << 6) | dtable[(unsigned char)c];
-            bits += 6;
-            if (bits >= 8) {
-                bits -= 8;
-                out.push_back((uint8_t)(buf >> bits));
-            }
-        }
-        return out;
-    };
+    int sidx = gguf_find_key(meta, "tokenizer.ggml.scores");
+    if (sidx >= 0) {
+        int ns = (int)gguf_get_arr_n(meta, sidx);
+        m.spm_scores.resize(ns);
+        const float* sp = (const float*)gguf_get_arr_data(meta, sidx);
+        for (int i = 0; i < ns; i++)
+            m.spm_scores[i] = sp[i];
+    }
 
-    m.spm_model_bytes = b64_decode(b64);
-    return !m.spm_model_bytes.empty();
+    // Find <unk> token ID
+    auto it = m.token_to_id.find("<unk>");
+    m.unk_id = (it != m.token_to_id.end()) ? it->second : 0;
+
+    return n > 0;
 }
 
 // ── Forward pass building blocks ───────────────────────────────────
@@ -1620,22 +1605,23 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
     *n_frames_out = 0;
 }
 
-// ── Simple tokenizer ──────────────────────────────────────────────
-// Stub: for now, convert UTF-8 text to byte-level token IDs using the
-// SPM model embedded in the GGUF. Since we don't have a full SPM
-// decoder yet, we use a simple byte-pair fallback that maps each byte
-// to a token ID offset. The real SPM integration is a TODO.
+// ── SentencePiece tokenizer ──────────────────────────────────────
+// Uses core_spm::tokenize (Viterbi unigram segmenter) with the vocab
+// and scores loaded from the GGUF tokenizer.ggml.tokens/scores arrays.
 static std::vector<int32_t> tokenize_text(pocket_tts_context* pctx, const char* text) {
-    (void)pctx;
-    std::vector<int32_t> tokens;
-    // Simple byte-to-token mapping: each byte maps to token ID [1..256]
-    // Token 0 is reserved for PAD, token 4000 is EOS
-    const uint8_t* p = (const uint8_t*)text;
-    while (*p) {
-        tokens.push_back((int32_t)*p);
-        p++;
+    const auto& m = pctx->model;
+    if (m.token_to_id.empty()) {
+        fprintf(stderr, "pocket_tts: tokenizer not loaded, cannot tokenize\n");
+        return {};
     }
-    return tokens;
+
+    core_spm::Config cfg;
+    cfg.unk_id = m.unk_id;
+    cfg.merge_consecutive_unk = false; // pocket-tts SPM does not merge
+    cfg.unk_penalty = -100.0f;
+
+    return core_spm::tokenize(std::string(text), m.token_to_id, m.spm_scores, cfg,
+                              /*prepend_space=*/true);
 }
 
 } // namespace
@@ -1727,7 +1713,7 @@ struct pocket_tts_context* pocket_tts_init_from_file(const char* path_model, str
                 ctx->model.flow_head_hp.flow_depth);
         fprintf(stderr, "  Mimi: %u Hz, frame_rate=%.1f, hop=%u\n", mi.sample_rate, mi.frame_rate(), mi.hop_length());
         fprintf(stderr, "  Voice cloning: %s\n", ctx->model.has_voice_cloning ? "yes" : "no");
-        fprintf(stderr, "  Tokenizer: %zu bytes\n", ctx->model.spm_model_bytes.size());
+        fprintf(stderr, "  Tokenizer: %zu pieces (unk_id=%d)\n", ctx->model.id_to_token.size(), ctx->model.unk_id);
         fprintf(stderr, "  Mimi tensors: quant_proj=%s upsample=%s seanet_init=%s seanet_final=%s\n",
                 ctx->model.quant_proj_w ? "ok" : "MISSING", ctx->model.upsample_conv_w ? "ok" : "MISSING",
                 ctx->model.seanet_dec.initial_conv_w ? "ok" : "MISSING",
@@ -1763,6 +1749,19 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     const int LD = (int)hp.latent_dim;
     const int lsd_steps = ctx->params.lsd_decode_steps;
 
+    // --- diff/debug hooks (env-gated; paths from env value, never hardcoded) ---
+    // POCKET_DUMP_DIR=d : write stage dumps under dir d
+    //   cpp_token_ids.i32    — token ID sequence
+    //   cpp_text_emb.f32     — (n_tokens, d_model) text embeddings
+    //   cpp_latents.f32      — (n_frames, latent_dim) AR latent sequence
+    //   cpp_pcm.f32          — final PCM
+    // POCKET_FORCE_LATENTS=f : teacher-force AR latents from file f
+    const char* pocket_dump_dir = getenv("POCKET_DUMP_DIR");
+    const char* pocket_force_lat = getenv("POCKET_FORCE_LATENTS");
+    auto dump_path = [&](const char* name) -> std::string {
+        return std::string(pocket_dump_dir ? pocket_dump_dir : ".") + "/" + name;
+    };
+
     // 1. Tokenize text
     std::vector<int32_t> tokens = tokenize_text(ctx, text);
     if (tokens.empty()) {
@@ -1774,13 +1773,35 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     if (ctx->verbosity >= 2)
         fprintf(stderr, "pocket_tts: tokenized %zu tokens\n", tokens.size());
 
+    // Dump token IDs
+    if (pocket_dump_dir) {
+        FILE* f = fopen(dump_path("cpp_token_ids.i32").c_str(), "wb");
+        if (f) {
+            fwrite(tokens.data(), sizeof(int32_t), tokens.size(), f);
+            fclose(f);
+        }
+        fprintf(stderr, "POCKET_DUMP_DIR: wrote cpp_token_ids.i32 (%zu tokens)\n", tokens.size());
+        // Also print IDs for quick inspection
+        fprintf(stderr, "  tokens:");
+        for (size_t i = 0; i < tokens.size() && i < 30; i++)
+            fprintf(stderr, " %d", tokens[i]);
+        if (tokens.size() > 30)
+            fprintf(stderr, " ...");
+        fprintf(stderr, "\n");
+    }
+
     // Determine max audio frames
     int max_frames = ctx->params.max_audio_frames;
     if (max_frames <= 0) {
-        // Heuristic: ~12.5 frames per second, assume ~2s per word,
-        // words ~ tokens/4, cap at reasonable length
-        max_frames = std::max(100, (int)(tokens.size() * 8));
-        max_frames = std::min(max_frames, 2000); // ~160s max
+        // Heuristic: ~12.5 frames per second, ~0.5s per token, min 25 frames (2s)
+        max_frames = std::max(25, (int)(tokens.size() * 6));
+        max_frames = std::min(max_frames, 500); // ~40s max
+    }
+    // Allow env override for testing
+    if (const char* mf_env = getenv("POCKET_MAX_FRAMES")) {
+        max_frames = std::atoi(mf_env);
+        if (max_frames <= 0)
+            max_frames = 25;
     }
 
     // 2. Initialize KV cache for backbone
@@ -1790,6 +1811,9 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
 
     // 3. Prefill: embed text tokens and run through backbone
     const float* embed_data = tensor_f32_data(m.conditioner_embed);
+    std::vector<float> text_emb_dump; // for dump
+    if (pocket_dump_dir)
+        text_emb_dump.reserve(tokens.size() * D);
 
     for (int i = 0; i < (int)tokens.size(); i++) {
         int32_t tok = tokens[i];
@@ -1799,6 +1823,9 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
         // Look up embedding (conditioner_embed is (n_bins+1, lut_dim))
         const float* emb = &embed_data[tok * D];
 
+        if (pocket_dump_dir)
+            text_emb_dump.insert(text_emb_dump.end(), emb, emb + D);
+
         std::vector<float> backbone_out(D);
         backbone_forward_step(ctx, emb, backbone_out.data());
         ctx->backbone_kv.offset++;
@@ -1807,9 +1834,38 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     if (ctx->verbosity >= 2)
         fprintf(stderr, "pocket_tts: prefill done, %zu positions cached\n", tokens.size());
 
+    // Dump text embeddings
+    if (pocket_dump_dir && !text_emb_dump.empty()) {
+        FILE* f = fopen(dump_path("cpp_text_emb.f32").c_str(), "wb");
+        if (f) {
+            fwrite(text_emb_dump.data(), sizeof(float), text_emb_dump.size(), f);
+            fclose(f);
+        }
+        fprintf(stderr, "POCKET_DUMP_DIR: wrote cpp_text_emb.f32 (%zu x %d)\n", tokens.size(), D);
+    }
+
     // 4. AR loop: generate audio latents
     std::vector<float> latent_sequence; // (n_gen_frames * LD)
     latent_sequence.reserve(max_frames * LD);
+
+    // Teacher-force latents if requested (for diff-testing)
+    std::vector<float> forced_latents;
+    if (pocket_force_lat) {
+        FILE* ff = fopen(pocket_force_lat, "rb");
+        if (ff) {
+            fseek(ff, 0, SEEK_END);
+            long sz = ftell(ff);
+            fseek(ff, 0, SEEK_SET);
+            forced_latents.resize(sz / sizeof(float));
+            if (fread(forced_latents.data(), sizeof(float), forced_latents.size(), ff) != forced_latents.size())
+                forced_latents.clear();
+            fclose(ff);
+            int forced_frames = (int)(forced_latents.size() / LD);
+            max_frames = forced_frames;
+            fprintf(stderr, "POCKET_FORCE_LATENTS: teacher-forcing %d frames from %s\n", forced_frames,
+                    pocket_force_lat);
+        }
+    }
 
     // BOS: use the learned bos_emb projected through input_linear
     std::vector<float> bos_proj(D);
@@ -1831,8 +1887,8 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
         backbone_forward_step(ctx, prev_input.data(), backbone_out.data());
         ctx->backbone_kv.offset++;
 
-        // Check EOS
-        if (check_eos(ctx, backbone_out.data())) {
+        // Check EOS (skip if teacher-forcing)
+        if (forced_latents.empty() && check_eos(ctx, backbone_out.data())) {
             frames_after_eos++;
             if (frames_after_eos >= eos_grace_frames) {
                 if (ctx->verbosity >= 2)
@@ -1841,20 +1897,25 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
             }
         }
 
-        // Sample noise
-        std::vector<float> noise(LD);
-        float temp = ctx->params.temperature;
-        float noise_clamp = ctx->params.noise_clamp;
-        for (int i = 0; i < LD; i++) {
-            float n = noise_dist(ctx->rng) * std::sqrt(temp);
-            if (noise_clamp > 0.0f)
-                n = std::max(-noise_clamp, std::min(noise_clamp, n));
-            noise[i] = n;
-        }
-
-        // Flow net: predict latent from backbone output + noise
         std::vector<float> latent(LD);
-        flow_net_forward(ctx, backbone_out.data(), noise.data(), lsd_steps, latent.data());
+        if (!forced_latents.empty()) {
+            // Teacher-force: use reference latent
+            vec_copy(latent.data(), &forced_latents[frame * LD], LD);
+        } else {
+            // Sample noise
+            std::vector<float> noise(LD);
+            float temp = ctx->params.temperature;
+            float noise_clamp = ctx->params.noise_clamp;
+            for (int i = 0; i < LD; i++) {
+                float n = noise_dist(ctx->rng) * std::sqrt(temp);
+                if (noise_clamp > 0.0f)
+                    n = std::max(-noise_clamp, std::min(noise_clamp, n));
+                noise[i] = n;
+            }
+
+            // Flow net: predict latent from backbone output + noise
+            flow_net_forward(ctx, backbone_out.data(), noise.data(), lsd_steps, latent.data());
+        }
 
         // Append to sequence
         latent_sequence.insert(latent_sequence.end(), latent.begin(), latent.end());
@@ -1870,6 +1931,16 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     if (ctx->verbosity >= 1)
         fprintf(stderr, "pocket_tts: generated %d audio frames (%.1f s at 12.5 Hz)\n", n_gen_frames,
                 n_gen_frames / 12.5f);
+
+    // Dump latent sequence
+    if (pocket_dump_dir && n_gen_frames > 0) {
+        FILE* f = fopen(dump_path("cpp_latents.f32").c_str(), "wb");
+        if (f) {
+            fwrite(latent_sequence.data(), sizeof(float), latent_sequence.size(), f);
+            fclose(f);
+        }
+        fprintf(stderr, "POCKET_DUMP_DIR: wrote cpp_latents.f32 (%d x %d)\n", n_gen_frames, LD);
+    }
 
     if (n_gen_frames == 0)
         return nullptr;
@@ -1888,6 +1959,16 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     if (ctx->verbosity >= 1)
         fprintf(stderr, "pocket_tts: decoded %d PCM samples (%.2f s at %u Hz)\n", pcm_samples,
                 (float)pcm_samples / m.mimi_hp.sample_rate, m.mimi_hp.sample_rate);
+
+    // Dump PCM
+    if (pocket_dump_dir && pcm_samples > 0) {
+        FILE* f = fopen(dump_path("cpp_pcm.f32").c_str(), "wb");
+        if (f) {
+            fwrite(pcm, sizeof(float), pcm_samples, f);
+            fclose(f);
+        }
+        fprintf(stderr, "POCKET_DUMP_DIR: wrote cpp_pcm.f32 (%d samples)\n", pcm_samples);
+    }
 
     *n_samples = pcm_samples;
     return pcm;

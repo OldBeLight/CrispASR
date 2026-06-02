@@ -119,6 +119,10 @@
 #include "dia_tts.h"
 #define CA_HAVE_DIA 1
 #endif
+#if __has_include("pocket_tts.h")
+#include "pocket_tts.h"
+#define CA_HAVE_POCKET 1
+#endif
 #if __has_include("voxcpm2_tts.h")
 #include "voxcpm2_tts.h"
 #define CA_HAVE_VOXCPM2 1
@@ -1305,6 +1309,9 @@ struct crispasr_session {
 #ifdef CA_HAVE_DIA
     dia_tts_context* dia_tts_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_POCKET
+    pocket_tts_context* pocket_tts_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_VOXCPM2
     voxcpm2_context* voxcpm2_ctx = nullptr;
     std::vector<float> voxcpm2_ref_pcm; // 16 kHz mono cloning reference
@@ -1962,6 +1969,21 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_POCKET
+    if (s->backend == "pocket-tts" || s->backend == "pocket_tts" || s->backend == "pocket") {
+        s->backend = "pocket-tts";
+        pocket_tts_context_params p = pocket_tts_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->pocket_tts_ctx = pocket_tts_init_from_file(model_path, p);
+        if (!s->pocket_tts_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_VOXCPM2
     if (s->backend == "voxcpm2-tts" || s->backend == "voxcpm2" || s->backend == "voxcpm2_tts") {
         s->backend = "voxcpm2-tts";
@@ -2366,6 +2388,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_DIA
     list += ",dia";
+#endif
+#ifdef CA_HAVE_POCKET
+    list += ",pocket-tts";
 #endif
 #ifdef CA_HAVE_VOXCPM2
     list += ",voxcpm2-tts";
@@ -4928,6 +4953,11 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
         return dia_tts_synthesize(s->dia_tts_ctx, text, out_n_samples);
     }
 #endif
+#ifdef CA_HAVE_POCKET
+    if (s->pocket_tts_ctx) {
+        return pocket_tts_synthesize(s->pocket_tts_ctx, text, out_n_samples);
+    }
+#endif
 #ifdef CA_HAVE_VOXCPM2
     if (s->voxcpm2_ctx) {
         // VoxCPM2 synthesises at 48 kHz mono; every other CrispASR TTS
@@ -5270,6 +5300,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
     if (s->dia_tts_ctx)
         dia_tts_free(s->dia_tts_ctx);
 #endif
+#ifdef CA_HAVE_POCKET
+    if (s->pocket_tts_ctx)
+        pocket_tts_free(s->pocket_tts_ctx);
+#endif
 #ifdef CA_HAVE_VOXCPM2
     if (s->voxcpm2_ctx)
         voxcpm2_free(s->voxcpm2_ctx);
@@ -5534,6 +5568,13 @@ CA_EXPORT int crispasr_session_set_temperature(crispasr_session* s, float temper
         touched++;
     }
 #endif
+#ifdef CA_HAVE_POCKET
+    if (s->pocket_tts_ctx) {
+        pocket_tts_set_temperature(s->pocket_tts_ctx, temperature);
+        pocket_tts_set_seed(s->pocket_tts_ctx, seed);
+        touched++;
+    }
+#endif
 #ifdef CA_HAVE_QWEN3_TTS
     if (s->qwen3_tts_ctx) {
         // qwen3-tts's code-predictor sampler reads cparams.temperature
@@ -5569,6 +5610,12 @@ CA_EXPORT int crispasr_session_set_tts_seed(crispasr_session* s, uint64_t seed) 
 #ifdef CA_HAVE_DIA
     if (s->dia_tts_ctx) {
         dia_tts_set_seed(s->dia_tts_ctx, seed);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_POCKET
+    if (s->pocket_tts_ctx) {
+        pocket_tts_set_seed(s->pocket_tts_ctx, seed);
         touched++;
     }
 #endif

@@ -503,21 +503,16 @@ def convert(args):
 
     # ── Write tokenizer ──
     if tokenizer_path:
-        with open(tokenizer_path, 'rb') as f:
-            tok_bytes = f.read()
-        # Store as raw bytes in a uint8 tensor
-        tok_array = np.frombuffer(tok_bytes, dtype=np.uint8)
-        writer.add_tensor("tokenizer.spm.model",
-                          tok_array, raw_dtype=GGMLQuantizationType.Q8_0
-                          if len(tok_array) >= 32
-                          else GGMLQuantizationType.F32)
-        # Actually, SPM model bytes should just be stored as-is.
-        # Use a KV string instead for simplicity:
-        import base64
-        writer.add_string("pocket_tts.tokenizer.spm_model_b64",
-                          base64.b64encode(tok_bytes).decode('ascii'))
-        writer.add_uint32("pocket_tts.tokenizer.spm_model_size", len(tok_bytes))
-        print(f"  Tokenizer: {len(tok_bytes)} bytes from {tokenizer_path}", file=sys.stderr)
+        import sentencepiece as spm
+        sp = spm.SentencePieceProcessor()
+        sp.Load(str(tokenizer_path))
+        vocab = [sp.IdToPiece(i) for i in range(sp.GetPieceSize())]
+        scores = [sp.GetScore(i) for i in range(sp.GetPieceSize())]
+        writer.add_array("tokenizer.ggml.tokens", vocab)
+        writer.add_array("tokenizer.ggml.scores", scores)
+        writer.add_string("tokenizer.ggml.model", "unigram")
+        print(f"  Tokenizer: {len(vocab)} pieces from {tokenizer_path}",
+              file=sys.stderr)
     else:
         print("  WARNING: no tokenizer.model found!", file=sys.stderr)
 
