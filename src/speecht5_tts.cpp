@@ -164,10 +164,26 @@ struct speecht5_tokenizer {
 
     std::vector<int32_t> encode(const std::string& text) const {
         std::vector<int32_t> ids;
-        // SpeechT5 tokenizer encodes character by character
-        // with special handling for spaces (encoded as "▁")
+        // SpeechT5 uses a SentencePiece char-level tokenizer that prepends ▁
+        // at the start of text and replaces spaces with ▁.
+        const std::string sp_marker = "\xe2\x96\x81"; // "▁"
+
+        // Prepend ▁ at start (SentencePiece convention)
+        auto sp_it = token_to_id.find(sp_marker);
+        if (sp_it != token_to_id.end()) {
+            ids.push_back(sp_it->second);
+        }
+
         size_t i = 0;
         while (i < text.size()) {
+            if (text[i] == ' ') {
+                // Spaces become ▁
+                if (sp_it != token_to_id.end()) {
+                    ids.push_back(sp_it->second);
+                }
+                i++;
+                continue;
+            }
             // Try longest match first (for multi-byte UTF-8 chars)
             bool found = false;
             for (int len = 4; len >= 1; len--) {
@@ -183,20 +199,13 @@ struct speecht5_tokenizer {
                 }
             }
             if (!found) {
-                // Try space encoding
-                if (text[i] == ' ') {
-                    auto it = token_to_id.find("\xe2\x96\x81"); // "▁"
-                    if (it != token_to_id.end()) {
-                        ids.push_back(it->second);
-                    }
-                }
-                i++;
+                i++; // skip unknown characters
             }
         }
         // Append EOS (</s> = id 2 for SpeechT5)
-        auto it = token_to_id.find("</s>");
-        if (it != token_to_id.end()) {
-            ids.push_back(it->second);
+        auto eos_it = token_to_id.find("</s>");
+        if (eos_it != token_to_id.end()) {
+            ids.push_back(eos_it->second);
         }
         return ids;
     }
@@ -703,11 +712,13 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
         if (sv_b)
             sv_cur = ggml_add(gc, sv_cur, sv_b);
 
-        // Name K_cur and V_cur for readback after compute
+        // Create copies for readback (originals may have buffers reused by later ops)
+        ggml_tensor* sk_cur_copy = ggml_dup(gc, sk_cur);
+        ggml_tensor* sv_cur_copy = ggml_dup(gc, sv_cur);
         std::string k_name = "sa_k_" + std::to_string(i);
         std::string v_name = "sa_v_" + std::to_string(i);
-        ggml_set_name(sk_cur, k_name.c_str());
-        ggml_set_name(sv_cur, v_name.c_str());
+        ggml_set_name(sk_cur_copy, k_name.c_str());
+        ggml_set_name(sv_cur_copy, v_name.c_str());
 
         // Build full K and V by concatenating past cache with current
         ggml_tensor* full_k;
@@ -739,8 +750,8 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
             layer_kv[i].past_v_input = nullptr;
         }
 
-        layer_kv[i].cur_k_out = sk_cur;
-        layer_kv[i].cur_v_out = sv_cur;
+        layer_kv[i].cur_k_out = sk_cur_copy;
+        layer_kv[i].cur_v_out = sv_cur_copy;
 
         // Multi-head attention: Q (1 pos) attending to full K/V (T_kv pos)
         int n_heads = hp.decoder_attention_heads;
@@ -884,6 +895,8 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
         }
     }
 
+    // dec_hidden = x — used by feat_out/prob_out below
+
     // ── Output heads ──
     // feat_out: Linear(hidden_size -> reduction_factor * num_mel_bins)
     ggml_tensor* feat_w = W(ts, "dec.postnet.feat_out.weight");
@@ -906,7 +919,7 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
     ggml_cgraph* gf = ggml_new_graph_custom(gc, 32768, false);
     ggml_build_forward_expand(gf, mel_out);
     ggml_build_forward_expand(gf, prob_out);
-    // Also expand K/V output tensors so they get computed
+    // Also expand K/V output copy tensors so they get computed and preserved
     for (int i = 0; i < hp.decoder_layers; i++) {
         ggml_build_forward_expand(gf, layer_kv[i].cur_k_out);
         ggml_build_forward_expand(gf, layer_kv[i].cur_v_out);
@@ -954,6 +967,37 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
     }
 
     ggml_backend_graph_compute(mg.backend, gf);
+
+    // ── SPEECHT5_DUMP_DIR: per-step intermediate dumps ──
+    {
+        static const char* dump_dir = getenv("SPEECHT5_DUMP_DIR");
+        if (dump_dir) {
+            auto dump_f32 = [&](const char* tag, const float* data, size_t n) {
+                std::string path = std::string(dump_dir) + "/step" + std::to_string(dec_step) + "_" + tag + ".f32";
+                FILE* f = fopen(path.c_str(), "wb");
+                if (f) {
+                    fwrite(data, sizeof(float), n, f);
+                    fclose(f);
+                }
+            };
+            // Dump mel_out
+            {
+                int mel_n = hp.reduction_factor * hp.num_mel_bins;
+                std::vector<float> buf(mel_n);
+                ggml_backend_tensor_get(mel_out, buf.data(), 0, mel_n * sizeof(float));
+                dump_f32("mel", buf.data(), mel_n);
+            }
+            // Dump self-attn K/V for first few steps (layer 0 only)
+            if (dec_step <= 2) {
+                std::vector<float> k0(hp.hidden_size);
+                ggml_backend_tensor_get(layer_kv[0].cur_k_out, k0.data(), 0, hp.hidden_size * sizeof(float));
+                dump_f32("self_k_L0", k0.data(), hp.hidden_size);
+            }
+            if (dec_step == 0) {
+                fprintf(stderr, "speecht5: SPEECHT5_DUMP_DIR active, dumping to %s\n", dump_dir);
+            }
+        }
+    }
 
     // Read back current K/V and append to cache
     for (int i = 0; i < hp.decoder_layers; i++) {
@@ -1080,8 +1124,17 @@ static std::vector<float> run_postnet(speecht5_tts_context* ctx,
         return {};
     }
 
-    // Set input: mel spectrogram in row-major (T_mel, num_mel_bins)
-    mg.set_input(x, mel_spectrogram.data(), T_mel * hp.num_mel_bins * sizeof(float));
+    // Set input: mel spectrogram -- transpose from row-major (T_mel, num_mel_bins)
+    // to ggml column-major layout where ne[0]=T_mel is fastest
+    {
+        std::vector<float> transposed(T_mel * hp.num_mel_bins);
+        for (int t = 0; t < T_mel; t++) {
+            for (int c = 0; c < hp.num_mel_bins; c++) {
+                transposed[t + c * T_mel] = mel_spectrogram[t * hp.num_mel_bins + c];
+            }
+        }
+        mg.set_input(x, transposed.data(), T_mel * hp.num_mel_bins * sizeof(float));
+    }
 
     // Set deferred BN inputs
     for (auto& bn : bn_inputs) {
@@ -1091,9 +1144,16 @@ static std::vector<float> run_postnet(speecht5_tts_context* ctx,
 
     ggml_backend_graph_compute(mg.backend, gf);
 
+    // Read output and transpose back from ggml column-major to row-major (T_mel, num_mel_bins)
     int n = (int)ggml_nelements(h);
+    std::vector<float> raw(n);
+    ggml_backend_tensor_get(h, raw.data(), 0, n * sizeof(float));
     std::vector<float> result(n);
-    ggml_backend_tensor_get(h, result.data(), 0, n * sizeof(float));
+    for (int t = 0; t < T_mel; t++) {
+        for (int c = 0; c < hp.num_mel_bins; c++) {
+            result[t * hp.num_mel_bins + c] = raw[t + c * T_mel];
+        }
+    }
     return result;
 }
 
@@ -1126,7 +1186,17 @@ static std::vector<float> run_vocoder(speecht5_tts_context* ctx,
         return {};
     }
 
-    mg.set_input(mel_in, mel_spectrogram.data(), T_mel * vhp.model_in_dim * sizeof(float));
+    // Transpose mel from row-major (T_mel, mel_dim) to ggml column-major (ne[0]=T fastest)
+    {
+        int C = vhp.model_in_dim;
+        std::vector<float> transposed(T_mel * C);
+        for (int t = 0; t < T_mel; t++) {
+            for (int c = 0; c < C; c++) {
+                transposed[t + c * T_mel] = mel_spectrogram[t * C + c];
+            }
+        }
+        mg.set_input(mel_in, transposed.data(), T_mel * C * sizeof(float));
+    }
 
     ggml_backend_graph_compute(mg.backend, gf);
 
