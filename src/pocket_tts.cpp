@@ -880,7 +880,10 @@ static void linear_f32(float* out, const float* x, ggml_tensor* W, ggml_tensor* 
     }
 }
 
-// RoPE: apply rotary embedding to a single vector (head_dim,) at position pos
+// RoPE: apply rotary embedding to a single vector (head_dim,) at position pos.
+// Uses interleaved complex pairs: vec[2i]=real, vec[2i+1]=imag
+// (matching the Kyutai/Moshi convention used by both FlowLM and Mimi).
+// freq[i] = exp(-i / (D/2) * ln(max_period)) = max_period^(-2i/D)
 static void apply_rope_inplace(float* vec, int head_dim, int pos, float max_period) {
     int half = head_dim / 2;
     for (int i = 0; i < half; i++) {
@@ -888,10 +891,10 @@ static void apply_rope_inplace(float* vec, int head_dim, int pos, float max_peri
         double angle = (double)pos * freq;
         float cos_val = (float)std::cos(angle);
         float sin_val = (float)std::sin(angle);
-        float x0 = vec[i];
-        float x1 = vec[i + half];
-        vec[i] = x0 * cos_val - x1 * sin_val;
-        vec[i + half] = x0 * sin_val + x1 * cos_val;
+        float xr = vec[2 * i];     // real
+        float xi = vec[2 * i + 1]; // imag
+        vec[2 * i] = xr * cos_val - xi * sin_val;
+        vec[2 * i + 1] = xr * sin_val + xi * cos_val;
     }
 }
 
