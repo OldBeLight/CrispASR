@@ -8122,7 +8122,9 @@ encoder benefits from CUDA for longer audio.
   5. **F16 biases**: 1D tensors (biases/norms) MUST be F32 in GGUF for ggml binary ops
   6. **Decoder KV cache**: proper AR self-attention needs accumulated past K/V across steps
 - Pipeline runs end-to-end: encoder → decoder w/ KV cache → postnet → HiFi-GAN → 16kHz WAV
-- Decoder produces speech but wrong content — needs more investigation (likely the decoder also needs position bias batch dim fix)
+- Decoder produced speech but wrong content — **FIXED 2026-06-02**, see
+  "SpeechT5 TTS decoder — what ACTUALLY fixed it" below. Three bugs:
+  KV cache buffer reuse, tokenizer `▁`, postnet/vocoder data layout.
 
 ### Dia 1.6B TTS
 - **Encoder cos = 1.000000** all 12 layers against Python F32 reference
@@ -8362,3 +8364,75 @@ The harness: (1) dump reference per-stage with forward hooks, (2) teacher-force
 tokens via `FASTPITCH_FORCE_TOKENS=<file>`, (3) dump C++ per-stage via
 `FASTPITCH_DUMP_DIR=<dir>`, (4) compare with numpy cosine similarity. First
 divergent stage is the bug. Debug hooks: `FASTPITCH_DUMP_DIR`, `FASTPITCH_FORCE_TOKENS`.
+
+## SpeechT5 TTS decoder — what ACTUALLY fixed it (2026-06-02)
+
+The encoder was validated at cos > 0.999 in the earlier round (§8115). The
+decoder "produced audio but not the prompt" — same symptom class as the Dia KV
+bug. Three bugs, all found by systematic per-step diff against a PyTorch
+reference with dropout disabled (`_consistent_dropout = lambda x, p: x`).
+
+**Bug 1 — self-attention KV cache buffer reuse (the primary cause).** The ggml
+graph allocator reused the memory buffer backing `sk_cur` / `sv_cur` (the K/V
+projection tensors for the current step) before the host-side C++ code read
+their values into the CPU-side KV cache via `ggml_backend_tensor_get`. At step 0
+(single-position self-attention) the cache doesn't matter, so step 0 matched
+perfectly. From step 1 onward, the cache contained whatever later graph
+operation happened to land in the same buffer — completely wrong K/V, causing
+the self-attention to produce garbage. **Fix:** create `ggml_dup` copies of
+`sk_cur`/`sv_cur` and expand them as graph outputs; the dup copies get their
+own non-reusable buffers. The original `sk_cur`/`sv_cur` still feed into the
+attention graph normally. This is the **exact same class** as Dia's KV bug
+(`01beaeaa`), just triggered differently: Dia stored K/V in wrong
+`[step][batch]` order; SpeechT5 stored them from a clobbered buffer.
+
+**Diagnostic that caught it:** the per-step dump initially showed the prenet
+output (after ReLU) containing negative values — impossible after ReLU.
+Switching from `ggml_graph_get_tensor(gf, "name")` to reading from the saved
+pointer gave the same corrupt data. Only `ggml_dup` (which forces the allocator
+to assign a fresh buffer) fixed it. The `ggml_build_forward_expand` call alone
+does NOT prevent buffer reuse — ggml's allocator tracks liveness, not output
+status. An intermediate tensor that is "dead" after its last consumer reads it
+may have its buffer overwritten even before `ggml_backend_graph_compute` returns,
+because compute is node-by-node.
+
+**Bug 2 — tokenizer missing leading `▁`.** SpeechT5 uses a SentencePiece
+char-level tokenizer that prepends `▁` (U+2581) at the start of text and
+replaces spaces with `▁`. The C++ tokenizer only replaced spaces, producing 7
+tokens for "Hello." where the reference produces 8 (`[▁, H, e, l, l, o, ., </s>]`).
+With the wrong token count, the encoder output differs and cross-attention
+attends to the wrong content. **Fix:** prepend `▁` before encoding characters.
+
+**Bug 3 — postnet + vocoder data layout.** The mel spectrogram was stored
+row-major `(T, 80)` in C++ (time steps × mel bins), then passed directly to
+`ggml_conv_1d` via a tensor declared as `(ne[0]=T, ne[1]=80)`. But ggml
+column-major layout means element `[t, c]` is at offset `t + c*T`, while the
+row-major data has it at `t*80 + c`. Result: the conv read transposed data →
+NaN/garbage output from the postnet and vocoder. **Fix:** explicit transpose
+when setting input (`transposed[t + c*T] = row_major[t*80 + c]`) and reverse
+transpose when reading output. Applied in both `run_postnet` and `run_vocoder`.
+
+**Method (reusable for AR-mel TTS).** (1) Dump per-step decoder intermediates
+from both PyTorch and C++ (prenet output, decoder hidden, mel, self-attn K/V).
+(2) Compare per-step with cosine similarity — the first step that diverges
+localizes the bug. (3) For KV cache bugs: step 0 matches perfectly (no past
+cache) but step 1 fails at the hidden state (past cache is corrupt). (4) For
+data layout bugs: all decoder steps match but final audio is garbage — isolate
+postnet vs vocoder by feeding reference mel through the C++ vocoder. (5) ASR
+roundtrip validates end-to-end. The Python reference ALSO drops "there" from
+"Hello there, how are you doing today?" → SpeechT5 model limitation, not a
+port bug.
+
+**Debug hooks:** `SPEECHT5_DUMP_DIR=<dir>` writes per-step `step{N}_mel.f32`
+and `step{N}_self_k_L0.f32`. Compare with `tools/dump_speecht5_decoder.py`
+(PyTorch side) and `tools/compare_speecht5_dumps.py` (cosine/maxabs report).
+
+### Key ggml lesson: `ggml_build_forward_expand` ≠ buffer preservation
+
+Expanding a tensor as a graph output ensures it gets **computed**, but the
+allocator may still reuse its buffer after its last consumer reads it — even
+before `ggml_backend_graph_compute` returns, because compute is node-by-node.
+To **read back an intermediate** after graph compute, you need a `ggml_dup`
+copy (or `ggml_cpy` to a pre-allocated input tensor). This applies to any
+backend that wants to read back KV projections, intermediate hidden states,
+or any tensor that has downstream consumers in the graph.
