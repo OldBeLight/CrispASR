@@ -84,14 +84,23 @@ SLOW_BACKENDS = [
     ("mimo-asr",          "MiMo-ASR",                420, "Q4_K ~4.2GB; PLAN #115 forces CPU (~297s/11s clip)"),
 ]
 
-# TTS backends suitable for Kaggle time limits (small/fast models)
+# TTS backends suitable for Kaggle time limits (small/fast models first,
+# then larger ones). Each entry downloads via -m auto, synthesises a phrase,
+# checks output WAV exists and has >1000 bytes. Models are cleaned up after
+# each backend to stay within Kaggle's ~20 GB scratch.
 TTS_BACKENDS = [
     # (backend, display_name, timeout_seconds, notes)
-    ("kokoro",            "Kokoro 82M",               60, "Q8_0, 82M params, multilingual"),
-    ("piper",             "Piper LessAC Medium",      30, "F16, ~30MB, VITS en_US"),
-    ("speecht5",          "SpeechT5 TTS",             60, "F16, encoder-decoder TTS"),
-    ("bark",              "Bark Small",               90, "Q8_0, text-to-audio generative"),
-    ("csm",               "CSM 1B",                  120, "Q4_K, 1B params, conversational speech"),
+    ("piper",             "Piper LessAC Medium",      30, "F16, ~16MB, VITS en_US"),
+    ("kokoro",            "Kokoro 82M",               90, "Q8_0, needs espeak-ng + voice GGUF"),
+    ("speecht5",          "SpeechT5 TTS",             90, "F16, ~300MB, encoder-decoder + HiFi-GAN"),
+    ("fastpitch",         "FastPitch 60M",            30, "F16, ~60MB, non-AR parallel TTS"),
+    ("pocket-tts",        "Pocket TTS 100M",          90, "F16, ~381MB, continuous-latent AR"),
+    ("bark",              "Bark Small",              120, "Q8_0, ~500MB, 3-stage GPT-2"),
+    ("f5-tts",            "F5-TTS v1 Base",          120, "F16, ~953MB, DiT flow-matching"),
+    ("csm",               "CSM 1B",                  240, "Q4_K, ~1.1GB, conversational TTS"),
+    ("parler-tts",        "Parler TTS Mini v1.1",    180, "Q8_0, ~1GB, T5 + MusicGen decoder"),
+    ("dia",               "Dia 1.6B",                240, "Q8_0, ~1.6GB, byte-level + DAC 44.1 kHz"),
+    ("orpheus",           "Orpheus 3B-FT",           300, "Q8_0, ~3.5GB, Llama-3.2 + SNAC"),
 ]
 
 print(f"CrispASR Benchmark — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -522,31 +531,59 @@ else:
 # TTS smoke benchmark (opt-in, separate from ASR)
 BENCHMARK_TTS = os.environ.get("BENCHMARK_TTS", "0")
 if BENCHMARK_TTS == "1":
+    # Install espeak-ng for kokoro (piper also benefits from it)
+    print("\nInstalling espeak-ng for TTS backends...")
+    subprocess.run("sudo apt-get update -qq && sudo apt-get install -y -qq libespeak-ng-dev espeak-ng",
+                   shell=True, capture_output=True)
+
     tts_results = []
+    TTS_PHRASE = "The quick brown fox jumps over the lazy dog."
+
     for backend, name, timeout, notes in TTS_BACKENDS:
         print(f"\n{'='*60}")
         print(f"  TTS: {name} (--backend {backend})")
         print(f"{'='*60}")
         outfile = f"/tmp/tts-bench-{backend}.wav"
-        cmd = [CRISPASR, "--backend", backend, "-m", "auto",
-               "--tts", "The quick brown fox jumps over the lazy dog.",
+        cmd = [CRISPASR, "--backend", backend, "-m", "auto", "--auto-download",
                "--tts-output", outfile, "--no-prints"]
+
+        # Per-backend phrase and voice overrides
+        phrase = TTS_PHRASE
+        if backend == "dia":
+            phrase = "[S1] The quick brown fox jumps over the lazy dog. This is a longer prompt for Dia which needs over one hundred characters to produce good output quality."
+        elif backend == "orpheus":
+            cmd += ["--voice", "tara"]
+
+        cmd += ["--tts", phrase]
+
         t0 = time.time()
         try:
-            proc = subprocess.run(cmd, timeout=timeout, capture_output=True)
+            proc = subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
             wall = time.time() - t0
             ok = proc.returncode == 0 and os.path.isfile(outfile) and os.path.getsize(outfile) > 1000
             sz = os.path.getsize(outfile) if os.path.isfile(outfile) else 0
-            tts_results.append({"backend": backend, "name": name, "wall_s": wall,
-                                "status": "PASS" if ok else "FAIL", "wav_bytes": sz})
-            print(f"  {'PASS' if ok else 'FAIL'} — {wall:.1f}s, {sz} bytes")
+            status = "PASS" if ok else "FAIL"
+            tts_results.append({"backend": backend, "name": name, "wall_s": round(wall, 1),
+                                "status": status, "wav_bytes": sz})
+            print(f"  {status} — {wall:.1f}s, {sz} bytes")
+            if not ok and proc.stderr:
+                print(f"  stderr: {proc.stderr[-300:]}")
         except subprocess.TimeoutExpired:
             tts_results.append({"backend": backend, "name": name, "wall_s": timeout,
                                 "status": "TIMEOUT", "wav_bytes": 0})
             print(f"  TIMEOUT after {timeout}s")
         if os.path.isfile(outfile):
             os.remove(outfile)
-    print(f"\nTTS results: {sum(1 for r in tts_results if r['status']=='PASS')}/{len(tts_results)} passed")
+        _cleanup_cache(backend)
+
+    print(f"\n{'='*60}")
+    print("TTS RESULTS")
+    print(f"{'='*60}")
+    print(f"| Backend | Status | Wall (s) | WAV bytes |")
+    print(f"|---|---|---|---|")
+    for r in tts_results:
+        print(f"| {r['name']} | {r['status']} | {r['wall_s']} | {r['wav_bytes']} |")
+    print(f"\n{sum(1 for r in tts_results if r['status']=='PASS')}/{len(tts_results)} passed")
 else:
     print(f"\n⏭ Skipping {len(TTS_BACKENDS)} TTS backends "
           f"(set BENCHMARK_TTS=1 to include)")
