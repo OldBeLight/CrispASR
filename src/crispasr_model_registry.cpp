@@ -482,9 +482,11 @@ constexpr Entry k_registry[] = {
     // Pocket TTS: Kyutai's 100M continuous-latent AR TTS (24 kHz, MIT/CC-BY-4.0).
     // Generates continuous 32-dim float vectors at 12.5 Hz via one-step LSD,
     // decoded by Mimi VAE to 24 kHz PCM. Single GGUF, no codec companion.
-    {"pocket-tts", "pocket-tts-english-novc-f16.gguf",
-     "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-english-novc-f16.gguf",
-     "~200 MB"},
+    // Voice cloning via --voice ref.wav (requires the -f16 variant with Mimi encoder).
+    // The -novc variant lacks the encoder and produces near-silence without conditioning.
+    {"pocket-tts", "pocket-tts-english-f16.gguf",
+     "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-english-f16.gguf",
+     "~220 MB"},
     // IndexTTS-1.5: GPT-2 AR mel-code generator + BigVGAN vocoder.
     // Voice cloning via Conformer+Perceiver conditioning on reference audio.
     // Two-file setup: GPT (mel codes) + BigVGAN (vocoder). Q8_0 recommended
