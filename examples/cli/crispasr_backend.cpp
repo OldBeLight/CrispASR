@@ -517,6 +517,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "sensevoice";
     if (contains_ci("speecht5"))
         return "speecht5";
+    if (contains_ci("bark"))
+        return "bark";
     if (contains_ci("dia") && contains_ci("1.6b"))
         return "dia";
     if (contains_ci("dia-tts") || contains_ci("dia_tts"))
@@ -627,6 +629,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "pocket-tts";
             else if (a == "speecht5-tts" || a == "speecht5_tts" || a == "speecht5")
                 result = "speecht5";
+            else if (a == "bark" || a == "bark-tts" || a == "bark_tts")
+                result = "bark";
             else if (a == "dia" || a == "dia-tts" || a == "dia_tts")
                 result = "dia";
             else if (a == "csm" || a == "csm-tts" || a == "csm_tts")
