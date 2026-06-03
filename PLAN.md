@@ -4854,3 +4854,29 @@ feature (LM shallow fusion) and out of scope for this item.
 session start). Only mimo-asr remains feasible but blocked; the
 other 5 without beam are CTC-only or NAR (not applicable).
 
+## §140 GPU / ggml_backend_sched for CPU-only TTS backends
+
+FastPitch (§133) was ported to `ggml_backend_sched` + `ggml_backend_init_best()`
+in commit TBD. The same upgrade is needed for the other CPU-only backends that
+still hardcode `ggml_backend_cpu_init()` + `ggml_gallocr` + `ggml_backend_graph_compute`:
+
+| Backend | GPU status | Notes |
+|---|---|---|
+| **fastpitch** | **DONE** | sched + init_best + core_gguf::load_weights |
+| **speecht5** | CPU-only | Same mini_graph pattern, ~80M params |
+| **piper** | CPU-only | Same mini_graph pattern, ~60M params (VITS) |
+| **parler-tts** | CPU-only | T5 encoder + DAC decoder, ~880M params — would benefit most |
+| **outetts** | CPU-only | OLMo LM + WavTokenizer, ~400M params |
+| **pocket-tts** | CPU-only | Llama backbone + Mimi codec |
+
+### Pattern (from FastPitch)
+
+1. Add `#include "core/gguf_loader.h"` + `#include "ggml-alloc.h"`
+2. Replace raw `gguf_init_from_file` weight loading with `core_gguf::load_weights(path, backend, ...)`
+3. Add `ggml_backend_t backend` + `ggml_backend_sched_t sched` to context
+4. Init: `backend = params.use_gpu ? ggml_backend_init_best() : backend_cpu`
+5. Create sched: `ggml_backend_sched_new(backends, nullptr, n_be, graph_size, false, false)`
+6. Each sub-graph: `sched_reset` → `sched_alloc_graph` → set inputs → `sched_graph_compute`
+7. Free: `sched_free` → `buffer_free` → `backend_free` (GPU before CPU)
+8. Wire `p.use_gpu = g_open_use_gpu_tls` in crispasr_c_api.cpp open dispatch
+

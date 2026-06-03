@@ -8,8 +8,10 @@
 #include "fastpitch_tts.h"
 
 #include "core/align.h"
+#include "core/gguf_loader.h"
 #include "core/hifigan.h"
 
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -90,29 +92,23 @@ struct fastpitch_hparams {
     core_hifigan::hparams voc_hp;
 };
 
-// ── mini_graph: short-lived ggml context + backend allocator ─────────
-namespace {
-struct mini_graph {
-    ggml_backend_t backend;
-    ggml_context* ctx;
-    ggml_gallocr_t alloc;
+// ── mini_graph: short-lived ggml context for graph building ──────────
 
-    mini_graph(ggml_backend_t be, size_t mem = 256 * 1024 * 1024) : backend(be) {
+struct mini_graph {
+    ggml_context* ctx;
+
+    mini_graph(size_t mem = 256 * 1024 * 1024) {
         struct ggml_init_params gp = {};
         gp.mem_size = mem;
         gp.mem_buffer = nullptr;
         gp.no_alloc = true;
         ctx = ggml_init(gp);
-        alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
     }
     ~mini_graph() {
-        if (alloc)
-            ggml_gallocr_free(alloc);
         if (ctx)
             ggml_free(ctx);
     }
 };
-} // namespace
 
 // ── Context ──────────────────────────────────────────────────────────
 
@@ -120,10 +116,12 @@ struct fastpitch_tts_context {
     fastpitch_tts_params params;
     fastpitch_hparams hp;
 
-    // ggml model
-    ggml_backend_t backend_cpu = nullptr;
+    // ggml model + backend
+    ggml_backend_t backend = nullptr;     // primary (GPU or CPU)
+    ggml_backend_t backend_cpu = nullptr; // always CPU (for n_threads, fallback)
     ggml_backend_buffer_t buf_w = nullptr;
     struct ggml_context* ctx_w = nullptr;
+    ggml_backend_sched_t sched = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
 
     // Tokenizer: ARPABET phoneme-based (NeMo EnglishPhonemesTokenizer).
@@ -297,31 +295,8 @@ static fastpitch_tts_context* load_model(const char* path, fastpitch_tts_params 
 
     gguf_free(gguf);
 
-    // ── Load tensors into ggml context ──
+    // ── Init backends ──
 
-    struct gguf_init_params gip2 = {};
-    gip2.no_alloc = false;
-    gip2.ctx = &ctx->ctx_w;
-
-    struct gguf_context* gguf2 = gguf_init_from_file(path, gip2);
-    if (!gguf2) {
-        delete ctx;
-        return nullptr;
-    }
-
-    // Collect tensor map
-    const int n_tensors = gguf_get_n_tensors(gguf2);
-    for (int i = 0; i < n_tensors; i++) {
-        const char* name = gguf_get_tensor_name(gguf2, i);
-        ggml_tensor* t = ggml_get_tensor(ctx->ctx_w, name);
-        if (t) {
-            ctx->tensors[name] = t;
-        }
-    }
-
-    gguf_free(gguf2);
-
-    // CPU backend
     ctx->backend_cpu = ggml_backend_cpu_init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "fastpitch: failed to init CPU backend\n");
@@ -329,6 +304,43 @@ static fastpitch_tts_context* load_model(const char* path, fastpitch_tts_params 
         return nullptr;
     }
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+
+    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    if (!ctx->backend)
+        ctx->backend = ctx->backend_cpu;
+
+    if (params.verbosity >= 1 && ctx->backend != ctx->backend_cpu) {
+        fprintf(stderr, "fastpitch: using GPU backend: %s\n", ggml_backend_name(ctx->backend));
+    }
+
+    // ── Load tensors via core_gguf (allocates on the active backend) ──
+
+    core_gguf::WeightLoad wl;
+    if (!core_gguf::load_weights(path, ctx->backend, "fastpitch", wl)) {
+        delete ctx;
+        return nullptr;
+    }
+    ctx->ctx_w = wl.ctx;
+    ctx->buf_w = wl.buf;
+    ctx->tensors = std::move(wl.tensors);
+
+    // ── Create backend scheduler ──
+    {
+        ggml_backend_t backends[2];
+        int n_be = 0;
+        backends[n_be++] = ctx->backend;
+        if (ctx->backend_cpu != ctx->backend)
+            backends[n_be++] = ctx->backend_cpu;
+
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be,
+                                            /*graph_size=*/16384,
+                                            /*parallel=*/false, /*op_offload=*/false);
+        if (!ctx->sched) {
+            fprintf(stderr, "fastpitch: failed to create backend scheduler\n");
+            delete ctx;
+            return nullptr;
+        }
+    }
 
     // Infer vocab size from embedding tensor
     auto it = ctx->tensors.find("enc.emb.weight");
@@ -341,8 +353,8 @@ static fastpitch_tts_context* load_model(const char* path, fastpitch_tts_params 
         fprintf(stderr,
                 "fastpitch: loaded %d tensors, %d vocab, %d speakers, "
                 "d_model=%d, enc=%d layers, dec=%d layers, mel=%d, sr=%d\n",
-                n_tensors, ctx->n_vocab, hp.n_speakers, hp.symbols_embedding_dim, hp.enc_n_layers, hp.dec_n_layers,
-                hp.n_mel_channels, hp.sample_rate);
+                (int)ctx->tensors.size(), ctx->n_vocab, hp.n_speakers, hp.symbols_embedding_dim, hp.enc_n_layers,
+                hp.dec_n_layers, hp.n_mel_channels, hp.sample_rate);
     }
 
     return ctx;
@@ -778,7 +790,7 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
 
     // ── Step 2: Build and run encoder + predictors graph ──
     {
-        mini_graph mg(ctx->backend_cpu);
+        mini_graph mg;
         auto* gc = mg.ctx;
 
         // Input: token IDs
@@ -827,7 +839,8 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
         ggml_build_forward_expand(gf, pitch_pred);
         ggml_build_forward_expand(gf, enc_copy);
 
-        if (!ggml_gallocr_alloc_graph(mg.alloc, gf)) {
+        ggml_backend_sched_reset(ctx->sched);
+        if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
             fprintf(stderr, "fastpitch: encoder graph alloc failed\n");
             return 0;
         }
@@ -843,7 +856,7 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
         }
 
         // Compute
-        ggml_backend_graph_compute(ctx->backend_cpu, gf);
+        ggml_backend_sched_graph_compute(ctx->sched, gf);
 
         // Read outputs
         std::vector<float> dur_data(T_text);
@@ -924,7 +937,7 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
         ggml_tensor* pitch_emb_b = T(ctx->tensors, "pitch_emb.bias");
 
         if (pitch_emb_w) {
-            mini_graph mg_pitch(ctx->backend_cpu, 64 * 1024 * 1024);
+            mini_graph mg_pitch(64 * 1024 * 1024);
             auto* gc2 = mg_pitch.ctx;
 
             // Input: pitch values — conv1d expects (T, Cin) = (T_frames, 1)
@@ -943,9 +956,10 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
             ggml_cgraph* gf2 = ggml_new_graph_custom(gc2, 256, false);
             ggml_build_forward_expand(gf2, pemb);
 
-            if (ggml_gallocr_alloc_graph(mg_pitch.alloc, gf2)) {
+            ggml_backend_sched_reset(ctx->sched);
+            if (ggml_backend_sched_alloc_graph(ctx->sched, gf2)) {
                 ggml_backend_tensor_set(pitch_in, pitch_frames.data(), 0, T_frames * sizeof(float));
-                ggml_backend_graph_compute(ctx->backend_cpu, gf2);
+                ggml_backend_sched_graph_compute(ctx->sched, gf2);
 
                 // Add pitch embedding to expanded features
                 std::vector<float> pemb_data((size_t)D * T_frames);
@@ -961,7 +975,7 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
 
         std::vector<float> dec_out_data;
         {
-            mini_graph mg_dec(ctx->backend_cpu);
+            mini_graph mg_dec;
             auto* gc3 = mg_dec.ctx;
 
             ggml_tensor* dec_in = ggml_new_tensor_2d(gc3, GGML_TYPE_F32, D, T_frames);
@@ -993,7 +1007,8 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
             ggml_cgraph* gf3 = ggml_new_graph_custom(gc3, 16384, false);
             ggml_build_forward_expand(gf3, mel);
 
-            if (!ggml_gallocr_alloc_graph(mg_dec.alloc, gf3)) {
+            ggml_backend_sched_reset(ctx->sched);
+            if (!ggml_backend_sched_alloc_graph(ctx->sched, gf3)) {
                 fprintf(stderr, "fastpitch: decoder graph alloc failed\n");
                 free(expanded);
                 return 0;
@@ -1022,7 +1037,7 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
 
         int T_mel = T_frames;
         {
-            mini_graph mg_voc(ctx->backend_cpu);
+            mini_graph mg_voc;
             auto* gc4 = mg_voc.ctx;
 
             // Input mel for HiFi-GAN vocoder.
@@ -1044,7 +1059,8 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
             ggml_cgraph* gf4 = ggml_new_graph_custom(gc4, 16384, false);
             ggml_build_forward_expand(gf4, audio);
 
-            if (!ggml_gallocr_alloc_graph(mg_voc.alloc, gf4)) {
+            ggml_backend_sched_reset(ctx->sched);
+            if (!ggml_backend_sched_alloc_graph(ctx->sched, gf4)) {
                 fprintf(stderr, "fastpitch: vocoder graph alloc failed\n");
                 return 0;
             }
@@ -1119,11 +1135,16 @@ struct fastpitch_tts_context* fastpitch_tts_init_from_file(const char* path_mode
 void fastpitch_tts_free(struct fastpitch_tts_context* ctx) {
     if (!ctx)
         return;
-    if (ctx->backend_cpu)
-        ggml_backend_free(ctx->backend_cpu);
+    if (ctx->sched)
+        ggml_backend_sched_free(ctx->sched);
+    if (ctx->buf_w)
+        ggml_backend_buffer_free(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
-    // buf_w is freed by ggml_free(ctx_w) when ctx_w owns it
+    if (ctx->backend && ctx->backend != ctx->backend_cpu)
+        ggml_backend_free(ctx->backend);
+    if (ctx->backend_cpu)
+        ggml_backend_free(ctx->backend_cpu);
     delete ctx;
 }
 
