@@ -172,8 +172,19 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
             all_tokens.append(next_tokens)
 
         if "gen_codes_20" in stages:
-            codes = np.array(all_tokens, dtype=np.float32).T  # (num_cb, n_steps)
-            captures["gen_codes_20"] = codes
+            n_s = len(all_tokens)
+            T_audio = max(0, n_s - num_cb + 1)
+            aligned = []
+            for t in range(T_audio):
+                frame = []
+                for k in range(num_cb):
+                    step = t + k
+                    tok = all_tokens[step][k] if step < n_s else 1024
+                    if tok == bos:
+                        tok = 1024
+                    frame.append(tok)
+                aligned.append(frame)
+            captures["gen_codes_20"] = np.array(aligned, dtype=np.float32)
 
     # Store metadata as string captures (dump_reference.py handles these)
     captures["parler_text"] = text

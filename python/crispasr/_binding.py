@@ -1301,7 +1301,7 @@ class Session:
             self._lib.crispasr_session_result_free(res)
 
     # ---------------------------------------------------------------------
-    # TTS synthesis (vibevoice, qwen3-tts, kokoro, orpheus, chatterbox, indextts, voxcpm2, csm, dia)
+    # TTS synthesis (vibevoice, qwen3-tts, kokoro, orpheus, chatterbox, indextts, voxcpm2, csm, dia, speecht5)
     # ---------------------------------------------------------------------
 
     def set_codec_path(self, path: str) -> None:
@@ -1326,6 +1326,9 @@ class Session:
 
         For orpheus voice selection is BY NAME — use
         :meth:`set_speaker_name` instead of this method.
+
+        For speecht5, pass a raw float32 binary file containing a 512-d
+        x-vector (e.g. from Matthijs/cmu-arctic-xvectors).
         """
         if not hasattr(self._lib, "crispasr_session_set_voice"):
             raise RuntimeError("TTS API not present in this libcrispasr build")

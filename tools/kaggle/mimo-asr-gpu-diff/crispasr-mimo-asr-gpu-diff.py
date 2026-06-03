@@ -159,6 +159,9 @@ def run_mimo(label: str, extra_env: dict, timeout: int = 900, gdb: bool = False)
 
 subprocess.run("apt-get install -y -q gdb >/dev/null 2>&1 || true", shell=True)
 cpu = run_mimo("cpu", {})
+# Validation: the fix keeps the Q4_K embed/audio.emb tables on CPU (CUDA
+# get_rows can't gather Q4_K) while the matmul weights stay GPU-resident.
+# Expect GPU == PASS now. gdb stays on to catch any residual crash.
 gpu = run_mimo("gpu", {"CRISPASR_MIMO_FORCE_GPU": "1"}, gdb=True)
 
 # ── Compare CPU vs GPU per stage — find the first divergence ──────────────

@@ -6,6 +6,37 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-02 mimo-asr GPU (PLAN #115 option C): the bug was in decode, not prefill
+
+mimo-asr had been forced to CPU since 2026-05-26 (option A) because the GPU
+path was "silent-empty / segfault" — PLAN #115 scoped the fix as per-tensor
+backend tagging in `mimo_asr_build_prefill_graph`. The local M1 can't hold
+the 4.2 GB model (box memory-saturated), so I debugged it on Kaggle GPU,
+driving the CLI directly and mirroring the funasr-cuda-debug kernel.
+
+Added `CRISPASR_MIMO_FORCE_GPU=1` (loads weights GPU-resident + computes
+there) and `MIMO_ASR_DUMP_STAGES=1` (per-stage prefill tensor stats, like
+funasr's `FUNASR_DUMP_STAGES`). Kernel `tools/kaggle/mimo-asr-gpu-diff/`,
+three P100 round-trips:
+
+- **Run 1:** the GPU **prefill is correct** — all 5 `mimo_dump` stages match
+  CPU, no NaN/Inf. But `rc=-11` (SIGSEGV) at 16.5 s, *after* the prefill →
+  the bug is in the **decode step**, refuting the PLAN premise.
+- **Run 2 (gdb):** `dequantize_row_q4_K` → `ggml_backend_cpu_graph_compute`
+  → `mimo_asr_transcribe_impl`. The sched (`[CUDA, CPU]`) offloaded a decode
+  op to the **CPU** backend, which then read a **GPU-resident Q4_K** weight's
+  device pointer as host memory → segfault. Not the §125 sched-src-mutation
+  class at all.
+- **Fix (`3ef9f87e`):** when `force_gpu`, build the sched **GPU-only** so no
+  op can be CPU-routed onto a GPU weight. Run 3 validating (expect GPU JFK
+  PASS); if green, flip `--gpu` to honour GPU residency by default and
+  restore the 22% PLAN #72 win.
+
+Lesson (LEARNINGS): GPU-resident quantized weights need a *single-backend*
+sched — a CPU "fallback" backend will dereference device memory. The earlier
+"per-tensor tagging in the prefill graph" hypothesis was wrong; reproduce on
+the real GPU before theorising.
+
 ## 2026-06-02 CSM-1B TTS (§135): "buzzing not speech" was one converter line
 
 CSM (sesame/csm-1b) loaded and generated frames but Whisper heard the

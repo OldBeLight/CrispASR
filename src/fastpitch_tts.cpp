@@ -24,6 +24,32 @@
 #include <string>
 #include <vector>
 
+// ── Dump helpers (env-gated: FASTPITCH_DUMP_DIR) ────────────────────
+
+static void dump_f32(const char* dir, const char* name, const float* data, size_t n) {
+    if (!dir)
+        return;
+    std::string path = std::string(dir) + "/" + name + ".f32";
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f)
+        return;
+    fwrite(data, sizeof(float), n, f);
+    fclose(f);
+    fprintf(stderr, "fastpitch: dumped %s (%zu floats)\n", path.c_str(), n);
+}
+
+static void dump_i32(const char* dir, const char* name, const int32_t* data, size_t n) {
+    if (!dir)
+        return;
+    std::string path = std::string(dir) + "/" + name + ".i32";
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f)
+        return;
+    fwrite(data, sizeof(int32_t), n, f);
+    fclose(f);
+    fprintf(stderr, "fastpitch: dumped %s (%zu ints)\n", path.c_str(), n);
+}
+
 // ── Hyperparameters ──────────────────────────────────────────────────
 
 struct fastpitch_hparams {
@@ -36,13 +62,13 @@ struct fastpitch_hparams {
     int enc_n_layers = 6;
     int enc_n_heads = 1;
     int enc_d_head = 64;
-    int enc_d_inner = 1024;
+    int enc_d_inner = 1536;
 
     // Decoder
     int dec_n_layers = 6;
     int dec_n_heads = 1;
     int dec_d_head = 64;
-    int dec_d_inner = 1024;
+    int dec_d_inner = 1536;
 
     // Duration predictor
     int dur_n_layers = 2;
@@ -100,13 +126,20 @@ struct fastpitch_tts_context {
     struct ggml_context* ctx_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
 
-    // Tokenizer: simple char-level mapping for German text.
-    // NeMo FastPitch uses a phoneme tokenizer (IPA via G2P).
-    // For the GGUF runtime we store the phoneme_id_map in metadata or
-    // fall back to a basic character-level tokenizer.
-    std::map<std::string, int> char_to_id;
+    // Tokenizer: ARPABET phoneme-based (NeMo EnglishPhonemesTokenizer).
+    // Vocabulary is loaded from GGUF metadata (semicolon-separated string).
+    // Tokens include: space, consonants, stressed vowels, lowercase chars,
+    // punctuation, special tokens (pad, blank, oov).
+    std::map<std::string, int> token_to_id;
+    std::vector<std::string> id_to_token;
     int pad_id = 0;
+    int blank_id = -1;
+    int space_id = 0;
     int n_vocab = 0;
+
+    // Pitch normalization (from training data stats)
+    float pitch_mean = 0.0f;
+    float pitch_std = 1.0f;
 };
 
 // ── GGUF loading ─────────────────────────────────────────────────────
@@ -116,6 +149,20 @@ static uint32_t gguf_get_u32(const gguf_context* g, const char* key, uint32_t de
     if (idx < 0)
         return def;
     return (uint32_t)gguf_get_val_u32(g, idx);
+}
+
+static float gguf_get_f32(const gguf_context* g, const char* key, float def) {
+    int idx = gguf_find_key(g, key);
+    if (idx < 0)
+        return def;
+    return gguf_get_val_f32(g, idx);
+}
+
+static std::string gguf_get_str(const gguf_context* g, const char* key) {
+    int idx = gguf_find_key(g, key);
+    if (idx < 0)
+        return "";
+    return gguf_get_val_str(g, idx);
 }
 
 static std::vector<int> gguf_get_int_array(const gguf_context* g, const char* key) {
@@ -171,6 +218,40 @@ static fastpitch_tts_context* load_model(const char* path, fastpitch_tts_params 
 
     hp.pitch_embedding_kernel_size = (int)gguf_get_u32(gguf, "fastpitch.pitch_embedding_kernel_size", 3);
     hp.sample_rate = (int)gguf_get_u32(gguf, "fastpitch.sample_rate", 22050);
+
+    // Pitch normalization stats
+    ctx->pitch_mean = gguf_get_f32(gguf, "fastpitch.pitch_mean", 0.0f);
+    ctx->pitch_std = gguf_get_f32(gguf, "fastpitch.pitch_std", 1.0f);
+
+    // Load tokenizer vocabulary (semicolon-separated string)
+    {
+        std::string vocab_str = gguf_get_str(gguf, "fastpitch.tokenizer_vocab");
+        if (!vocab_str.empty()) {
+            size_t pos = 0;
+            int id = 0;
+            while (pos < vocab_str.size()) {
+                size_t next = vocab_str.find(';', pos);
+                if (next == std::string::npos)
+                    next = vocab_str.size();
+                std::string token = vocab_str.substr(pos, next - pos);
+                ctx->id_to_token.push_back(token);
+                ctx->token_to_id[token] = id;
+                id++;
+                pos = next + 1;
+            }
+            ctx->n_vocab = id;
+            // Find special token IDs
+            auto it_pad = ctx->token_to_id.find("<pad>");
+            if (it_pad != ctx->token_to_id.end())
+                ctx->pad_id = it_pad->second;
+            auto it_blank = ctx->token_to_id.find("<blank>");
+            if (it_blank != ctx->token_to_id.end())
+                ctx->blank_id = it_blank->second;
+            auto it_space = ctx->token_to_id.find(" ");
+            if (it_space != ctx->token_to_id.end())
+                ctx->space_id = it_space->second;
+        }
+    }
 
     // Vocoder hparams
     hp.voc_hp.model_in_dim = (int)gguf_get_u32(gguf, "fastpitch.voc_model_in_dim", 80);
@@ -279,28 +360,41 @@ static std::vector<int> tokenize_text(const fastpitch_tts_context* ctx, const ch
     if (!text)
         return ids;
 
-    // Use char_to_id map if populated, otherwise raw codepoints
-    if (!ctx->char_to_id.empty()) {
-        const char* p = text;
-        while (*p) {
-            // Try multi-char match (up to 4 bytes for UTF-8)
-            bool found = false;
-            for (int len = 4; len >= 1; len--) {
-                if (p + len > text + strlen(text))
-                    continue;
-                std::string candidate(p, len);
-                auto it = ctx->char_to_id.find(candidate);
-                if (it != ctx->char_to_id.end()) {
+    // Character-level tokenization using the NeMo ARPABET vocabulary.
+    // For now this handles chars + punctuation; G2P phoneme conversion
+    // is not yet implemented (would require CMUDict lookup).
+    if (!ctx->token_to_id.empty()) {
+        // Pad with space at beginning and end (NeMo pad_with_space=True)
+        ids.push_back(ctx->space_id);
+
+        // Convert to lowercase and tokenize character by character
+        bool last_was_space = true;
+        for (const char* p = text; *p; p++) {
+            char c = *p;
+            // Lowercase
+            if (c >= 'A' && c <= 'Z')
+                c = c - 'A' + 'a';
+
+            std::string token(1, c);
+            auto it = ctx->token_to_id.find(token);
+            if (it != ctx->token_to_id.end()) {
+                // Avoid consecutive spaces
+                if (c == ' ') {
+                    if (!last_was_space) {
+                        ids.push_back(it->second);
+                        last_was_space = true;
+                    }
+                } else {
                     ids.push_back(it->second);
-                    p += len;
-                    found = true;
-                    break;
+                    last_was_space = false;
                 }
             }
-            if (!found) {
-                // Unknown character -> skip or use pad
-                p++;
-            }
+            // Unknown chars are skipped (NeMo behavior)
+        }
+
+        // Pad with space at end
+        if (!ids.empty() && ids.back() != ctx->space_id) {
+            ids.push_back(ctx->space_id);
         }
     } else {
         // Fallback: raw ASCII codepoints clamped to vocab
@@ -334,15 +428,24 @@ static ggml_tensor* layer_norm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* g
     return x;
 }
 
-// Conv1d: weight (K, Cin, Cout in ggml), bias (Cout,), input (D, T)
+// Conv1d: weight (K, Cin, Cout in ggml), bias (Cout,)
+// ggml_conv_1d expects input as (T, Cin) and weight as (K, Cin, Cout).
+// Output is 3D: (OL, OC, N). We squeeze to 2D (OL, OC) and add bias.
 static ggml_tensor* conv1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, int stride = 1,
                            int pad = 0, int dilation = 1) {
     ggml_tensor* y = ggml_conv_1d(ctx, w, x, stride, pad, dilation);
+    // ggml_conv_1d returns 3D (OL, OC, N). Squeeze batch dim to get (OL, OC).
+    y = ggml_reshape_2d(ctx, y, (int)y->ne[0], (int)y->ne[1]);
     if (b) {
-        ggml_tensor* bias = ggml_reshape_2d(ctx, b, (int)b->ne[0], 1);
+        ggml_tensor* bias = ggml_reshape_2d(ctx, b, 1, (int)b->ne[0]);
         y = ggml_add(ctx, y, bias);
     }
     return y;
+}
+
+// Transpose helper: (A, B) -> (B, A) with ggml_cont to ensure contiguous
+static ggml_tensor* transpose_2d(ggml_context* ctx, ggml_tensor* x) {
+    return ggml_cont(ctx, ggml_transpose(ctx, x));
 }
 
 // ── Encoder forward pass ─────────────────────────────────────────────
@@ -364,14 +467,12 @@ static ggml_tensor* build_encoder_graph(ggml_context* gctx, const fastpitch_tts_
     // Token embedding: lookup
     ggml_tensor* emb_w = T(ts, "enc.emb.weight");
     ggml_tensor* x = ggml_get_rows(gctx, emb_w, token_ids);
-    // x is (D, T) after get_rows with transposed embedding
+    // x is (D, T) after get_rows: ne[0]=D, ne[1]=T
 
-    // Positional embedding: add learned sinusoidal positions
+    // Positional embedding: pre-computed sinusoidal positions from inv_freq
     ggml_tensor* pos_emb = T(ts, "enc.pos_emb");
     if (pos_emb) {
-        // pos_emb is typically (1, D, max_len). We need (D, T) slice.
         int T_len = (int)x->ne[1];
-        // Create a view of the first T positions
         ggml_tensor* pos_slice = ggml_view_2d(gctx, pos_emb, D, T_len, pos_emb->nb[1], 0);
         x = ggml_add(gctx, x, pos_slice);
     }
@@ -389,30 +490,21 @@ static ggml_tensor* build_encoder_graph(ggml_context* gctx, const fastpitch_tts_
         x = ggml_add(gctx, x, spk);
     }
 
-    // Transformer layers
+    // Transformer layers (POST-norm: LayerNorm after residual, matching NeMo default pre_lnorm=False)
     for (int i = 0; i < hp.enc_n_layers; i++) {
         std::string pfx = "enc.layer." + std::to_string(i);
-
-        // Pre-norm for attention
-        ggml_tensor* ln1_w = T(ts, pfx + ".attn_norm.weight");
-        ggml_tensor* ln1_b = T(ts, pfx + ".attn_norm.bias");
-        ggml_tensor* normed = layer_norm(gctx, x, ln1_w, ln1_b);
-
-        // Multi-head attention (bidirectional, no causal mask)
+        // Multi-head attention on raw input (post-norm = no norm before attention)
         ggml_tensor* qkv_w = T(ts, pfx + ".attn.qkv.weight");
         ggml_tensor* qkv_b = T(ts, pfx + ".attn.qkv.bias");
 
-        // QKV projection: (3*n_heads*d_head, D) @ (D, T) -> (3*H*d, T)
-        ggml_tensor* qkv = ggml_mul_mat(gctx, qkv_w, normed);
+        ggml_tensor* qkv = ggml_mul_mat(gctx, qkv_w, x);
         if (qkv_b)
             qkv = ggml_add(gctx, qkv, qkv_b);
 
         int n_heads = hp.enc_n_heads;
         int d_head = hp.enc_d_head;
-        int d_qkv = 3 * n_heads * d_head;
         int T_len = (int)x->ne[1];
 
-        // Split Q, K, V: each (n_heads * d_head, T)
         ggml_tensor* Q = ggml_view_2d(gctx, qkv, n_heads * d_head, T_len, qkv->nb[1], 0);
         ggml_tensor* K = ggml_view_2d(gctx, qkv, n_heads * d_head, T_len, qkv->nb[1],
                                       (size_t)(n_heads * d_head) * ggml_type_size(qkv->type));
@@ -423,52 +515,50 @@ static ggml_tensor* build_encoder_graph(ggml_context* gctx, const fastpitch_tts_
         K = ggml_cont(gctx, K);
         V = ggml_cont(gctx, V);
 
-        // Reshape for multi-head: (d_head, T, n_heads)
         Q = ggml_reshape_3d(gctx, Q, d_head, T_len, n_heads);
         K = ggml_reshape_3d(gctx, K, d_head, T_len, n_heads);
         V = ggml_reshape_3d(gctx, V, d_head, T_len, n_heads);
 
-        // Flash attention (bidirectional = no mask)
-        // ggml_flash_attn_ext expects Q(d,T_q,n_heads), K(d,T_k,n_heads), V(d,T_k,n_heads)
         float scale = 1.0f / sqrtf((float)d_head);
         ggml_tensor* attn = ggml_flash_attn_ext(gctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
-
-        // Reshape back: (d_head, T, n_heads) -> (n_heads*d_head, T)
         attn = ggml_reshape_2d(gctx, attn, n_heads * d_head, T_len);
 
-        // Output projection
         ggml_tensor* o_w = T(ts, pfx + ".attn.out.weight");
         ggml_tensor* o_b = T(ts, pfx + ".attn.out.bias");
         ggml_tensor* attn_out = ggml_mul_mat(gctx, o_w, attn);
         if (o_b)
             attn_out = ggml_add(gctx, attn_out, o_b);
 
-        // Residual
+        // Post-norm: LayerNorm(residual + attn_out)
         x = ggml_add(gctx, x, attn_out);
+        ggml_tensor* ln1_w = T(ts, pfx + ".attn_norm.weight");
+        ggml_tensor* ln1_b = T(ts, pfx + ".attn_norm.bias");
+        x = layer_norm(gctx, x, ln1_w, ln1_b);
 
-        // Pre-norm for FFN
-        ggml_tensor* ln2_w = T(ts, pfx + ".ffn_norm.weight");
-        ggml_tensor* ln2_b = T(ts, pfx + ".ffn_norm.bias");
-        normed = layer_norm(gctx, x, ln2_w, ln2_b);
-
-        // PositionwiseConvFF: Conv1d(D, d_inner, k1) -> ReLU -> Conv1d(d_inner, D, k2)
+        // PositionwiseConvFF on post-normed features (no norm before FFN in post-norm)
+        // NeMo transposes to (B, D, T) for Conv1d, then back.
+        // ggml_conv_1d expects input (T, Cin), so transpose (D, T) -> (T, D).
         ggml_tensor* ffn_c1_w = T(ts, pfx + ".ffn.conv1.weight");
         ggml_tensor* ffn_c1_b = T(ts, pfx + ".ffn.conv1.bias");
         ggml_tensor* ffn_c2_w = T(ts, pfx + ".ffn.conv2.weight");
         ggml_tensor* ffn_c2_b = T(ts, pfx + ".ffn.conv2.bias");
 
-        // Determine padding from kernel size
         int k1 = ffn_c1_w ? (int)ffn_c1_w->ne[0] : 3;
         int k2 = ffn_c2_w ? (int)ffn_c2_w->ne[0] : 3;
         int pad1 = (k1 - 1) / 2;
         int pad2 = (k2 - 1) / 2;
 
-        ggml_tensor* ff = conv1d(gctx, normed, ffn_c1_w, ffn_c1_b, 1, pad1, 1);
+        ggml_tensor* xt = transpose_2d(gctx, x); // (D, T) -> (T, D) for conv
+        ggml_tensor* ff = conv1d(gctx, xt, ffn_c1_w, ffn_c1_b, 1, pad1, 1);
         ff = ggml_relu(gctx, ff);
         ff = conv1d(gctx, ff, ffn_c2_w, ffn_c2_b, 1, pad2, 1);
+        ff = transpose_2d(gctx, ff); // (T, D) -> (D, T) back
 
-        // Residual
+        // Post-norm: LayerNorm(residual + ffn_out)
         x = ggml_add(gctx, x, ff);
+        ggml_tensor* ln2_w = T(ts, pfx + ".ffn_norm.weight");
+        ggml_tensor* ln2_b = T(ts, pfx + ".ffn_norm.bias");
+        x = layer_norm(gctx, x, ln2_w, ln2_b);
     }
 
     return x; // (D, T)
@@ -499,8 +589,10 @@ static ggml_tensor* build_temporal_predictor(ggml_context* gctx, const fastpitch
         x = ggml_add(gctx, x, spk);
     }
 
-    // Conv layers
+    // Conv layers: input x is (D, T), conv1d needs (T, D)
     int pad = (kernel_size - 1) / 2;
+    // Transpose to (T, D) for conv1d
+    x = transpose_2d(gctx, x);
     for (int i = 0; i < n_layers; i++) {
         std::string cpfx = prefix + ".conv." + std::to_string(i);
         std::string npfx = prefix + ".norm." + std::to_string(i);
@@ -511,23 +603,23 @@ static ggml_tensor* build_temporal_predictor(ggml_context* gctx, const fastpitch
         x = conv1d(gctx, x, cw, cb, 1, pad, 1);
         x = ggml_relu(gctx, x);
 
-        // LayerNorm after conv (NeMo's ConditionalLayerNorm)
+        // LayerNorm after conv: output of conv1d is (T, C), norm over C (ne[1])
+        // Need to transpose to (C, T), norm, transpose back
         ggml_tensor* ln_w = T(ts, npfx + ".weight");
         ggml_tensor* ln_b = T(ts, npfx + ".bias");
         if (ln_w) {
-            // Conv output is (C, T). LayerNorm is over C dimension.
-            // ggml_norm normalizes over ne[0] which is C — correct for (C, T).
+            x = transpose_2d(gctx, x); // (T, C) -> (C, T)
             x = layer_norm(gctx, x, ln_w, ln_b);
+            x = transpose_2d(gctx, x); // (C, T) -> (T, C)
         }
     }
+    // Back to (C, T) for linear projection
+    x = transpose_2d(gctx, x); // (T, C) -> (C, T)
 
-    // Final linear projection to scalar per timestep
-    // fc.weight: (1, filter_size), fc.bias: (1,)
-    // But the output should be (1, T), so we do matmul
+    // Final linear projection: fc.weight (1, filter_size), fc.bias (1,)
     ggml_tensor* fc_w = T(ts, prefix + ".fc.weight");
     ggml_tensor* fc_b = T(ts, prefix + ".fc.bias");
 
-    // Transpose x to (T, filter_size) for matmul, then back
     ggml_tensor* out = ggml_mul_mat(gctx, fc_w, x);
     if (fc_b)
         out = ggml_add(gctx, out, fc_b);
@@ -568,18 +660,15 @@ static ggml_tensor* build_decoder_graph(ggml_context* gctx, const fastpitch_tts_
         x = ggml_add(gctx, x, spk);
     }
 
-    // Transformer layers (same structure as encoder)
+    // Transformer layers (POST-norm, matching NeMo default pre_lnorm=False)
     for (int i = 0; i < hp.dec_n_layers; i++) {
         std::string pfx = "dec.layer." + std::to_string(i);
 
-        ggml_tensor* ln1_w = T(ts, pfx + ".attn_norm.weight");
-        ggml_tensor* ln1_b = T(ts, pfx + ".attn_norm.bias");
-        ggml_tensor* normed = layer_norm(gctx, x, ln1_w, ln1_b);
-
+        // Multi-head attention on raw input (post-norm)
         ggml_tensor* qkv_w = T(ts, pfx + ".attn.qkv.weight");
         ggml_tensor* qkv_b = T(ts, pfx + ".attn.qkv.bias");
 
-        ggml_tensor* qkv = ggml_mul_mat(gctx, qkv_w, normed);
+        ggml_tensor* qkv = ggml_mul_mat(gctx, qkv_w, x);
         if (qkv_b)
             qkv = ggml_add(gctx, qkv, qkv_b);
 
@@ -603,7 +692,6 @@ static ggml_tensor* build_decoder_graph(ggml_context* gctx, const fastpitch_tts_
 
         float scale = 1.0f / sqrtf((float)d_head);
         ggml_tensor* attn = ggml_flash_attn_ext(gctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
-
         attn = ggml_reshape_2d(gctx, attn, n_heads * d_head, T_len);
 
         ggml_tensor* o_w = T(ts, pfx + ".attn.out.weight");
@@ -612,12 +700,14 @@ static ggml_tensor* build_decoder_graph(ggml_context* gctx, const fastpitch_tts_
         if (o_b)
             attn_out = ggml_add(gctx, attn_out, o_b);
 
+        // Post-norm: LayerNorm(residual + attn_out)
         x = ggml_add(gctx, x, attn_out);
+        ggml_tensor* ln1_w = T(ts, pfx + ".attn_norm.weight");
+        ggml_tensor* ln1_b = T(ts, pfx + ".attn_norm.bias");
+        x = layer_norm(gctx, x, ln1_w, ln1_b);
 
-        ggml_tensor* ln2_w = T(ts, pfx + ".ffn_norm.weight");
-        ggml_tensor* ln2_b = T(ts, pfx + ".ffn_norm.bias");
-        normed = layer_norm(gctx, x, ln2_w, ln2_b);
-
+        // PositionwiseConvFF (post-norm: no norm before FFN)
+        // Transpose for conv1d: (D, T) -> (T, D)
         ggml_tensor* ffn_c1_w = T(ts, pfx + ".ffn.conv1.weight");
         ggml_tensor* ffn_c1_b = T(ts, pfx + ".ffn.conv1.bias");
         ggml_tensor* ffn_c2_w = T(ts, pfx + ".ffn.conv2.weight");
@@ -628,11 +718,17 @@ static ggml_tensor* build_decoder_graph(ggml_context* gctx, const fastpitch_tts_
         int pad1 = (k1 - 1) / 2;
         int pad2 = (k2 - 1) / 2;
 
-        ggml_tensor* ff = conv1d(gctx, normed, ffn_c1_w, ffn_c1_b, 1, pad1, 1);
+        ggml_tensor* xt = transpose_2d(gctx, x);
+        ggml_tensor* ff = conv1d(gctx, xt, ffn_c1_w, ffn_c1_b, 1, pad1, 1);
         ff = ggml_relu(gctx, ff);
         ff = conv1d(gctx, ff, ffn_c2_w, ffn_c2_b, 1, pad2, 1);
+        ff = transpose_2d(gctx, ff); // back to (D, T)
 
+        // Post-norm: LayerNorm(residual + ffn_out)
         x = ggml_add(gctx, x, ff);
+        ggml_tensor* ln2_w = T(ts, pfx + ".ffn_norm.weight");
+        ggml_tensor* ln2_b = T(ts, pfx + ".ffn_norm.bias");
+        x = layer_norm(gctx, x, ln2_w, ln2_b);
     }
 
     return x;
@@ -643,9 +739,31 @@ static ggml_tensor* build_decoder_graph(ggml_context* gctx, const fastpitch_tts_
 static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, float** pcm_out, int* sample_rate_out) {
     const auto& hp = ctx->hp;
     const int D = hp.symbols_embedding_dim;
+    const char* dump_dir = getenv("FASTPITCH_DUMP_DIR");
 
     // ── Step 1: Tokenize ──
-    std::vector<int> token_ids = tokenize_text(ctx, text);
+    std::vector<int> token_ids;
+
+    // Allow teacher-forcing tokens from file (for diff testing)
+    const char* force_tokens_path = getenv("FASTPITCH_FORCE_TOKENS");
+    if (force_tokens_path) {
+        FILE* f = fopen(force_tokens_path, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            int n = (int)(sz / sizeof(int32_t));
+            token_ids.resize(n);
+            fread(token_ids.data(), sizeof(int32_t), n, f);
+            fclose(f);
+            fprintf(stderr, "fastpitch: forced %d tokens from %s\n", n, force_tokens_path);
+        }
+    }
+
+    if (token_ids.empty()) {
+        token_ids = tokenize_text(ctx, text);
+    }
+
     if (token_ids.empty()) {
         fprintf(stderr, "fastpitch: empty token sequence for input text\n");
         return 0;
@@ -655,6 +773,8 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
     if (ctx->params.verbosity >= 2) {
         fprintf(stderr, "fastpitch: %d tokens from '%s'\n", T_text, text);
     }
+
+    dump_i32(dump_dir, "cpp_tokens", (const int32_t*)token_ids.data(), T_text);
 
     // ── Step 2: Build and run encoder + predictors graph ──
     {
@@ -735,6 +855,10 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
         ggml_backend_tensor_get(pitch_pred, pitch_data.data(), 0, T_text * sizeof(float));
         ggml_backend_tensor_get(enc_copy, enc_data.data(), 0, (size_t)D * T_text * sizeof(float));
 
+        dump_f32(dump_dir, "cpp_enc_out", enc_data.data(), (size_t)D * T_text);
+        dump_f32(dump_dir, "cpp_dur_pred", dur_data.data(), T_text);
+        dump_f32(dump_dir, "cpp_pitch_pred", pitch_data.data(), T_text);
+
         // ── Step 3: Process durations and pitch (CPU) ──
 
         // Convert log durations to integer durations:
@@ -771,6 +895,11 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
             return 0;
         }
 
+        {
+            std::vector<int32_t> dur_i32(durations.begin(), durations.end());
+            dump_i32(dump_dir, "cpp_durations", dur_i32.data(), T_text);
+        }
+
         if (ctx->params.verbosity >= 2) {
             fprintf(stderr, "fastpitch: %d tokens -> %d frames (%.1fx expansion)\n", T_text, T_frames,
                     (float)T_frames / T_text);
@@ -798,14 +927,16 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
             mini_graph mg_pitch(ctx->backend_cpu, 64 * 1024 * 1024);
             auto* gc2 = mg_pitch.ctx;
 
-            // Input: pitch values (1, T_frames)
-            ggml_tensor* pitch_in = ggml_new_tensor_2d(gc2, GGML_TYPE_F32, 1, T_frames);
+            // Input: pitch values — conv1d expects (T, Cin) = (T_frames, 1)
+            ggml_tensor* pitch_in = ggml_new_tensor_2d(gc2, GGML_TYPE_F32, T_frames, 1);
             ggml_set_name(pitch_in, "pitch_in");
             ggml_set_input(pitch_in);
 
             int pk = hp.pitch_embedding_kernel_size;
             int ppad = (pk - 1) / 2;
             ggml_tensor* pemb = conv1d(gc2, pitch_in, pitch_emb_w, pitch_emb_b, 1, ppad, 1);
+            // pemb is (T_frames, D) from conv1d, transpose to (D, T_frames) for add
+            pemb = transpose_2d(gc2, pemb);
             ggml_set_name(pemb, "pitch_emb");
             ggml_set_output(pemb);
 
@@ -884,6 +1015,7 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
             ggml_backend_tensor_get(mel, dec_out_data.data(), 0, dec_out_data.size() * sizeof(float));
         }
 
+        dump_f32(dump_dir, "cpp_mel", dec_out_data.data(), dec_out_data.size());
         free(expanded);
 
         // ── Step 7: HiFi-GAN vocoder ──
@@ -893,8 +1025,13 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
             mini_graph mg_voc(ctx->backend_cpu);
             auto* gc4 = mg_voc.ctx;
 
-            // Input mel: (n_mel, T_mel)
-            ggml_tensor* mel_in = ggml_new_tensor_2d(gc4, GGML_TYPE_F32, hp.n_mel_channels, T_mel);
+            // Input mel for HiFi-GAN vocoder.
+            // Decoder output is ggml (ne[0]=n_mel, ne[1]=T_mel), stored as n_mel
+            // contiguous values per timestep in the flat buffer.
+            // HiFi-GAN (core_hifigan::forward) expects ne[0]=T_mel, ne[1]=n_mel
+            // where ne[0] is the spatial dimension for conv1d.
+            // We must CPU-transpose the data to match.
+            ggml_tensor* mel_in = ggml_new_tensor_2d(gc4, GGML_TYPE_F32, T_mel, hp.n_mel_channels);
             ggml_set_name(mel_in, "voc_mel_in");
             ggml_set_input(mel_in);
 
@@ -912,7 +1049,18 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
                 return 0;
             }
 
-            ggml_backend_tensor_set(mel_in, dec_out_data.data(), 0, dec_out_data.size() * sizeof(float));
+            // Transpose mel from ggml (n_mel, T) to vocoder (T, n_mel) layout.
+            // Source: data[t * n_mel + c] (n_mel contiguous per timestep)
+            // Target: data[c * T_mel + t] (T_mel contiguous per channel for ne[0]=T_mel)
+            {
+                std::vector<float> mel_voc((size_t)hp.n_mel_channels * T_mel);
+                for (int t = 0; t < T_mel; t++) {
+                    for (int c = 0; c < hp.n_mel_channels; c++) {
+                        mel_voc[(size_t)c * T_mel + t] = dec_out_data[(size_t)t * hp.n_mel_channels + c];
+                    }
+                }
+                ggml_backend_tensor_set(mel_in, mel_voc.data(), 0, mel_voc.size() * sizeof(float));
+            }
 
             ggml_backend_graph_compute(ctx->backend_cpu, gf4);
 
@@ -930,6 +1078,8 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
                 return 0;
 
             ggml_backend_tensor_get(audio, pcm, 0, (size_t)T_audio * sizeof(float));
+
+            dump_f32(dump_dir, "cpp_audio", pcm, T_audio);
 
             *pcm_out = pcm;
             if (sample_rate_out)

@@ -3975,7 +3975,41 @@ in the **decode step**. So option C is NOT in `mimo_asr_build_prefill_graph`;
 it's the per-token decode path (build_decode_graph + fresh-cgraph-per-token),
 same shape as #125 P0's sched src-mutation-on-re-laid-out-graph — which the
 `95d74455` hardening was supposed to fix but evidently doesn't on P100.
-Kernel run 2 wraps the GPU run in gdb to capture the crash backtrace.
+
+**Kernel run 2 (P100, gdb) — root cause.** The backtrace is
+`dequantize_row_q4_K` → `ggml_backend_cpu_graph_compute` →
+`mimo_asr_transcribe_impl`. So it is NOT the sched src-mutation class at all:
+with `force_gpu` the weights are GPU-resident, but the sched was still built
+with **both** `[CUDA, CPU]` backends, so its placement heuristic offloaded a
+**decode** op to the **CPU** backend — and `dequantize_row_q4_K` (a CPU
+function) then read a **GPU-resident Q4_K** weight's CUDA pointer as host
+memory → SIGSEGV. The prefill survived because none of its ops got
+CPU-routed; exactly one decode op does.
+
+**Run 3 (`3ef9f87e`) — single-GPU-backend sched is wrong.** Building the
+sched with `{CUDA}` only *aborts* in `ggml_backend_sched_new` (`signo=6`):
+ggml requires a CPU backend as the mandatory last/fallback entry. Reverted.
+So the real bug is a specific **decode op CUDA can't run**, which the sched
+then offloads to CPU where it dereferences a GPU-resident Q4_K weight. The
+decode step reads the embedding table.
+
+**Root cause (definitive, runs 4 + dtype check).** `GGML_SCHED_DEBUG=2` is a
+no-op in Release, so it was found by reading the CUDA supports_op + the gguf
+tensor dtypes: CUDA's `GET_ROWS` supports_op (ggml-cuda.cu:5004) lists
+F16/F32/BF16/I32/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 — **not Q4_K** — and mimo's
+`llm.embed.weight` + `audio.emb.*` are **Q4_K**. So `get_rows(embed[Q4_K])`
+is CUDA-unsupported → the sched routes it to CPU → `dequantize_row_q4_K` reads
+the GPU-resident weight's device pointer → SIGSEGV. Same shape as CSM §135: a
+converter quantized a tensor that must stay gather-friendly (token embeddings
+should never be Q4_K). (The set_rows theory was wrong — set_rows is fine.)
+
+**Fix (runtime).** Under `force_gpu`, load only the get_rows'd
+`embed`/`audio.emb` tables on CPU via `load_weights_split`; every matmul
+weight stays GPU-resident for the speedup (the small embed output is copied
+GPU-ward by the sched). Validating on kernel run 5 → expect GPU JFK PASS; if
+green, flip `--gpu` on by default + mark option C DONE. Cleaner long-term:
+the converter keeps `llm.embed`/`audio.emb` at F16/Q8_0 (CUDA-gatherable) so
+no runtime split is needed — fold into the next mimo-asr GGUF re-bake.
 
 **Status (2026-05-26):** option A shipped, option C still open.
 

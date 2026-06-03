@@ -123,6 +123,14 @@
 #include "pocket_tts.h"
 #define CA_HAVE_POCKET 1
 #endif
+#if __has_include("fastpitch_tts.h")
+#include "fastpitch_tts.h"
+#define CA_HAVE_FASTPITCH 1
+#endif
+#if __has_include("speecht5_tts.h")
+#include "speecht5_tts.h"
+#define CA_HAVE_SPEECHT5 1
+#endif
 #if __has_include("voxcpm2_tts.h")
 #include "voxcpm2_tts.h"
 #define CA_HAVE_VOXCPM2 1
@@ -1312,6 +1320,13 @@ struct crispasr_session {
 #ifdef CA_HAVE_POCKET
     pocket_tts_context* pocket_tts_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_FASTPITCH
+    fastpitch_tts_context* fastpitch_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_SPEECHT5
+    speecht5_tts_context* speecht5_ctx = nullptr;
+    std::vector<float> speecht5_speaker; // 512-d x-vector
+#endif
 #ifdef CA_HAVE_VOXCPM2
     voxcpm2_context* voxcpm2_ctx = nullptr;
     std::vector<float> voxcpm2_ref_pcm; // 16 kHz mono cloning reference
@@ -1984,6 +1999,34 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_FASTPITCH
+    if (s->backend == "fastpitch" || s->backend == "fastpitch-tts" || s->backend == "fastpitch_tts") {
+        s->backend = "fastpitch";
+        fastpitch_tts_params p = fastpitch_tts_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        s->fastpitch_ctx = fastpitch_tts_init_from_file(model_path, p);
+        if (!s->fastpitch_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_SPEECHT5
+    if (s->backend == "speecht5" || s->backend == "speecht5-tts" || s->backend == "speecht5_tts") {
+        s->backend = "speecht5";
+        speecht5_tts_params p = speecht5_tts_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        s->speecht5_ctx = speecht5_tts_init(model_path, p);
+        if (!s->speecht5_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_VOXCPM2
     if (s->backend == "voxcpm2-tts" || s->backend == "voxcpm2" || s->backend == "voxcpm2_tts") {
         s->backend = "voxcpm2-tts";
@@ -2391,6 +2434,12 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_POCKET
     list += ",pocket-tts";
+#endif
+#ifdef CA_HAVE_FASTPITCH
+    list += ",fastpitch";
+#endif
+#ifdef CA_HAVE_SPEECHT5
+    list += ",speecht5";
 #endif
 #ifdef CA_HAVE_VOXCPM2
     list += ",voxcpm2-tts";
@@ -3221,7 +3270,9 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         std::vector<int32_t> prefix_ids, suffix_ids;
         if (use_v3_template) {
             const std::string prefix_str = "<|start_of_role|>user<|end_of_role|>";
-            const std::string suffix_str = "can you transcribe the speech into a written format?"
+            const std::string suffix_str = (!s->ask.empty() ? s->ask
+                                                            : std::string("can you transcribe the speech into a "
+                                                                          "written format?")) +
                                            "<|end_of_text|>\n"
                                            "<|start_of_role|>assistant<|end_of_role|>";
             int n = 0;
@@ -3240,10 +3291,21 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         } else {
             // granite-4.0-1b legacy hardcoded ids: "USER: " + transcription request.
             static const int32_t kPrefix4[] = {6584, 25, 220};
-            static const int32_t kSuffix4[] = {4919, 499,  1380, 3191, 279,   8982, 1139, 264,
-                                               5439, 3645, 30,   198,  36660, 3931, 2891, 25};
             prefix_ids.assign(kPrefix4, kPrefix4 + (sizeof(kPrefix4) / sizeof(kPrefix4[0])));
-            suffix_ids.assign(kSuffix4, kSuffix4 + (sizeof(kSuffix4) / sizeof(kSuffix4[0])));
+            if (!s->ask.empty()) {
+                const std::string suffix4_str = s->ask + "\nASSISTANT:";
+                int n = 0;
+                int32_t* a = granite_speech_tokenize(s->granite_ctx, suffix4_str.c_str(), &n);
+                if (a && n > 0) {
+                    suffix_ids.assign(a, a + n);
+                    std::free(a);
+                } else if (a)
+                    std::free(a);
+            } else {
+                static const int32_t kSuffix4[] = {4919, 499,  1380, 3191, 279,   8982, 1139, 264,
+                                                   5439, 3645, 30,   198,  36660, 3931, 2891, 25};
+                suffix_ids.assign(kSuffix4, kSuffix4 + (sizeof(kSuffix4) / sizeof(kSuffix4[0])));
+            }
         }
         if (prefix_ids.empty() || suffix_ids.empty()) {
             std::free(proj);
@@ -4691,6 +4753,26 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
         return kokoro_load_voice_pack(s->kokoro_ctx, path);
     }
 #endif
+#ifdef CA_HAVE_SPEECHT5
+    if (s->speecht5_ctx) {
+        // SpeechT5 needs a 512-d x-vector (raw float32 .bin file).
+        if (ends_with_wav(path))
+            return -2;
+        FILE* f = fopen(path, "rb");
+        if (!f)
+            return -1;
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        int n = (int)(sz / sizeof(float));
+        s->speecht5_speaker.resize(n);
+        size_t rd = fread(s->speecht5_speaker.data(), sizeof(float), n, f);
+        fclose(f);
+        if ((int)rd != n)
+            return -1;
+        return speecht5_tts_set_speaker(s->speecht5_ctx, s->speecht5_speaker.data(), n);
+    }
+#endif
 #ifdef CA_HAVE_INDEXTTS
     if (s->indextts_ctx) {
         // indextts clones from a reference clip. Decode the WAV (16 kHz
@@ -4956,6 +5038,25 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
 #ifdef CA_HAVE_POCKET
     if (s->pocket_tts_ctx) {
         return pocket_tts_synthesize(s->pocket_tts_ctx, text, out_n_samples);
+    }
+#endif
+#ifdef CA_HAVE_FASTPITCH
+    if (s->fastpitch_ctx) {
+        // FastPitch emits 22050 Hz mono float; deterministic (no sampling).
+        float* pcm = nullptr;
+        int sr = 0;
+        int n = fastpitch_tts_synthesize(s->fastpitch_ctx, text, &pcm, &sr);
+        if (n <= 0 || !pcm)
+            return nullptr;
+        if (out_n_samples)
+            *out_n_samples = n;
+        return pcm;
+    }
+#endif
+#ifdef CA_HAVE_SPEECHT5
+    if (s->speecht5_ctx) {
+        // SpeechT5 emits 16 kHz mono float; PCM is malloc'd, freed via crispasr_pcm_free.
+        return speecht5_tts_synthesize(s->speecht5_ctx, text, out_n_samples);
     }
 #endif
 #ifdef CA_HAVE_VOXCPM2
@@ -5304,6 +5405,14 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
     if (s->pocket_tts_ctx)
         pocket_tts_free(s->pocket_tts_ctx);
 #endif
+#ifdef CA_HAVE_FASTPITCH
+    if (s->fastpitch_ctx)
+        fastpitch_tts_free(s->fastpitch_ctx);
+#endif
+#ifdef CA_HAVE_SPEECHT5
+    if (s->speecht5_ctx)
+        speecht5_tts_free(s->speecht5_ctx);
+#endif
 #ifdef CA_HAVE_VOXCPM2
     if (s->voxcpm2_ctx)
         voxcpm2_free(s->voxcpm2_ctx);
@@ -5495,9 +5604,9 @@ CA_EXPORT int crispasr_session_set_translate(crispasr_session* s, int enable) {
 }
 
 // Sticky audio Q&A prompt for instruct-tuned audio-LLM backends
-// (voxtral / voxtral4b / qwen3-asr). Pass an empty string to clear
-// and resume verbatim transcription. Other backends ignore — set is
-// cheap so we don't error.
+// (granite / voxtral / voxtral4b / qwen3-asr). Pass an empty string
+// to clear and resume verbatim transcription. Other backends ignore —
+// set is cheap so we don't error.
 CA_EXPORT int crispasr_session_set_ask(crispasr_session* s, const char* prompt) {
     if (!s)
         return -1;

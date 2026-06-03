@@ -61,28 +61,39 @@ except ImportError:
 
 
 def load_nemo_archive(nemo_path: str):
-    """Load a .nemo archive, returning (config_dict, state_dict)."""
+    """Load a .nemo archive, returning (config_dict, state_dict).
+
+    NeMo archives can be gzip-compressed or plain tar.
+    """
     import yaml
 
-    with tarfile.open(nemo_path, "r:gz") as tar:
-        config = None
-        weights = None
+    # Try gzip first, fall back to plain tar
+    for mode in ("r:gz", "r"):
+        try:
+            with tarfile.open(nemo_path, mode) as tar:
+                config = None
+                weights = None
 
-        for member in tar.getmembers():
-            if member.name.endswith("model_config.yaml"):
-                f = tar.extractfile(member)
-                config = yaml.safe_load(f)
-            elif member.name.endswith("model_weights.ckpt"):
-                f = tar.extractfile(member)
-                buf = io.BytesIO(f.read())
-                weights = torch.load(buf, map_location="cpu", weights_only=False)
+                for member in tar.getmembers():
+                    if member.name.endswith("model_config.yaml"):
+                        f = tar.extractfile(member)
+                        config = yaml.safe_load(f)
+                    elif member.name.endswith("model_weights.ckpt"):
+                        f = tar.extractfile(member)
+                        buf = io.BytesIO(f.read())
+                        weights = torch.load(buf, map_location="cpu",
+                                             weights_only=False)
 
-        if config is None:
-            raise ValueError(f"No model_config.yaml in {nemo_path}")
-        if weights is None:
-            raise ValueError(f"No model_weights.ckpt in {nemo_path}")
+                if config is None:
+                    raise ValueError(f"No model_config.yaml in {nemo_path}")
+                if weights is None:
+                    raise ValueError(f"No model_weights.ckpt in {nemo_path}")
 
-    return config, weights
+                return config, weights
+        except tarfile.ReadError:
+            continue
+
+    raise ValueError(f"Cannot open {nemo_path} as tar archive")
 
 
 def load_from_hf(model_name: str, model_class_name: str):
@@ -105,38 +116,48 @@ def load_from_hf(model_name: str, model_class_name: str):
 # ---------------------------------------------------------------------------
 
 
+def generate_sinusoidal_pe(inv_freq: torch.Tensor, max_len: int = 2048) -> np.ndarray:
+    """Generate sinusoidal positional encodings from inv_freq tensor.
+
+    NeMo PositionalEmbedding computes:
+      sinusoid_inp = pos_seq.unsqueeze(-1) @ inv_freq.unsqueeze(0)  # (T, d/2)
+      pos_emb = cat([sin(sinusoid_inp), cos(sinusoid_inp)], dim=1)  # (T, d)
+
+    So the layout is [sin_0..sin_{d/2-1}, cos_0..cos_{d/2-1}] (concatenated,
+    NOT interleaved). The output shape is (1, T, d) but we store as (T, d).
+    """
+    d_half = inv_freq.shape[0]
+    d_model = d_half * 2
+    positions = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)  # (max_len, 1)
+    inv_freq_row = inv_freq.float().unsqueeze(0)  # (1, d_half)
+    sinusoid = positions * inv_freq_row  # (max_len, d_half)
+    # NeMo: cat([sin, cos], dim=1) — sin first half, cos second half
+    pe = torch.cat([sinusoid.sin(), sinusoid.cos()], dim=1)  # (max_len, d_model)
+    return pe.numpy()  # (max_len, d_model)
+
+
 def rename_fastpitch_weights(state_dict: dict) -> dict:
     """
     Rename FastPitch state_dict keys to clean GGUF tensor names.
 
-    NeMo FastPitch state_dict has keys like:
-      fastpitch.encoder.word_emb.weight
-      fastpitch.encoder.pos_emb.pe
-      fastpitch.encoder.layers.0.dec_attn.qkv_net.weight
-      fastpitch.encoder.layers.0.dec_attn.o_net.weight
-      fastpitch.encoder.layers.0.norm1.weight  (LayerNorm)
-      fastpitch.encoder.layers.0.norm1.bias
-      fastpitch.encoder.layers.0.pos_ff.conv_1.weight
-      fastpitch.encoder.layers.0.pos_ff.conv_1.bias
-      fastpitch.encoder.layers.0.pos_ff.conv_2.weight
-      fastpitch.encoder.layers.0.pos_ff.conv_2.bias
-      fastpitch.encoder.layers.0.norm2.weight
-      fastpitch.encoder.layers.0.norm2.bias
-      fastpitch.duration_predictor.layers.0.conv.weight  (Conv1d)
-      fastpitch.duration_predictor.layers.0.norm.weight  (LayerNorm)
-      fastpitch.duration_predictor.fc.weight  (Linear projection)
-      fastpitch.pitch_predictor.layers.0.conv.weight
-      fastpitch.pitch_predictor.layers.0.norm.weight
-      fastpitch.pitch_predictor.fc.weight
-      fastpitch.pitch_emb.weight  (Conv1d)
-      fastpitch.speaker_emb.weight (Embedding)
-      fastpitch.decoder.layers.0...  (same as encoder minus word_emb)
-      fastpitch.proj.weight  (Linear -> mel_dim)
+    Handles both NeMo naming conventions:
+      Convention A (nvidia/tts_en_fastpitch, newer NeMo):
+        .dec_attn.layer_norm. -> .attn_norm.
+        .pos_ff.layer_norm.   -> .ffn_norm.
+        .pos_ff.CoreNet.0.    -> .ffn.conv1.
+        .pos_ff.CoreNet.2.    -> .ffn.conv2.
+        .pos_emb.inv_freq     -> (generate sinusoidal PE)
+      Convention B (German multispeaker, older NeMo):
+        .norm1.               -> .attn_norm.
+        .norm2.               -> .ffn_norm.
+        .pos_ff.conv_1.       -> .ffn.conv1.
+        .pos_ff.conv_2.       -> .ffn.conv2.
+        .pos_emb.pe           -> pos_emb (stored directly)
 
     We produce:
       enc.emb.weight
-      enc.pos_emb
-      enc.layer.{i}.attn.qkv.weight
+      enc.pos_emb                        (d_model, max_len) sinusoidal PE
+      enc.layer.{i}.attn.qkv.weight / .bias
       enc.layer.{i}.attn.out.weight
       enc.layer.{i}.attn_norm.weight / .bias
       enc.layer.{i}.ffn.conv1.weight / .bias
@@ -153,13 +174,13 @@ def rename_fastpitch_weights(state_dict: dict) -> dict:
       dec.layer.{i}.... (same structure as enc)
       dec.pos_emb
       proj.weight / .bias
-      voc.conv_pre.weight / .bias
-      voc.ups.{i}.weight / .bias
-      voc.resblocks.{j}.convs1.{k}.weight / .bias
-      voc.resblocks.{j}.convs2.{k}.weight / .bias
-      voc.conv_post.weight / .bias
     """
+    import re
     renamed = {}
+
+    # Collect inv_freq tensors for sinusoidal PE generation
+    enc_inv_freq = None
+    dec_inv_freq = None
 
     for key, tensor in state_dict.items():
         new_key = key
@@ -168,31 +189,53 @@ def rename_fastpitch_weights(state_dict: dict) -> dict:
         if new_key.startswith("fastpitch."):
             new_key = new_key[len("fastpitch."):]
 
+        # Skip training-only aligner weights
+        if new_key.startswith("aligner."):
+            continue
+
+        # Skip pitch_mean/pitch_std (stored as metadata, not tensors)
+        if new_key in ("pitch_mean", "pitch_std"):
+            continue
+
+        # Handle inv_freq: collect and generate PE later
+        if new_key == "encoder.pos_emb.inv_freq":
+            enc_inv_freq = tensor
+            continue
+        if new_key == "decoder.pos_emb.inv_freq":
+            dec_inv_freq = tensor
+            continue
+
         # Encoder
         new_key = new_key.replace("encoder.word_emb.weight", "enc.emb.weight")
         new_key = new_key.replace("encoder.pos_emb.pe", "enc.pos_emb")
 
-        # Encoder layers: fastpitch.encoder.layers.N -> enc.layer.N
+        # Encoder/decoder layer renames (handle both naming conventions)
+        def rename_layer(k, src_prefix, dst_prefix):
+            k = k.replace(src_prefix, dst_prefix)
+            # Attention
+            k = k.replace(".dec_attn.qkv_net.", ".attn.qkv.")
+            k = k.replace(".dec_attn.o_net.", ".attn.out.")
+            # Convention A: LayerNorm inside submodule
+            k = k.replace(".dec_attn.layer_norm.", ".attn_norm.")
+            k = k.replace(".pos_ff.layer_norm.", ".ffn_norm.")
+            # Convention B: LayerNorm at layer level
+            k = k.replace(".norm1.", ".attn_norm.")
+            k = k.replace(".norm2.", ".ffn_norm.")
+            # Convention A: CoreNet.{0,2} for FFN convolutions
+            k = k.replace(".pos_ff.CoreNet.0.", ".ffn.conv1.")
+            k = k.replace(".pos_ff.CoreNet.2.", ".ffn.conv2.")
+            # Convention B: conv_1/conv_2
+            k = k.replace(".pos_ff.conv_1.", ".ffn.conv1.")
+            k = k.replace(".pos_ff.conv_2.", ".ffn.conv2.")
+            return k
+
         if "encoder.layers." in new_key:
-            new_key = new_key.replace("encoder.layers.", "enc.layer.")
-            new_key = new_key.replace(".dec_attn.qkv_net.", ".attn.qkv.")
-            new_key = new_key.replace(".dec_attn.o_net.", ".attn.out.")
-            new_key = new_key.replace(".norm1.", ".attn_norm.")
-            new_key = new_key.replace(".pos_ff.conv_1.", ".ffn.conv1.")
-            new_key = new_key.replace(".pos_ff.conv_2.", ".ffn.conv2.")
-            new_key = new_key.replace(".norm2.", ".ffn_norm.")
+            new_key = rename_layer(new_key, "encoder.layers.", "enc.layer.")
         elif "encoder.cond_input." in new_key:
             new_key = new_key.replace("encoder.cond_input.", "enc.cond_input.")
 
-        # Decoder layers: fastpitch.decoder.layers.N -> dec.layer.N
         if "decoder.layers." in new_key:
-            new_key = new_key.replace("decoder.layers.", "dec.layer.")
-            new_key = new_key.replace(".dec_attn.qkv_net.", ".attn.qkv.")
-            new_key = new_key.replace(".dec_attn.o_net.", ".attn.out.")
-            new_key = new_key.replace(".norm1.", ".attn_norm.")
-            new_key = new_key.replace(".pos_ff.conv_1.", ".ffn.conv1.")
-            new_key = new_key.replace(".pos_ff.conv_2.", ".ffn.conv2.")
-            new_key = new_key.replace(".norm2.", ".ffn_norm.")
+            new_key = rename_layer(new_key, "decoder.layers.", "dec.layer.")
         elif "decoder.pos_emb.pe" in new_key:
             new_key = new_key.replace("decoder.pos_emb.pe", "dec.pos_emb")
         elif "decoder.cond_input." in new_key:
@@ -202,38 +245,19 @@ def rename_fastpitch_weights(state_dict: dict) -> dict:
         if "duration_predictor." in new_key:
             new_key = new_key.replace("duration_predictor.", "dur_pred.")
             new_key = new_key.replace(".layers.", ".block.")
-            # dur_pred.block.{i}.conv.weight -> dur_pred.conv.{i}.weight
-            # dur_pred.block.{i}.norm.weight -> dur_pred.norm.{i}.weight
-            import re
             m = re.match(r"dur_pred\.block\.(\d+)\.(conv|norm)\.(weight|bias)", new_key)
             if m:
                 idx, sub, wb = m.groups()
                 new_key = f"dur_pred.{sub}.{idx}.{wb}"
-            new_key = new_key.replace("dur_pred.fc.", "dur_pred.fc.")
 
         # Pitch predictor
         if "pitch_predictor." in new_key:
             new_key = new_key.replace("pitch_predictor.", "pitch_pred.")
             new_key = new_key.replace(".layers.", ".block.")
-            import re
             m = re.match(r"pitch_pred\.block\.(\d+)\.(conv|norm)\.(weight|bias)", new_key)
             if m:
                 idx, sub, wb = m.groups()
                 new_key = f"pitch_pred.{sub}.{idx}.{wb}"
-            new_key = new_key.replace("pitch_pred.fc.", "pitch_pred.fc.")
-
-        # Pitch embedding conv1d
-        new_key = new_key.replace("pitch_emb.", "pitch_emb.")
-
-        # Speaker embedding
-        new_key = new_key.replace("speaker_emb.", "speaker_emb.")
-
-        # Output projection
-        if new_key.startswith("proj."):
-            new_key = "proj." + new_key[len("proj."):]
-
-        # ConditionalInput projections
-        new_key = new_key.replace("cond_input.add_proj.", "cond_input.add_proj.")
 
         # ConditionalLayerNorm projections
         new_key = new_key.replace(".cond_weight.", ".cond_w.")
@@ -241,25 +265,41 @@ def rename_fastpitch_weights(state_dict: dict) -> dict:
 
         renamed[new_key] = tensor
 
+    # Generate sinusoidal positional encodings from inv_freq
+    if enc_inv_freq is not None:
+        pe = generate_sinusoidal_pe(enc_inv_freq, max_len=2048)
+        renamed["enc.pos_emb"] = pe
+        print(f"  generated enc.pos_emb from inv_freq: {pe.shape}")
+    if dec_inv_freq is not None:
+        pe = generate_sinusoidal_pe(dec_inv_freq, max_len=2048)
+        renamed["dec.pos_emb"] = pe
+        print(f"  generated dec.pos_emb from inv_freq: {pe.shape}")
+
     return renamed
 
 
 def rename_vocoder_weights(state_dict: dict) -> dict:
-    """Rename HiFi-GAN vocoder state_dict keys to voc.* namespace."""
+    """Rename HiFi-GAN vocoder state_dict keys to voc.* namespace.
+
+    Skips discriminator (mpd.*, msd.*) and mel-spec processor weights
+    which are training-only and not needed for inference.
+    """
     renamed = {}
 
     for key, tensor in state_dict.items():
+        # Skip training-only weights
+        if any(key.startswith(p) for p in [
+            "mpd.", "msd.", "audio_to_melspec", "trg_melspec"
+        ]):
+            continue
+
         new_key = key
 
         # Strip common NeMo prefixes
-        for prefix in ["generator.", "vocoder.", "hifi_gan.", ""]:
-            if new_key.startswith(prefix) and prefix:
+        for prefix in ["generator.", "vocoder.", "hifi_gan."]:
+            if new_key.startswith(prefix):
                 new_key = new_key[len(prefix):]
                 break
-
-        # Remove weight_norm suffixes (NeMo stores weight_g and weight_v)
-        # We need to reconstruct the fused weight = weight_v * (weight_g / norm(weight_v))
-        # This is handled separately below.
 
         # Add voc. prefix
         new_key = "voc." + new_key
@@ -309,9 +349,14 @@ def fuse_weight_norm(state_dict: dict) -> dict:
 
 
 def transpose_conv_weight(arr: np.ndarray) -> np.ndarray:
-    """Transpose 3D conv weight from PyTorch to ggml layout."""
-    if arr.ndim == 3:
-        return np.ascontiguousarray(arr.transpose(2, 1, 0))
+    """Transpose 3D conv weight from PyTorch to ggml layout.
+
+    PyTorch Conv1d weight: (Cout, Cin, K)
+    Numpy row-major -> ggml column-major mapping: last axis -> ne[0]
+    So (Cout, Cin, K) numpy -> ggml ne[0]=K, ne[1]=Cin, ne[2]=Cout
+    This is ALREADY what ggml_conv_1d expects!
+    No transpose needed — just return as-is.
+    """
     return arr
 
 
@@ -512,38 +557,136 @@ def extract_vocoder_hparams(state_dict: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def build_tokenizer_vocab(cfg: dict) -> list:
+    """Build the NeMo EnglishPhonemesTokenizer vocabulary from config.
+
+    Returns the ordered list of token strings matching the model's embedding
+    table, suitable for storing in GGUF metadata.
+    """
+    import itertools as it
+    import string as strmod
+
+    if cfg is None:
+        return []
+
+    tt = cfg.get("text_tokenizer", {})
+    target = tt.get("_target_", "")
+    if "EnglishPhonemes" not in target and "IPA" not in target:
+        return []  # Unknown tokenizer type
+
+    stresses = tt.get("stresses", True)
+    chars = tt.get("chars", True)
+    apostrophe = tt.get("apostrophe", True)
+    punct = tt.get("punct", True)
+    add_blank = tt.get("add_blank_at", None) is not None or tt.get("add_blank_at") is True
+
+    CONSONANTS = ('B','CH','D','DH','F','G','HH','JH','K','L','M','N',
+                  'NG','P','R','S','SH','T','TH','V','W','Y','Z','ZH')
+    VOWELS = ('AA','AE','AH','AO','AW','AY','EH','ER','EY','IH',
+              'IY','OW','OY','UH','UW')
+    PUNCT = (',','.',  '!','?','-',':',';','/','\"','(',')',
+             '[',']','{','}')
+
+    tokens = [' ']  # space
+    tokens.extend(CONSONANTS)
+    vowels = list(VOWELS)
+    if stresses:
+        vowels = [f'{p}{s}' for p, s in it.product(vowels, (0, 1, 2))]
+    tokens.extend(vowels)
+    if chars:
+        tokens.extend(strmod.ascii_lowercase)
+    if apostrophe:
+        tokens.append("'")
+    if punct:
+        tokens.extend(PUNCT)
+    tokens.append('<pad>')
+    if add_blank:
+        tokens.append('<blank>')
+    tokens.append('<oov>')
+    return tokens
+
+
+def download_nemo_from_hf(repo_id: str, filename: str = None) -> str:
+    """Download a .nemo file from HuggingFace, return local path."""
+    from huggingface_hub import hf_hub_download, list_repo_files
+
+    if filename is None:
+        # Find the .nemo file in the repo
+        files = list_repo_files(repo_id)
+        nemo_files = [f for f in files if f.endswith(".nemo")]
+        if not nemo_files:
+            raise ValueError(f"No .nemo file found in {repo_id}")
+        filename = nemo_files[0]
+
+    path = hf_hub_download(repo_id, filename)
+    return path
+
+
+def extract_pitch_stats(state_dict: dict) -> dict:
+    """Extract pitch_mean and pitch_std from state dict (stored as scalar tensors)."""
+    stats = {}
+    for key in ("pitch_mean", "pitch_std"):
+        # Try with and without fastpitch. prefix
+        for prefix in ("fastpitch.", ""):
+            full_key = prefix + key
+            if full_key in state_dict:
+                t = state_dict[full_key]
+                val = t.item() if hasattr(t, "item") else float(t)
+                stats[key] = val
+                break
+    return stats
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Convert FastPitch + HiFi-GAN to GGUF")
     parser.add_argument("--nemo", help="Path to FastPitch .nemo")
     parser.add_argument("--vocoder-nemo", help="Path to HiFi-GAN vocoder .nemo")
     parser.add_argument("--hf-model",
-                        default="inOXcrm/German_multispeaker_FastPitch_nemo",
+                        default="nvidia/tts_en_fastpitch",
                         help="HuggingFace FastPitch model name")
     parser.add_argument("--hf-vocoder",
-                        default="nvidia/tts_de_hui_hifigan_ft_fastpitch_multispeaker_5",
+                        default="nvidia/tts_hifigan",
                         help="HuggingFace HiFi-GAN model name")
     parser.add_argument("--output", required=True, help="Output .gguf path")
     parser.add_argument("--ftype", default="f16",
                         choices=["f16", "f32", "q8_0"],
                         help="Weight storage type")
+    parser.add_argument("--use-nemo-api", action="store_true",
+                        help="Use NeMo model API instead of direct .nemo loading")
     args = parser.parse_args()
 
     # ── Load FastPitch ──
     if args.nemo:
         print(f"Loading FastPitch from .nemo: {args.nemo}")
         fp_cfg, fp_sd = load_nemo_archive(args.nemo)
-    else:
-        print(f"Loading FastPitch from HF: {args.hf_model}")
+    elif args.use_nemo_api:
+        print(f"Loading FastPitch from HF via NeMo: {args.hf_model}")
         fp_cfg, fp_sd, _ = load_from_hf(args.hf_model, "FastPitchModel")
+    else:
+        # Download .nemo from HF and load directly (avoids NeMo import issues)
+        print(f"Downloading FastPitch .nemo from HF: {args.hf_model}")
+        nemo_path = download_nemo_from_hf(args.hf_model)
+        print(f"  -> {nemo_path}")
+        fp_cfg, fp_sd = load_nemo_archive(nemo_path)
+
+    # Extract pitch stats before renaming (may be lost)
+    pitch_stats = extract_pitch_stats(fp_sd)
+    if pitch_stats:
+        print(f"  pitch stats: {pitch_stats}")
 
     # ── Load Vocoder ──
     if args.vocoder_nemo:
         print(f"Loading HiFi-GAN from .nemo: {args.vocoder_nemo}")
         voc_cfg, voc_sd = load_nemo_archive(args.vocoder_nemo)
-    else:
-        print(f"Loading HiFi-GAN from HF: {args.hf_vocoder}")
+    elif args.use_nemo_api:
+        print(f"Loading HiFi-GAN from HF via NeMo: {args.hf_vocoder}")
         voc_cfg, voc_sd, _ = load_from_hf(args.hf_vocoder, "HifiGanModel")
+    else:
+        print(f"Downloading HiFi-GAN .nemo from HF: {args.hf_vocoder}")
+        nemo_path = download_nemo_from_hf(args.hf_vocoder)
+        print(f"  -> {nemo_path}")
+        voc_cfg, voc_sd = load_nemo_archive(nemo_path)
 
     # ── Fuse weight_norm ──
     print("Fusing weight_norm parameters...")
@@ -651,11 +794,11 @@ def main():
     voc_rb_kernels = hparams.get("voc_resblock_kernel_sizes", [3, 7, 11])
 
     writer.add_array("fastpitch.voc_upsample_rates",
-                     np.array(voc_rates, dtype=np.int32))
+                     [int(x) for x in voc_rates])
     writer.add_array("fastpitch.voc_upsample_kernel_sizes",
-                     np.array(voc_kernels, dtype=np.int32))
+                     [int(x) for x in voc_kernels])
     writer.add_array("fastpitch.voc_resblock_kernel_sizes",
-                     np.array(voc_rb_kernels, dtype=np.int32))
+                     [int(x) for x in voc_rb_kernels])
 
     # Dilations: standard HiFi-GAN [[1,3,5],[1,3,5],[1,3,5]]
     n_dilations = hparams.get("voc_n_dilations", 3)
@@ -663,12 +806,32 @@ def main():
     dilation_pattern = [1, 3, 5][:n_dilations]
     flat_dilations = dilation_pattern * len(voc_rb_kernels)
     writer.add_array("fastpitch.voc_resblock_dilations",
-                     np.array(flat_dilations, dtype=np.int32))
+                     [int(x) for x in flat_dilations])
     writer.add_uint32("fastpitch.voc_n_dilations", n_dilations)
 
     # N symbols (vocab size)
     if "n_symbols" in hparams:
         writer.add_uint32("fastpitch.n_symbols", hparams["n_symbols"])
+
+    # Pitch statistics (for denormalization; from training config)
+    if "pitch_mean" in pitch_stats:
+        writer.add_float32("fastpitch.pitch_mean", pitch_stats["pitch_mean"])
+    if "pitch_std" in pitch_stats:
+        writer.add_float32("fastpitch.pitch_std", pitch_stats["pitch_std"])
+    # Also store pitch stats from training config if available
+    train_ds = fp_cfg.get("train_ds", {}) if fp_cfg else {}
+    ds = train_ds.get("dataset", {}) if isinstance(train_ds, dict) else {}
+    if ds.get("pitch_mean") and ds["pitch_mean"] != 0:
+        writer.add_float32("fastpitch.pitch_mean", float(ds["pitch_mean"]))
+        writer.add_float32("fastpitch.pitch_std", float(ds["pitch_std"]))
+
+    # Tokenizer vocabulary (ARPABET phonemes for English)
+    # Stored as semicolon-separated string for compact metadata
+    vocab = build_tokenizer_vocab(fp_cfg)
+    if vocab:
+        writer.add_string("fastpitch.tokenizer_vocab",
+                          ";".join(vocab))
+        writer.add_uint32("fastpitch.tokenizer_vocab_size", len(vocab))
 
     # ── Write tensors ──
     n_tensors = 0

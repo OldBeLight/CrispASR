@@ -238,4 +238,82 @@ static inline std::string detokenize(const std::vector<int32_t>& ids, const std:
     return result;
 }
 
+// ── SentencePiece BPE tokenizer ────────────────────────────────────
+static inline std::vector<int32_t> tokenize_bpe(const std::string& text,
+                                                const std::unordered_map<std::string, int32_t>& token_to_id,
+                                                const std::vector<float>& scores, const Config& cfg = {},
+                                                bool prepend_space = true) {
+    std::string s;
+    s.reserve(text.size() + 4);
+    if (prepend_space) {
+        s.append("\xE2\x96\x81");
+    }
+    for (char ch : text) {
+        if (prepend_space && (ch == ' ' || ch == '\t' || ch == '\n')) {
+            s.append("\xE2\x96\x81");
+        } else {
+            s.push_back(ch);
+        }
+    }
+    if (s.empty())
+        return {};
+    std::vector<std::string> symbols;
+    {
+        size_t i = 0;
+        while (i < s.size()) {
+            unsigned char c = (unsigned char)s[i];
+            size_t len;
+            if (c < 0x80)
+                len = 1;
+            else if ((c & 0xE0) == 0xC0)
+                len = 2;
+            else if ((c & 0xF0) == 0xE0)
+                len = 3;
+            else if ((c & 0xF8) == 0xF0)
+                len = 4;
+            else
+                len = 1;
+            if (i + len > s.size())
+                len = 1;
+            symbols.emplace_back(s, i, len);
+            i += len;
+        }
+    }
+    if (symbols.empty())
+        return {};
+    constexpr float NEG_INF = -1e30f;
+    const int max_iter = (int)symbols.size() * 2;
+    for (int iter = 0; iter < max_iter && symbols.size() >= 2; iter++) {
+        int best_i = -1;
+        float best_score = NEG_INF;
+        for (size_t k = 0; k + 1 < symbols.size(); k++) {
+            std::string merged = symbols[k] + symbols[k + 1];
+            auto it = token_to_id.find(merged);
+            if (it != token_to_id.end()) {
+                int32_t tid = it->second;
+                float sc = (tid >= 0 && tid < (int32_t)scores.size()) ? scores[tid] : NEG_INF;
+                if (sc > best_score) {
+                    best_score = sc;
+                    best_i = (int)k;
+                }
+            }
+        }
+        if (best_i < 0)
+            break;
+        symbols[best_i] += symbols[best_i + 1];
+        symbols.erase(symbols.begin() + best_i + 1);
+    }
+    std::vector<int32_t> ids;
+    ids.reserve(symbols.size());
+    for (const auto& sym : symbols) {
+        auto it = token_to_id.find(sym);
+        if (it != token_to_id.end()) {
+            ids.push_back(it->second);
+        } else {
+            ids.push_back(cfg.unk_id);
+        }
+    }
+    return ids;
+}
+
 } // namespace core_spm

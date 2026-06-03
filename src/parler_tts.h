@@ -37,6 +37,7 @@ struct parler_tts_context_params {
     float temperature;    // 0 = greedy (default 1.0 per upstream)
     uint64_t seed;        // RNG seed (0 = default)
     int max_audio_tokens; // upper bound on AR decode steps; 0 = built-in default (2580)
+    int top_k;            // top-k sampling; 0 = disabled (default 0)
     bool flash_attn;
 };
 

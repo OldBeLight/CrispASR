@@ -1,6 +1,6 @@
 # CrispASR
 
-**One C++ binary, twenty-seven ASR backends + eight TTS engines + multilingual text translation, zero Python dependencies.**
+**One C++ binary, twenty-seven ASR backends + nine TTS engines + multilingual text translation, zero Python dependencies.**
 
 CrispASR started as a fork of [whisper.cpp](https://github.com/ggml-org/whisper.cpp) and extends that base into a **unified speech engine** called `crispasr`, backed by full ggml C++ runtimes for major open-weights ASR *and* TTS architectures. One build, one binary, one consistent CLI — pick the backend at the command line or let CrispASR auto-detect it from your GGUF file. See [Text-to-Speech](#text-to-speech-tts) for the TTS side.
 
@@ -29,7 +29,7 @@ No Python. No PyTorch. No separate per-model binary. No `pip install`. Just one 
 
 | Project | What it does |
 |---|---|
-| **[CrispASR](https://github.com/CrispStrobe/CrispASR)** | This repo — C++ speech recognition engine. 26 ASR backends + 8 TTS backends, CLI + HTTP server + C-ABI + Python/Rust/Dart bindings. |
+| **[CrispASR](https://github.com/CrispStrobe/CrispASR)** | This repo — C++ speech recognition engine. 26 ASR backends + 9 TTS backends, CLI + HTTP server + C-ABI + Python/Rust/Dart bindings. |
 | **[CrisperWeaver](https://github.com/CrispStrobe/CrisperWeaver)** | Cross-platform Flutter transcription app built on CrispASR. Desktop + mobile, all 10 backends, model browser with download queue, mic capture, SRT/VTT/JSON export, diarization, batch processing. Fully offline. |
 | **[CrispEmbed](https://github.com/CrispStrobe/CrispEmbed)** | Text embedding engine via ggml — same philosophy as CrispASR but for retrieval. 10 architectures (XLM-R, Qwen3-Embed, Gemma3, ModernBERT, ...), dense + sparse + ColBERT + reranking. 9.5x faster than ONNX on CPU, GPU via CUDA/Metal/Vulkan. Python/Rust/Dart bindings. |
 | **[Susurrus](https://github.com/CrispStrobe/Susurrus)** | Python ASR GUI with 9 backends (faster-whisper, mlx-whisper, voxtral, insanely-fast-whisper, ...). The Python counterpart to CrispASR's C++ approach. |
@@ -60,7 +60,7 @@ No Python. No PyTorch. No separate per-model binary. No `pip install`. Just one 
 ## Supported backends
 
 CrispASR ships **26 ASR backends** for transcription/translation and
-**eight TTS engines** for synthesis. Pick at the CLI with `--backend NAME`,
+**nine TTS engines** for synthesis. Pick at the CLI with `--backend NAME`,
 or omit it to let the binary auto-detect from the GGUF metadata. Jump
 to the [TTS table](#text-to-speech-models) for the synthesis side.
 
@@ -132,6 +132,7 @@ quick-start commands and engine selection guidance.
 | **cosyvoice3-tts** | [`cstr/cosyvoice3-0.5b-2512-GGUF`](https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF) | Qwen2-0.5B AR speech-token LM + DiT-CFM (10-step Euler) + HiFT (NSF + iSTFT) at 24 kHz; baked-voice zero-shot cloning via `--voice <name>` | 9 langs + 18 zh dialects | Apache-2.0 |
 | **csm** | [`cstr/csm-1b-GGUF`](https://huggingface.co/cstr/csm-1b-GGUF) | Sesame CSM-1B conversational TTS: Llama-3.2 1B backbone + 100M depth decoder (32-codebook RVQ) + Kyutai Mimi codec at 24 kHz ([more](docs/architecture.md#csm)) | en | Apache-2.0 |
 | **dia** | [`nari-labs/Dia-1.6B`](https://huggingface.co/cstr/dia-1.6b-GGUF) | Byte-level text encoder (12L) + AR audio decoder (18L GQA + CFG) → 9 delayed DAC codebooks + 44.1 kHz DAC codec; dialogue style with `[S1]`/`[S2]` tags (use >100-char prompts) | en | Apache-2.0 |
+| **speecht5** | [`cstr/speecht5-tts-GGUF`](https://huggingface.co/cstr/speecht5-tts-GGUF) | SpeechT5 80M: char-level encoder (12L) + AR mel decoder (6L) + 5-layer conv postnet + HiFi-GAN at 16 kHz; speaker via 512-d x-vector (`--voice <xvector.bin>`) | en | MIT |
 
 > _Status:_ end-to-end runnable on both Q4_K and F16; zero-shot synth and
 > voice cloning (`--voice <wav>`) both work and ASR-roundtrip correctly.
