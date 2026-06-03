@@ -8436,3 +8436,89 @@ To **read back an intermediate** after graph compute, you need a `ggml_dup`
 copy (or `ggml_cpy` to a pre-allocated input tensor). This applies to any
 backend that wants to read back KV projections, intermediate hidden states,
 or any tensor that has downstream consumers in the graph.
+
+---
+
+## Parler TTS — T5 + MusicGen decoder + DAC 44 kHz (§137, June 2026)
+
+### `gguf_init_from_file(no_alloc=false)` sets `tensor->data` but not `tensor->buffer`
+
+The legacy GGUF loading pattern (`no_alloc=false`) allocates tensor data inside the
+ggml_context's memory pool. This means `tensor->data` is valid for CPU reads, but
+`tensor->buffer` is NULL. Consequences:
+
+1. `ggml_backend_tensor_get()` crashes (requires `tensor->buffer`).
+2. `ggml_backend_sched` crashes during `alloc_graph` — can't route tensors without buffers.
+3. `ggml_free(ctx_w)` on exit triggers `munmap_chunk(): invalid pointer` — the GGUF loader's
+   internal allocation tracking conflicts with ggml_context's own free path.
+
+Fix: switch to the two-pass `core_gguf::load_weights()` pattern (metadata pass, then
+`no_alloc=true` + `ggml_backend_alloc_ctx_tensors`). This gives every tensor a proper
+`buffer`, enabling `ggml_backend_tensor_get`, scheduler routing, and clean shutdown.
+
+### Per-step `ggml_gallocr` create/free is the dominant cost in AR decode
+
+Each MusicGen AR decode step (up to 2580 steps) was creating a new `ggml_gallocr`,
+allocating the graph, computing, then freeing. The allocator's internal hash table
+construction/destruction dominated wall time — the actual matmuls were secondary.
+
+Fix: create one `ggml_gallocr` before the loop, `ggml_gallocr_reserve()` with a
+worst-case graph (max KV length), then `ggml_gallocr_alloc_graph()` each step.
+The reserved memory fits all subsequent steps since they have equal or smaller tensors.
+
+### SentencePiece BPE ≠ Viterbi unigram — different algorithm, same `.model` file
+
+SentencePiece `.model` files can be either unigram (model_type=1) or BPE (model_type=2).
+Both store a vocab with scores, but the tokenization algorithms are fundamentally different:
+
+- **Unigram Viterbi**: DP over byte positions, picks the highest-score segmentation.
+- **BPE merge**: start with characters, iteratively merge the pair whose merged result
+  has the highest score. Greedy, not global-optimal.
+
+The Parler tokenizer is BPE (LLaMA-2 sentencepiece). Using Viterbi produced 2/24 wrong
+tokens for typical voice descriptions (e.g. "moderate" → `▁moder`+`ate` instead of
+`▁moderate`). The T5 encoder then conditions differently, compounding over 500+ AR steps.
+
+Fix: added `core_spm::tokenize_bpe()` to `sentencepiece.h` — iterative best-merge with
+UTF-8 symbol splitting. Converter stores original SP scores (not byte-length hack) +
+`parler.tokenizer.is_bpe` GGUF flag. Runtime auto-selects algorithm.
+
+Validation: 24/24 description tokens and 13/13 prompt tokens match Python HF tokenizer
+exactly after fix (was 22/24 + 13/13 before).
+
+### DAC audio codec weights are precision-sensitive to quantization
+
+The DAC 44 kHz codec (Snake activations + ConvTranspose1d upsampling stack) reconstructs
+waveforms from 8-dim codebook embeddings through 4 decoder blocks × 3 residual units.
+Quantization noise in these small conv weights produces audible artefacts — same pattern
+as chatterbox's HiFi-GAN vocoder and F5-TTS's Vocos.
+
+Fix: `crispasr-quantize` skips all `dac.*` tensors (left at F16/F32). The T5 encoder and
+MusicGen decoder are safe to quantize. Impact: Q8_0 GGUF is 979 MB instead of ~900 MB
+(80 MB overhead for preserving ~116 DAC tensors at F16).
+
+### Diff harness: compare un-delayed codes, not raw generation-step tokens
+
+MusicGen uses a delay pattern: codebook k is delayed by k steps. The raw generation
+output has codebook 0 producing at step 0, codebook 1 starting at step 1, etc.
+`synthesize_codes()` returns un-delayed aligned codes (audio frame × codebook).
+
+The reference Python dumper originally stored raw per-step tokens in `(num_cb, n_steps)`
+layout. The C++ diff harness indexed these as delayed codes but compared against un-delayed
+C++ output — producing a misleading 21.7% match rate even when the decode was correct.
+
+Fix: Python dumps un-delayed aligned codes in `(T_audio, num_cb)` row-major layout.
+C++ comparison indexes both sides with `t * num_cb + k`.
+
+### MusicGen requires stochastic sampling — greedy produces degenerate output
+
+MusicGen's 9-codebook delay pattern means the model is trained with temperature=1.0
+sampling. Greedy decode (temp=0) produces degenerate output in Python too ("♪ How ♪"
+repeated). The C++ port confirms this — greedy tokens match Python exactly for 10 steps,
+but the resulting audio is garbage. Stochastic sampling with temp=1.0 is required.
+
+The C++ sampler uses `std::mt19937` while PyTorch uses its own MT19937 implementation.
+Same seed produces different random sequences → different token choices → divergent audio
+after the first few words. This is expected and unfixable without implementing PyTorch's
+exact RNG. Top-k sampling (added as `top_k` param) constrains the distribution so
+divergent draws still land in high-probability regions.
