@@ -199,6 +199,10 @@ struct parakeet_context {
     float decode_temperature = 0.0f;
     uint64_t decode_seed = 0;
     int decode_beam_size = 1; // 1 = greedy (default); >1 = TDT/RNNT beam search
+    bool decode_maes = false; // MAES beam search (requires beam_size > 1)
+    int maes_num_steps = 2;   // max non-blank expansions per frame
+    float maes_gamma = 2.3f;  // gamma-threshold pruning
+    int maes_beta = 2;        // extra candidates beyond beam_size
 
     // CTC-WS phrase-boost trie (PLAN #98). Set via parakeet_set_hotwords().
     core_context_bias::Trie hotword_trie;
@@ -1678,6 +1682,195 @@ static std::vector<parakeet_emitted_token> parakeet_rnnt_beam_decode(parakeet_co
 }
 
 // ===========================================================================
+// MAES (Modified Adaptive Expansion Search) for TDT
+//
+// Time-synchronous beam search that processes one encoder frame at a time
+// with up to `maes_num_steps` non-blank expansions per frame.
+//
+// Key differences from the label-looping beam search above:
+//   1. Process ALL beams at the same encoder frame before advancing.
+//   2. Up to N expansions per frame (adaptive: stop early if all blank).
+//   3. Gamma-threshold pruning: keep candidate if score >= best - gamma.
+//   4. After last expansion step, force-add blank score to non-blank hyps.
+//
+// Reference: NeMo BeamRNNTInfer.modified_adaptive_expansion_search
+// ===========================================================================
+
+static std::vector<parakeet_emitted_token> parakeet_tdt_maes_decode(parakeet_context* ctx, const float* enc, int T_enc,
+                                                                    int d_model, int beam_size, int maes_num_steps = 2,
+                                                                    float maes_gamma = 2.3f, int maes_beta = 2) {
+    parakeet_init_pred_weights(ctx);
+    parakeet_init_joint_weights(ctx);
+
+    const auto& hp = ctx->model.hparams;
+    const int blank_id = (int)hp.blank_id;
+    const int n_vocab_blk = blank_id + 1;
+    const int n_dur = (int)hp.n_tdt_durations;
+    const int B = std::max(1, beam_size);
+    const int topk = B + maes_beta; // candidates per hypothesis
+
+    auto& W = ctx->pred_w;
+    auto& J = ctx->joint_w;
+
+    struct Hyp {
+        parakeet_lstm_state lstm;
+        std::vector<float> pred_out;
+        double score = 0.0;
+        std::vector<parakeet_emitted_token> emitted;
+        std::vector<int> y_seq; // token sequence for prefix detection
+    };
+
+    // Initialise single beam with SOS
+    std::vector<Hyp> kept;
+    kept.resize(1);
+    {
+        auto& h = kept[0];
+        lstm_init_state(h.lstm, W.H);
+        predictor_step(W, blank_id, h.lstm, h.pred_out);
+        h.emitted.reserve(256);
+    }
+
+    std::vector<float> proj_e(J.joint_hidden);
+    std::vector<float> logits(J.vocab_total);
+
+    for (int t = 0; t < T_enc; /* advanced inside */) {
+        // Pre-compute encoder projection for this frame
+        joint_proj_enc(J, enc + (size_t)t * d_model, proj_e);
+
+        // Working set for this frame: start with kept_hyps
+        std::vector<Hyp> hyps = kept;
+        std::vector<Hyp> list_b; // blank-expanded hypotheses
+
+        for (int n = 0; n < maes_num_steps; n++) {
+            std::vector<Hyp> list_exp; // token-expanded hypotheses
+
+            for (auto& h : hyps) {
+                // Joint step
+                joint_step(J, proj_e.data(), h.pred_out.data(), logits);
+
+                // Duration: always argmax over duration head
+                int dur_id = 0;
+                float dur_lp = logits[n_vocab_blk];
+                for (int d = 1; d < n_dur; d++) {
+                    if (logits[n_vocab_blk + d] > dur_lp) {
+                        dur_lp = logits[n_vocab_blk + d];
+                        dur_id = d;
+                    }
+                }
+                int dur_skip = (int)hp.tdt_durations[dur_id];
+
+                // Log-softmax over token head (vocab + blank)
+                float max_l = logits[0];
+                for (int v = 1; v < n_vocab_blk; v++)
+                    if (logits[v] > max_l)
+                        max_l = logits[v];
+                double logZ = 0.0;
+                for (int v = 0; v < n_vocab_blk; v++)
+                    logZ += std::exp((double)(logits[v] - max_l));
+                logZ = (double)max_l + std::log(logZ);
+
+                // Top-k candidates by logit value
+                struct Expansion {
+                    int token;
+                    double new_score;
+                };
+                std::vector<Expansion> expansions;
+                expansions.reserve(topk);
+
+                // Find top-k tokens
+                std::vector<std::pair<float, int>> topk_pairs(n_vocab_blk);
+                for (int v = 0; v < n_vocab_blk; v++)
+                    topk_pairs[v] = {logits[v], v};
+                std::partial_sort(topk_pairs.begin(), topk_pairs.begin() + std::min(topk, n_vocab_blk),
+                                  topk_pairs.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+
+                // Gamma pruning: keep if score >= best - gamma
+                double best_exp_score = h.score + ((double)topk_pairs[0].first - logZ);
+                for (int k = 0; k < std::min(topk, n_vocab_blk); k++) {
+                    double new_score = h.score + ((double)topk_pairs[k].first - logZ);
+                    if (new_score >= best_exp_score - (double)maes_gamma) {
+                        expansions.push_back({topk_pairs[k].second, new_score});
+                    }
+                }
+
+                // Split expansions into blank and non-blank
+                for (auto& ex : expansions) {
+                    if (ex.token == blank_id) {
+                        Hyp bh;
+                        bh.lstm = h.lstm;
+                        bh.pred_out = h.pred_out;
+                        bh.score = ex.new_score;
+                        bh.emitted = h.emitted;
+                        bh.y_seq = h.y_seq;
+                        list_b.push_back(std::move(bh));
+                    } else {
+                        Hyp nh;
+                        nh.lstm = h.lstm;
+                        nh.score = ex.new_score;
+                        nh.emitted = h.emitted;
+                        nh.y_seq = h.y_seq;
+                        nh.y_seq.push_back(ex.token);
+                        int t_end = std::min(T_enc, t + std::max(0, dur_skip));
+                        nh.emitted.push_back({ex.token, t, t_end, (float)std::exp(ex.new_score - h.score)});
+                        // Advance predictor for non-blank
+                        predictor_step(W, ex.token, nh.lstm, nh.pred_out);
+                        list_exp.push_back(std::move(nh));
+                    }
+                }
+            }
+
+            if (list_exp.empty()) {
+                // All expansions were blank → stop expanding this frame
+                break;
+            }
+
+            if (n < maes_num_steps - 1) {
+                // Not the last step: continue expanding non-blank hyps
+                hyps = std::move(list_exp);
+            } else {
+                // Last expansion step: force-add blank score to all
+                // non-blank hyps so they can compete with blank hyps.
+                for (auto& nh : list_exp) {
+                    joint_step(J, proj_e.data(), nh.pred_out.data(), logits);
+                    float max_l = logits[0];
+                    for (int v = 1; v < n_vocab_blk; v++)
+                        if (logits[v] > max_l)
+                            max_l = logits[v];
+                    double logZ2 = 0.0;
+                    for (int v = 0; v < n_vocab_blk; v++)
+                        logZ2 += std::exp((double)(logits[v] - max_l));
+                    logZ2 = (double)max_l + std::log(logZ2);
+                    nh.score += ((double)logits[blank_id] - logZ2);
+                    list_b.push_back(std::move(nh));
+                }
+            }
+        }
+
+        // Select top-B from list_b
+        if ((int)list_b.size() > B) {
+            std::partial_sort(list_b.begin(), list_b.begin() + B, list_b.end(),
+                              [](const Hyp& a, const Hyp& b) { return a.score > b.score; });
+            list_b.resize(B);
+        }
+
+        // Advance time: TDT duration on blank → skip frames
+        // For MAES, blanks just advance by 1 frame (like standard RNNT).
+        // The TDT duration applies to the non-blank path emissions already.
+        kept = std::move(list_b);
+        t++;
+    }
+
+    // Return best hypothesis
+    if (kept.empty())
+        return {};
+    int best = 0;
+    for (int i = 1; i < (int)kept.size(); i++)
+        if (kept[i].score > kept[best].score)
+            best = i;
+    return std::move(kept[best].emitted);
+}
+
+// ===========================================================================
 // Standard RNNT greedy decode (n_tdt_durations == 0)
 // ===========================================================================
 // Identical predictor / joint infrastructure to TDT but no duration head:
@@ -1930,6 +2123,17 @@ extern "C" void parakeet_set_beam_size(struct parakeet_context* ctx, int beam_si
     if (!ctx)
         return;
     ctx->decode_beam_size = beam_size > 1 ? beam_size : 1;
+}
+
+extern "C" void parakeet_set_maes(struct parakeet_context* ctx, bool enable, int num_steps, float gamma, int beta) {
+    if (!ctx)
+        return;
+    ctx->decode_maes = enable;
+    if (enable) {
+        ctx->maes_num_steps = num_steps > 0 ? num_steps : 2;
+        ctx->maes_gamma = gamma > 0.0f ? gamma : 2.3f;
+        ctx->maes_beta = beta > 0 ? beta : 2;
+    }
 }
 
 extern "C" void parakeet_set_ctc_mode(struct parakeet_context* ctx, bool ctc) {
@@ -2367,12 +2571,15 @@ extern "C" struct parakeet_result* parakeet_decode_frames(struct parakeet_contex
     const bool use_ctc = ctx->decode_ctc && ctx->model.has_ctc;
     const bool use_rnnt = !use_ctc && ctx->model.hparams.n_tdt_durations == 0;
     const bool use_beam = !use_ctc && ctx->decode_beam_size > 1;
-    auto emitted = use_ctc ? parakeet_ctc_decode(ctx, enc_frames, T_enc, d_model)
-                   : use_rnnt
-                       ? (use_beam ? parakeet_rnnt_beam_decode(ctx, enc_frames, T_enc, d_model, ctx->decode_beam_size)
-                                   : parakeet_rnnt_decode(ctx, enc_frames, T_enc, d_model))
-                       : (use_beam ? parakeet_tdt_beam_decode(ctx, enc_frames, T_enc, d_model, ctx->decode_beam_size)
-                                   : parakeet_tdt_decode(ctx, enc_frames, T_enc, d_model));
+    const bool use_maes = use_beam && ctx->decode_maes && !use_rnnt;
+    auto emitted =
+        use_ctc    ? parakeet_ctc_decode(ctx, enc_frames, T_enc, d_model)
+        : use_rnnt ? (use_beam ? parakeet_rnnt_beam_decode(ctx, enc_frames, T_enc, d_model, ctx->decode_beam_size)
+                               : parakeet_rnnt_decode(ctx, enc_frames, T_enc, d_model))
+        : use_maes ? parakeet_tdt_maes_decode(ctx, enc_frames, T_enc, d_model, ctx->decode_beam_size,
+                                              ctx->maes_num_steps, ctx->maes_gamma, ctx->maes_beta)
+                   : (use_beam ? parakeet_tdt_beam_decode(ctx, enc_frames, T_enc, d_model, ctx->decode_beam_size)
+                               : parakeet_tdt_decode(ctx, enc_frames, T_enc, d_model));
 
     // Build result (same as the tail of parakeet_transcribe_ex)
     auto* r = (parakeet_result*)calloc(1, sizeof(parakeet_result));
@@ -2520,11 +2727,15 @@ extern "C" struct parakeet_result* parakeet_transcribe_chunked(struct parakeet_c
     const bool use_ctc = ctx->decode_ctc && ctx->model.has_ctc;
     const bool use_rnnt = !use_ctc && ctx->model.hparams.n_tdt_durations == 0;
     const bool use_beam = !use_ctc && ctx->decode_beam_size > 1;
+    const bool use_maes = use_beam && ctx->decode_maes && !use_rnnt;
     auto emitted =
         use_ctc ? parakeet_ctc_decode(ctx, enc_all.data(), T_enc_total, d_model)
         : use_rnnt
             ? (use_beam ? parakeet_rnnt_beam_decode(ctx, enc_all.data(), T_enc_total, d_model, ctx->decode_beam_size)
                         : parakeet_rnnt_decode(ctx, enc_all.data(), T_enc_total, d_model))
+        : use_maes
+            ? parakeet_tdt_maes_decode(ctx, enc_all.data(), T_enc_total, d_model, ctx->decode_beam_size,
+                                       ctx->maes_num_steps, ctx->maes_gamma, ctx->maes_beta)
             : (use_beam ? parakeet_tdt_beam_decode(ctx, enc_all.data(), T_enc_total, d_model, ctx->decode_beam_size)
                         : parakeet_tdt_decode(ctx, enc_all.data(), T_enc_total, d_model));
 
@@ -2726,10 +2937,13 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
     const bool use_ctc = ctx->decode_ctc && ctx->model.has_ctc;
     const bool use_rnnt = !use_ctc && ctx->model.hparams.n_tdt_durations == 0;
     const bool use_beam = !use_ctc && ctx->decode_beam_size > 1;
+    const bool use_maes = use_beam && ctx->decode_maes && !use_rnnt;
     const int d = (int)ctx->model.hparams.d_model;
     auto emitted = use_ctc    ? parakeet_ctc_decode(ctx, enc.data(), T_enc, d)
                    : use_rnnt ? (use_beam ? parakeet_rnnt_beam_decode(ctx, enc.data(), T_enc, d, ctx->decode_beam_size)
                                           : parakeet_rnnt_decode(ctx, enc.data(), T_enc, d))
+                   : use_maes ? parakeet_tdt_maes_decode(ctx, enc.data(), T_enc, d, ctx->decode_beam_size,
+                                                         ctx->maes_num_steps, ctx->maes_gamma, ctx->maes_beta)
                               : (use_beam ? parakeet_tdt_beam_decode(ctx, enc.data(), T_enc, d, ctx->decode_beam_size)
                                           : parakeet_tdt_decode(ctx, enc.data(), T_enc, d));
     if (getenv("PARAKEET_DEBUG"))

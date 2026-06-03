@@ -111,6 +111,13 @@ void parakeet_set_temperature(struct parakeet_context* ctx, float temperature, u
 // hypotheses alive — especially beneficial with hotword phrase boost.
 void parakeet_set_beam_size(struct parakeet_context* ctx, int beam_size);
 
+// MAES (Modified Adaptive Expansion Search) beam decoding. Requires
+// beam_size > 1. More efficient than label-looping beam search for
+// transducers: processes one frame at a time with adaptive expansion.
+// gamma = pruning threshold (lower = more pruning); num_steps = max
+// non-blank expansions per frame; beta = extra candidates beyond beam.
+void parakeet_set_maes(struct parakeet_context* ctx, bool enable, int num_steps, float gamma, int beta);
+
 // CTC decode mode (hybrid TDT+CTC models only).
 void parakeet_set_ctc_mode(struct parakeet_context* ctx, bool ctc);
 bool parakeet_has_ctc(struct parakeet_context* ctx);

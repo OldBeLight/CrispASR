@@ -100,6 +100,25 @@ public:
         parakeet_set_temperature(ctx_, params.temperature, params.seed);
         parakeet_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
 
+        // MAES beam search (env: CRISPASR_PARAKEET_MAES=1, or --decode maes).
+        // Requires beam_size > 1. Configurable via env vars.
+        {
+            const char* maes_env = std::getenv("CRISPASR_PARAKEET_MAES");
+            bool use_maes = (maes_env && atoi(maes_env) > 0) || params.parakeet_decoder == "maes";
+            if (use_maes && params.beam_size > 1) {
+                int num_steps = 2;
+                float gamma = 2.3f;
+                int beta = 2;
+                if (const char* v = std::getenv("CRISPASR_MAES_NUM_STEPS"))
+                    num_steps = atoi(v);
+                if (const char* v = std::getenv("CRISPASR_MAES_GAMMA"))
+                    gamma = (float)atof(v);
+                if (const char* v = std::getenv("CRISPASR_MAES_BETA"))
+                    beta = atoi(v);
+                parakeet_set_maes(ctx_, true, num_steps, gamma, beta);
+            }
+        }
+
         // PLAN #98: CTC-WS hotword phrase boost
         if (!params.hotwords.empty()) {
             auto hw = core_context_bias::parse_hotwords(params.hotwords);
