@@ -1807,7 +1807,12 @@ struct bark_context* bark_init_from_file(const char* path_model, struct bark_con
 
     // Backend setup
     ctx->backend_cpu = ggml_backend_cpu_init();
-    ctx->backend = ctx->backend_cpu; // CPU-only for now
+    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    if (!ctx->backend)
+        ctx->backend = ctx->backend_cpu;
+    if (ggml_backend_is_cpu(ctx->backend))
+        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
 
     // Load GGUF
     core_gguf::WeightLoad wl;
@@ -1865,9 +1870,14 @@ struct bark_context* bark_init_from_file(const char* path_model, struct bark_con
     // Allocate compute metadata buffer for graph building
     ctx->compute_meta.resize(GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + ggml_graph_overhead());
 
-    // Setup scheduler
-    ggml_backend_t backends[] = {ctx->backend};
-    ctx->sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, false);
+    // Setup scheduler (GPU primary + CPU fallback when GPU is active)
+    if (ctx->backend != ctx->backend_cpu) {
+        ggml_backend_t backends[] = {ctx->backend, ctx->backend_cpu};
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
+    } else {
+        ggml_backend_t backends[] = {ctx->backend};
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, false);
+    }
 
     if (params.verbosity >= 1) {
         fprintf(stderr, "bark: loaded from '%s'\n", path_model);
@@ -2030,8 +2040,8 @@ static std::vector<npz_entry> parse_npz(const uint8_t* data, size_t len) {
             break;
 
         uint16_t compression = (uint16_t)(data[pos + 8] | (data[pos + 9] << 8));
-        uint32_t comp_size = (uint32_t)data[pos + 18] | ((uint32_t)data[pos + 19] << 8) |
-                             ((uint32_t)data[pos + 20] << 16) | ((uint32_t)data[pos + 21] << 24);
+        uint32_t comp_size32 = (uint32_t)data[pos + 18] | ((uint32_t)data[pos + 19] << 8) |
+                               ((uint32_t)data[pos + 20] << 16) | ((uint32_t)data[pos + 21] << 24);
         uint16_t name_len = (uint16_t)(data[pos + 26] | (data[pos + 27] << 8));
         uint16_t extra_len = (uint16_t)(data[pos + 28] | (data[pos + 29] << 8));
 
@@ -2040,17 +2050,29 @@ static std::vector<npz_entry> parse_npz(const uint8_t* data, size_t len) {
             break;
         std::string name((const char*)data + name_start, name_len);
 
+        // Handle ZIP64: if comp_size == 0xFFFFFFFF, read from ZIP64 extra field
+        uint64_t comp_size = comp_size32;
+        if (comp_size32 == 0xFFFFFFFF && extra_len >= 20) {
+            size_t extra_off = name_start + name_len;
+            uint16_t tag = (uint16_t)(data[extra_off] | (data[extra_off + 1] << 8));
+            if (tag == 0x0001) {
+                // ZIP64 extra: tag(2) + size(2) + uncomp(8) + comp(8)
+                comp_size = 0;
+                for (int b = 0; b < 8; b++)
+                    comp_size |= (uint64_t)data[extra_off + 12 + b] << (b * 8);
+            }
+        }
+
         size_t data_start = name_start + name_len + extra_len;
         if (data_start + comp_size > len)
             break;
 
         if (compression == 0) {
             // Stored (no compression) — typical for .npz
-            entries.push_back({name, std::vector<uint8_t>(data + data_start, data + data_start + comp_size)});
+            entries.push_back({name, std::vector<uint8_t>(data + data_start, data + data_start + (size_t)comp_size)});
         }
-        // Skip compressed entries (bark .npz files are typically stored uncompressed)
 
-        pos = data_start + comp_size;
+        pos = data_start + (size_t)comp_size;
     }
 
     return entries;
@@ -2216,8 +2238,12 @@ void bark_free(struct bark_context* ctx) {
 }
 
 void bark_set_n_threads(struct bark_context* ctx, int n) {
-    if (ctx)
-        ctx->n_threads = n > 0 ? n : 1;
+    if (!ctx)
+        return;
+    ctx->n_threads = n > 0 ? n : 1;
+    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (ggml_backend_is_cpu(ctx->backend))
+        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
 }
 
 void bark_set_temperature_semantic(struct bark_context* ctx, float t) {
