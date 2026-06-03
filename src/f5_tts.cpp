@@ -179,6 +179,8 @@ struct f5_tts_context {
     f5_vocab vocab;
 
     ggml_backend_t backend = nullptr;
+    ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_sched_t sched = nullptr;
     ggml_context* w_ctx = nullptr;
     ggml_backend_buffer_t w_buf = nullptr;
 
@@ -218,17 +220,13 @@ static void dump_stage(const f5_tts_context* ctx, const char* label, const float
 
 struct f5_mini_graph {
     ggml_context* ctx = nullptr;
-    ggml_gallocr_t alloc = nullptr;
-    ggml_backend_t backend = nullptr;
+    ggml_backend_sched_t sched = nullptr;
 
-    f5_mini_graph(ggml_backend_t be, size_t ctx_size = 32 * 1024 * 1024) : backend(be) {
+    f5_mini_graph(ggml_backend_sched_t s, size_t ctx_size = 32 * 1024 * 1024) : sched(s) {
         struct ggml_init_params params = {ctx_size, nullptr, true};
         ctx = ggml_init(params);
-        alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
     }
     ~f5_mini_graph() {
-        if (alloc)
-            ggml_gallocr_free(alloc);
         if (ctx)
             ggml_free(ctx);
     }
@@ -236,11 +234,12 @@ struct f5_mini_graph {
     std::vector<float> compute(ggml_tensor* output, int /*n_threads*/) {
         ggml_cgraph* gf = ggml_new_graph_custom(ctx, 32768, false);
         ggml_build_forward_expand(gf, output);
-        if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+        ggml_backend_sched_reset(sched);
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
             fprintf(stderr, "f5_tts: graph alloc failed\n");
             return {};
         }
-        ggml_backend_graph_compute(backend, gf);
+        ggml_backend_sched_graph_compute(sched, gf);
         int n = (int)ggml_nelements(output);
         std::vector<float> result(n);
         ggml_backend_tensor_get(output, result.data(), 0, n * sizeof(float));
@@ -250,11 +249,12 @@ struct f5_mini_graph {
     bool compute_into(ggml_tensor* output, float* dst, size_t nbytes, int /*n_threads*/) {
         ggml_cgraph* gf = ggml_new_graph_custom(ctx, 32768, false);
         ggml_build_forward_expand(gf, output);
-        if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+        ggml_backend_sched_reset(sched);
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
             fprintf(stderr, "f5_tts: graph alloc failed\n");
             return false;
         }
-        ggml_backend_graph_compute(backend, gf);
+        ggml_backend_sched_graph_compute(sched, gf);
         ggml_backend_tensor_get(output, dst, 0, nbytes);
         return true;
     }
@@ -265,11 +265,12 @@ struct f5_mini_graph {
         for (auto* o : outputs) {
             ggml_build_forward_expand(gf, o);
         }
-        if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+        ggml_backend_sched_reset(sched);
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
             fprintf(stderr, "f5_tts: graph alloc failed\n");
             return false;
         }
-        ggml_backend_graph_compute(backend, gf);
+        ggml_backend_sched_graph_compute(sched, gf);
         return true;
     }
 
@@ -335,7 +336,7 @@ static std::vector<float> compute_time_embed(f5_tts_context* ctx, float t_val) {
     }
 
     // MLP: Linear(256→1024) → SiLU → Linear(1024→1024)
-    f5_mini_graph mg(ctx->backend);
+    f5_mini_graph mg(ctx->sched);
     ggml_tensor* inp = ggml_new_tensor_1d(mg.ctx, GGML_TYPE_F32, freq_dim);
     ggml_set_name(inp, "time_sinus");
     ggml_set_input(inp);
@@ -353,10 +354,11 @@ static std::vector<float> compute_time_embed(f5_tts_context* ctx, float t_val) {
 
     ggml_cgraph* gf = ggml_new_graph_custom(mg.ctx, 256, false);
     ggml_build_forward_expand(gf, h);
-    if (!ggml_gallocr_alloc_graph(mg.alloc, gf))
+    ggml_backend_sched_reset(mg.sched);
+    if (!ggml_backend_sched_alloc_graph(mg.sched, gf))
         return {};
     mg.set_input(inp, sinus.data(), freq_dim * sizeof(float));
-    ggml_backend_graph_compute(mg.backend, gf);
+    ggml_backend_sched_graph_compute(mg.sched, gf);
 
     std::vector<float> result(hp.dim);
     ggml_backend_tensor_get(h, result.data(), 0, hp.dim * sizeof(float));
@@ -900,7 +902,7 @@ static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, 
 
         // ── Unified ggml graph: AdaLN + QKV + RoPE + Attention + O-proj + FFN ──
         {
-            f5_mini_graph mg(ctx->backend, 128 * 1024 * 1024);
+            f5_mini_graph mg(ctx->sched, 128 * 1024 * 1024);
 
             ggml_tensor* x_in = ggml_new_tensor_2d(mg.ctx, GGML_TYPE_F32, dim, T);
             ggml_set_name(x_in, "blk_in");
@@ -995,7 +997,8 @@ static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, 
             // Build and compute
             ggml_cgraph* gf = ggml_new_graph_custom(mg.ctx, 32768, false);
             ggml_build_forward_expand(gf, x_out);
-            if (!ggml_gallocr_alloc_graph(mg.alloc, gf))
+            ggml_backend_sched_reset(mg.sched);
+            if (!ggml_backend_sched_alloc_graph(mg.sched, gf))
                 return {};
 
             // Set inputs
@@ -1006,7 +1009,7 @@ static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, 
                 pos_data[i] = i;
             mg.set_input(pos, pos_data.data(), T * sizeof(int32_t));
 
-            ggml_backend_graph_compute(mg.backend, gf);
+            ggml_backend_sched_graph_compute(mg.sched, gf);
 
             hidden.resize(T * dim);
             ggml_backend_tensor_get(x_out, hidden.data(), 0, hidden.size() * sizeof(float));
@@ -1020,7 +1023,7 @@ static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, 
 
     // ── Final AdaLN + projection ──
     {
-        f5_mini_graph mg(ctx->backend);
+        f5_mini_graph mg(ctx->sched);
         ggml_tensor* x_in = ggml_new_tensor_2d(mg.ctx, GGML_TYPE_F32, dim, T);
         ggml_set_name(x_in, "final_in");
         ggml_set_input(x_in);
@@ -1052,11 +1055,12 @@ static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, 
 
         ggml_cgraph* gf = ggml_new_graph_custom(mg.ctx, 4096, false);
         ggml_build_forward_expand(gf, output);
-        if (!ggml_gallocr_alloc_graph(mg.alloc, gf))
+        ggml_backend_sched_reset(mg.sched);
+        if (!ggml_backend_sched_alloc_graph(mg.sched, gf))
             return {};
         mg.set_input(x_in, hidden.data(), hidden.size() * sizeof(float));
         mg.set_input(t_emb, time_emb_data, dim * sizeof(float));
-        ggml_backend_graph_compute(mg.backend, gf);
+        ggml_backend_sched_graph_compute(mg.sched, gf);
 
         std::vector<float> velocity(T * mel_dim);
         ggml_backend_tensor_get(output, velocity.data(), 0, velocity.size() * sizeof(float));
@@ -1676,20 +1680,43 @@ struct f5_tts_context* f5_tts_init_from_file(const char* path_model, struct f5_t
     ctx->seed = params.seed;
     ctx->speed = params.speed;
 
-    // Initialize CPU backend
-    ctx->backend = ggml_backend_cpu_init();
-    if (!ctx->backend) {
+    // Initialize backends
+    ctx->backend_cpu = ggml_backend_cpu_init();
+    if (!ctx->backend_cpu) {
         fprintf(stderr, "f5_tts: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend, params.n_threads);
+    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+
+    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    if (!ctx->backend)
+        ctx->backend = ctx->backend_cpu;
+
+    if (params.verbosity >= 1 && ctx->backend != ctx->backend_cpu) {
+        fprintf(stderr, "f5_tts: using GPU backend: %s\n", ggml_backend_name(ctx->backend));
+    }
 
     // Load weights
     if (!load_weights(ctx, path_model)) {
         fprintf(stderr, "f5_tts: failed to load model: %s\n", path_model);
         f5_tts_free(ctx);
         return nullptr;
+    }
+
+    // Create backend scheduler
+    {
+        ggml_backend_t backends[2];
+        int n_be = 0;
+        backends[n_be++] = ctx->backend;
+        if (ctx->backend_cpu != ctx->backend)
+            backends[n_be++] = ctx->backend_cpu;
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 32768, false, false);
+        if (!ctx->sched) {
+            fprintf(stderr, "f5_tts: failed to create backend scheduler\n");
+            f5_tts_free(ctx);
+            return nullptr;
+        }
     }
 
     // Apply params (0 = use model default)
@@ -1708,12 +1735,16 @@ struct f5_tts_context* f5_tts_init_from_file(const char* path_model, struct f5_t
 void f5_tts_free(struct f5_tts_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->sched)
+        ggml_backend_sched_free(ctx->sched);
     if (ctx->w_buf)
         ggml_backend_buffer_free(ctx->w_buf);
     if (ctx->w_ctx)
         ggml_free(ctx->w_ctx);
-    if (ctx->backend)
+    if (ctx->backend && ctx->backend != ctx->backend_cpu)
         ggml_backend_free(ctx->backend);
+    if (ctx->backend_cpu)
+        ggml_backend_free(ctx->backend_cpu);
     delete ctx;
 }
 

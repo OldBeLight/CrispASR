@@ -1167,6 +1167,8 @@ struct crispasr_session {
     int best_of = 1;
     int max_new_tokens = 0;
     float frequency_penalty = 0.0f;
+    float temperature = 0.0f;  // 0 = greedy / backend default
+    uint64_t seed = 0;         // 0 = time-based
 
     // ── §90 session-level beam-search width ──────────────────────────────
     // beam_size > 1 activates beam search for backends that support it:
@@ -2221,6 +2223,7 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         f5_tts_params p = f5_tts_default_params();
         p.n_threads = s->n_threads;
         p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
         p.seed = 42;
         s->f5tts_ctx = f5_tts_init_from_file(model_path, p);
         if (!s->f5tts_ctx) {
@@ -3583,7 +3586,9 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         }
         const int V = (int)s->wav2vec2_ctx->hparams.vocab_size;
         const int T = (int)(logits.size() / (size_t)V);
-        auto emits = wav2vec2_greedy_decode_with_probs(*s->wav2vec2_ctx, logits.data(), T);
+        auto emits = (s->beam_size > 1)
+                         ? wav2vec2_beam_decode_with_probs(*s->wav2vec2_ctx, logits.data(), T, s->beam_size, 2.3f)
+                         : wav2vec2_greedy_decode_with_probs(*s->wav2vec2_ctx, logits.data(), T);
         const float frame_dur_s = wav2vec2_frame_dur(*s->wav2vec2_ctx);
 
         // Build the transcript text and project emissions into the
@@ -5793,6 +5798,8 @@ CA_EXPORT int crispasr_session_set_ask(crispasr_session* s, const char* prompt) 
 CA_EXPORT int crispasr_session_set_temperature(crispasr_session* s, float temperature, uint64_t seed) {
     if (!s)
         return -1;
+    s->temperature = temperature;
+    s->seed = seed;
     int touched = 0;
 #ifdef CA_HAVE_CANARY
     if (s->canary_ctx) {
