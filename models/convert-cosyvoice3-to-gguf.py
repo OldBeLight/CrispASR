@@ -175,7 +175,7 @@ def convert_llm(base, output_path):
     print(f"  {len(sd)} tensors")
 
     qwen_cfg_path = os.path.join(base, "CosyVoice-BlankEN", "config.json")
-    with open(qwen_cfg_path) as f:
+    with open(qwen_cfg_path, encoding="utf-8") as f:
         qcfg = json.load(f)
     print(f"  Qwen2 config: hidden={qcfg['hidden_size']}, layers={qcfg['num_hidden_layers']}, "
           f"heads={qcfg['num_attention_heads']}, kv_heads={qcfg['num_key_value_heads']}, "
@@ -201,7 +201,7 @@ def convert_llm(base, output_path):
     writer.add_uint32("cosyvoice3.llm.speech_token_codebook", 6561)
 
     # Tokenizer (Qwen2 BPE, lives in CosyVoice-BlankEN/).
-    with open(os.path.join(base, "CosyVoice-BlankEN", "vocab.json")) as f:
+    with open(os.path.join(base, "CosyVoice-BlankEN", "vocab.json"), encoding="utf-8") as f:
         vocab_map = json.load(f)
     tokens = [None] * (max(vocab_map.values()) + 1)
     for s, i in vocab_map.items():
@@ -210,7 +210,7 @@ def convert_llm(base, output_path):
     tokens = [t if t is not None else "" for t in tokens]
     print(f"  Qwen2 tokenizer: {len(tokens)} tokens")
     merges = []
-    with open(os.path.join(base, "CosyVoice-BlankEN", "merges.txt")) as f:
+    with open(os.path.join(base, "CosyVoice-BlankEN", "merges.txt"), encoding="utf-8") as f:
         for ln in f:
             ln = ln.rstrip("\n")
             if not ln or ln.startswith("#"):

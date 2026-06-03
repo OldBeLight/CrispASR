@@ -364,7 +364,7 @@ def main():
 
     model_dir = load_model_dir(args.input)
 
-    with open(model_dir / "config.json") as f:
+    with open(model_dir / "config.json", encoding="utf-8") as f:
         cfg = json.load(f)
 
     # --- Backbone hparams ---
@@ -430,7 +430,7 @@ def main():
     # CSM uses an index file for sharded safetensors
     index_file = model_dir / "transformers.safetensors.index.json"
     if index_file.exists():
-        with open(index_file) as f:
+        with open(index_file, encoding="utf-8") as f:
             index = json.load(f)
         weight_map = index.get("weight_map", {})
         shard_files = sorted(set(weight_map.values()))
@@ -504,7 +504,7 @@ def main():
     # --- Tokenizer (Llama-3.2 BPE) ---
     tj = model_dir / "tokenizer.json"
     if tj.exists():
-        with open(tj) as f:
+        with open(tj, encoding="utf-8") as f:
             tjd = json.load(f)
 
         model_block = tjd.get("model", {})

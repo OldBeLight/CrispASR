@@ -483,7 +483,7 @@ def write_t3_gguf(
 
     # ── Load and write base Chatterbox tokenizer ──
     if tokenizer_path and tokenizer_path.exists():
-        with open(tokenizer_path, 'r') as f:
+        with open(tokenizer_path, "r", encoding="utf-8") as f:
             tok_data = json.load(f)
         model = tok_data.get('model', {})
         vocab = model.get('vocab')
@@ -618,7 +618,7 @@ def write_turbo_t3_gguf(
     merges_path = model_dir / "merges.txt"
     if vocab_path.exists():
         import json as _json
-        with open(vocab_path) as f:
+        with open(vocab_path, encoding="utf-8") as f:
             vocab = _json.load(f)
         max_id = max(vocab.values())
         tokens = [""] * (max_id + 1)
@@ -629,7 +629,7 @@ def write_turbo_t3_gguf(
 
         if merges_path.exists():
             merges = []
-            with open(merges_path) as f:
+            with open(merges_path, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith('#'):

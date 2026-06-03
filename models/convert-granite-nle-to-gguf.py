@@ -244,7 +244,7 @@ def is_f32_tensor(name: str, shape) -> bool:
 
 def convert(input_dir: Path, out_path: Path) -> None:
     print(f"Loading: {input_dir}")
-    with open(input_dir / "config.json") as f:
+    with open(input_dir / "config.json", encoding="utf-8") as f:
         cfg = json.load(f)
 
     enc_cfg = cfg.get("encoder_config", {})
@@ -262,7 +262,7 @@ def convert(input_dir: Path, out_path: Path) -> None:
     # shard-index path for forward-compat with future quantised releases).
     idx_path = input_dir / "model.safetensors.index.json"
     if idx_path.exists():
-        with open(idx_path) as f:
+        with open(idx_path, encoding="utf-8") as f:
             idx = json.load(f)
         wanted = sorted(set(idx.get("weight_map", {}).values()))
         files = [input_dir / n for n in wanted]
@@ -370,7 +370,7 @@ def convert(input_dir: Path, out_path: Path) -> None:
     vocab_dict = None
     merges_list = None
     if vocab_path.exists():
-        with open(vocab_path) as f:
+        with open(vocab_path, encoding="utf-8") as f:
             vocab_dict = json.load(f)
         if merges_path.exists():
             with open(merges_path, encoding="utf-8") as f:

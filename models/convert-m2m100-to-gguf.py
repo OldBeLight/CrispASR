@@ -326,7 +326,7 @@ def build_vocab(model_dir: Path) -> tuple[list[str], list[float], list[str]]:
     if not spm_path.exists():
         sys.exit(f"Missing sentencepiece.bpe.model at {spm_path}")
 
-    with open(vocab_json_path) as f:
+    with open(vocab_json_path, encoding="utf-8") as f:
         vj = json.load(f)
 
     # Build id-to-token from vocab.json (authoritative for IDs 0..128003)
@@ -364,7 +364,7 @@ def build_vocab(model_dir: Path) -> tuple[list[str], list[float], list[str]]:
     tok_cfg_path = model_dir / "tokenizer_config.json"
     lang_codes_list: list[str] = []
     if tok_cfg_path.exists():
-        with open(tok_cfg_path) as f:
+        with open(tok_cfg_path, encoding="utf-8") as f:
             tok_cfg = json.load(f)
         for s in tok_cfg.get("additional_special_tokens", []):
             if s.startswith("__") and s.endswith("__") and len(s) >= 5:
@@ -377,7 +377,7 @@ def build_vocab(model_dir: Path) -> tuple[list[str], list[float], list[str]]:
     cfg_path = model_dir / "config.json"
     target_vocab_size = None
     if cfg_path.exists():
-        with open(cfg_path) as f:
+        with open(cfg_path, encoding="utf-8") as f:
             target_vocab_size = json.load(f).get("vocab_size")
 
     vocab_size_base = len(inv_vj)
@@ -423,7 +423,7 @@ def convert(input_dir: Path, out_path: Path) -> None:
     cfg_path = input_dir / "config.json"
     if not cfg_path.exists():
         sys.exit(f"Missing config.json at {cfg_path}")
-    with open(cfg_path) as f:
+    with open(cfg_path, encoding="utf-8") as f:
         cfg = json.load(f)
 
     vocab_size    = cfg.get("vocab_size", 128112)
@@ -493,7 +493,7 @@ def convert(input_dir: Path, out_path: Path) -> None:
     # Language codes and their token IDs (dynamic, read from tokenizer_config)
     # Lang tokens start right after the base vocab from vocab.json
     vj_path = input_dir / "vocab.json"
-    with open(vj_path) as f:
+    with open(vj_path, encoding="utf-8") as f:
         lang_start_id = len(json.load(f))
     lang_token_ids = [lang_start_id + i for i in range(len(lang_codes_list))]
     writer.add_array("m2m100.lang_codes",    lang_codes_list)

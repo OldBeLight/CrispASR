@@ -56,9 +56,9 @@ def main():
         vocab_path = hf_hub_download(args.input, "vocab.json")
 
         sd_raw = load_file(sf_path)
-        with open(cfg_path) as f:
+        with open(cfg_path, encoding="utf-8") as f:
             cfg = json.load(f)
-        with open(vocab_path) as f:
+        with open(vocab_path, encoding="utf-8") as f:
             vocab_json = json.load(f)
 
         # Map v2 tensor names to v1 names for unified processing

@@ -175,7 +175,7 @@ def main():
 
     model_dir = load_model_dir(args.input)
 
-    with open(model_dir / "config.json") as f:
+    with open(model_dir / "config.json", encoding="utf-8") as f:
         cfg = json.load(f)
 
     talker = cfg.get("talker_config", {})
@@ -317,7 +317,7 @@ def main():
     vocab_p = model_dir / "vocab.json"
     merges_p = model_dir / "merges.txt"
     if vocab_p.exists():
-        with open(vocab_p) as f:
+        with open(vocab_p, encoding="utf-8") as f:
             vocab_d = json.load(f)
         toks = [""] * len(vocab_d)
         for tok, idx in vocab_d.items():
@@ -326,7 +326,7 @@ def main():
         w.add_token_list(toks)
         print(f"  Tokens:        {len(toks)} entries from vocab.json")
     if merges_p.exists():
-        with open(merges_p) as f:
+        with open(merges_p, encoding="utf-8") as f:
             merges = [
                 ln.strip() for ln in f
                 if ln.strip() and not ln.startswith("#")

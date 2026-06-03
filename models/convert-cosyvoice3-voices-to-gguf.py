@@ -298,7 +298,7 @@ def main():
     args = ap.parse_args()
 
     if args.manifest:
-        with open(args.manifest) as f:
+        with open(args.manifest, encoding="utf-8") as f:
             manifest = json.load(f)
     else:
         manifest = [

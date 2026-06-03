@@ -413,7 +413,7 @@ def main():
 
     model_dir = load_model_dir(args.input)
 
-    with open(model_dir / "config.json") as f:
+    with open(model_dir / "config.json", encoding="utf-8") as f:
         cfg = json.load(f)
 
     enc = cfg.get("encoder_config", cfg.get("encoder", {}))

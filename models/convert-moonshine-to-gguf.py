@@ -123,7 +123,7 @@ def load_config(model_dir: Path) -> dict:
     """Load and return model config."""
     config_path = model_dir / "config.json"
     try:
-        with open(config_path) as f:
+        with open(config_path, encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
         print(f"Error: config.json not found in {model_dir}")
@@ -162,7 +162,7 @@ def convert_tokenizer(model_dir: Path, out_dir: Path, config_vocab_size: int = 3
     """Convert tokenizer.json to tokenizer.bin format."""
     tokenizer_path = model_dir / "tokenizer.json"
     try:
-        with open(tokenizer_path) as f:
+        with open(tokenizer_path, encoding="utf-8") as f:
             tokenizer_data = json.load(f)
     except FileNotFoundError:
         print(f"Warning: tokenizer.json not found in {model_dir}, skipping tokenizer conversion")

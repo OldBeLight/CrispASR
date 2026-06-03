@@ -154,13 +154,13 @@ def discover_orpheus_specials(model_dir: Path) -> dict:
         if not tj.exists():
             sys.exit("no added_tokens.json or tokenizer.json — cannot resolve "
                      "<custom_token_N> block")
-        with open(tj) as f:
+        with open(tj, encoding="utf-8") as f:
             tjd = json.load(f)
         items = tjd.get("added_tokens", [])
         # Each entry: {"id": int, "content": str, ...}
         added_map = {it["content"]: it["id"] for it in items}
     else:
-        with open(added) as f:
+        with open(added, encoding="utf-8") as f:
             added_map = json.load(f)
 
     custom_ids = []
@@ -239,7 +239,7 @@ def main():
 
     model_dir = load_model_dir(args.input)
 
-    with open(model_dir / "config.json") as f:
+    with open(model_dir / "config.json", encoding="utf-8") as f:
         cfg = json.load(f)
 
     n_layers = int(cfg["num_hidden_layers"])
@@ -339,7 +339,7 @@ def main():
     tj = model_dir / "tokenizer.json"
     if not tj.exists():
         sys.exit("no tokenizer.json — cannot persist BPE vocab")
-    with open(tj) as f:
+    with open(tj, encoding="utf-8") as f:
         tjd = json.load(f)
 
     model_block = tjd.get("model", {})

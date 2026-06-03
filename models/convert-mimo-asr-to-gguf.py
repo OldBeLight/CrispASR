@@ -96,7 +96,7 @@ def main():
 
     model_dir = load_model_dir(args.input)
 
-    with open(model_dir / "config.json") as f:
+    with open(model_dir / "config.json", encoding="utf-8") as f:
         config = json.load(f)
 
     ac = config.get("audio_config", {})
@@ -166,7 +166,7 @@ def main():
     # type 9) — `core_gguf::kv_str_array` reads this fine.
     tok_path = model_dir / "tokenizer.json"
     if tok_path.exists():
-        with open(tok_path) as f:
+        with open(tok_path, encoding="utf-8") as f:
             tok_data = json.load(f)
         vocab = tok_data.get("model", {}).get("vocab", {})
         added = tok_data.get("added_tokens", [])

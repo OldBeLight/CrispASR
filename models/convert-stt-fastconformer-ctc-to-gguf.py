@@ -143,7 +143,7 @@ def parse_yaml_hparams(yaml_path: Path) -> dict:
     are line-based and very regular for the keys we care about.
     """
     hp = {}
-    with open(yaml_path) as f:
+    with open(yaml_path, encoding="utf-8") as f:
         for line in f:
             s = line.strip()
             if ":" not in s:

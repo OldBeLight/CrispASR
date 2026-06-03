@@ -72,7 +72,7 @@ def main():
     n_mels = 60  # VoxLingua107 default
     hp_path = os.path.join(base, "hyperparams.yaml")
     if os.path.exists(hp_path):
-        with open(hp_path) as f:
+        with open(hp_path, encoding="utf-8") as f:
             for line in f:
                 if line.strip().startswith("n_mels:") and not line.strip().startswith("n_mels: !"):
                     n_mels = int(line.split(":")[1].strip())

@@ -213,7 +213,7 @@ def main():
     config_path = model_dir / "config.json"
     if not config_path.exists():
         sys.exit(f"No config.json found in {model_dir}")
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         config = json.load(f)
 
     backbone_cfg = config["backbone"]

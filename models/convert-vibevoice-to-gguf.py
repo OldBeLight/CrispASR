@@ -46,7 +46,7 @@ def main():
         model_dir = snapshot_download(args.input)
 
     # Read config
-    with open(os.path.join(model_dir, "config.json")) as f:
+    with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as f:
         cfg = json.load(f)
 
     dec_cfg = cfg.get("decoder_config", {})

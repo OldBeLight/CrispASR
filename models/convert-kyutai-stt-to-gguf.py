@@ -53,7 +53,7 @@ def main():
         config_path = hf_hub_download(args.input, "config.json", cache_dir=cache_dir)
         base = os.path.dirname(config_path)
 
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         config = json.load(f)
 
     mimi_name = config.get("mimi_name", "mimi-pytorch-e351c8d8@125.safetensors")

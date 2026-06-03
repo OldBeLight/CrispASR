@@ -113,7 +113,7 @@ def load_yaml(path: Path) -> dict:
         import yaml  # type: ignore
     except ImportError:
         sys.exit("pip install pyyaml (needed to read StyleTTS2 config.yml)")
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -403,7 +403,7 @@ def main():
         None,
     )
     if json_cfg.is_file():
-        with open(json_cfg) as f:
+        with open(json_cfg, encoding="utf-8") as f:
             cfg = json.load(f)
         print(f"  config:  {json_cfg.name} (Kokoro layout)", file=sys.stderr)
     elif yml_cfg is not None:

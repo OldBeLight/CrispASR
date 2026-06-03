@@ -278,7 +278,7 @@ def serialize_tekken_vocab(tekken: dict) -> bytes:
 
 def convert(input_dir: Path, out_path: Path) -> None:
     print(f"Loading: {input_dir}")
-    with open(input_dir / "config.json", "r") as f:
+    with open(input_dir / "config.json", "r", encoding="utf-8") as f:
         cfg = json.load(f)
     audio = cfg["audio_config"]
     text = cfg["text_config"]

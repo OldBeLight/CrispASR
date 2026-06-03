@@ -421,7 +421,7 @@ def serialize_rope_factors(config: dict) -> tuple[np.ndarray, np.ndarray]:
 
 def convert(input_dir: Path, out_path: Path) -> None:
     print(f"Loading config: {input_dir}")
-    with open(input_dir / "config.json", "r") as f:
+    with open(input_dir / "config.json", "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
     lm_cfg = cfg.get("lm_config", {})

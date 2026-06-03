@@ -132,7 +132,7 @@ def main():
     model_dir = Path(args.input)
     state = load_state_dict(model_dir)
 
-    with open(model_dir / "config.json") as f:
+    with open(model_dir / "config.json", encoding="utf-8") as f:
         cfg = json.load(f)
 
     # Decoder block strides — verified against the live model:

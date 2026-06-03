@@ -117,7 +117,7 @@ def discover_specials(model_dir: Path) -> dict:
     tj = model_dir / "tokenizer.json"
     if not tj.exists():
         sys.exit("no tokenizer.json -- cannot resolve OuteTTS special tokens")
-    with open(tj) as f:
+    with open(tj, encoding="utf-8") as f:
         tjd = json.load(f)
 
     added = tjd.get("added_tokens", [])
@@ -201,7 +201,7 @@ def main():
 
     model_dir = load_model_dir(args.input)
 
-    with open(model_dir / "config.json") as f:
+    with open(model_dir / "config.json", encoding="utf-8") as f:
         cfg = json.load(f)
 
     n_layers = int(cfg["num_hidden_layers"])
@@ -287,7 +287,7 @@ def main():
     tj = model_dir / "tokenizer.json"
     if not tj.exists():
         sys.exit("no tokenizer.json")
-    with open(tj) as f:
+    with open(tj, encoding="utf-8") as f:
         tjd = json.load(f)
 
     model_block = tjd.get("model", {})

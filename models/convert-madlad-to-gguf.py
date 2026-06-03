@@ -355,7 +355,7 @@ def convert(input_dir: Path, out_path: Path) -> None:
     cfg_path = input_dir / "config.json"
     if not cfg_path.exists():
         sys.exit(f"Missing config.json at {cfg_path}")
-    with open(cfg_path) as f:
+    with open(cfg_path, encoding="utf-8") as f:
         cfg = json.load(f)
 
     vocab_size         = cfg.get("vocab_size", 256000)

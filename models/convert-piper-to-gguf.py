@@ -120,7 +120,7 @@ def main():
     tensors = load_onnx_tensors(model)
 
     print(f"Loading config: {json_path}")
-    with open(json_path) as f:
+    with open(json_path, encoding="utf-8") as f:
         config = json.load(f)
 
     # Rename anonymous flow conv weights

@@ -278,7 +278,7 @@ def is_f32_tensor(gguf_name: str, shape: tuple[int, ...]) -> bool:
 
 def convert(input_dir: Path, out_path: Path) -> None:
     print(f"Loading: {input_dir}")
-    with open(input_dir / "config.json", "r") as f:
+    with open(input_dir / "config.json", "r", encoding="utf-8") as f:
         cfg = json.load(f)
     thinker = cfg["thinker_config"]
     audio = thinker["audio_config"]

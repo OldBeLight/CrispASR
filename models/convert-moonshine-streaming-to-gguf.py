@@ -162,7 +162,7 @@ def main():
 
     # Load config
     config_path = model_dir / "config.json"
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         config = json.load(f)
 
     enc_config = config.get("encoder_config", {})

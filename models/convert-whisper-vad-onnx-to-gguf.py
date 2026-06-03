@@ -93,7 +93,7 @@ def main():
 
     meta = {}
     if meta_path.exists():
-        with open(meta_path) as f:
+        with open(meta_path, encoding="utf-8") as f:
             meta = json.load(f)
 
     # Extract all tensors

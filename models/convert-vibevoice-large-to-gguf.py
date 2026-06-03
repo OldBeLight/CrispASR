@@ -40,7 +40,7 @@ def main():
         from huggingface_hub import snapshot_download
         model_dir = snapshot_download(args.input)
 
-    with open(os.path.join(model_dir, "config.json")) as f:
+    with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as f:
         cfg = json.load(f)
 
     dec_cfg = cfg.get("decoder_config", {})

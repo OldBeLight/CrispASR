@@ -199,7 +199,7 @@ def main():
     print(f"  {len(sd)} tensors")
 
     # ---- Read Qwen3-0.6B config (LLM hyperparameters) ----
-    with open(qwen_cfg_path) as f:
+    with open(qwen_cfg_path, encoding="utf-8") as f:
         llm_cfg = json.load(f)
     print(f"  Qwen3 config: hidden={llm_cfg['hidden_size']}, layers={llm_cfg['num_hidden_layers']}, "
           f"heads={llm_cfg['num_attention_heads']}, kv_heads={llm_cfg['num_key_value_heads']}, "
@@ -226,7 +226,7 @@ def main():
     cfg_path = os.path.join(base, "config.yaml")
     use_low_frame_rate = False  # upstream default when key is absent
     if os.path.isfile(cfg_path):
-        with open(cfg_path) as f:
+        with open(cfg_path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
         ada_conf = cfg.get("audio_adaptor_conf", {})
         use_low_frame_rate = ada_conf.get("use_low_frame_rate", False)
@@ -254,7 +254,7 @@ def main():
     writer.add_uint32("funasr.llm.max_pos", int(llm_cfg.get("max_position_embeddings", 32768)))
 
     # ---- Tokenizer (Qwen3-0.6B GPT2-style BPE) ----
-    with open(os.path.join(qwen_dir, "tokenizer.json")) as f:
+    with open(os.path.join(qwen_dir, "tokenizer.json"), encoding="utf-8") as f:
         tok = json.load(f)
     vocab_map = tok["model"]["vocab"]                     # str -> int
     tokens = [None] * (max(vocab_map.values()) + 1)
@@ -285,7 +285,7 @@ def main():
         writer.add_uint32("funasr.audio_end_token_id", name_to_id["<|endofspeech|>"])
     # EOS / pad come from generation_config.json or tokenizer_config.json
     try:
-        with open(os.path.join(qwen_dir, "generation_config.json")) as f:
+        with open(os.path.join(qwen_dir, "generation_config.json"), encoding="utf-8") as f:
             gcfg = json.load(f)
         if "eos_token_id" in gcfg:
             eos = gcfg["eos_token_id"]

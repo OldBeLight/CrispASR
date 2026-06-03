@@ -92,7 +92,7 @@ def main():
 
     model_dir = load_model_dir(args.input)
 
-    with open(model_dir / "config.json") as f:
+    with open(model_dir / "config.json", encoding="utf-8") as f:
         config = json.load(f)
 
     print(f"\nMiMo-Audio-Tokenizer (encoder only)")

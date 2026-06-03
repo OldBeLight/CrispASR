@@ -102,16 +102,17 @@ public:
             tgt = params.translate ? std::string("en") : src;
         }
 
-        // PLAN #114 P3 / issue #89 follow-up: canary-1b-v2's BPE vocab
-        // includes every ISO-639 `<|xx|>` language token, but the model
-        // is only trained on en/de/fr/es. Passing `-l ja` (or anything
-        // else not in the supported set) produces hallucinated output —
-        // sometimes English-shaped, sometimes mixed Cyrillic/Greek
-        // garbage on the same JFK clip. Whitelist the actual trained
-        // languages and refuse anything else with a clear error,
-        // suggesting parakeet for ja/zh and qwen3/voxtral for the
-        // broader multilingual set.
-        static const char* kSupportedLangs[] = {"en", "de", "fr", "es"};
+        // Issue #89 / #140: canary-1b-v2 is trained on 25 European
+        // languages (per the NVIDIA model card). The BPE vocab includes
+        // every ISO-639 `<|xx|>` token, but only the 25 below have
+        // training signal — anything else produces hallucinated output.
+        // clang-format off
+        static const char* kSupportedLangs[] = {
+            "en", "bg", "hr", "cs", "da", "nl", "et", "fi", "fr",
+            "de", "el", "hu", "it", "lv", "lt", "mt", "pl", "pt",
+            "ro", "sk", "sl", "es", "sv", "ru", "uk",
+        };
+        // clang-format on
         auto is_supported = [&](const std::string& lang) {
             for (const char* s : kSupportedLangs)
                 if (lang == s)
@@ -120,13 +121,11 @@ public:
         };
         if (!is_supported(src) || !is_supported(tgt)) {
             fprintf(stderr,
-                    "canary: src='%s' tgt='%s' — canary-1b-v2 is trained on "
-                    "{en, de, fr, es} only. Passing `-l ja` or similar "
-                    "produces hallucinated output (the vocab has the lang "
-                    "tokens but the model has no training signal for them). "
-                    "For Japanese/Mandarin use --backend parakeet-tdt-0.6b-ja "
-                    "or parakeet-tdt-0.6b-zh; for the broader multilingual "
-                    "set use --backend qwen3 or --backend voxtral.\n",
+                    "canary: src='%s' tgt='%s' — not in canary-1b-v2's "
+                    "trained language set (25 European languages). "
+                    "For Japanese/Mandarin use --backend parakeet; for "
+                    "the broader multilingual set use --backend qwen3 "
+                    "or --backend voxtral.\n",
                     src.c_str(), tgt.c_str());
             return out;
         }

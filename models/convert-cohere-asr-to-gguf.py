@@ -140,7 +140,7 @@ def main():
         return load_tensor(header, mm, data_offset, key).astype(np.float32)
 
     # --- Read config ----------------------------------------------------------
-    with open(os.path.join(args.model_dir, "config.json")) as f:
+    with open(os.path.join(args.model_dir, "config.json"), encoding="utf-8") as f:
         cfg = json.load(f)
 
     dec_cfg = cfg["transf_decoder"]["config_dict"]

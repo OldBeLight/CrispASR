@@ -67,7 +67,7 @@ def main():
     cfg_path = model_dir / "decoder" / "config.json"
     if not cfg_path.exists():
         sys.exit(f"no decoder/config.json in {model_dir}")
-    with open(cfg_path) as f:
+    with open(cfg_path, encoding="utf-8") as f:
         cfg = json.load(f)
 
     bb_cfg = cfg["backbone_config"]

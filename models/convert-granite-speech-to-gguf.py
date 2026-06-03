@@ -399,7 +399,7 @@ def _load_lora_adapter(input_dir: Path) -> tuple[dict, dict] | None:
     ada_path = input_dir / "adapter_model.safetensors"
     if not (cfg_path.exists() and ada_path.exists()):
         return None
-    with open(cfg_path) as f:
+    with open(cfg_path, encoding="utf-8") as f:
         cfg = json.load(f)
     alpha = float(cfg.get("lora_alpha", 32))
     r = float(cfg.get("r", 64))
@@ -446,7 +446,7 @@ def _apply_lora(name: str, arr, lora_map) -> any:
 
 def convert(input_dir: Path, out_path: Path) -> None:
     print(f"Loading: {input_dir}")
-    with open(input_dir / "config.json") as f:
+    with open(input_dir / "config.json", encoding="utf-8") as f:
         cfg = json.load(f)
     enc_cfg = cfg.get("encoder_config", {})
     text_cfg = cfg.get("text_config", {})
@@ -459,7 +459,7 @@ def convert(input_dir: Path, out_path: Path) -> None:
     # don't have an index.
     idx_path = input_dir / "model.safetensors.index.json"
     if idx_path.exists():
-        with open(idx_path) as f:
+        with open(idx_path, encoding="utf-8") as f:
             idx = json.load(f)
         wanted = sorted(set(idx.get("weight_map", {}).values()))
         safetensor_files = [input_dir / n for n in wanted]
@@ -591,7 +591,7 @@ def convert(input_dir: Path, out_path: Path) -> None:
     gen_cfg_path = input_dir / "generation_config.json"
     gen_cfg = {}
     if gen_cfg_path.exists():
-        with open(gen_cfg_path) as f:
+        with open(gen_cfg_path, encoding="utf-8") as f:
             gen_cfg = json.load(f)
 
     def _first_int(*vals, default):
@@ -626,7 +626,7 @@ def convert(input_dir: Path, out_path: Path) -> None:
     merges_list = None  # list of "left right"
 
     if vocab_path.exists():
-        with open(vocab_path) as f:
+        with open(vocab_path, encoding="utf-8") as f:
             vocab_dict = json.load(f)
         if merges_path.exists():
             with open(merges_path, encoding="utf-8") as f:
@@ -670,7 +670,7 @@ def convert(input_dir: Path, out_path: Path) -> None:
         # Add special tokens from tokenizer_config.json (overrides vocab)
         tok_cfg_path = input_dir / "tokenizer_config.json"
         if tok_cfg_path.exists():
-            with open(tok_cfg_path) as f:
+            with open(tok_cfg_path, encoding="utf-8") as f:
                 tok_cfg = json.load(f)
             for tid_str, info in tok_cfg.get("added_tokens_decoder", {}).items():
                 tid = int(tid_str)

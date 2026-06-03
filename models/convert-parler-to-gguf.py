@@ -495,7 +495,7 @@ def load_tokenizer_vocab(model_dir: Path) -> tuple[list[str], list[float], bool]
         print("WARNING: tokenizer.json not found, skipping vocab", file=sys.stderr)
         return [], [], False
 
-    with open(tok_json) as f:
+    with open(tok_json, encoding="utf-8") as f:
         tok = json.load(f)
 
     model = tok.get("model", {})
@@ -559,7 +559,7 @@ def load_description_tokenizer(model_dir: Path) -> tuple[list[str], list[float]]
 
     # Fall back to tokenizer.json
     if desc_tok_json.exists():
-        with open(desc_tok_json) as f:
+        with open(desc_tok_json, encoding="utf-8") as f:
             tok = json.load(f)
         model = tok.get("model", {})
         vocab_items = model.get("vocab", [])
@@ -598,14 +598,14 @@ def main():
     config_path = model_dir / "config.json"
     if not config_path.exists():
         sys.exit(f"config.json not found in {model_dir}")
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         config = json.load(f)
 
     # Load generation config for max_length
     gen_config_path = model_dir / "generation_config.json"
     gen_config = {}
     if gen_config_path.exists():
-        with open(gen_config_path) as f:
+        with open(gen_config_path, encoding="utf-8") as f:
             gen_config = json.load(f)
 
     # Load all safetensor weights

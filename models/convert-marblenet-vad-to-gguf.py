@@ -52,7 +52,7 @@ def load_nemo(path: str):
         cfg_path = Path(tmpdir) / "model_config.yaml"
 
     sd = torch.load(str(ckpt), map_location="cpu", weights_only=True)
-    with open(cfg_path) as f:
+    with open(cfg_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     return sd, cfg
 

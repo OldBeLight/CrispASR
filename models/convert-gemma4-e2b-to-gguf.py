@@ -157,7 +157,7 @@ def main():
     model_dir = load_model_dir(args.input)
 
     # Load config
-    with open(model_dir / "config.json") as f:
+    with open(model_dir / "config.json", encoding="utf-8") as f:
         config = json.load(f)
 
     ac = config.get("audio_config", {})
@@ -253,7 +253,7 @@ def main():
     # Tokenizer: store BPE tokens from tokenizer.json
     tok_path = model_dir / "tokenizer.json"
     if tok_path.exists():
-        with open(tok_path) as f:
+        with open(tok_path, encoding="utf-8") as f:
             tok_data = json.load(f)
         vocab = tok_data.get("model", {}).get("vocab", {})
         if vocab:

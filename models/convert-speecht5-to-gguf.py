@@ -108,7 +108,7 @@ def load_state_dict(model_dir: Path, prefix: str = "") -> dict[str, torch.Tensor
 def load_config(model_dir: Path) -> dict:
     cfg_path = model_dir / "config.json"
     if cfg_path.exists():
-        with open(cfg_path) as f:
+        with open(cfg_path, encoding="utf-8") as f:
             return json.load(f)
     return {}
 
@@ -166,14 +166,14 @@ def load_vocab(model_dir: Path) -> list[str]:
     # The standard SpeechT5 tokenizer is character-based
     tokenizer_path = model_dir / "tokenizer_config.json"
     if tokenizer_path.exists():
-        with open(tokenizer_path) as f:
+        with open(tokenizer_path, encoding="utf-8") as f:
             tok_cfg = json.load(f)
 
     # Try loading from the tokenizer files
     vocab_file = model_dir / "spm_char.vocab"
     if vocab_file.exists():
         vocab = []
-        with open(vocab_file) as f:
+        with open(vocab_file, encoding="utf-8") as f:
             for line in f:
                 parts = line.strip().split("\t")
                 if parts:

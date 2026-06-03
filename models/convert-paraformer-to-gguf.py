@@ -48,7 +48,7 @@ def add_tensor(writer, name: str, t: np.ndarray, *, force_f32: bool = False):
 
 def parse_kaldi_cmvn(path):
     """Parse am.mvn (Kaldi AddShift + Rescale) into shift/scale arrays."""
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         text = f.read()
     # Extract the two vectors between [ ... ]
     vectors = re.findall(r'\[\s*([-\d\s.eE+]+)\s*\]', text)
@@ -99,7 +99,7 @@ def main():
 
     # Read vocab size from tokens.json
     tok_path = os.path.join(base, "tokens.json")
-    with open(tok_path) as f:
+    with open(tok_path, encoding="utf-8") as f:
         tokens = json.load(f)
     vocab_size = len(tokens)
     hp["vocab_size"] = vocab_size

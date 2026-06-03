@@ -350,7 +350,7 @@ def convert(args):
 
     if config_path:
         print(f"Using config: {config_path}", file=sys.stderr)
-        with open(config_path) as f:
+        with open(config_path, encoding="utf-8") as f:
             config = yaml.safe_load(f)
     else:
         print(f"No config YAML found, using defaults for '{lang}'", file=sys.stderr)

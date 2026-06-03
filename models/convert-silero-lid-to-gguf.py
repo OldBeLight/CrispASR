@@ -53,9 +53,9 @@ def convert(input_dir: Path, out_path: Path) -> None:
     model = onnx.load(str(onnx_path))
 
     # Language + group dicts
-    with open(input_dir / "lang_dict_95.json") as f:
+    with open(input_dir / "lang_dict_95.json", encoding="utf-8") as f:
         lang_dict = json.load(f)
-    with open(input_dir / "lang_group_dict_95.json") as f:
+    with open(input_dir / "lang_group_dict_95.json", encoding="utf-8") as f:
         group_dict = json.load(f)
     lang_list = [""] * 95
     for k, v in lang_dict.items():
