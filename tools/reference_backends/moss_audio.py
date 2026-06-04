@@ -114,29 +114,49 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     print(f"  GitHub source: {github_path}")
 
     # ---- Load model ----
-    # Use bfloat16 to fit in 16 GB GPU or 30 GB CPU RAM. The reference
-    # captures are converted to float32 numpy on extraction so the GGUF
-    # archive is always F32 regardless of the model dtype.
-    # Suppress trust_remote_code interactive prompt
-    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-    os.environ["TRUST_REMOTE_CODE"] = "1"
+    # Load config manually (bypasses HF auto_map trust_remote_code prompt)
+    # then use from_pretrained with the pre-built config object.
+    import json as _json
+    with open(Path(model_dir) / "config.json") as f:
+        cfg_dict = _json.load(f)
+    config = MossAudioConfig(
+        audio_config=cfg_dict.get("audio_config"),
+        language_config=cfg_dict.get("language_config"),
+        adapter_hidden_size=cfg_dict.get("adapter_hidden_size", 8192),
+        deepstack_num_inject_layers=cfg_dict.get("deepstack_num_inject_layers"),
+    )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16
-    config = MossAudioConfig.from_pretrained(str(model_dir), trust_remote_code=True)
-    model = MossAudioModel.from_pretrained(
-        str(model_dir),
-        config=config,
-        torch_dtype=dtype,
-        device_map=device,
-        trust_remote_code=True,
-    ).eval()
-    print(f"  device={device}, dtype={dtype}")
+    # Load weights with the manually-built config — no auto_map lookup
+    model = MossAudioModel(config)
+    # Load sharded safetensors weights
+    from safetensors.torch import load_file
+    import glob as _glob
+    st_files = sorted(_glob.glob(str(Path(model_dir) / "model-*.safetensors")))
+    if not st_files:
+        st_files = sorted(_glob.glob(str(Path(model_dir) / "*.safetensors")))
+    state_dict = {}
+    for sf in st_files:
+        state_dict.update(load_file(sf))
+    model.load_state_dict(state_dict, strict=False)
+    del state_dict
+    gc.collect()
+    model = model.to(device=device, dtype=dtype).eval()
+    print(f"  device={device}, dtype={dtype}, params={sum(p.numel() for p in model.parameters())/1e6:.0f}M")
 
-    processor = MossAudioProcessor.from_pretrained(
-        str(model_dir),
-        trust_remote_code=True,
+    # Processor — also bypass HF auto_map by loading from the JSON config
+    with open(Path(model_dir) / "processor_config.json") as f:
+        proc_cfg = _json.load(f)
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
+    processor = MossAudioProcessor(
+        tokenizer=tokenizer,
+        mel_config=proc_cfg.get("mel_config"),
         enable_time_marker=True,
+        audio_token_id=proc_cfg.get("audio_token_id", 151654),
+        audio_start_id=proc_cfg.get("audio_start_id", 151669),
+        audio_end_id=proc_cfg.get("audio_end_id", 151670),
     )
 
     # ---- Prepare inputs ----
