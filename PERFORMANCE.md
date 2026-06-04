@@ -169,7 +169,29 @@ fun-asr-mlt-nano, voxtral4b.
 - **fun-asr-mlt-nano (0.1x RT):** running F16 (~2 GB) on CPU. Q8_0 quant
   exists on HF (`cstr/funasr-mlt-nano-GGUF/funasr-mlt-nano-2512-q8_0.gguf`)
   and should be GPU-safe; switching would recover 5-10x speed.
-- TTS benchmarks were run separately (see TTS section below).
+### TTS benchmark (same run, P100 GPU)
+
+First comprehensive TTS benchmark across 11 backends. Phrase: "The quick
+brown fox jumps over the lazy dog." Each model auto-downloaded, synthesised,
+output WAV checked for >1 KB, then cleaned up.
+
+| Rank | Backend | Status | Wall (s) | WAV size | Notes |
+|---|---|---|---|---|---|
+| 1 | Piper LessAC Medium | PASS | 3.7 | 103 KB | Fastest TTS, 22 kHz VITS |
+| 2 | SpeechT5 TTS | PASS | 4.6 | 56 KB | 16 kHz, deterministic |
+| 3 | Bark Small | PASS | 16.9 | 245 KB | 3-stage GPT-2, 24 kHz |
+| 4 | Kokoro 82M | PASS | 17.5 | 152 KB | Needs espeak-ng (installed) |
+| 5 | Pocket TTS 100M | PASS | 72.1 | 181 KB | Continuous-latent AR, 24 kHz |
+| 6 | CSM 1B | PASS | 213.4 | 165 KB | Llama-3.2 + Mimi, 24 kHz |
+| 7 | Orpheus 3B-FT | PASS | 269.7 | 205 KB | Llama-3.2 + SNAC, 24 kHz |
+| — | FastPitch 60M | TIMEOUT | >30 | 0 | Timeout too short (30s) |
+| — | F5-TTS v1 Base | FAIL | 4.1 | 0 | Needs `--voice <ref.wav>` |
+| — | Parler TTS Mini v1.1 | TIMEOUT | >180 | 0 | Too slow on CPU path |
+| — | Dia 1.6B | TIMEOUT | >240 | 0 | Too slow on CPU path |
+
+**7/11 pass.** FastPitch needs a longer timeout (model download is slow, not
+inference). F5-TTS requires a reference audio for voice cloning. Parler-TTS
+and Dia are AR LLM-based and need GPU acceleration or longer timeouts.
 
 ---
 
