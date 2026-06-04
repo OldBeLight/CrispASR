@@ -8,24 +8,6 @@
 import os, subprocess, sys, shutil
 from pathlib import Path
 
-os.environ["PYTHONUNBUFFERED"] = "1"
-try:
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
-except Exception:
-    pass
-
-try:
-    from kaggle_secrets import UserSecretsClient
-    hf_token_secret = UserSecretsClient().get_secret("HF_TOKEN")
-    os.environ["HF_TOKEN"] = hf_token_secret
-    os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token_secret
-    print("[1] HF_TOKEN OK", flush=True)
-except Exception as exc:
-    hf_token_secret = None
-    print(f"[1] HF_TOKEN fail: {exc}", flush=True)
-
-# %% [code]
 WORK = Path("/kaggle/working")
 REPO = WORK / "CrispASR"
 BUILD = WORK / "build"
@@ -33,7 +15,7 @@ OUT_F16 = WORK / "moss-audio-4b-instruct-f16.gguf"
 OUT_Q4K = WORK / "moss-audio-4b-instruct-q4_k.gguf"
 BRANCH = os.environ.get("CRISPASR_REF", "feature/moss-audio")
 
-print(f"[2] cloning {BRANCH}", flush=True)
+print(f"[1] cloning {BRANCH}", flush=True)
 if REPO.exists():
     shutil.rmtree(REPO)
 subprocess.check_call([
@@ -44,7 +26,10 @@ subprocess.check_call([
 sys.path.insert(0, str(REPO / "tools" / "kaggle"))
 import kaggle_harness as kh
 kh.init_progress()
+hf_token = kh.resolve_hf_token()
+kh.step("cloned", branch=BRANCH, hf_token_ok=bool(hf_token))
 
+# %% [code]
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", "--quiet",
     "safetensors", "gguf", "huggingface_hub", "hf_transfer",
@@ -84,12 +69,12 @@ print("[5] building crispasr-quantize", flush=True)
 kh.install_build_toolchain()
 BUILD.mkdir(exist_ok=True)
 
-cmake_args = (
+cmake_cfg = (
     f"cmake -G Ninja -S {REPO} -B {BUILD} "
     f"-DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DCRISPASR_BUILD_TESTS=OFF "
     + " ".join(kh.cache_and_link_flags())
 )
-kh.sh_with_progress(cmake_args)
+kh.sh_with_progress(cmake_cfg)
 
 with kh.build_heartbeat("cmake.build"):
     kh.sh_with_progress(
@@ -99,20 +84,20 @@ with kh.build_heartbeat("cmake.build"):
 kh.step("quantize_built")
 
 QUANTIZE = BUILD / "bin" / "crispasr-quantize"
-print(f"[5] quantizing F16 -> Q4_K", flush=True)
+print("[5] quantizing F16 -> Q4_K", flush=True)
 subprocess.check_call([str(QUANTIZE), str(OUT_F16), str(OUT_Q4K), "q4_k"])
 print(f"[5] Q4K: {OUT_Q4K.stat().st_size / (1024**3):.1f} GiB", flush=True)
 kh.step("q4k_done", size_gb=round(OUT_Q4K.stat().st_size / (1024**3), 2))
 
-# Delete F16 to free working space (keep Q4K for output)
+# Delete F16 to free working space
 OUT_F16.unlink(missing_ok=True)
 
 # %% [code]
 HF_REPO = "cstr/MOSS-Audio-4B-Instruct-GGUF"
-if hf_token_secret:
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+hf_token = os.environ.get("HF_TOKEN")
+if hf_token:
     from huggingface_hub import HfApi
-    api = HfApi(token=hf_token_secret)
+    api = HfApi(token=hf_token)
     try:
         api.create_repo(HF_REPO, repo_type="model", exist_ok=True)
     except Exception as e:
@@ -128,7 +113,7 @@ if hf_token_secret:
         print("[6] uploaded Q4K", flush=True)
     kh.step("uploaded")
 else:
-    print("[6] no token — staged locally", flush=True)
+    print("[6] no HF_TOKEN resolved — staged locally", flush=True)
     if OUT_Q4K.exists():
         print(f"  {OUT_Q4K} ({OUT_Q4K.stat().st_size / (1024**3):.1f} GiB)")
 
