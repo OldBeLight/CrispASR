@@ -83,6 +83,8 @@ def main():
     ap.add_argument("--ckpt", required=True, help="checkpoint.pth")
     ap.add_argument("--config", required=True, help="config.json")
     ap.add_argument("--output", required=True, help="Output .gguf")
+    ap.add_argument("--all-f32", action="store_true",
+                    help="Store ALL tensors as F32 (for quantization base)")
     ap.add_argument(
         "--cmudict",
         default=None,
@@ -292,7 +294,7 @@ def main():
             "emb" in name or "emb_g" in name or "emb_rel" in name
         )
         is_sdp = name.startswith("sdp.") or name.startswith("dp.")
-        if arr.ndim <= 1 or is_emb or is_sdp:
+        if args.all_f32 or arr.ndim <= 1 or is_emb or is_sdp:
             writer.add_tensor(name, arr.astype(np.float32))
         else:
             writer.add_tensor(name, arr.astype(np.float16))
