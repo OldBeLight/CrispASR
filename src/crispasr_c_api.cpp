@@ -95,6 +95,10 @@
 #include "vibevoice.h"
 #define CA_HAVE_VIBEVOICE 1
 #endif
+#if __has_include("kugelaudio.h")
+#include "kugelaudio.h"
+#define CA_HAVE_KUGELAUDIO 1
+#endif
 #if __has_include("qwen3_tts.h")
 #include "qwen3_tts.h"
 #define CA_HAVE_QWEN3_TTS 1
@@ -1304,6 +1308,9 @@ struct crispasr_session {
 #ifdef CA_HAVE_VIBEVOICE
     vibevoice_context* vibevoice_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_KUGELAUDIO
+    kugelaudio_context* kugelaudio_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_QWEN3_TTS
     qwen3_tts_context* qwen3_tts_ctx = nullptr;
     bool qwen3_tts_voice_loaded = false;
@@ -1819,6 +1826,22 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         p.flash_attn = g_open_flash_attn_tls;
         s->vibevoice_ctx = vibevoice_init_from_file(model_path, p);
         if (!s->vibevoice_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_KUGELAUDIO
+    if (s->backend == "kugelaudio" || s->backend == "kugelaudio-tts") {
+        s->backend = "kugelaudio";
+        kugelaudio_context_params p = kugelaudio_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        p.flash_attn = g_open_flash_attn_tls;
+        s->kugelaudio_ctx = kugelaudio_init_from_file(model_path, p);
+        if (!s->kugelaudio_ctx) {
             delete s;
             return nullptr;
         }
@@ -2540,6 +2563,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_VIBEVOICE
     list += ",vibevoice,vibevoice-tts";
+#endif
+#ifdef CA_HAVE_KUGELAUDIO
+    list += ",kugelaudio";
 #endif
 #ifdef CA_HAVE_QWEN3_TTS
     list += ",qwen3-tts";
@@ -4907,6 +4933,11 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
         return vibevoice_load_voice(s->vibevoice_ctx, path);
     }
 #endif
+#ifdef CA_HAVE_KUGELAUDIO
+    if (s->kugelaudio_ctx) {
+        return kugelaudio_load_voice(s->kugelaudio_ctx, path);
+    }
+#endif
 #ifdef CA_HAVE_QWEN3_TTS
     if (s->qwen3_tts_ctx) {
         if (ends_with_wav(path)) {
@@ -5201,6 +5232,11 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
 #ifdef CA_HAVE_VIBEVOICE
     if (s->vibevoice_ctx) {
         return vibevoice_synthesize(s->vibevoice_ctx, text, out_n_samples);
+    }
+#endif
+#ifdef CA_HAVE_KUGELAUDIO
+    if (s->kugelaudio_ctx) {
+        return kugelaudio_synthesize(s->kugelaudio_ctx, text, out_n_samples);
     }
 #endif
 #ifdef CA_HAVE_QWEN3_TTS
@@ -5637,6 +5673,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_VIBEVOICE
     if (s->vibevoice_ctx)
         vibevoice_free(s->vibevoice_ctx);
+#endif
+#ifdef CA_HAVE_KUGELAUDIO
+    if (s->kugelaudio_ctx)
+        kugelaudio_free(s->kugelaudio_ctx);
 #endif
 #ifdef CA_HAVE_QWEN3_TTS
     if (s->qwen3_tts_ctx)
@@ -6085,6 +6125,12 @@ CA_EXPORT int crispasr_session_set_tts_seed(crispasr_session* s, uint64_t seed) 
         touched++;
     }
 #endif
+#ifdef CA_HAVE_KUGELAUDIO
+    if (s->kugelaudio_ctx) {
+        kugelaudio_set_seed(s->kugelaudio_ctx, (uint32_t)seed);
+        touched++;
+    }
+#endif
 #ifdef CA_HAVE_QWEN3_TTS
     if (s->qwen3_tts_ctx) {
         qwen3_tts_set_seed((qwen3_tts_context*)s->qwen3_tts_ctx, seed);
@@ -6156,6 +6202,12 @@ CA_EXPORT int crispasr_session_set_tts_steps(crispasr_session* s, int steps) {
         // synthesize() call, so post-init mutation changes the next
         // call's schedule density.
         vibevoice_set_tts_steps((vibevoice_context*)s->vibevoice_ctx, steps);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_KUGELAUDIO
+    if (s->kugelaudio_ctx) {
+        kugelaudio_set_tts_steps(s->kugelaudio_ctx, steps);
         touched++;
     }
 #endif
