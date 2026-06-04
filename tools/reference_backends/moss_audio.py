@@ -117,9 +117,13 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     # Use bfloat16 to fit in 16 GB GPU or 30 GB CPU RAM. The reference
     # captures are converted to float32 numpy on extraction so the GGUF
     # archive is always F32 regardless of the model dtype.
+    # Suppress trust_remote_code interactive prompt
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    os.environ["TRUST_REMOTE_CODE"] = "1"
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16
-    config = MossAudioConfig.from_pretrained(str(model_dir))
+    config = MossAudioConfig.from_pretrained(str(model_dir), trust_remote_code=True)
     model = MossAudioModel.from_pretrained(
         str(model_dir),
         config=config,
