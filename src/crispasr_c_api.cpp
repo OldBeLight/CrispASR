@@ -1826,9 +1826,7 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
     }
 #endif
 #ifdef CA_HAVE_QWEN3_TTS
-    if (s->backend == "qwen3-tts" || s->backend == "qwen3_tts" || s->backend == "qwen3tts" ||
-        s->backend == "gwen-tts" || s->backend == "gwen_tts" || s->backend == "gwentts" || s->backend == "darwin-tts" ||
-        s->backend == "darwin_tts" || s->backend == "darwintts") {
+    if (s->backend == "qwen3-tts" || s->backend == "qwen3_tts" || s->backend == "qwen3tts") {
         qwen3_tts_context_params p = qwen3_tts_context_default_params();
         p.n_threads = s->n_threads;
         p.verbosity = g_open_verbosity_tls;
@@ -2544,7 +2542,7 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
     list += ",vibevoice,vibevoice-tts";
 #endif
 #ifdef CA_HAVE_QWEN3_TTS
-    list += ",qwen3-tts,gwen-tts,darwin-tts";
+    list += ",qwen3-tts";
 #endif
 #ifdef CA_HAVE_GLMASR
     list += ",glm-asr";
@@ -5420,18 +5418,13 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
         int sr = 0;
         const int nIn = melotts_synthesize(s->melotts_ctx, text, &src, &sr);
         if (!src || nIn <= 0) {
-            if (src)
-                free(src);
+            if (src) free(src);
             return nullptr;
         }
-        if (sr <= 0)
-            sr = 44100;
+        if (sr <= 0) sr = 44100;
         const int64_t nOut = (int64_t)nIn * 24000 / sr;
         float* dst = (float*)malloc((size_t)(nOut > 0 ? nOut : 1) * sizeof(float));
-        if (!dst) {
-            free(src);
-            return nullptr;
-        }
+        if (!dst) { free(src); return nullptr; }
         const double ratio = (double)sr / 24000.0;
         for (int64_t j = 0; j < nOut; ++j) {
             const double pos = (double)j * ratio;
@@ -5441,8 +5434,7 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
             dst[j] = (float)((double)src[i0] * (1.0 - frac) + (double)src[i1] * frac);
         }
         melotts_pcm_free(src);
-        if (out_n_samples)
-            *out_n_samples = (int)nOut;
+        if (out_n_samples) *out_n_samples = (int)nOut;
         return dst;
     }
 #endif

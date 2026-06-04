@@ -98,8 +98,7 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
     if (name == "vibevoice-1.5b" || name == "vibevoice-tts-1.5b" || name == "vibevoice-tts-base")
         return crispasr_make_vibevoice_1p5b_backend();
     if (name == "qwen3-tts" || name == "qwen3_tts" || name == "qwen3tts" || name == "qwen3-tts-1.7b-base" ||
-        name == "qwen3-tts-1.7b" || name == "gwen-tts" || name == "gwen_tts" || name == "gwentts" ||
-        name == "darwin-tts" || name == "darwin_tts" || name == "darwintts")
+        name == "qwen3-tts-1.7b")
         return crispasr_make_qwen3_tts_base_backend();
     if (name == "qwen3-tts-customvoice" || name == "qwen3tts-customvoice" || name == "qwen3-tts-cv" ||
         name == "qwen3-tts-1.7b-customvoice" || name == "qwen3-tts-1.7b-cv" || name == "qwen3-tts-1.7b-voicedesign" ||
@@ -470,14 +469,6 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "mega-asr";
     if (contains_ci("qwen3") && contains_ci("asr"))
         return "qwen3";
-    if (contains_ci("darwin") && contains_ci("tts"))
-        return "darwin-tts";
-    if (contains_ci("gwen") && contains_ci("tts"))
-        return "gwen-tts";
-    if (contains_ci("darwin") && contains_ci("tts"))
-        return "darwin-tts";
-    if (contains_ci("gwen") && contains_ci("tts"))
-        return "gwen-tts";
     if (contains_ci("qwen3") && contains_ci("tts"))
         return "qwen3-tts";
     if (contains_ci("orpheus") || contains_ci("kartoffel-orpheus") || contains_ci("kartoffel_orpheus"))
