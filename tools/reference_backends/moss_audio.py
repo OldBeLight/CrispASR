@@ -203,7 +203,7 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         audio_data_seqlens = inputs.get("audio_data_seqlens")
 
         if audio_data is not None:
-            audio_data = audio_data.float()
+            audio_data = audio_data.to(dtype=dtype)
 
         # ---- Encoder stages ----
         want_enc = any(s in stages for s in [
