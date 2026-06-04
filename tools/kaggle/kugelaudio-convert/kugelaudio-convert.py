@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Kaggle kernel: convert KugelAudio-0-Open to GGUF + capture reference intermediates.
+"""Kaggle kernel: convert KugelAudio-0-Open to GGUF.
 
-Two phases:
-  1. GGUF conversion (runs on GPU kernel for the 18.7 GB model)
-  2. Reference dump with forward hooks for C++ validation
+CPU-only (30 GB RAM is enough for the 18.7 GB model).
+Reference dump (Phase 3) requires GPU — skipped on CPU kernels,
+run separately when GPU quota is available.
 
 Push: python -m kaggle kernels push -p tools/kaggle/kugelaudio-convert
 """
@@ -66,30 +66,20 @@ kh.sh_with_progress(
 
 print(f"GGUF written: {gguf_path} ({gguf_path.stat().st_size / 1e9:.2f} GB)")
 
-# ── Phase 3: Reference dump ────────────────────────────────────────────────
-kh.report_status("running reference dump")
+# ── Phase 3: Tensor map dump (CPU-safe, no inference) ─────────────────────
+kh.report_status("dumping tensor map")
 ref_dir = OUTPUT / "reference"
 ref_script = str(REPO / "tools" / "reference_backends" / "kugelaudio.py")
-
-# This requires kugelaudio_open package or manual model loading
 try:
     kh.sh_with_progress(
         f"python {ref_script} "
         f"--model {model_dir} "
-        f"--text 'Hello, this is a test of the speech synthesis system.' "
-        f"--output-dir {ref_dir} "
-        f"--num-steps 20 --seed 42 --cfg-scale 3.0"
-    )
-    print(f"reference dump completed: {ref_dir}")
-except Exception as e:
-    print(f"reference dump failed (may need kugelaudio-open package): {e}")
-    # Fallback: just dump tensor map
-    kh.sh_with_progress(
-        f"python {ref_script} "
-        f"--model {MODEL_ID} "
         f"--output-dir {ref_dir} "
         f"--dump-tensor-map"
     )
+    print(f"tensor map dumped to {ref_dir}")
+except Exception as e:
+    print(f"tensor map dump failed: {e}")
 
 # ── Phase 4: Upload artifacts ───────────────────────────────────────────────
 kh.report_status("listing outputs")
