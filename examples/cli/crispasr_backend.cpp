@@ -25,6 +25,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_qwen3_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_qwen3_tts_base_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_orpheus_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_chatterbox_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_tada_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_indextts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_m2m100_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_t5_backend();
@@ -121,6 +122,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         name == "kartoffelbox_turbo" || name == "lahgtna" || name == "lahgtna-chatterbox" ||
         name == "lahgtna-chatterbox-v1")
         return crispasr_make_chatterbox_backend();
+    if (name == "tada" || name == "tada-tts" || name == "tada-3b" || name == "tada-3b-ml")
+        return crispasr_make_tada_backend();
     if (name == "indextts" || name == "indextts-1.5" || name == "indextts1.5" || name == "index-tts")
         return crispasr_make_indextts_backend();
     if (name == "kokoro" || name == "styletts2" || name == "styletts2-ljspeech" || name == "kokoro-tts")
