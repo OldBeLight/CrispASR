@@ -696,33 +696,58 @@ static ggml_cgraph* build_pred_head_graph(kugelaudio_context* ctx, int n_frames)
     ggml_tensor* cond = ggml_mul_mat(ctx0, G("model.prediction_head.cond_proj.weight"), condition);
 
     // Combined c = cond + t_emb (t_emb broadcasts over n_frames)
+    fprintf(stderr, "pred: t_emb=[%lld,%lld] x=[%lld,%lld] cond=[%lld,%lld]\n",
+            (long long)t_emb->ne[0],(long long)t_emb->ne[1],
+            (long long)x->ne[0],(long long)x->ne[1],
+            (long long)cond->ne[0],(long long)cond->ne[1]);
     ggml_tensor* c = ggml_add(ctx0, cond, t_emb);
+    fprintf(stderr, "pred: c=[%lld,%lld] OK\n", (long long)c->ne[0],(long long)c->ne[1]);
 
     // 4 HeadLayers: AdaLN(3-way) + SwiGLU FFN
     for (int i = 0; i < hp.head_layers; i++) {
         char base[128];
         snprintf(base, sizeof(base), "model.prediction_head.layers.%d", i);
+        fprintf(stderr, "pred: layer %d x=[%lld,%lld]\n", i, (long long)x->ne[0],(long long)x->ne[1]);
 
         // AdaLN: SiLU(c) → Linear → chunk(3) → (shift, scale, gate)
         ggml_tensor* c_silu = ggml_silu(ctx0, c);
-        ggml_tensor* adaln_out = ggml_mul_mat(ctx0, G(std::string(base) + ".adaLN_modulation.1.weight"), c_silu);
+        ggml_tensor* adaln_w = G(std::string(base) + ".adaLN_modulation.1.weight");
+        fprintf(stderr, "pred: L%d adaln_w=[%lld,%lld] c_silu=[%lld,%lld]\n", i,
+                (long long)adaln_w->ne[0],(long long)adaln_w->ne[1],
+                (long long)c_silu->ne[0],(long long)c_silu->ne[1]);
+        ggml_tensor* adaln_out = ggml_mul_mat(ctx0, adaln_w, c_silu);
+        fprintf(stderr, "pred: L%d adaln_out=[%lld,%lld]\n", i,
+                (long long)adaln_out->ne[0],(long long)adaln_out->ne[1]);
         size_t nb1 = adaln_out->nb[1];
         ggml_tensor* shift = ggml_view_2d(ctx0, adaln_out, d_lm, n_frames, nb1, 0);
         ggml_tensor* scale = ggml_view_2d(ctx0, adaln_out, d_lm, n_frames, nb1, (size_t)d_lm * sizeof(float));
         ggml_tensor* gate  = ggml_view_2d(ctx0, adaln_out, d_lm, n_frames, nb1, (size_t)2 * d_lm * sizeof(float));
+        fprintf(stderr, "pred: L%d shift=[%lld,%lld] scale=[%lld,%lld] gate=[%lld,%lld]\n", i,
+                (long long)shift->ne[0],(long long)shift->ne[1],
+                (long long)scale->ne[0],(long long)scale->ne[1],
+                (long long)gate->ne[0],(long long)gate->ne[1]);
 
         // RMSNorm(x) * (1 + scale) + shift
         ggml_tensor* h = ggml_rms_norm(ctx0, x, hp.diff_norm_eps);
-        h = ggml_mul(ctx0, h, G(std::string(base) + ".norm.weight"));
+        ggml_tensor* norm_w = G(std::string(base) + ".norm.weight");
+        fprintf(stderr, "pred: L%d h=[%lld,%lld] norm_w=[%lld,%lld]\n", i,
+                (long long)h->ne[0],(long long)h->ne[1],
+                (long long)norm_w->ne[0],(long long)norm_w->ne[1]);
+        h = ggml_mul(ctx0, h, norm_w);
+        fprintf(stderr, "pred: L%d after norm_mul OK\n", i);
         ggml_tensor* h_scaled = ggml_mul(ctx0, h, scale);
+        fprintf(stderr, "pred: L%d after scale_mul OK\n", i);
         h = ggml_add(ctx0, h, h_scaled);
+        fprintf(stderr, "pred: L%d after add(h, h_scaled) OK\n", i);
         h = ggml_add(ctx0, h, shift);
+        fprintf(stderr, "pred: L%d after add(h, shift) OK\n", i);
 
         // SwiGLU FFN
         h = core_ffn::swiglu(ctx0, h,
                              G(std::string(base) + ".ffn.gate_proj.weight"),
                              G(std::string(base) + ".ffn.up_proj.weight"),
                              G(std::string(base) + ".ffn.down_proj.weight"));
+        fprintf(stderr, "pred: L%d after swiglu OK\n", i);
 
         // gate * ffn + residual
         h = ggml_mul(ctx0, h, gate);
