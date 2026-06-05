@@ -609,7 +609,7 @@ static ggml_cgraph* moss_audio_build_encoder_graph(
     // Padding mask: (T_down, T_down) F16. For key positions that are padded,
     // the mask is -inf; for valid positions, 0. Used by flash_attn_ext.
     // Bidirectional (encoder), so all valid positions attend to all valid positions.
-    ggml_tensor* attn_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, T_down, T_down);
+    ggml_tensor* attn_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T_down, T_down);
     ggml_set_name(attn_mask, "attn_mask");
     ggml_set_input(attn_mask);
 
@@ -631,25 +631,27 @@ static ggml_cgraph* moss_audio_build_encoder_graph(
         ggml_tensor* V = ggml_mul_mat(ctx0, blk.attn_v_w, h);
         if (blk.attn_v_b) V = ggml_add(ctx0, V, blk.attn_v_b);
 
-        // Reshape for multi-head attention: (T, d) → (head_dim, T, n_heads)
+        // Reshape to (head_dim, n_heads, T), then permute to (hd, T, n_h)
         Q = ggml_reshape_3d(ctx0, Q, head_dim, n_heads, T_down);
-        Q = ggml_permute(ctx0, Q, 0, 2, 1, 3); // (head_dim, T, n_heads)
         K = ggml_reshape_3d(ctx0, K, head_dim, n_heads, T_down);
-        K = ggml_permute(ctx0, K, 0, 2, 1, 3);
         V = ggml_reshape_3d(ctx0, V, head_dim, n_heads, T_down);
-        V = ggml_permute(ctx0, V, 0, 2, 1, 3);
+        Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3)); // (hd, T, n_h)
+        K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
+        V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
 
-        // Bidirectional self-attention with padding mask
-        float scale = 1.0f / std::sqrt((float)head_dim);
-        ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, attn_mask, scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+        // Manual self-attention (matching qwen3_asr encoder pattern):
+        // scores = Q @ K^T, shape (T, T, n_heads)
+        float attn_scale = 1.0f / std::sqrt((float)head_dim);
+        ggml_tensor* scores = ggml_mul_mat(ctx0, K, Q); // (T, T, n_h)
+        scores = ggml_add(ctx0, scores, attn_mask);
+        scores = ggml_soft_max_ext(ctx0, scores, nullptr, attn_scale, 0.0f);
 
-        // Reshape back: flash_attn output is (head_dim, T, n_heads).
-        // Need (d=head_dim*n_heads, T) where for each T, all heads are
-        // concatenated. Permute to (head_dim, n_heads, T) first so
-        // reshape merges head_dim×n_heads into the fast axis.
-        attn = ggml_permute(ctx0, attn, 0, 2, 1, 3); // (head_dim, n_heads, T)
-        attn = ggml_cont(ctx0, attn);
+        // attn = scores @ V: permute V to (T, hd, n_h) for dot over T
+        ggml_tensor* V2 = ggml_cont(ctx0, ggml_permute(ctx0, V, 1, 0, 2, 3));
+        ggml_tensor* attn = ggml_mul_mat(ctx0, V2, scores); // (hd, T, n_h)
+
+        // Reshape: (hd, T, n_h) → (hd, n_h, T) → (d, T)
+        attn = ggml_cont(ctx0, ggml_permute(ctx0, attn, 0, 2, 1, 3));
         attn = ggml_reshape_2d(ctx0, attn, d, T_down);
 
         // Output projection
@@ -834,18 +836,18 @@ extern "C" float* moss_audio_run_encoder(struct moss_audio_context* ctx,
         ggml_tensor* mask_t = ggml_graph_get_tensor(gf, "attn_mask");
         if (mask_t) {
             int valid = valid_lens[c];
-            std::vector<ggml_fp16_t> mask_data((size_t)T_chunk_down * T_chunk_down);
-            const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
-            const ggml_fp16_t neginf_h = ggml_fp32_to_fp16(-INFINITY);
+            std::vector<float> mask_data((size_t)T_chunk_down * T_chunk_down);
             for (int q = 0; q < T_chunk_down; q++) {
                 for (int k = 0; k < T_chunk_down; k++) {
-                    // Both query and key must be valid (< valid)
+                    // Mask: valid queries attend to valid keys only.
+                    // Padded queries attend to ALL keys (avoid NaN softmax;
+                    // their output is discarded anyway).
                     mask_data[(size_t)q * T_chunk_down + k] =
-                        (q < valid && k < valid) ? zero_h : neginf_h;
+                        (q >= valid) ? 0.0f : (k < valid ? 0.0f : -INFINITY);
                 }
             }
             ggml_backend_tensor_set(mask_t, mask_data.data(), 0,
-                                    mask_data.size() * sizeof(ggml_fp16_t));
+                                    mask_data.size() * sizeof(float));
         }
 
         // Set positional embedding for this chunk
