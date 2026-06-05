@@ -4744,45 +4744,110 @@ int main(int argc, char** argv) {
 
         // Run full synthesis and capture audio
         int n_audio = 0;
-        float* audio_out = kugelaudio_synthesize(ctx, syn_text.c_str(), &n_audio);
+        // ── Per-stage comparisons using reference inputs ────────────
 
-        for (const char* stage : diff_stages) {
-            auto ref_shape = ref.shape(stage);
-            if (ref_shape.empty()) {
-                printf("[SKIP] %-22s (not in reference archive)\n", stage);
-                n_skip++;
-                continue;
-            }
-
-            // For stages we can compare directly from reference:
-            if (strcmp(stage, "decoded_audio") == 0 && audio_out && n_audio > 0) {
-                int ref_n = 1;
-                for (auto s : ref_shape) ref_n *= s;
-                int cmp_n = std::min(n_audio, ref_n);
-                auto r = compare_with_row_width(ref, stage, audio_out, cmp_n, cmp_n);
-                float threshold = COS_TTS_AUDIO;
-                print_row(stage, r, threshold);
-                if (r.found) {
-                    if (r.is_pass(threshold)) n_pass++; else n_fail++;
-                } else n_skip++;
-            } else if (strcmp(stage, "text_token_ids") == 0) {
-                // Token IDs: exact match check, not cosine
-                auto pair = ref.get_f32(stage);
-                if (pair.first && pair.second > 0) {
-                    printf("[INFO] %-22s ref has %zu tokens\n", stage, pair.second);
+        // 1. Diffusion head: feed ref condition + ref noise → compare pred output
+        {
+            auto cond_pair = ref.get_f32("lm_hidden_last");
+            auto noisy_pair = ref.get_f32("diff_step0_noisy");
+            auto ref_out = ref.get_f32("pred_output_step0");
+            if (cond_pair.first && noisy_pair.first && ref_out.first) {
+                // Get first timestep from reference
+                // Default: step 0 of 20-step schedule = timestep 999
+                int timestep = 999;
+                int out_dim = 0;
+                float* cpp_out = kugelaudio_run_diffusion_step(ctx,
+                    noisy_pair.first, (int)noisy_pair.second,
+                    timestep,
+                    cond_pair.first, (int)cond_pair.second,
+                    &out_dim);
+                if (cpp_out && out_dim > 0) {
+                    auto r = compare_with_row_width(ref, "pred_output_step0",
+                        cpp_out, out_dim, out_dim);
+                    print_row("pred_output_step0", r, COS_THRESHOLD);
+                    if (r.found) {
+                        if (r.is_pass(COS_THRESHOLD)) n_pass++; else n_fail++;
+                    } else n_skip++;
+                    free(cpp_out);
+                } else {
+                    printf("[SKIP] %-22s (C++ diffusion step returned null)\n", "pred_output_step0");
                     n_skip++;
-                } else n_skip++;
+                }
             } else {
-                // Stages that need per-stage C++ API (not yet wired for all):
-                // lm_hidden_last, pred_*, diff_step0_*, diffusion_latent, scaled_latent
-                // These require kugelaudio_run_diffusion_step etc.
-                // For now, skip with a note
-                printf("[SKIP] %-22s (C++ stage API not wired yet)\n", stage);
+                printf("[SKIP] %-22s (ref inputs missing)\n", "pred_output_step0");
                 n_skip++;
             }
         }
 
-        if (audio_out) free(audio_out);
+        // 2. Acoustic decoder: feed ref scaled_latent → compare decoded audio
+        {
+            auto lat_pair = ref.get_f32("scaled_latent");
+            if (lat_pair.first && lat_pair.second > 0) {
+                int dec_n = 0;
+                float* dec_out = kugelaudio_run_acoustic_decoder(ctx,
+                    lat_pair.first, (int)lat_pair.second, &dec_n);
+                if (dec_out && dec_n > 0) {
+                    // Compare against ref decoded_audio
+                    auto ref_audio = ref.get_f32("decoded_audio");
+                    if (ref_audio.first && ref_audio.second > 0) {
+                        int cmp_n = std::min((size_t)dec_n, ref_audio.second);
+                        // Use row_w = full vector for single cos
+                        auto r = compare_with_row_width(ref, "decoded_audio",
+                            dec_out, cmp_n, cmp_n);
+                        print_row("vae_from_ref_latent", r, COS_TTS_AUDIO,
+                            "  (C++ VAE fed Python's scaled_latent)");
+                        if (r.found) {
+                            if (r.is_pass(COS_TTS_AUDIO)) n_pass++; else n_fail++;
+                        } else n_skip++;
+                    } else n_skip++;
+                    free(dec_out);
+                } else {
+                    printf("[SKIP] %-22s (C++ decoder returned null)\n", "vae_from_ref_latent");
+                    n_skip++;
+                }
+            } else {
+                printf("[SKIP] %-22s (scaled_latent not in ref)\n", "vae_from_ref_latent");
+                n_skip++;
+            }
+        }
+
+        // 3. End-to-end: run full synthesis, compare audio (different seed → low cos expected)
+        {
+            float* audio_out = kugelaudio_synthesize(ctx, syn_text.c_str(), &n_audio);
+            if (audio_out && n_audio > 0) {
+                auto ref_audio_pair = ref.get_f32("decoded_audio");
+                if (ref_audio_pair.first && ref_audio_pair.second > 0) {
+                    int cmp_n = std::min((size_t)n_audio, ref_audio_pair.second);
+                    auto r = compare_with_row_width(ref, "decoded_audio",
+                        audio_out, cmp_n, cmp_n);
+                    print_row("e2e_decoded_audio", r, COS_TTS_AUDIO,
+                        "  (full e2e, Q4_K no CFG vs F16+CFG)");
+                    if (r.found) {
+                        if (r.is_pass(COS_TTS_AUDIO)) n_pass++; else n_fail++;
+                    } else n_skip++;
+                } else n_skip++;
+                free(audio_out);
+            } else {
+                printf("[SKIP] %-22s (synthesis returned no audio)\n", "e2e_decoded_audio");
+                n_skip++;
+            }
+        }
+
+        // 4. Report skipped ref-only stages
+        for (const char* stage : diff_stages) {
+            if (strcmp(stage, "pred_output_step0") == 0 || strcmp(stage, "decoded_audio") == 0)
+                continue;
+            auto ref_shape = ref.shape(stage);
+            if (ref_shape.empty()) {
+                printf("[SKIP] %-22s (not in reference archive)\n", stage);
+            } else {
+                printf("[INFO] %-22s ref shape=[", stage);
+                for (size_t i = 0; i < ref_shape.size(); i++)
+                    printf("%s%d", i ? "," : "", ref_shape[i]);
+                printf("]  (stage comparison not yet wired)\n");
+            }
+            n_skip++;
+        }
         kugelaudio_free(ctx);
 #else
         fprintf(stderr, "crispasr-diff: kugelaudio backend not compiled in\n");
