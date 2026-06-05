@@ -58,6 +58,7 @@ All 52 backends compiled into the `crispasr` binary, with their declared capabil
 | `omniasr-llm-1b` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ | ✓ |  | ✓ | ✓ |  |  |  |  |
 | `mimo-asr` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ | ✓ |  |  | ✓ | ✓ |  |  |  |  |
 | `moss-audio` |  |  |  |  |  |  |  | ✓ |  |  |  |  |  | ✓ |  | ✓ |  |  |  |
+| `kugelaudio` | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `funasr` |  |  |  |  |  | ✓ |  | ✓ |  |  |  |  | ✓ | ✓ | ✓ |  |  |  |  |
 | `fun-asr-mlt-nano` |  |  |  |  |  | ✓ |  | ✓ |  |  |  |  | ✓ | ✓ | ✓ |  |  |  |  |
 | `paraformer` |  |  |  |  |  | ✓ |  |  |  |  |  |  | ✓ | ✓ | ✓ |  |  |  |  |

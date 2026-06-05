@@ -37,6 +37,7 @@ at `tools/reference_backends/<name>.py`, add an env spec at
 | `lid-glotlid` | `tools/reference_backends/lid_glotlid.py` | — | — | yes | fasttext |
 | `mimo-asr` | `tools/reference_backends/mimo_asr.py` | `/Volumes/backups/ai/mimo-asr-ref.gguf` | 2026-05-01 | yes | torch, torchaudio, transformers |
 | `moss-audio` | `tools/reference_backends/moss_audio.py` | `cstr/MOSS-Audio-4B-Instruct-GGUF` | 2026-06-05 | yes | torch, transformers==4.57.1, safetensors |
+| `kugelaudio` | `tools/reference_backends/kugelaudio.py` | — | — | yes | torch, safetensors |
 | `mimo-tokenizer` | `tools/reference_backends/mimo_tokenizer.py` | — | — | yes | torch, torchaudio |
 | `moonshine` | `tools/reference_backends/moonshine.py` | — | — | yes | torch, transformers |
 | `moonshine-base` | `tools/reference_backends/moonshine.py` | — | — | **no** | torch, transformers |

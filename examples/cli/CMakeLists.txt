@@ -279,6 +279,7 @@ target_link_libraries(${TARGET} PRIVATE
     canary_ctc
     wav2vec2-ggml
     vibevoice
+    kugelaudio
     silero-lid
     pyannote-seg
     funasr
