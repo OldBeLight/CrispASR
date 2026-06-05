@@ -4787,12 +4787,21 @@ int main(int argc, char** argv) {
                 float* dec_out = kugelaudio_run_acoustic_decoder(ctx,
                     lat_pair.first, (int)lat_pair.second, &dec_n);
                 if (dec_out && dec_n > 0) {
-                    // Compare against ref decoded_audio
-                    auto ref_audio = ref.get_f32("decoded_audio");
-                    if (ref_audio.first && ref_audio.second > 0) {
-                        int cmp_n = std::min((size_t)dec_n, ref_audio.second);
-                        // Use row_w = full vector for single cos
-                        auto r = compare_with_row_width(ref, "decoded_audio",
+                    printf("[INFO] vae_from_ref_latent  C++ produced %d samples from %zu-elem latent\n",
+                           dec_n, lat_pair.second);
+                    // Compare against dec_full_out (single-frame Python decode), NOT decoded_audio (full synthesis)
+                    auto ref_vae = ref.get_f32("dec_full_out");
+                    const char* ref_key = "dec_full_out";
+                    if (!ref_vae.first || ref_vae.second == 0) {
+                        // Fallback to decoded_audio if dec_full_out not available
+                        ref_vae = ref.get_f32("decoded_audio");
+                        ref_key = "decoded_audio";
+                    }
+                    if (ref_vae.first && ref_vae.second > 0) {
+                        int cmp_n = std::min((size_t)dec_n, ref_vae.second);
+                        printf("[INFO] vae_from_ref_latent  comparing %d samples against %s (%zu samples)\n",
+                               cmp_n, ref_key, ref_vae.second);
+                        auto r = compare_with_row_width(ref, ref_key,
                             dec_out, cmp_n, cmp_n);
                         print_row("vae_from_ref_latent", r, COS_TTS_AUDIO,
                             "  (C++ VAE fed Python's scaled_latent)");
