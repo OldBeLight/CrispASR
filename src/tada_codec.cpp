@@ -400,10 +400,12 @@ static ggml_cgraph* build_decode_graph(tada_codec_context* c, int n_frames) {
     ggml_set_name(dump_proj, "dump_proj");
     ggml_build_forward_expand(gf, dump_proj);
 
-    // 2. Local attention encoder (6 layers)
-    // NOTE: Simplified — no block-attention mask for now (full self-attention).
-    // The v2 block attention mask is an optimization for quality but not
-    // required for basic functionality.
+    // 2. Local attention encoder (6 layers) with v2 block attention mask
+    // Mask input: (T, T) F16 — True=masked, False=attend. Built from token_masks on CPU.
+    ggml_tensor* attn_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_frames, n_frames);
+    ggml_set_name(attn_mask, "attn_mask");
+    ggml_set_input(attn_mask);
+
     for (int il = 0; il < c->n_attn_layers; il++) {
         const auto& l = c->attn_layers[il];
 
@@ -444,7 +446,7 @@ static ggml_cgraph* build_decode_graph(tada_codec_context* c, int n_frames) {
         // Attention: softmax(Q @ K^T / sqrt(hd)) @ V
         float scale = 1.0f / std::sqrt((float)hd);
         ggml_tensor* attn = ggml_flash_attn_ext(ctx0, q, k, v,
-                                                  /*mask*/nullptr, scale, 0, 0);
+                                                  attn_mask, scale, 0, 0);
         // Result: (hd, T, nh) → reshape to (d, T)
         attn = ggml_cont(ctx0, attn);
         attn = ggml_reshape_2d(ctx0, attn, d, n_frames);
@@ -576,7 +578,7 @@ struct tada_codec_context* tada_codec_init_from_file(const char* path, int n_thr
 
 float* tada_codec_decode(struct tada_codec_context* ctx,
                          const float* features, int n_frames,
-                         const int32_t* /*token_masks*/,
+                         const int32_t* token_masks,
                          int* out_n_samples) {
     if (!ctx || !features || n_frames <= 0) return nullptr;
 
@@ -605,6 +607,33 @@ float* tada_codec_decode(struct tada_codec_context* ctx,
         ggml_backend_tensor_set(pos_t, positions.data(), 0,
                                  (size_t)n_frames * sizeof(int32_t));
     }
+    // Build v2 block attention mask from token_masks
+    ggml_tensor* mask_t = ggml_graph_get_tensor(gf, "attn_mask");
+    if (mask_t) {
+        // Compute block IDs: cumsum(token_masks) - token_masks
+        std::vector<int32_t> block_ids(n_frames);
+        int block = 0;
+        for (int i = 0; i < n_frames; i++) {
+            if (token_masks[i]) block++;
+            block_ids[i] = block - (token_masks[i] ? 1 : 0);
+        }
+
+        // Build mask: can_attend[i][j] = (block_ids[j] == block_ids[i]) || (block_ids[j] == block_ids[i]-1)
+        // ggml_flash_attn_ext mask: 0.0 = attend, -inf = masked
+        std::vector<ggml_fp16_t> mask_data((size_t)n_frames * n_frames);
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+        for (int i = 0; i < n_frames; i++) {
+            for (int j = 0; j < n_frames; j++) {
+                bool same = (block_ids[j] == block_ids[i]);
+                bool prev = (block_ids[j] == block_ids[i] - 1);
+                mask_data[(size_t)i * n_frames + j] = (same || prev) ? zero : neg_inf;
+            }
+        }
+        ggml_backend_tensor_set(mask_t, mask_data.data(), 0,
+                                 mask_data.size() * sizeof(ggml_fp16_t));
+    }
+
     if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "tada-codec: graph compute failed\n");
         ggml_backend_sched_free(sched);
