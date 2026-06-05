@@ -95,6 +95,55 @@ public:
         if (!ctx_)
             return false;
 
+        // Load BERT companion model for contextual conditioning.
+        // Sources (in priority order):
+        //   1. --codec-model <path>  (explicit)
+        //   2. MELOTTS_BERT env var
+        //   3. bert-base-uncased.gguf next to the melotts model
+        //   4. Auto-download from registry companion
+        {
+            std::string bert_path;
+            if (!p.tts_codec_model.empty()) {
+                bert_path = p.tts_codec_model;
+            } else {
+                const char* env = std::getenv("MELOTTS_BERT");
+                if (env && *env) {
+                    bert_path = env;
+                } else {
+                    // Look next to the melotts model
+                    std::string model_dir = p.model;
+                    size_t sep = model_dir.find_last_of("/\\");
+                    if (sep != std::string::npos)
+                        model_dir.resize(sep + 1);
+                    else
+                        model_dir = "./";
+                    std::string candidate = model_dir + "bert-base-uncased.gguf";
+                    FILE* test = fopen(candidate.c_str(), "rb");
+                    if (test) {
+                        fclose(test);
+                        bert_path = candidate;
+                    }
+                    // Also try the cache dir
+                    if (bert_path.empty() && !p.cache_dir.empty()) {
+                        candidate = p.cache_dir + "/bert-base-uncased.gguf";
+                        test = fopen(candidate.c_str(), "rb");
+                        if (test) {
+                            fclose(test);
+                            bert_path = candidate;
+                        }
+                    }
+                }
+            }
+            if (!bert_path.empty()) {
+                if (melotts_load_bert(ctx_, bert_path.c_str())) {
+                    if (!p.no_prints)
+                        fprintf(stderr, "melotts: BERT conditioning enabled\n");
+                } else if (!p.no_prints) {
+                    fprintf(stderr, "melotts: BERT model not loaded (quality will be reduced)\n");
+                }
+            }
+        }
+
         // Try to load OpenVoice2 TCC model for voice cloning.
         // Look for openvoice2-tcc-*.gguf next to the melotts model.
         if (!p.tts_voice.empty()) {
@@ -117,7 +166,8 @@ public:
                     ov2_ctx_ = openvoice2_init_from_file(tcc_path.c_str(), cp);
                     if (ov2_ctx_) {
                         const char* dd = std::getenv("OV2_DUMP_DIR");
-                        if (dd) openvoice2_set_dump_dir(ov2_ctx_, dd);
+                        if (dd)
+                            openvoice2_set_dump_dir(ov2_ctx_, dd);
                         if (!p.no_prints)
                             fprintf(stderr, "melotts: OpenVoice2 TCC loaded from '%s'\n", tcc_path.c_str());
                     }

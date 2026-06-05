@@ -600,10 +600,14 @@ constexpr Entry k_registry[] = {
     // V3: 1 speaker (EN-Newest), 219 symbols, 16 tones (newest checkpoint).
     {"melotts", "melotts-en-v2-f16.gguf",
      "https://huggingface.co/cstr/melotts-en-v2-GGUF/resolve/main/melotts-en-v2-f16.gguf",
-     "~97 MB", nullptr, nullptr},
+     "~97 MB",
+     "bert-base-uncased.gguf",
+     "https://huggingface.co/cstr/melotts-en-v2-GGUF/resolve/main/bert-base-uncased.gguf"},
     {"melotts-v3", "melotts-en-v3-f16.gguf",
      "https://huggingface.co/cstr/melotts-en-v3-GGUF/resolve/main/melotts-en-v3-f16.gguf",
-     "~93 MB", nullptr, nullptr},
+     "~93 MB",
+     "bert-base-uncased.gguf",
+     "https://huggingface.co/cstr/melotts-en-v3-GGUF/resolve/main/bert-base-uncased.gguf"},
 
     // SpeechT5 TTS: 80M param AR mel decoder + HiFi-GAN vocoder.
     // MIT license (microsoft/speecht5_tts). Needs a 512-d x-vector for

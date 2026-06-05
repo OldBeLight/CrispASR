@@ -2317,6 +2317,27 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
             delete s;
             return nullptr;
         }
+        // Try to load BERT companion from MELOTTS_BERT env var or
+        // bert-base-uncased.gguf next to the model.
+        {
+            const char* bert_env = std::getenv("MELOTTS_BERT");
+            std::string bert_path;
+            if (bert_env && *bert_env) {
+                bert_path = bert_env;
+            } else {
+                std::string mp = model_path;
+                size_t sep = mp.find_last_of("/\\");
+                std::string dir = (sep != std::string::npos) ? mp.substr(0, sep + 1) : "./";
+                std::string candidate = dir + "bert-base-uncased.gguf";
+                FILE* test = fopen(candidate.c_str(), "rb");
+                if (test) {
+                    fclose(test);
+                    bert_path = candidate;
+                }
+            }
+            if (!bert_path.empty())
+                melotts_load_bert(s->melotts_ctx, bert_path.c_str());
+        }
         return s;
     }
 #endif
