@@ -1041,16 +1041,39 @@ extern "C" float* kugelaudio_synthesize(struct kugelaudio_context* ctx,
 
     // ── 1. Tokenize ────────────────────────────────────────────────────
     // Build prompt template matching KugelAudio training format:
-    //   " Transform the text provided by..." + " Text input:\n" +
-    //   " Speaker 0: <text>\n" + " Speech output:\n" + speech_start_token
+    //   system_prompt + [voice_input section if voice loaded] + text_input + speech_output + speech_start
     std::string system_prompt = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n";
-    std::string text_section = " Text input:\n Speaker 0: " + std::string(text) + "\n Speech output:\n";
-    std::string full_prompt = system_prompt + text_section;
 
-    // Tokenize using Qwen2.5 BPE vocabulary
+    bool has_voice = (ctx->n_voice_frames > 0 && !ctx->voice_acoustic_mean.empty());
+
+    // Voice input section: " Voice input:\n Speaker 0:" + [VAE placeholders] + "\n"
+    std::string voice_section;
+    if (has_voice) {
+        voice_section = " Voice input:\n Speaker 0:";
+        // The VAE placeholder tokens will be replaced with voice embeddings after tokenization
+    }
+
+    std::string text_section = " Text input:\n Speaker 0: " + std::string(text) + "\n Speech output:\n";
+    std::string full_prompt = system_prompt + voice_section;
+
+    // Tokenize the text parts
     std::vector<int32_t> token_ids;
     if (!ctx->model.vocab.empty()) {
         token_ids = tokenize_text_greedy(ctx->model, full_prompt.c_str());
+    }
+
+    // Insert voice placeholder tokens (speech_diffusion_id) for voice frames
+    int voice_token_start = -1;
+    if (has_voice) {
+        voice_token_start = (int)token_ids.size();
+        for (int i = 0; i < ctx->n_voice_frames; i++)
+            token_ids.push_back(hp.speech_diffusion_id); // placeholder
+        // Tokenize newline + text section
+        auto rest_ids = tokenize_text_greedy(ctx->model, ("\n" + text_section).c_str());
+        token_ids.insert(token_ids.end(), rest_ids.begin(), rest_ids.end());
+    } else {
+        auto rest_ids = tokenize_text_greedy(ctx->model, text_section.c_str());
+        token_ids.insert(token_ids.end(), rest_ids.begin(), rest_ids.end());
     }
 
     if (token_ids.empty()) {
@@ -1123,6 +1146,53 @@ extern "C" float* kugelaudio_synthesize(struct kugelaudio_context* ctx,
     if (!run_embed_lookup(token_ids.data(), n_prompt, prompt_embeds)) {
         fprintf(stderr, "kugelaudio: embedding lookup failed\n");
         return nullptr;
+    }
+
+    // ── 3b. Replace voice placeholder embeddings with connector output ─
+    if (has_voice && voice_token_start >= 0) {
+        // Scale voice latents: (acoustic_mean + bias) * scaling
+        int vae_dim = hp.vae_dim_acoustic;
+        std::vector<float> scaled_voice(ctx->n_voice_frames * vae_dim);
+        for (int i = 0; i < ctx->n_voice_frames * vae_dim; i++) {
+            scaled_voice[i] = (ctx->voice_acoustic_mean[i] + hp.speech_bias_factor) * hp.speech_scaling_factor;
+        }
+
+        // Run acoustic connector on each voice frame
+        for (int fi = 0; fi < ctx->n_voice_frames; fi++) {
+            size_t mem = ctx->compute_meta.size();
+            ggml_init_params ip = {mem, ctx->compute_meta.data(), true};
+            ggml_context* ctx0 = ggml_init(ip);
+            ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 256, false);
+
+            ggml_tensor* lat_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, vae_dim);
+            ggml_set_name(lat_in, "conn_in");
+            ggml_set_input(lat_in);
+
+            ggml_tensor* h = ggml_mul_mat(ctx0, G("model.acoustic_connector.fc1.weight"), lat_in);
+            if (auto* b = G("model.acoustic_connector.fc1.bias")) h = ggml_add(ctx0, h, b);
+            h = ggml_rms_norm(ctx0, h, 1e-6f);
+            h = ggml_mul(ctx0, h, G("model.acoustic_connector.norm.weight"));
+            h = ggml_mul_mat(ctx0, G("model.acoustic_connector.fc2.weight"), h);
+            if (auto* b = G("model.acoustic_connector.fc2.bias")) h = ggml_add(ctx0, h, b);
+
+            ggml_set_name(h, "conn_out");
+            ggml_set_output(h);
+            ggml_build_forward_expand(gf, h);
+
+            ggml_backend_sched_reset(ctx->sched);
+            if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) break;
+            ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "conn_in"),
+                                    &scaled_voice[fi * vae_dim], 0, vae_dim * sizeof(float));
+            if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) break;
+
+            // Replace embedding at voice_token_start + fi
+            int emb_offset = (voice_token_start + fi) * hp.d_lm;
+            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "conn_out"),
+                                    &prompt_embeds[emb_offset], 0, hp.d_lm * sizeof(float));
+        }
+        if (ctx->params.verbosity >= 1) {
+            fprintf(stderr, "kugelaudio: injected %d voice frames into prompt\n", ctx->n_voice_frames);
+        }
     }
 
     // ── 4. AR decode loop ──────────────────────────────────────────────
@@ -1463,8 +1533,49 @@ extern "C" float* kugelaudio_run_acoustic_decoder(struct kugelaudio_context* ctx
 }
 
 extern "C" int kugelaudio_load_voice(struct kugelaudio_context* ctx, const char* voice_path) {
-    // TODO: Load pre-encoded voice GGUF with acoustic_mean tensor
-    (void)ctx; (void)voice_path;
-    fprintf(stderr, "kugelaudio: voice loading not yet implemented\n");
-    return -1;
+    if (!ctx || !voice_path) return -1;
+
+    // Load voice GGUF (small file: just acoustic_mean tensor + metadata)
+    gguf_context* gctx = core_gguf::open_metadata(voice_path);
+    if (!gctx) {
+        fprintf(stderr, "kugelaudio: failed to open voice GGUF: %s\n", voice_path);
+        return -1;
+    }
+
+    int n_frames = core_gguf::kv_u32(gctx, "kugelaudio.voice.n_frames", 0);
+    int vae_dim = core_gguf::kv_u32(gctx, "kugelaudio.voice.vae_dim", ctx->model.hp.vae_dim_acoustic);
+    gguf_free(gctx);
+
+    if (n_frames == 0) {
+        fprintf(stderr, "kugelaudio: voice GGUF has 0 frames\n");
+        return -1;
+    }
+
+    // Load tensor data
+    core_gguf::WeightLoad wl;
+    if (!core_gguf::load_weights(voice_path, ctx->backend, "kugelaudio-voice", wl)) {
+        fprintf(stderr, "kugelaudio: failed to load voice weights\n");
+        return -1;
+    }
+
+    ggml_tensor* am = core_gguf::try_get(wl.tensors, "voice.acoustic_mean");
+    if (!am) {
+        fprintf(stderr, "kugelaudio: voice GGUF missing voice.acoustic_mean tensor\n");
+        core_gguf::free_weights(wl);
+        return -1;
+    }
+
+    // Copy to host
+    int total = n_frames * vae_dim;
+    ctx->voice_acoustic_mean.resize(total);
+    ggml_backend_tensor_get(am, ctx->voice_acoustic_mean.data(), 0, total * sizeof(float));
+    ctx->n_voice_frames = n_frames;
+
+    core_gguf::free_weights(wl);
+
+    if (ctx->params.verbosity >= 1) {
+        fprintf(stderr, "kugelaudio: loaded voice from %s (%d frames, vae_dim=%d)\n",
+                voice_path, n_frames, vae_dim);
+    }
+    return 0;
 }
