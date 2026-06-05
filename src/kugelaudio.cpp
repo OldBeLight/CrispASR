@@ -1426,7 +1426,9 @@ extern "C" float* kugelaudio_synthesize(struct kugelaudio_context* ctx,
             std::vector<float> x0_prev(vae_dim, 0.0f);
             std::vector<float> x0_cur(vae_dim, 0.0f);
 
+            fprintf(stderr, "kugelaudio: starting %d diffusion steps\n", tts_steps);
             for (int si = 0; si < tts_steps; si++) {
+                fprintf(stderr, "kugelaudio: diff step %d/%d t=%d\n", si, tts_steps, sched.timesteps[si]);
                 // Compute sinusoidal timestep embedding
                 float t_val = (float)sched.timesteps[si];
                 std::vector<float> t_sin(256);
@@ -1447,10 +1449,12 @@ extern "C" float* kugelaudio_synthesize(struct kugelaudio_context* ctx,
                 ggml_backend_tensor_set(ggml_graph_get_tensor(pred_gf, "pred_condition"),
                                         hidden_state.data(), 0, hp.d_lm * sizeof(float));
 
+                fprintf(stderr, "kugelaudio: diff step %d pred compute...\n", si);
                 if (ggml_backend_sched_graph_compute(ctx->sched, pred_gf) != GGML_STATUS_SUCCESS) {
                     fprintf(stderr, "kugelaudio: pred head compute failed at step %d\n", si);
                     break;
                 }
+                fprintf(stderr, "kugelaudio: diff step %d pred OK\n", si);
 
                 std::vector<float> v_pred(vae_dim);
                 ggml_backend_tensor_get(ggml_graph_get_tensor(pred_gf, "pred_output"),
