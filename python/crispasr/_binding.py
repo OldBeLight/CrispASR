@@ -1377,7 +1377,7 @@ class Session:
             self._lib.crispasr_session_result_free(res)
 
     # ---------------------------------------------------------------------
-    # TTS synthesis (vibevoice, qwen3-tts, kokoro, orpheus, chatterbox, outetts, indextts, voxcpm2, csm, dia, bark, speecht5, parler-tts, pocket-tts)
+    # TTS synthesis (vibevoice, qwen3-tts, kokoro, orpheus, chatterbox, outetts, indextts, voxcpm2, csm, dia, bark, speecht5, parler-tts, pocket-tts, kugelaudio)
     # ---------------------------------------------------------------------
 
     def set_codec_path(self, path: str) -> None:
@@ -2013,7 +2013,7 @@ class Session:
         ``kokoro``, ``orpheus``, ``chatterbox``, ``indextts``, ``voxcpm2-tts``,
         ``csm``, ``dia``, ``fastpitch``, ``speecht5``, ``melotts``, ``piper``,
         ``parler-tts``, ``outetts``, ``cosyvoice3-tts``, ``pocket-tts``,
-        ``f5-tts``, ``bark``.
+        ``f5-tts``, ``bark``, ``kugelaudio``.
         For qwen3-tts call :meth:`set_codec_path` and one of:
 
         * :meth:`set_voice` — Base variants (WAV + ref_text, or voice-pack GGUF)

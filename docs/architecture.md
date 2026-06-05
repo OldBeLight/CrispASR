@@ -667,6 +667,18 @@ HiFT vocoder (NSF + iSTFT) @ 24 kHz. Supports 9 languages + 18 Chinese
 dialects. Zero-shot voice cloning via baked voice packs. Three separate GGUFs:
 LLM, flow, HiFT.
 
+### kugelaudio
+
+KugelAudio-0-Open (MIT, 23 languages): hybrid AR + diffusion TTS based on
+VibeVoice. Qwen2.5-7B language model (28L, 3584d, GQA 28/4) generates
+constrained tokens; on `speech_diffusion` token, a 4-layer DiT prediction
+head (AdaLN + SwiGLU, v-prediction) runs 20-step SDE-DPMSolver++ with
+cosine beta schedule to produce 64-dim acoustic latents. An acoustic VAE
+decoder (6-stage ConvNeXt with depthwise conv mixer, transposed-conv
+upsample ratios [8,5,5,4,2,2] = 3200×) converts latents to 24 kHz mono
+PCM. Pre-encoded voice embeddings (acoustic connector: FC1→RMSNorm→FC2)
+inject speaker identity into the LM input sequence.
+
 ### pocket-tts
 
 Kyutai Pocket TTS: Llama-1B backbone (causal LM) generating Mimi RVQ codec
