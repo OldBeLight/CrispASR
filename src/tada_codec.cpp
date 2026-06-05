@@ -486,11 +486,17 @@ static ggml_cgraph* build_decode_graph(tada_codec_context* c, int n_frames) {
     // 3. DAC decoder
     // Input conv: (1024, T) → (1536, T)
     cur = wn_conv1d(ctx0, cur, c->in_conv, /*dilation*/1);
+    ggml_tensor* dump_dac_in = ggml_cont(ctx0, cur);
+    ggml_set_name(dump_dac_in, "dump_dac_in");
+    ggml_build_forward_expand(gf, dump_dac_in);
 
     // 4 decoder blocks with strides [4,4,5,6]
     for (int b = 0; b < 4; b++) {
         cur = dec_block(ctx0, cur, c->blocks[b], c->strides[b]);
     }
+    ggml_tensor* dump_dac_out = ggml_cont(ctx0, cur);
+    ggml_set_name(dump_dac_out, "dump_dac_out");
+    ggml_build_forward_expand(gf, dump_dac_out);
 
     // Output: Snake → Conv1d(96, 1, k=7) → Tanh
     cur = snake1d(ctx0, cur, c->out_snake_alpha, c->out_inv_snake_alpha);
@@ -617,6 +623,8 @@ float* tada_codec_decode(struct tada_codec_context* ctx,
     };
     dump("dump_proj");
     dump("dump_attn");
+    dump("dump_dac_in");
+    dump("dump_dac_out");
 
     ggml_tensor* pcm_t = ggml_graph_get_tensor(gf, "pcm");
     int n_samples = (int)ggml_nelements(pcm_t);

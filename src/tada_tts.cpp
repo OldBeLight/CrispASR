@@ -1153,6 +1153,17 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "tada: %zu acoustic frames, %zu time values\n",
                 acoustic_features.size(), time_before_list.size());
+        // Dump feature stats for debugging
+        for (size_t i = 0; i < acoustic_features.size(); i++) {
+            float rms = 0;
+            for (int d = 0; d < ad; d++) rms += acoustic_features[i][d] * acoustic_features[i][d];
+            rms = std::sqrt(rms / ad);
+            bool is_prompt = (ctx->n_prompt > 0 && (int)i < ctx->n_prompt);
+            if (i < 5 || i >= acoustic_features.size() - 3) {
+                fprintf(stderr, "  feat[%zu] rms=%.4f %s\n", i, rms,
+                        is_prompt ? "(prompt)" : "(generated)");
+            }
+        }
     }
 
     // ── Denormalize and expand ──
