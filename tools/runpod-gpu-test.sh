@@ -137,8 +137,8 @@ echo "=== Running mimo-asr GPU test ==="
 $SSH << 'REMOTE'
 export LD_LIBRARY_PATH=/runpod-volume/build/src:/runpod-volume/build/ggml/src:/runpod-volume/build/ggml/src/ggml-cuda
 CLI=/runpod-volume/build/bin/crispasr
-CRISPASR_MIMO_FORCE_GPU=1 MIMO_ASR_BENCH=1 \
-  $CLI --backend mimo-asr -m auto --auto-download --cache-dir /runpod-volume/cache --gpu \
+MIMO_ASR_BENCH=1 \
+  $CLI --backend mimo-asr -m auto --auto-download --cache-dir /runpod-volume/cache \
   -f /runpod-volume/CrispASR/samples/jfk.wav -otxt -of /tmp/mimo-gpu 2>&1 | tail -15
 echo "=== GPU transcript ==="
 cat /tmp/mimo-gpu.txt 2>/dev/null || echo "(empty)"
