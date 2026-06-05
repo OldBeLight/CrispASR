@@ -827,14 +827,17 @@ static ggml_cgraph* build_vae_decoder_graph(kugelaudio_context* ctx, int n_frame
     const auto& ratios = hp.decoder_ratios;
 
     // Stage 0: stem conv (SConv1d, stride=1)
+    fprintf(stderr, "dec: stem inp=[%lld,%lld]\n", (long long)h->ne[0],(long long)h->ne[1]);
     h = build_causal_conv1d(ctx0, h,
         G("model.acoustic_tokenizer.decoder.upsample_layers.0.0.conv.conv.weight"),
         G("model.acoustic_tokenizer.decoder.upsample_layers.0.0.conv.conv.bias"), 1);
+    fprintf(stderr, "dec: stem out=[%lld,%lld]\n", (long long)h->ne[0],(long long)h->ne[1]);
 
     // Stage 0 blocks
     for (int bi = 0; bi < depths[0]; bi++) {
         char base[256];
         snprintf(base, sizeof(base), "model.acoustic_tokenizer.decoder.stages.0.%d", bi);
+        fprintf(stderr, "dec: s0.b%d h=[%lld,%lld]\n", bi, (long long)h->ne[0],(long long)h->ne[1]);
         h = build_block1d(ctx0, h,
             G(std::string(base) + ".norm.weight"),
             G(std::string(base) + ".mixer.conv.conv.conv.weight"),
@@ -848,6 +851,7 @@ static ggml_cgraph* build_vae_decoder_graph(kugelaudio_context* ctx, int n_frame
             G(std::string(base) + ".ffn_gamma"),
             eps);
     }
+    fprintf(stderr, "dec: stage 0 done h=[%lld,%lld]\n", (long long)h->ne[0],(long long)h->ne[1]);
 
     // Stages 1-6: ConvTranspose1d upsample + ConvNeXt blocks
     int n_upsample = (int)ratios.size();
@@ -856,7 +860,10 @@ static ggml_cgraph* build_vae_decoder_graph(kugelaudio_context* ctx, int n_frame
         snprintf(wn, sizeof(wn), "model.acoustic_tokenizer.decoder.upsample_layers.%d.0.convtr.convtr.weight", si);
         snprintf(bn, sizeof(bn), "model.acoustic_tokenizer.decoder.upsample_layers.%d.0.convtr.convtr.bias", si);
         int stride = ratios[si - 1];
+        fprintf(stderr, "dec: stage %d upsample stride=%d h=[%lld,%lld]\n", si, stride,
+                (long long)h->ne[0],(long long)h->ne[1]);
         h = build_transposed_conv1d(ctx0, h, G(wn), G(bn), stride);
+        fprintf(stderr, "dec: stage %d upsample out=[%lld,%lld]\n", si, (long long)h->ne[0],(long long)h->ne[1]);
 
         int n_blocks = (si < (int)depths.size()) ? depths[si] : 3;
         for (int bi = 0; bi < n_blocks; bi++) {
@@ -1490,7 +1497,9 @@ extern "C" float* kugelaudio_synthesize(struct kugelaudio_context* ctx,
             }
 
             // Run acoustic decoder
+            fprintf(stderr, "kugelaudio: building VAE decoder graph...\n");
             ggml_cgraph* dec_gf = build_vae_decoder_graph(ctx, 1);
+            fprintf(stderr, "kugelaudio: VAE decoder graph built OK\n");
             ggml_backend_sched_reset(ctx->sched);
             if (!ggml_backend_sched_alloc_graph(ctx->sched, dec_gf)) {
                 fprintf(stderr, "kugelaudio: decoder alloc failed\n");
