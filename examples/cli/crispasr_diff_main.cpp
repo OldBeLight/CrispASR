@@ -68,6 +68,7 @@
 #include "sensevoice.h"
 #include "cosyvoice3_tts.h"
 #include "parler_tts.h"
+#include "moss_audio.h"
 
 #include "common-crispasr.h"
 
@@ -792,7 +793,8 @@ int main(int argc, char** argv) {
             "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, "
             "granite-4.1, "
             "granite-nle, parakeet, chatterbox, voxcpm2-tts, "
-            "canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, moonshine-streaming, parler-tts\n"
+            "canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, moonshine-streaming, "
+            "parler-tts, moss-audio\n"
             "  model.gguf    crispasr-compatible model weights\n"
             "  reference.gguf  archive produced by tools/dump_reference.py\n"
             "  audio.wav     16 kHz mono WAV\n",
@@ -4699,13 +4701,101 @@ int main(int argc, char** argv) {
 
         parler_tts_free(ctx);
 
+    } else if (backend_name == "moss-audio") {
+        auto cp = moss_audio_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 1;
+        moss_audio_context* ctx = moss_audio_init_from_file(model_path.c_str(), cp);
+        if (!ctx) { fprintf(stderr, "failed to load moss-audio model\n"); return 4; }
+
+        // ---- mel_spectrogram ----
+        int n_mels = 0, T_mel = 0;
+        float* mel = nullptr;
+        const char* mel_override = std::getenv("MOSS_AUDIO_MEL_FILE");
+        if (mel_override) {
+            FILE* mf = fopen(mel_override, "rb");
+            if (mf) {
+                fseek(mf, 0, SEEK_END);
+                size_t sz = (size_t)ftell(mf);
+                fseek(mf, 0, SEEK_SET);
+                n_mels = 128; T_mel = (int)(sz / sizeof(float) / n_mels);
+                mel = (float*)malloc(sz);
+                fread(mel, 1, sz, mf); fclose(mf);
+                printf("  (mel override from %s: %d x %d)\n", mel_override, n_mels, T_mel);
+            }
+        }
+        if (!mel) {
+            mel = moss_audio_compute_mel(ctx, samples.data(), (int)samples.size(), &n_mels, &T_mel);
+        }
+        if (mel) {
+            auto rep = ref.compare("mel_spectrogram", mel, (size_t)n_mels * T_mel);
+            print_row("mel_spectrogram", rep, COS_THRESHOLD);
+            record(rep);
+        } else {
+            printf("[ERR ] mel_spectrogram         (compute failed)\n"); n_fail++;
+        }
+
+        // ---- encoder + deepstack taps ----
+        {
+            if (mel) {
+                int T_enc = 0, d_enc = 0;
+                float *ds0 = nullptr, *ds1 = nullptr, *ds2 = nullptr;
+                float* enc = moss_audio_run_encoder(ctx, mel, n_mels, T_mel,
+                                                     &T_enc, &d_enc, &ds0, &ds1, &ds2);
+                free(mel);
+                if (enc) {
+                    // enc_post_stem_proj: first chunk only (50 tokens × 1280)
+                    ggml_tensor* stem_t = ggml_graph_get_tensor(nullptr, "enc_post_stem_proj");
+                    // Can't get from graph after run — use run_encoder's graph.
+                    // For now, skip stem_proj in diff (need API extension).
+                    // TODO: expose stem_proj capture in moss_audio_run_encoder
+
+                    auto rep = ref.compare("encoder_output", enc, (size_t)T_enc * d_enc);
+                    print_row("encoder_output", rep, COS_THRESHOLD);
+                    record(rep);
+
+                    // DeepStack taps (per-chunk, compare first chunk = first 50 tokens)
+                    // Ref taps are shape (50, 1280) = first chunk only
+                    int chunk_tokens = 50; // conv_out_len(conv_out_len(conv_out_len(400)))
+                    if (ds0) {
+                        auto r0 = ref.compare("enc_layer_8", ds0, (size_t)chunk_tokens * d_enc);
+                        print_row("enc_layer_8", r0, COS_THRESHOLD); record(r0);
+                    }
+                    if (ds1) {
+                        auto r1 = ref.compare("enc_layer_16", ds1, (size_t)chunk_tokens * d_enc);
+                        print_row("enc_layer_16", r1, COS_THRESHOLD); record(r1);
+                    }
+                    if (ds2) {
+                        auto r2 = ref.compare("enc_layer_24", ds2, (size_t)chunk_tokens * d_enc);
+                        print_row("enc_layer_24", r2, COS_THRESHOLD); record(r2);
+                    }
+
+                    // ---- adapter_output ----
+                    int adapt_T = 0, adapt_d = 0;
+                    float* adapted = moss_audio_run_adapter(ctx, enc, T_enc, d_enc, &adapt_T, &adapt_d);
+                    if (adapted) {
+                        auto ra = ref.compare("adapter_output", adapted, (size_t)adapt_T * adapt_d);
+                        print_row("adapter_output", ra, COS_THRESHOLD); record(ra);
+                        free(adapted);
+                    }
+
+                    free(enc);
+                    free(ds0); free(ds1); free(ds2);
+                } else {
+                    printf("[ERR ] encoder_output         (encoder failed)\n"); n_fail++;
+                }
+            }
+        }
+
+        moss_audio_free(ctx);
+
     } else {
         fprintf(stderr,
                 "crispasr-diff: backend '%s' is not recognised. "
                 "Supported: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, granite-4.1, "
                 "granite-nle, parakeet, canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, "
                 "moonshine-streaming, lid-cld3, glm-asr, firered-asr, voxcpm2-tts, funasr, paraformer, sensevoice, "
-                "cosyvoice3-tts, parler-tts.\n",
+                "cosyvoice3-tts, parler-tts, moss-audio.\n",
                 backend_name.c_str());
         return 5;
     }

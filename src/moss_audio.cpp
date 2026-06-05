@@ -600,6 +600,11 @@ static ggml_cgraph* moss_audio_build_encoder_graph(
     x = ggml_mul_mat(ctx0, enc.stem_proj_w, x);
     x = ggml_add(ctx0, x, enc.stem_proj_b);
 
+    // Capture stem_proj output for diff validation
+    ggml_tensor* stem_out = ggml_cont(ctx0, x);
+    ggml_set_name(stem_out, "enc_post_stem_proj");
+    ggml_set_output(stem_out);
+
     // Positional embedding (sinusoidal, precomputed)
     ggml_tensor* pe_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, T_down);
     ggml_set_name(pe_in, "pos_embed");
@@ -695,6 +700,7 @@ static ggml_cgraph* moss_audio_build_encoder_graph(
     ggml_set_name(x, "encoder_output");
     ggml_set_output(x);
     ggml_build_forward_expand(gf, x);
+    ggml_build_forward_expand(gf, stem_out);
 
     // Also build forward for deepstack taps
     for (int t = 0; t < 3; t++) {
@@ -869,6 +875,20 @@ extern "C" float* moss_audio_run_encoder(struct moss_audio_context* ctx,
             free(result);
             for (int t = 0; t < 3; t++) free(ds_results[t]);
             return nullptr;
+        }
+
+        // Diagnostic: dump stem_proj for chunk 0
+        if (c == 0 && ctx->params.verbosity >= 1) {
+            ggml_tensor* stem_t = ggml_graph_get_tensor(gf, "enc_post_stem_proj");
+            if (stem_t) {
+                std::vector<float> stem_buf(ggml_nelements(stem_t));
+                ggml_backend_tensor_get(stem_t, stem_buf.data(), 0, stem_buf.size() * sizeof(float));
+                fprintf(stderr, "moss_audio: stem_proj[0] first8=[%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f] absmax=%.2f\n",
+                        stem_buf[0], stem_buf[1], stem_buf[2], stem_buf[3],
+                        stem_buf[4], stem_buf[5], stem_buf[6], stem_buf[7],
+                        *std::max_element(stem_buf.begin(), stem_buf.end(),
+                            [](float a, float b){ return fabsf(a) < fabsf(b); }));
+            }
         }
 
         // Extract encoder output — only valid_lens[c] tokens (not padded ones)
