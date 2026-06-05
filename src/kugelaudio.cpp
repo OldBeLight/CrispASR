@@ -913,23 +913,30 @@ static ggml_cgraph* build_lm_graph(kugelaudio_context* ctx, int n_tokens, int n_
         }
         ggml_tensor* Q = ggml_mul_mat(ctx0, q_w, cur);
         if (il == 0) fprintf(stderr, "kugelaudio: L0 Q=[%lld,%lld]\n", (long long)Q->ne[0], (long long)Q->ne[1]);
-        if (q_b) Q = ggml_add(ctx0, Q, q_b);
+        if (q_b) { if (il==0) fprintf(stderr, "kugelaudio: L0 add Q+qb\n"); Q = ggml_add(ctx0, Q, q_b); }
         ggml_tensor* K = ggml_mul_mat(ctx0, k_w, cur);
-        if (k_b) K = ggml_add(ctx0, K, k_b);
+        if (il == 0) fprintf(stderr, "kugelaudio: L0 K=[%lld,%lld]\n", (long long)K->ne[0], (long long)K->ne[1]);
+        if (k_b) { if (il==0) fprintf(stderr, "kugelaudio: L0 add K+kb\n"); K = ggml_add(ctx0, K, k_b); }
+        if (il == 0) fprintf(stderr, "kugelaudio: L0 K after bias OK\n");
         ggml_tensor* V = ggml_mul_mat(ctx0, v_w, cur);
-        if (v_b) V = ggml_add(ctx0, V, v_b);
+        if (il == 0) fprintf(stderr, "kugelaudio: L0 V=[%lld,%lld]\n", (long long)V->ne[0], (long long)V->ne[1]);
+        if (v_b) { if (il==0) fprintf(stderr, "kugelaudio: L0 add V+vb\n"); V = ggml_add(ctx0, V, v_b); }
+        if (il == 0) fprintf(stderr, "kugelaudio: L0 QKV done\n");
 
+        if (il == 0) fprintf(stderr, "kugelaudio: L0 reshape\n");
         // Reshape for GQA
         Q = ggml_reshape_3d(ctx0, Q, hp.head_dim, hp.n_heads, T_cur);
         K = ggml_reshape_3d(ctx0, K, hp.head_dim, hp.n_kv_heads, T_cur);
         V = ggml_reshape_3d(ctx0, V, hp.head_dim, hp.n_kv_heads, T_cur);
 
+        if (il == 0) fprintf(stderr, "kugelaudio: L0 rope\n");
         // RoPE (Qwen2.5 uses NEOX layout)
         Q = ggml_rope_ext(ctx0, Q, positions, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX,
                           0, hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         K = ggml_rope_ext(ctx0, K, positions, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX,
                           0, hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
+        if (il == 0) fprintf(stderr, "kugelaudio: L0 kv write\n");
         // Write K, V to KV cache
         ggml_tensor* K_perm = ggml_permute(ctx0, K, 0, 2, 1, 3);
         ggml_tensor* V_perm = ggml_permute(ctx0, V, 0, 2, 1, 3);
@@ -944,6 +951,7 @@ static ggml_cgraph* build_lm_graph(kugelaudio_context* ctx, int n_tokens, int n_
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, K_perm, k_view));
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, V_perm, v_view));
 
+        if (il == 0) fprintf(stderr, "kugelaudio: L0 kv read\n");
         // Read full K, V from cache
         ggml_tensor* Kfull = ggml_cont(ctx0, ggml_view_3d(ctx0, ctx->kv_k,
             hp.head_dim, Lk, hp.n_kv_heads,
@@ -954,24 +962,40 @@ static ggml_cgraph* build_lm_graph(kugelaudio_context* ctx, int n_tokens, int n_
             ctx->kv_v->nb[1], ctx->kv_v->nb[2],
             (size_t)il * ctx->kv_v->nb[3]));
 
+        if (il == 0) fprintf(stderr, "kugelaudio: L0 flash_attn Q=[%lld,%lld,%lld] K=[%lld,%lld,%lld]\n",
+                (long long)Q->ne[0],(long long)Q->ne[1],(long long)Q->ne[2],
+                (long long)Kfull->ne[0],(long long)Kfull->ne[1],(long long)Kfull->ne[2]);
         // Flash attention (native GQA)
         Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
         float scale = 1.0f / sqrtf((float)hp.head_dim);
         ggml_tensor* attn_out = ggml_flash_attn_ext(ctx0, Q, Kfull, Vfull, causal_mask, scale, 0.0f, 0.0f);
 
+        if (il == 0) fprintf(stderr, "kugelaudio: L0 attn_out=[%lld,%lld,%lld]\n",
+                (long long)attn_out->ne[0],(long long)attn_out->ne[1],(long long)attn_out->ne[2]);
         attn_out = ggml_reshape_2d(ctx0, attn_out, hp.d_lm, T_cur);
         attn_out = ggml_mul_mat(ctx0, G(std::string(p) + ".self_attn.o_proj.weight"), attn_out);
+        if (il == 0) fprintf(stderr, "kugelaudio: L0 o_proj done, adding residual\n");
         cur = ggml_add(ctx0, residual, attn_out);
+        if (il == 0) fprintf(stderr, "kugelaudio: L0 attn residual done\n");
 
         // FFN: RMSNorm + SwiGLU
+        if (il == 0) fprintf(stderr, "kugelaudio: L0 FFN start\n");
         residual = cur;
         cur = ggml_rms_norm(ctx0, cur, hp.rms_norm_eps);
         cur = ggml_mul(ctx0, cur, G(std::string(p) + ".post_attention_layernorm.weight"));
-        ggml_tensor* ffn = core_ffn::swiglu(ctx0, cur,
-            G(std::string(p) + ".mlp.gate_proj.weight"),
-            G(std::string(p) + ".mlp.up_proj.weight"),
-            G(std::string(p) + ".mlp.down_proj.weight"));
+        ggml_tensor* gate_w = G(std::string(p) + ".mlp.gate_proj.weight");
+        ggml_tensor* up_w = G(std::string(p) + ".mlp.up_proj.weight");
+        ggml_tensor* down_w = G(std::string(p) + ".mlp.down_proj.weight");
+        if (il == 0) fprintf(stderr, "kugelaudio: L0 FFN gate=[%lld,%lld] up=[%lld,%lld] down=[%lld,%lld] cur=[%lld,%lld]\n",
+                (long long)gate_w->ne[0],(long long)gate_w->ne[1],
+                (long long)up_w->ne[0],(long long)up_w->ne[1],
+                (long long)down_w->ne[0],(long long)down_w->ne[1],
+                (long long)cur->ne[0],(long long)cur->ne[1]);
+        ggml_tensor* ffn = core_ffn::swiglu(ctx0, cur, gate_w, up_w, down_w);
+        if (il == 0) fprintf(stderr, "kugelaudio: L0 FFN done, ffn=[%lld,%lld]\n",
+                (long long)ffn->ne[0],(long long)ffn->ne[1]);
         cur = ggml_add(ctx0, residual, ffn);
+        if (il == 0) fprintf(stderr, "kugelaudio: L0 layer done\n");
     }
 
     // Final RMSNorm
