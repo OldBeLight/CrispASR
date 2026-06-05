@@ -145,8 +145,24 @@ os.symlink(path, '/runpod-volume/kugelaudio-q4k.gguf') if not os.path.exists('/r
 ls -lh /runpod-volume/kugelaudio-q4k.gguf
 REMOTE
 
-# ── Test: Load model ──────────────────────────────────────────────
-echo "=== Test: verify model loads ==="
+
+# ── Download whisper model for ASR roundtrip ─────────────────
+echo "=== Downloading whisper base.en model ==="
+$SSH << 'REMOTE'
+set -e
+python3 -c "
+from huggingface_hub import hf_hub_download
+import shutil
+path = hf_hub_download('ggerganov/whisper.cpp', 'ggml-base.en.bin',
+                       cache_dir='/runpod-volume/cache')
+shutil.copy2(path, '/runpod-volume/cache/ggml-base.en.bin')
+print(f'whisper model: /runpod-volume/cache/ggml-base.en.bin')
+"
+ls -lh /runpod-volume/cache/ggml-base.en.bin
+REMOTE
+
+# ── Test: TTS synthesis ──────────────────────────────────────────
+echo "=== Test: TTS synthesis ==="
 $SSH << 'REMOTE'
 set -e
 export LD_LIBRARY_PATH=/runpod-volume/build/src:/runpod-volume/build/ggml/src:/runpod-volume/build/ggml/src/ggml-cuda
@@ -155,26 +171,46 @@ CLI=/runpod-volume/build/bin/crispasr
 echo "--- Backend list ---"
 $CLI --list-backends 2>&1 | grep kugelaudio
 
-echo "--- Loading model (dry run) ---"
+echo "--- TTS: English ---"
 $CLI --backend kugelaudio -m /runpod-volume/kugelaudio-q4k.gguf \
-  --tts "Hello." --tts-output /tmp/kugelaudio-test.wav 2>&1 | tail -20
-echo "--- TTS output ---"
-ls -lh /tmp/kugelaudio-test.wav 2>/dev/null || echo "(no output yet — may need further debugging)"
+  --tts "Hello, this is a test of the speech synthesis system." \
+  --tts-output /tmp/kugelaudio-en.wav 2>&1 | tail -10
+ls -lh /tmp/kugelaudio-en.wav 2>/dev/null || echo "FAILED: no English audio"
+
+echo "--- TTS: German ---"
+$CLI --backend kugelaudio -m /runpod-volume/kugelaudio-q4k.gguf \
+  --tts "Hallo, dies ist ein Test." -l de \
+  --tts-output /tmp/kugelaudio-de.wav 2>&1 | tail -10
+ls -lh /tmp/kugelaudio-de.wav 2>/dev/null || echo "FAILED: no German audio"
 REMOTE
 
 # ── Test: ASR roundtrip ──────────────────────────────────────────
-echo "=== Test: ASR roundtrip (if TTS produced audio) ==="
+echo "=== Test: ASR roundtrip ==="
 $SSH << 'REMOTE'
 set -e
 export LD_LIBRARY_PATH=/runpod-volume/build/src:/runpod-volume/build/ggml/src:/runpod-volume/build/ggml/src/ggml-cuda
 CLI=/runpod-volume/build/bin/crispasr
+WHISPER=/runpod-volume/cache/ggml-base.en.bin
 
-if [ -f /tmp/kugelaudio-test.wav ]; then
-    echo "--- Whisper ASR on generated audio ---"
-    $CLI -m /runpod-volume/CrispASR/models/ggml-base.en.bin \
-      -f /tmp/kugelaudio-test.wav 2>&1 | tail -5
+echo "=== English roundtrip ==="
+if [ -f /tmp/kugelaudio-en.wav ]; then
+    echo "Input:  Hello, this is a test of the speech synthesis system."
+    echo -n "Output: "
+    $CLI -m $WHISPER -f /tmp/kugelaudio-en.wav --no-timestamps -otxt -of /tmp/rt-en 2>/dev/null
+    cat /tmp/rt-en.txt 2>/dev/null || echo "(no transcript)"
 else
-    echo "No TTS output to roundtrip (expected for scaffold stage)"
+    echo "SKIPPED: no English audio"
+fi
+
+echo ""
+echo "=== German roundtrip ==="
+if [ -f /tmp/kugelaudio-de.wav ]; then
+    echo "Input:  Hallo, dies ist ein Test."
+    echo -n "Output: "
+    $CLI -m $WHISPER -f /tmp/kugelaudio-de.wav --no-timestamps -l de -otxt -of /tmp/rt-de 2>/dev/null
+    cat /tmp/rt-de.txt 2>/dev/null || echo "(no transcript)"
+else
+    echo "SKIPPED: no German audio"
 fi
 REMOTE
 

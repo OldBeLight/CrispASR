@@ -37,6 +37,19 @@
 #include <string>
 #include <vector>
 
+// ── Debug ───────────────────────────────────────────────────────────────────
+// Trace-level debug: set KUGELAUDIO_DEBUG=1 to see per-layer/per-step shapes.
+// Normal verbosity (params.verbosity >= 1) still prints load + synthesis summary.
+static bool kugelaudio_debug_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = std::getenv("KUGELAUDIO_DEBUG");
+        cached = (e && (e[0] == '1' || e[0] == 't' || e[0] == 'T')) ? 1 : 0;
+    }
+    return cached != 0;
+}
+#define KUGELAUDIO_TRACE(...) do { if (kugelaudio_debug_enabled()) fprintf(stderr, __VA_ARGS__); } while(0)
+
 // ── Constants ───────────────────────────────────────────────────────────────
 
 static constexpr int KUGELAUDIO_SPEECH_START_ID    = 151652;
@@ -697,33 +710,33 @@ static ggml_cgraph* build_pred_head_graph(kugelaudio_context* ctx, int n_frames)
     ggml_tensor* cond = ggml_mul_mat(ctx0, G("model.prediction_head.cond_proj.weight"), condition);
 
     // Combined c = cond + t_emb (t_emb broadcasts over n_frames)
-    fprintf(stderr, "pred: t_emb=[%lld,%lld] x=[%lld,%lld] cond=[%lld,%lld]\n",
+    KUGELAUDIO_TRACE("pred: t_emb=[%lld,%lld] x=[%lld,%lld] cond=[%lld,%lld]\n",
             (long long)t_emb->ne[0],(long long)t_emb->ne[1],
             (long long)x->ne[0],(long long)x->ne[1],
             (long long)cond->ne[0],(long long)cond->ne[1]);
     ggml_tensor* c = ggml_add(ctx0, cond, t_emb);
-    fprintf(stderr, "pred: c=[%lld,%lld] OK\n", (long long)c->ne[0],(long long)c->ne[1]);
+    KUGELAUDIO_TRACE("pred: c=[%lld,%lld] OK\n", (long long)c->ne[0],(long long)c->ne[1]);
 
     // 4 HeadLayers: AdaLN(3-way) + SwiGLU FFN
     for (int i = 0; i < hp.head_layers; i++) {
         char base[128];
         snprintf(base, sizeof(base), "model.prediction_head.layers.%d", i);
-        fprintf(stderr, "pred: layer %d x=[%lld,%lld]\n", i, (long long)x->ne[0],(long long)x->ne[1]);
+        KUGELAUDIO_TRACE("pred: layer %d x=[%lld,%lld]\n", i, (long long)x->ne[0],(long long)x->ne[1]);
 
         // AdaLN: SiLU(c) → Linear → chunk(3) → (shift, scale, gate)
         ggml_tensor* c_silu = ggml_silu(ctx0, c);
         ggml_tensor* adaln_w = G(std::string(base) + ".adaLN_modulation.1.weight");
-        fprintf(stderr, "pred: L%d adaln_w=[%lld,%lld] c_silu=[%lld,%lld]\n", i,
+        KUGELAUDIO_TRACE("pred: L%d adaln_w=[%lld,%lld] c_silu=[%lld,%lld]\n", i,
                 (long long)adaln_w->ne[0],(long long)adaln_w->ne[1],
                 (long long)c_silu->ne[0],(long long)c_silu->ne[1]);
         ggml_tensor* adaln_out = ggml_mul_mat(ctx0, adaln_w, c_silu);
-        fprintf(stderr, "pred: L%d adaln_out=[%lld,%lld]\n", i,
+        KUGELAUDIO_TRACE("pred: L%d adaln_out=[%lld,%lld]\n", i,
                 (long long)adaln_out->ne[0],(long long)adaln_out->ne[1]);
         size_t nb1 = adaln_out->nb[1];
         ggml_tensor* shift = ggml_view_2d(ctx0, adaln_out, d_lm, n_frames, nb1, 0);
         ggml_tensor* scale = ggml_view_2d(ctx0, adaln_out, d_lm, n_frames, nb1, (size_t)d_lm * sizeof(float));
         ggml_tensor* gate  = ggml_view_2d(ctx0, adaln_out, d_lm, n_frames, nb1, (size_t)2 * d_lm * sizeof(float));
-        fprintf(stderr, "pred: L%d shift=[%lld,%lld] scale=[%lld,%lld] gate=[%lld,%lld]\n", i,
+        KUGELAUDIO_TRACE("pred: L%d shift=[%lld,%lld] scale=[%lld,%lld] gate=[%lld,%lld]\n", i,
                 (long long)shift->ne[0],(long long)shift->ne[1],
                 (long long)scale->ne[0],(long long)scale->ne[1],
                 (long long)gate->ne[0],(long long)gate->ne[1]);
@@ -731,68 +744,68 @@ static ggml_cgraph* build_pred_head_graph(kugelaudio_context* ctx, int n_frames)
         // RMSNorm(x) * (1 + scale) + shift
         ggml_tensor* h = ggml_rms_norm(ctx0, x, hp.diff_norm_eps);
         ggml_tensor* norm_w = G(std::string(base) + ".norm.weight");
-        fprintf(stderr, "pred: L%d h=[%lld,%lld] norm_w=[%lld,%lld]\n", i,
+        KUGELAUDIO_TRACE("pred: L%d h=[%lld,%lld] norm_w=[%lld,%lld]\n", i,
                 (long long)h->ne[0],(long long)h->ne[1],
                 (long long)norm_w->ne[0],(long long)norm_w->ne[1]);
         h = ggml_mul(ctx0, h, norm_w);
-        fprintf(stderr, "pred: L%d after norm_mul OK\n", i);
+        KUGELAUDIO_TRACE("pred: L%d after norm_mul OK\n", i);
         ggml_tensor* h_scaled = ggml_mul(ctx0, h, scale);
-        fprintf(stderr, "pred: L%d after scale_mul OK\n", i);
+        KUGELAUDIO_TRACE("pred: L%d after scale_mul OK\n", i);
         h = ggml_add(ctx0, h, h_scaled);
-        fprintf(stderr, "pred: L%d after add(h, h_scaled) OK\n", i);
+        KUGELAUDIO_TRACE("pred: L%d after add(h, h_scaled) OK\n", i);
         h = ggml_add(ctx0, h, shift);
-        fprintf(stderr, "pred: L%d after add(h, shift) OK\n", i);
+        KUGELAUDIO_TRACE("pred: L%d after add(h, shift) OK\n", i);
 
         // SwiGLU FFN
         h = core_ffn::swiglu(ctx0, h,
                              G(std::string(base) + ".ffn.gate_proj.weight"),
                              G(std::string(base) + ".ffn.up_proj.weight"),
                              G(std::string(base) + ".ffn.down_proj.weight"));
-        fprintf(stderr, "pred: L%d after swiglu OK\n", i);
+        KUGELAUDIO_TRACE("pred: L%d after swiglu OK\n", i);
 
         // gate * ffn + residual
-        fprintf(stderr, "pred: L%d gate_mul h=[%lld,%lld,%lld,%lld] gate=[%lld,%lld,%lld,%lld]\n", i,
+        KUGELAUDIO_TRACE("pred: L%d gate_mul h=[%lld,%lld,%lld,%lld] gate=[%lld,%lld,%lld,%lld]\n", i,
                 (long long)h->ne[0],(long long)h->ne[1],(long long)h->ne[2],(long long)h->ne[3],
                 (long long)gate->ne[0],(long long)gate->ne[1],(long long)gate->ne[2],(long long)gate->ne[3]);
         h = ggml_mul(ctx0, h, gate);
-        fprintf(stderr, "pred: L%d gate_mul OK\n", i);
+        KUGELAUDIO_TRACE("pred: L%d gate_mul OK\n", i);
         x = ggml_add(ctx0, x, h);
     }
 
     // Final layer: AdaLN(2-way) + Linear → [vae_dim]
     {
-        fprintf(stderr, "pred: final layer x=[%lld,%lld]\n", (long long)x->ne[0],(long long)x->ne[1]);
+        KUGELAUDIO_TRACE("pred: final layer x=[%lld,%lld]\n", (long long)x->ne[0],(long long)x->ne[1]);
         ggml_tensor* c_silu_f = ggml_silu(ctx0, c);
         ggml_tensor* final_adaln_w = G("model.prediction_head.final_layer.adaLN_modulation.1.weight");
-        fprintf(stderr, "pred: final adaln_w=[%lld,%lld] c_silu=[%lld,%lld]\n",
+        KUGELAUDIO_TRACE("pred: final adaln_w=[%lld,%lld] c_silu=[%lld,%lld]\n",
                 (long long)final_adaln_w->ne[0],(long long)final_adaln_w->ne[1],
                 (long long)c_silu_f->ne[0],(long long)c_silu_f->ne[1]);
         ggml_tensor* adaln_out = ggml_mul_mat(ctx0, final_adaln_w, c_silu_f);
-        fprintf(stderr, "pred: final adaln_out=[%lld,%lld]\n", (long long)adaln_out->ne[0],(long long)adaln_out->ne[1]);
+        KUGELAUDIO_TRACE("pred: final adaln_out=[%lld,%lld]\n", (long long)adaln_out->ne[0],(long long)adaln_out->ne[1]);
         size_t nb1_f = adaln_out->nb[1];
         ggml_tensor* shift = ggml_view_2d(ctx0, adaln_out, d_lm, n_frames, nb1_f, 0);
         ggml_tensor* scale = ggml_view_2d(ctx0, adaln_out, d_lm, n_frames, nb1_f,
                                            (size_t)d_lm * sizeof(float));
-        fprintf(stderr, "pred: final shift=[%lld,%lld] scale=[%lld,%lld]\n",
+        KUGELAUDIO_TRACE("pred: final shift=[%lld,%lld] scale=[%lld,%lld]\n",
                 (long long)shift->ne[0],(long long)shift->ne[1],
                 (long long)scale->ne[0],(long long)scale->ne[1]);
 
         // RMSNorm without affine (elementwise_affine=False in Python)
         ggml_tensor* h = ggml_rms_norm(ctx0, x, hp.diff_norm_eps);
-        fprintf(stderr, "pred: final rms h=[%lld,%lld]\n", (long long)h->ne[0],(long long)h->ne[1]);
+        KUGELAUDIO_TRACE("pred: final rms h=[%lld,%lld]\n", (long long)h->ne[0],(long long)h->ne[1]);
         ggml_tensor* h_scaled = ggml_mul(ctx0, h, scale);
-        fprintf(stderr, "pred: final mul(h,scale) OK\n");
+        KUGELAUDIO_TRACE("pred: final mul(h,scale) OK\n");
         h = ggml_add(ctx0, h, h_scaled);
-        fprintf(stderr, "pred: final add(h,h_scaled) OK\n");
+        KUGELAUDIO_TRACE("pred: final add(h,h_scaled) OK\n");
         h = ggml_add(ctx0, h, shift);
-        fprintf(stderr, "pred: final add(h,shift) OK\n");
+        KUGELAUDIO_TRACE("pred: final add(h,shift) OK\n");
 
         ggml_tensor* final_lin_w = G("model.prediction_head.final_layer.linear.weight");
-        fprintf(stderr, "pred: final linear_w=[%lld,%lld] h=[%lld,%lld]\n",
+        KUGELAUDIO_TRACE("pred: final linear_w=[%lld,%lld] h=[%lld,%lld]\n",
                 (long long)final_lin_w->ne[0],(long long)final_lin_w->ne[1],
                 (long long)h->ne[0],(long long)h->ne[1]);
         ggml_tensor* output = ggml_mul_mat(ctx0, final_lin_w, h);
-        fprintf(stderr, "pred: final output=[%lld,%lld] OK\n", (long long)output->ne[0],(long long)output->ne[1]);
+        KUGELAUDIO_TRACE("pred: final output=[%lld,%lld] OK\n", (long long)output->ne[0],(long long)output->ne[1]);
         ggml_set_name(output, "pred_output");
         ggml_set_output(output);
         ggml_build_forward_expand(gf, output);
@@ -828,17 +841,17 @@ static ggml_cgraph* build_vae_decoder_graph(kugelaudio_context* ctx, int n_frame
     const auto& ratios = hp.decoder_ratios;
 
     // Stage 0: stem conv (SConv1d, stride=1)
-    fprintf(stderr, "dec: stem inp=[%lld,%lld]\n", (long long)h->ne[0],(long long)h->ne[1]);
+    KUGELAUDIO_TRACE("dec: stem inp=[%lld,%lld]\n", (long long)h->ne[0],(long long)h->ne[1]);
     h = build_causal_conv1d(ctx0, h,
         G("model.acoustic_tokenizer.decoder.upsample_layers.0.0.conv.conv.weight"),
         G("model.acoustic_tokenizer.decoder.upsample_layers.0.0.conv.conv.bias"), 1);
-    fprintf(stderr, "dec: stem out=[%lld,%lld]\n", (long long)h->ne[0],(long long)h->ne[1]);
+    KUGELAUDIO_TRACE("dec: stem out=[%lld,%lld]\n", (long long)h->ne[0],(long long)h->ne[1]);
 
     // Stage 0 blocks
     for (int bi = 0; bi < depths[0]; bi++) {
         char base[256];
         snprintf(base, sizeof(base), "model.acoustic_tokenizer.decoder.stages.0.%d", bi);
-        fprintf(stderr, "dec: s0.b%d h=[%lld,%lld]\n", bi, (long long)h->ne[0],(long long)h->ne[1]);
+        KUGELAUDIO_TRACE("dec: s0.b%d h=[%lld,%lld]\n", bi, (long long)h->ne[0],(long long)h->ne[1]);
         h = build_block1d(ctx0, h,
             G(std::string(base) + ".norm.weight"),
             G(std::string(base) + ".mixer.conv.conv.conv.weight"),
@@ -852,7 +865,7 @@ static ggml_cgraph* build_vae_decoder_graph(kugelaudio_context* ctx, int n_frame
             G(std::string(base) + ".ffn_gamma"),
             eps);
     }
-    fprintf(stderr, "dec: stage 0 done h=[%lld,%lld]\n", (long long)h->ne[0],(long long)h->ne[1]);
+    KUGELAUDIO_TRACE("dec: stage 0 done h=[%lld,%lld]\n", (long long)h->ne[0],(long long)h->ne[1]);
 
     // Stages 1-6: ConvTranspose1d upsample + ConvNeXt blocks
     int n_upsample = (int)ratios.size();
@@ -861,10 +874,10 @@ static ggml_cgraph* build_vae_decoder_graph(kugelaudio_context* ctx, int n_frame
         snprintf(wn, sizeof(wn), "model.acoustic_tokenizer.decoder.upsample_layers.%d.0.convtr.convtr.weight", si);
         snprintf(bn, sizeof(bn), "model.acoustic_tokenizer.decoder.upsample_layers.%d.0.convtr.convtr.bias", si);
         int stride = ratios[si - 1];
-        fprintf(stderr, "dec: stage %d upsample stride=%d h=[%lld,%lld]\n", si, stride,
+        KUGELAUDIO_TRACE("dec: stage %d upsample stride=%d h=[%lld,%lld]\n", si, stride,
                 (long long)h->ne[0],(long long)h->ne[1]);
         h = build_transposed_conv1d(ctx0, h, G(wn), G(bn), stride);
-        fprintf(stderr, "dec: stage %d upsample out=[%lld,%lld]\n", si, (long long)h->ne[0],(long long)h->ne[1]);
+        KUGELAUDIO_TRACE("dec: stage %d upsample out=[%lld,%lld]\n", si, (long long)h->ne[0],(long long)h->ne[1]);
 
         int n_blocks = (si < (int)depths.size()) ? depths[si] : 3;
         for (int bi = 0; bi < n_blocks; bi++) {
@@ -938,11 +951,11 @@ static ggml_cgraph* build_lm_graph(kugelaudio_context* ctx, int n_tokens, int n_
         cur = ggml_rms_norm(ctx0, cur, hp.rms_norm_eps);
         ggml_tensor* ln_w = G(std::string(p) + ".input_layernorm.weight");
         if (!ln_w) {
-            fprintf(stderr, "kugelaudio: MISSING %s.input_layernorm.weight\n", p);
+            KUGELAUDIO_TRACE("kugelaudio: MISSING %s.input_layernorm.weight\n", p);
             return nullptr;
         }
         if (il <= 1) {
-            fprintf(stderr, "kugelaudio: L%d cur=[%lld,%lld] ln_w=[%lld,%lld]\n", il,
+            KUGELAUDIO_TRACE( "kugelaudio: L%d cur=[%lld,%lld] ln_w=[%lld,%lld]\n", il,
                     (long long)cur->ne[0], (long long)cur->ne[1],
                     (long long)ln_w->ne[0], (long long)ln_w->ne[1]);
         }
@@ -959,41 +972,41 @@ static ggml_cgraph* build_lm_graph(kugelaudio_context* ctx, int n_tokens, int n_
         ggml_tensor* k_b = G(std::string(p) + ".self_attn.k_proj.bias");
         ggml_tensor* v_b = G(std::string(p) + ".self_attn.v_proj.bias");
         if (il == 0) {
-            fprintf(stderr, "kugelaudio: L0 q_w=[%lld,%lld] k_w=[%lld,%lld] v_w=[%lld,%lld]\n",
+            KUGELAUDIO_TRACE("kugelaudio: L q_w=[%lld,%lld] k_w=[%lld,%lld] v_w=[%lld,%lld]\n",
                     (long long)q_w->ne[0], (long long)q_w->ne[1],
                     (long long)k_w->ne[0], (long long)k_w->ne[1],
                     (long long)v_w->ne[0], (long long)v_w->ne[1]);
-            if (q_b) fprintf(stderr, "kugelaudio: L0 q_b=[%lld,%lld] k_b=[%lld,%lld] v_b=[%lld,%lld]\n",
+            if (q_b) KUGELAUDIO_TRACE("kugelaudio: L q_b=[%lld,%lld] k_b=[%lld,%lld] v_b=[%lld,%lld]\n",
                     (long long)q_b->ne[0], (long long)q_b->ne[1],
                     k_b ? (long long)k_b->ne[0] : -1, k_b ? (long long)k_b->ne[1] : -1,
                     v_b ? (long long)v_b->ne[0] : -1, v_b ? (long long)v_b->ne[1] : -1);
         }
         ggml_tensor* Q = ggml_mul_mat(ctx0, q_w, cur);
-        if (il <= 1) fprintf(stderr, "kugelaudio: L0 Q=[%lld,%lld]\n", (long long)Q->ne[0], (long long)Q->ne[1]);
-        if (q_b) { if (il<=1) fprintf(stderr, "kugelaudio: L0 add Q+qb\n"); Q = ggml_add(ctx0, Q, q_b); }
+        if (il <= 1) KUGELAUDIO_TRACE("kugelaudio: L Q=[%lld,%lld]\n", (long long)Q->ne[0], (long long)Q->ne[1]);
+        if (q_b) { if (il<=1) KUGELAUDIO_TRACE("kugelaudio: L add Q+qb\n"); Q = ggml_add(ctx0, Q, q_b); }
         ggml_tensor* K = ggml_mul_mat(ctx0, k_w, cur);
-        if (il <= 1) fprintf(stderr, "kugelaudio: L0 K=[%lld,%lld]\n", (long long)K->ne[0], (long long)K->ne[1]);
-        if (k_b) { if (il<=1) fprintf(stderr, "kugelaudio: L0 add K+kb\n"); K = ggml_add(ctx0, K, k_b); }
-        if (il <= 1) fprintf(stderr, "kugelaudio: L0 K after bias OK\n");
+        if (il <= 1) KUGELAUDIO_TRACE("kugelaudio: L K=[%lld,%lld]\n", (long long)K->ne[0], (long long)K->ne[1]);
+        if (k_b) { if (il<=1) KUGELAUDIO_TRACE("kugelaudio: L add K+kb\n"); K = ggml_add(ctx0, K, k_b); }
+        if (il <= 1) KUGELAUDIO_TRACE("kugelaudio: L K after bias OK\n");
         ggml_tensor* V = ggml_mul_mat(ctx0, v_w, cur);
-        if (il <= 1) fprintf(stderr, "kugelaudio: L0 V=[%lld,%lld]\n", (long long)V->ne[0], (long long)V->ne[1]);
-        if (v_b) { if (il<=1) fprintf(stderr, "kugelaudio: L0 add V+vb\n"); V = ggml_add(ctx0, V, v_b); }
-        if (il <= 1) fprintf(stderr, "kugelaudio: L0 QKV done\n");
+        if (il <= 1) KUGELAUDIO_TRACE("kugelaudio: L V=[%lld,%lld]\n", (long long)V->ne[0], (long long)V->ne[1]);
+        if (v_b) { if (il<=1) KUGELAUDIO_TRACE("kugelaudio: L add V+vb\n"); V = ggml_add(ctx0, V, v_b); }
+        if (il <= 1) KUGELAUDIO_TRACE("kugelaudio: L QKV done\n");
 
-        if (il <= 1) fprintf(stderr, "kugelaudio: L0 reshape\n");
+        if (il <= 1) KUGELAUDIO_TRACE("kugelaudio: L reshape\n");
         // Reshape for GQA
         Q = ggml_reshape_3d(ctx0, Q, hp.head_dim, hp.n_heads, T_cur);
         K = ggml_reshape_3d(ctx0, K, hp.head_dim, hp.n_kv_heads, T_cur);
         V = ggml_reshape_3d(ctx0, V, hp.head_dim, hp.n_kv_heads, T_cur);
 
-        if (il <= 1) fprintf(stderr, "kugelaudio: L0 rope\n");
+        if (il <= 1) KUGELAUDIO_TRACE("kugelaudio: L rope\n");
         // RoPE (Qwen2.5 uses NEOX layout)
         Q = ggml_rope_ext(ctx0, Q, positions, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX,
                           0, hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         K = ggml_rope_ext(ctx0, K, positions, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX,
                           0, hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-        if (il <= 1) fprintf(stderr, "kugelaudio: L0 kv write\n");
+        if (il <= 1) KUGELAUDIO_TRACE("kugelaudio: L kv write\n");
         // Write K, V to KV cache
         ggml_tensor* K_perm = ggml_permute(ctx0, K, 0, 2, 1, 3);
         ggml_tensor* V_perm = ggml_permute(ctx0, V, 0, 2, 1, 3);
@@ -1008,7 +1021,7 @@ static ggml_cgraph* build_lm_graph(kugelaudio_context* ctx, int n_tokens, int n_
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, K_perm, k_view));
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, V_perm, v_view));
 
-        if (il <= 1) fprintf(stderr, "kugelaudio: L0 kv read\n");
+        if (il <= 1) KUGELAUDIO_TRACE("kugelaudio: L kv read\n");
         // Read full K, V from cache
         ggml_tensor* Kfull = ggml_cont(ctx0, ggml_view_3d(ctx0, ctx->kv_k,
             hp.head_dim, Lk, hp.n_kv_heads,
@@ -1019,7 +1032,7 @@ static ggml_cgraph* build_lm_graph(kugelaudio_context* ctx, int n_tokens, int n_
             ctx->kv_v->nb[1], ctx->kv_v->nb[2],
             (size_t)il * ctx->kv_v->nb[3]));
 
-        if (il <= 1) fprintf(stderr, "kugelaudio: L0 flash_attn Q=[%lld,%lld,%lld] K=[%lld,%lld,%lld]\n",
+        if (il <= 1) KUGELAUDIO_TRACE("kugelaudio: L flash_attn Q=[%lld,%lld,%lld] K=[%lld,%lld,%lld]\n",
                 (long long)Q->ne[0],(long long)Q->ne[1],(long long)Q->ne[2],
                 (long long)Kfull->ne[0],(long long)Kfull->ne[1],(long long)Kfull->ne[2]);
         // Flash attention (native GQA)
@@ -1027,43 +1040,43 @@ static ggml_cgraph* build_lm_graph(kugelaudio_context* ctx, int n_tokens, int n_
         float scale = 1.0f / sqrtf((float)hp.head_dim);
         ggml_tensor* attn_out = ggml_flash_attn_ext(ctx0, Q, Kfull, Vfull, causal_mask, scale, 0.0f, 0.0f);
 
-        if (il <= 1) fprintf(stderr, "kugelaudio: L0 attn_out=[%lld,%lld,%lld]\n",
+        if (il <= 1) KUGELAUDIO_TRACE("kugelaudio: L attn_out=[%lld,%lld,%lld]\n",
                 (long long)attn_out->ne[0],(long long)attn_out->ne[1],(long long)attn_out->ne[2]);
         attn_out = ggml_reshape_2d(ctx0, attn_out, hp.d_lm, T_cur);
         attn_out = ggml_mul_mat(ctx0, G(std::string(p) + ".self_attn.o_proj.weight"), attn_out);
-        if (il <= 1) fprintf(stderr, "kugelaudio: L0 o_proj done, adding residual\n");
+        if (il <= 1) KUGELAUDIO_TRACE("kugelaudio: L o_proj done, adding residual\n");
         cur = ggml_add(ctx0, residual, attn_out);
-        if (il <= 1) fprintf(stderr, "kugelaudio: L0 attn residual done\n");
+        if (il <= 1) KUGELAUDIO_TRACE("kugelaudio: L attn residual done\n");
 
         // FFN: RMSNorm + SwiGLU
-        if (il <= 1) fprintf(stderr, "kugelaudio: L0 FFN start\n");
+        if (il <= 1) KUGELAUDIO_TRACE("kugelaudio: L FFN start\n");
         residual = cur;
         cur = ggml_rms_norm(ctx0, cur, hp.rms_norm_eps);
         cur = ggml_mul(ctx0, cur, G(std::string(p) + ".post_attention_layernorm.weight"));
         ggml_tensor* gate_w = G(std::string(p) + ".mlp.gate_proj.weight");
         ggml_tensor* up_w = G(std::string(p) + ".mlp.up_proj.weight");
         ggml_tensor* down_w = G(std::string(p) + ".mlp.down_proj.weight");
-        if (il <= 1) fprintf(stderr, "kugelaudio: L0 FFN gate=[%lld,%lld] up=[%lld,%lld] down=[%lld,%lld] cur=[%lld,%lld]\n",
+        if (il <= 1) KUGELAUDIO_TRACE("kugelaudio: L FFN gate=[%lld,%lld] up=[%lld,%lld] down=[%lld,%lld] cur=[%lld,%lld]\n",
                 (long long)gate_w->ne[0],(long long)gate_w->ne[1],
                 (long long)up_w->ne[0],(long long)up_w->ne[1],
                 (long long)down_w->ne[0],(long long)down_w->ne[1],
                 (long long)cur->ne[0],(long long)cur->ne[1]);
         ggml_tensor* ffn = core_ffn::swiglu(ctx0, cur, gate_w, up_w, down_w);
-        if (il <= 1) fprintf(stderr, "kugelaudio: L0 FFN done, ffn=[%lld,%lld]\n",
+        if (il <= 1) KUGELAUDIO_TRACE("kugelaudio: L FFN done, ffn=[%lld,%lld]\n",
                 (long long)ffn->ne[0],(long long)ffn->ne[1]);
         cur = ggml_add(ctx0, residual, ffn);
         if (il <= 1 || il == hp.n_lm_layers - 1)
-            fprintf(stderr, "kugelaudio: L%d done\n", il);
+            KUGELAUDIO_TRACE( "kugelaudio: L%d done\n", il);
     }
 
     // Final RMSNorm
-    fprintf(stderr, "kugelaudio: final_norm cur=[%lld,%lld]\n", (long long)cur->ne[0], (long long)cur->ne[1]);
+    KUGELAUDIO_TRACE("kugelaudio: final_norm cur=[%lld,%lld]\n", (long long)cur->ne[0], (long long)cur->ne[1]);
     cur = ggml_rms_norm(ctx0, cur, hp.rms_norm_eps);
     ggml_tensor* fnw = G("model.language_model.norm.weight");
-    fprintf(stderr, "kugelaudio: final_norm w=%p [%lld,%lld]\n", (void*)fnw,
+    KUGELAUDIO_TRACE("kugelaudio: final_norm w=%p [%lld,%lld]\n", (void*)fnw,
             fnw?(long long)fnw->ne[0]:-1, fnw?(long long)fnw->ne[1]:-1);
     cur = ggml_mul(ctx0, cur, fnw);
-    fprintf(stderr, "kugelaudio: final_norm OK\n");
+    KUGELAUDIO_TRACE("kugelaudio: final_norm OK\n");
 
     // Output both hidden states and logits
     if (output_hidden) {
@@ -1090,15 +1103,15 @@ static ggml_cgraph* build_lm_graph(kugelaudio_context* ctx, int n_tokens, int n_
         last_tok = cur;
     }
     ggml_tensor* lm_head_w = G("lm_head.weight");
-    fprintf(stderr, "kugelaudio: lm_head w=[%lld,%lld] last_tok=[%lld,%lld]\n",
+    KUGELAUDIO_TRACE("kugelaudio: lm_head w=[%lld,%lld] last_tok=[%lld,%lld]\n",
             lm_head_w?(long long)lm_head_w->ne[0]:-1, lm_head_w?(long long)lm_head_w->ne[1]:-1,
             (long long)last_tok->ne[0], (long long)last_tok->ne[1]);
     ggml_tensor* logits = ggml_mul_mat(ctx0, lm_head_w, last_tok);
-    fprintf(stderr, "kugelaudio: logits=[%lld,%lld] OK\n", (long long)logits->ne[0], (long long)logits->ne[1]);
+    KUGELAUDIO_TRACE("kugelaudio: logits=[%lld,%lld] OK\n", (long long)logits->ne[0], (long long)logits->ne[1]);
     ggml_set_name(logits, "logits");
     ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
-    fprintf(stderr, "kugelaudio: build_lm_graph done\n");
+    KUGELAUDIO_TRACE("kugelaudio: build_lm_graph done\n");
 
     return gf;
 }
@@ -1304,7 +1317,7 @@ extern "C" float* kugelaudio_synthesize(struct kugelaudio_context* ctx,
                                     &prompt_embeds[emb_offset], 0, hp.d_lm * sizeof(float));
         }
         if (ctx->params.verbosity >= 1) {
-            fprintf(stderr, "kugelaudio: injected %d voice frames into prompt\n", ctx->n_voice_frames);
+            KUGELAUDIO_TRACE("kugelaudio: injected %d voice frames into prompt\n", ctx->n_voice_frames);
         }
     }
 
@@ -1327,33 +1340,33 @@ extern "C" float* kugelaudio_synthesize(struct kugelaudio_context* ctx,
                     if (k > n_past + q) mask[(size_t)q * Lk + k] = neg_inf;
         }
 
-        fprintf(stderr, "kugelaudio: sched_reset...\n");
+        KUGELAUDIO_TRACE("kugelaudio: sched_reset...\n");
         ggml_backend_sched_reset(ctx->sched);
-        fprintf(stderr, "kugelaudio: alloc_graph n_nodes=%d...\n", ggml_graph_n_nodes(gf));
+        KUGELAUDIO_TRACE("kugelaudio: alloc_graph n_nodes=%d...\n", ggml_graph_n_nodes(gf));
         if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) return false;
-        fprintf(stderr, "kugelaudio: alloc_graph OK, setting inputs...\n");
+        KUGELAUDIO_TRACE("kugelaudio: alloc_graph OK, setting inputs...\n");
 
         ggml_tensor* t_inp = ggml_graph_get_tensor(gf, "lm_input");
-        fprintf(stderr, "kugelaudio: lm_input tensor=%p\n", (void*)t_inp);
+        KUGELAUDIO_TRACE("kugelaudio: lm_input tensor=%p\n", (void*)t_inp);
         ggml_backend_tensor_set(t_inp, embeds_data, 0, (size_t)hp.d_lm * n_toks * sizeof(float));
-        fprintf(stderr, "kugelaudio: lm_input set OK\n");
+        KUGELAUDIO_TRACE("kugelaudio: lm_input set OK\n");
 
         ggml_tensor* t_pos = ggml_graph_get_tensor(gf, "positions");
-        fprintf(stderr, "kugelaudio: positions tensor=%p\n", (void*)t_pos);
+        KUGELAUDIO_TRACE("kugelaudio: positions tensor=%p\n", (void*)t_pos);
         ggml_backend_tensor_set(t_pos, pos.data(), 0, pos.size() * sizeof(int32_t));
-        fprintf(stderr, "kugelaudio: positions set OK\n");
+        KUGELAUDIO_TRACE("kugelaudio: positions set OK\n");
 
         if (n_toks > 1) {
             ggml_tensor* t_mask = ggml_graph_get_tensor(gf, "causal_mask");
-            fprintf(stderr, "kugelaudio: causal_mask tensor=%p shape=[%lld,%lld]\n",
+            KUGELAUDIO_TRACE("kugelaudio: causal_mask tensor=%p shape=[%lld,%lld]\n",
                     (void*)t_mask, t_mask?(long long)t_mask->ne[0]:-1, t_mask?(long long)t_mask->ne[1]:-1);
             ggml_backend_tensor_set(t_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
-            fprintf(stderr, "kugelaudio: causal_mask set OK\n");
+            KUGELAUDIO_TRACE("kugelaudio: causal_mask set OK\n");
         }
 
-        fprintf(stderr, "kugelaudio: graph_compute...\n");
+        KUGELAUDIO_TRACE("kugelaudio: graph_compute...\n");
         if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) return false;
-        fprintf(stderr, "kugelaudio: graph_compute OK\n");
+        KUGELAUDIO_TRACE("kugelaudio: graph_compute OK\n");
 
         logits.resize(hp.vocab_size);
         ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "logits"), logits.data(), 0,
@@ -1385,9 +1398,9 @@ extern "C" float* kugelaudio_synthesize(struct kugelaudio_context* ctx,
     // ── Prefill ────────────────────────────────────────────────────────
     std::vector<float> logits;
     std::vector<float> hidden_state;
-    fprintf(stderr, "kugelaudio: prefill %d tokens, d_lm=%d, embeds size=%zu\n",
+    KUGELAUDIO_TRACE("kugelaudio: prefill %d tokens, d_lm=%d, embeds size=%zu\n",
             n_prompt, hp.d_lm, prompt_embeds.size());
-    fprintf(stderr, "kugelaudio: kv_k shape=[%lld,%lld,%lld,%lld] kv_v shape=[%lld,%lld,%lld,%lld]\n",
+    KUGELAUDIO_TRACE("kugelaudio: kv_k shape=[%lld,%lld,%lld,%lld] kv_v shape=[%lld,%lld,%lld,%lld]\n",
             (long long)ctx->kv_k->ne[0], (long long)ctx->kv_k->ne[1],
             (long long)ctx->kv_k->ne[2], (long long)ctx->kv_k->ne[3],
             (long long)ctx->kv_v->ne[0], (long long)ctx->kv_v->ne[1],
@@ -1409,7 +1422,7 @@ extern "C" float* kugelaudio_synthesize(struct kugelaudio_context* ctx,
     for (int step = 0; step < max_tokens && !finished; step++) {
         int next_token = constrained_argmax(logits);
 
-        fprintf(stderr, "  step %d: token %d (start=%d diff=%d end=%d eos=%d)\n",
+        KUGELAUDIO_TRACE("  step %d: token %d (start=%d diff=%d end=%d eos=%d)\n",
                 step, next_token, hp.speech_start_id, hp.speech_diffusion_id,
                 hp.speech_end_id, hp.eos_token_id);
 
@@ -1419,7 +1432,7 @@ extern "C" float* kugelaudio_synthesize(struct kugelaudio_context* ctx,
         }
 
         if (next_token == hp.speech_diffusion_id) {
-            fprintf(stderr, "kugelaudio: diffusion path\n");
+            KUGELAUDIO_TRACE("kugelaudio: diffusion path\n");
             // ── Run diffusion → decode → audio chunk ───────────────
             // Condition = last hidden state from LM
 
@@ -1434,9 +1447,9 @@ extern "C" float* kugelaudio_synthesize(struct kugelaudio_context* ctx,
             std::vector<float> x0_prev(vae_dim, 0.0f);
             std::vector<float> x0_cur(vae_dim, 0.0f);
 
-            fprintf(stderr, "kugelaudio: starting %d diffusion steps\n", tts_steps);
+            KUGELAUDIO_TRACE("kugelaudio: starting %d diffusion steps\n", tts_steps);
             for (int si = 0; si < tts_steps; si++) {
-                fprintf(stderr, "kugelaudio: diff step %d/%d t=%d\n", si, tts_steps, sched.timesteps[si]);
+                KUGELAUDIO_TRACE("kugelaudio: diff step %d/%d t=%d\n", si, tts_steps, sched.timesteps[si]);
                 // Compute sinusoidal timestep embedding
                 float t_val = (float)sched.timesteps[si];
                 std::vector<float> t_sin(256);
@@ -1457,12 +1470,12 @@ extern "C" float* kugelaudio_synthesize(struct kugelaudio_context* ctx,
                 ggml_backend_tensor_set(ggml_graph_get_tensor(pred_gf, "pred_condition"),
                                         hidden_state.data(), 0, hp.d_lm * sizeof(float));
 
-                fprintf(stderr, "kugelaudio: diff step %d pred compute...\n", si);
+                KUGELAUDIO_TRACE("kugelaudio: diff step %d pred compute...\n", si);
                 if (ggml_backend_sched_graph_compute(ctx->sched, pred_gf) != GGML_STATUS_SUCCESS) {
                     fprintf(stderr, "kugelaudio: pred head compute failed at step %d\n", si);
                     break;
                 }
-                fprintf(stderr, "kugelaudio: diff step %d pred OK\n", si);
+                KUGELAUDIO_TRACE("kugelaudio: diff step %d pred OK\n", si);
 
                 std::vector<float> v_pred(vae_dim);
                 ggml_backend_tensor_get(ggml_graph_get_tensor(pred_gf, "pred_output"),
@@ -1498,9 +1511,9 @@ extern "C" float* kugelaudio_synthesize(struct kugelaudio_context* ctx,
             }
 
             // Run acoustic decoder
-            fprintf(stderr, "kugelaudio: building VAE decoder graph...\n");
+            KUGELAUDIO_TRACE("kugelaudio: building VAE decoder graph...\n");
             ggml_cgraph* dec_gf = build_vae_decoder_graph(ctx, 1);
-            fprintf(stderr, "kugelaudio: VAE decoder graph built OK\n");
+            KUGELAUDIO_TRACE("kugelaudio: VAE decoder graph built OK\n");
             ggml_backend_sched_reset(ctx->sched);
             if (!ggml_backend_sched_alloc_graph(ctx->sched, dec_gf)) {
                 fprintf(stderr, "kugelaudio: decoder alloc failed\n");
@@ -1570,11 +1583,11 @@ extern "C" float* kugelaudio_synthesize(struct kugelaudio_context* ctx,
                 ctx->kv_n_used++;
             }
         } else {
-            fprintf(stderr, "kugelaudio: embed token %d path\n", next_token);
+            KUGELAUDIO_TRACE("kugelaudio: embed token %d path\n", next_token);
             // speech_start or other token — embed and continue
             std::vector<float> tok_embed;
             if (!run_embed_lookup(&next_token, 1, tok_embed)) break;
-            fprintf(stderr, "kugelaudio: embed OK, running LM step n_past=%d\n", ctx->kv_n_used);
+            KUGELAUDIO_TRACE("kugelaudio: embed OK, running LM step n_past=%d\n", ctx->kv_n_used);
 
             if (!run_lm_step(tok_embed.data(), 1, ctx->kv_n_used, logits, &hidden_state)) {
                 fprintf(stderr, "kugelaudio: LM step failed\n");
