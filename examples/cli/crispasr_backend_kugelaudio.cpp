@@ -78,6 +78,7 @@ public:
 
     int tts_sample_rate() const override { return 24000; }
 
+    // cppcheck-suppress virtualCallInConstructor
     void shutdown() override {
         if (kctx_) {
             kugelaudio_free(kctx_);
