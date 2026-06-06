@@ -89,6 +89,32 @@ static int is_clause_break_at(const std::string& text, size_t i) {
     return 0;
 }
 
+// Returns true if the text contains at least one CJK/Hangul/kana character.
+// Used to guard the 42-char split fallback in split_text_at_punct, which is
+// designed for CJK text that lacks sentence-ending punctuation (#29).
+// Without this guard the fallback fires on long English sentences and splits
+// words at raw character boundaries (e.g. "about" → "abo" / "ut", #150).
+static bool text_has_cjk(const std::string& text) {
+    for (size_t i = 0; i < text.size();) {
+        unsigned char b0 = (unsigned char)text[i];
+        // 3-byte UTF-8 sequences with first byte 0xE3–0xEF cover U+3000–U+FFFF,
+        // which includes all CJK Unified Ideographs, Hiragana, Katakana, and Hangul.
+        // Latin text (including accented Latin) only uses 1- and 2-byte sequences
+        // (first byte ≤ 0xDF, i.e. U+0000–U+07FF).
+        if (b0 >= 0xE3 && b0 < 0xF0)
+            return true;
+        if (b0 < 0x80)
+            i += 1;
+        else if (b0 < 0xE0)
+            i += 2;
+        else if (b0 < 0xF0)
+            i += 3; // 0xE0–0xE2: non-CJK 3-byte (Samaritan, arrows, math, …)
+        else
+            i += 4;
+    }
+    return false;
+}
+
 // Count UTF-8 codepoints in a string
 static int utf8_len(const std::string& s) {
     int n = 0;
@@ -149,7 +175,9 @@ static std::vector<std::pair<std::string, float>> split_text_at_punct(const std:
     // Fallback for CJK text without sentence-ending punctuation (#29):
     // If we got <=1 sentence and the text is long (>42 codepoints),
     // re-split at clause breaks (、，) or at ~42 character boundaries.
-    if (sentences.size() <= 1 && utf8_len(text) > 42) {
+    // Guard with text_has_cjk: long English sentences with only a trailing
+    // period must not be split at raw character boundaries (#150).
+    if (sentences.size() <= 1 && utf8_len(text) > 42 && text_has_cjk(text)) {
         sentences.clear();
         start = 0;
         int chars_since_split = 0;
