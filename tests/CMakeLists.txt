@@ -888,6 +888,17 @@ catch_discover_tests(test_audioseal
     PROPERTIES LABELS "unit"
 )
 
+# ─── test_audioseal_cosine — standalone cosine comparison against PyTorch ref.
+# Not a Catch2 test — standalone main(). Run manually after generating
+# reference with Python. Requires AUDIOSEAL_GGUF env var.
+add_executable(test_audioseal_cosine test_audioseal_cosine.cpp)
+target_include_directories(test_audioseal_cosine PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test_audioseal_cosine PRIVATE
+    audioseal
+)
+
 # ─── test_server_chunking — Catch2 unit tests for the sentence splitter
 #used by / v1 / audio / speech long - form input(PLAN §75d / issue #66).
 #Pure functions, no backend dependency.

@@ -128,58 +128,94 @@ static ggml_tensor* conv1d(ggml_context* ctx, ggml_tensor* x,
 // AudioSeal's StreamableLSTM adds a skip connection: output = lstm(x) + x
 // ---------------------------------------------------------------------------
 
-// Single LSTM layer forward pass. x: (D, T), returns (D, T).
-// Input must be in (D, T) layout for mul_mat to work (D is the
-// reduction dimension matching weight_ih's ne[0]=D).
+// Proper recurrent LSTM layer with time-step unrolling.
+// x: (D, T) — D is the hidden/input dim, T is time steps.
+// Returns (D, T) — the hidden state sequence.
 //
-// weight_ih ne = [512, 2048] → mul_mat(weight_ih, x) where x has ne[0]=512
-// gives result with ne[0]=2048 (=4*D), ne[1]=T
+// At each time step t:
+//   gates_t = W_ih @ x_t + b_ih + W_hh @ h_{t-1} + b_hh
+//   i = sigmoid(gates[0:D])
+//   f = sigmoid(gates[D:2D])
+//   g = tanh(gates[2D:3D])
+//   o = sigmoid(gates[3D:4D])
+//   c_t = f * c_{t-1} + i * g
+//   h_t = o * tanh(c_t)
+//
+// Unrolled at graph-construction time since T is known (typically 50).
+// Node count: ~12 ops per step × T steps × 2 layers = ~1200 nodes.
 static ggml_tensor* lstm_layer_forward(ggml_context* ctx,
                                        ggml_tensor* x,
                                        const audioseal_lstm_layer& layer,
                                        int D) {
-    // x: ne[0]=D, ne[1]=T. weight_ih: ne[0]=D, ne[1]=4*D.
-    // mul_mat(weight_ih, x) → ne[0]=4*D, ne[1]=T
+    const int T = (int)x->ne[1]; // x: ne[0]=D, ne[1]=T
+
+    // Precompute input contribution for all time steps:
+    // ih_all = W_ih @ x + b_ih + b_hh   shape: (4*D, T)
     ggml_tensor* ih_all = ggml_mul_mat(ctx, layer.weight_ih, x);
-    // ih_all: ne[0]=4*D, ne[1]=T. Bias: ne[0]=4*D → reshape to (4*D, 1)
-    if (std::getenv("AUDIOSEAL_DEBUG")) fprintf(stderr, "    LSTM ih_all ne=[%lld,%lld], D=%d\n",
-            (long long)ih_all->ne[0], (long long)ih_all->ne[1], D);
     if (layer.bias_ih) {
-        if (std::getenv("AUDIOSEAL_DEBUG")) fprintf(stderr, "    bias_ih ne=[%lld], nelements=%lld, target=(%d,1)\n",
-                (long long)layer.bias_ih->ne[0], (long long)ggml_nelements(layer.bias_ih), 4*D);
         ih_all = ggml_add(ctx, ih_all,
                           ggml_reshape_2d(ctx, layer.bias_ih, 4 * D, 1));
     }
-
-    // Single-pass approximation: h_{t-1} = 0 for all t.
-    ggml_tensor* gates = ih_all;
     if (layer.bias_hh) {
-        gates = ggml_add(ctx, gates,
-                         ggml_reshape_2d(ctx, layer.bias_hh, 4 * D, 1));
+        ih_all = ggml_add(ctx, ih_all,
+                          ggml_reshape_2d(ctx, layer.bias_hh, 4 * D, 1));
     }
 
-    // gates: ne[0]=4*D, ne[1]=T. Split into 4 × (D, T) along dim 0.
-    // View with offset along ne[0] (the innermost/fastest dimension).
-    ggml_tensor* i_gate = ggml_view_2d(ctx, gates, D, gates->ne[1], gates->nb[1], 0);
-    ggml_tensor* f_gate = ggml_view_2d(ctx, gates, D, gates->ne[1], gates->nb[1], (size_t)D * sizeof(float));
-    ggml_tensor* g_gate = ggml_view_2d(ctx, gates, D, gates->ne[1], gates->nb[1], (size_t)2 * D * sizeof(float));
-    ggml_tensor* o_gate = ggml_view_2d(ctx, gates, D, gates->ne[1], gates->nb[1], (size_t)3 * D * sizeof(float));
+    // Unroll over T time steps
+    // h_{t-1} and c_{t-1} start as zero vectors. Use scale(x[:,0], 0) to
+    // create a zero tensor of the right shape without needing a named input.
+    ggml_tensor* x_col0 = ggml_view_1d(ctx, x, D, 0);
+    ggml_tensor* h_prev = ggml_scale(ctx, x_col0, 0.0f); // (D,) zeros
+    ggml_tensor* c_prev = ggml_scale(ctx, x_col0, 0.0f); // (D,) zeros
 
-    i_gate = ggml_sigmoid(ctx, ggml_cont(ctx, i_gate));
-    f_gate = ggml_sigmoid(ctx, ggml_cont(ctx, f_gate));
-    g_gate = ggml_tanh(ctx, ggml_cont(ctx, g_gate));
-    o_gate = ggml_sigmoid(ctx, ggml_cont(ctx, o_gate));
+    // Collect output columns
+    std::vector<ggml_tensor*> h_steps(T);
 
-    // c = i * g  (f * c_{prev} = 0 since c_{prev} = 0)
-    ggml_tensor* c = ggml_mul(ctx, i_gate, g_gate);
-    // h = o * tanh(c)
-    ggml_tensor* output = ggml_mul(ctx, o_gate, ggml_tanh(ctx, c));
+    for (int t = 0; t < T; t++) {
+        // Extract ih_all[:, t] — the input contribution for this step
+        // ih_all is (4*D, T), column t starts at offset t * 4*D * sizeof(float)
+        ggml_tensor* ih_t = ggml_view_1d(ctx, ih_all, 4 * D,
+                                          (size_t)t * ih_all->nb[1]);
 
-    return output; // (T, D)
+        // Recurrent contribution: W_hh @ h_{t-1}  → (4*D,)
+        // weight_hh: ne[0]=D, ne[1]=4*D. h_prev: ne[0]=D.
+        // We need mul_mat for (D, 4*D) × (D, 1) → (4*D, 1)
+        ggml_tensor* h_2d = ggml_reshape_2d(ctx, h_prev, D, 1);
+        ggml_tensor* hh_t = ggml_mul_mat(ctx, layer.weight_hh, h_2d); // (4*D, 1)
+        hh_t = ggml_reshape_1d(ctx, hh_t, 4 * D);
+
+        // Combined gates
+        ggml_tensor* gates_t = ggml_add(ctx, ih_t, hh_t); // (4*D,)
+
+        // Split into 4 gates of size D
+        ggml_tensor* i_t = ggml_sigmoid(ctx, ggml_view_1d(ctx, gates_t, D, 0));
+        ggml_tensor* f_t = ggml_sigmoid(ctx, ggml_view_1d(ctx, gates_t, D, (size_t)D * sizeof(float)));
+        ggml_tensor* g_t = ggml_tanh(ctx, ggml_view_1d(ctx, gates_t, D, (size_t)2 * D * sizeof(float)));
+        ggml_tensor* o_t = ggml_sigmoid(ctx, ggml_view_1d(ctx, gates_t, D, (size_t)3 * D * sizeof(float)));
+
+        // Cell state: c_t = f * c_{t-1} + i * g
+        ggml_tensor* c_t = ggml_add(ctx,
+                                     ggml_mul(ctx, f_t, c_prev),
+                                     ggml_mul(ctx, i_t, g_t));
+
+        // Hidden state: h_t = o * tanh(c_t)
+        ggml_tensor* h_t = ggml_mul(ctx, o_t, ggml_tanh(ctx, c_t));
+
+        h_steps[t] = h_t;
+        h_prev = h_t;
+        c_prev = c_t;
+    }
+
+    // Concatenate h_steps[0..T-1] into (D, T) by reshaping each to (D, 1)
+    // and concatenating along dim 1 (time axis).
+    ggml_tensor* result = ggml_reshape_2d(ctx, h_steps[0], D, 1);
+    for (int t = 1; t < T; t++) {
+        ggml_tensor* col = ggml_reshape_2d(ctx, h_steps[t], D, 1);
+        result = ggml_concat(ctx, result, col, 1);
+    }
+
+    return result; // (D, T)
 }
-
-// (lstm_forward removed — callers use lstm_layer_forward directly
-// with the skip connection applied at the StreamableLSTM call site)
 
 } // namespace
 
