@@ -813,6 +813,21 @@ static void fm_euler_solve(tada_context* c, float* speech, const float* cond,
             run_fm_step(c, speech, t_val, cond, vel_pos.data());
             run_fm_step(c, speech, t_val, neg, vel_neg.data());
 
+            if (i == 0) {
+                float vp_rms = 0, vn_rms = 0, diff_rms = 0;
+                for (int j = 0; j < ad; j++) {
+                    vp_rms += vel_pos[j]*vel_pos[j];
+                    vn_rms += vel_neg[j]*vel_neg[j];
+                    diff_rms += (vel_pos[j]-vel_neg[j])*(vel_pos[j]-vel_neg[j]);
+                }
+                vp_rms = std::sqrt(vp_rms / ad); vn_rms = std::sqrt(vn_rms / ad);
+                diff_rms = std::sqrt(diff_rms / ad);
+                fprintf(stderr, "    fm[0] cfg=%.2f vp=%.4f vn=%.4f diff=%.6f vp[0..4]=[%.4f,%.4f,%.4f,%.4f,%.4f] vn[0..4]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n",
+                        a_cfg, vp_rms, vn_rms, diff_rms,
+                        vel_pos[0],vel_pos[1],vel_pos[2],vel_pos[3],vel_pos[4],
+                        vel_neg[0],vel_neg[1],vel_neg[2],vel_neg[3],vel_neg[4]);
+            }
+
             for (int j = 0; j < ad; j++) {
                 // Acoustic dims: apply acoustic CFG
                 speech[j] += dt * (vel_neg[j] + a_cfg * (vel_pos[j] - vel_neg[j]));
@@ -1123,6 +1138,26 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
                 free(neg_emb);
                 neg_hidden = neg_tr.hidden; // caller frees
             }
+
+            if (step < 3 || (step >= shift && step < shift + 3)) {
+                float neg_rms = 0, pos_rms = 0;
+                for (int j = 0; j < (int)hp.fm_hidden; j++) {
+                    neg_rms += neg_hidden[j] * neg_hidden[j];
+                    pos_rms += tr.hidden[j] * tr.hidden[j];
+                }
+                neg_rms = std::sqrt(neg_rms / hp.fm_hidden);
+                pos_rms = std::sqrt(pos_rms / hp.fm_hidden);
+                // Cosine similarity
+                float dot = 0, na = 0, nb = 0;
+                for (int j = 0; j < (int)hp.fm_hidden; j++) {
+                    dot += tr.hidden[j] * neg_hidden[j];
+                    na += tr.hidden[j] * tr.hidden[j];
+                    nb += neg_hidden[j] * neg_hidden[j];
+                }
+                float cos_sim = dot / (std::sqrt(na) * std::sqrt(nb) + 1e-12f);
+                fprintf(stderr, "  step %d: pos_h_rms=%.4f neg_h_rms=%.4f cos_sim=%.4f tok=%d neg_tok=%d\n",
+                        step, pos_rms, neg_rms, cos_sim, cur_token, neg_token);
+            }
         }
         n_past++;
 
@@ -1134,7 +1169,25 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
         }
 
         // Solve ODE with proper negative conditioning
+        float noise_rms = 0;
+        for (int j = 0; j < ad; j++) noise_rms += speech[j] * speech[j];
+        noise_rms = std::sqrt(noise_rms / ad);
+
         fm_euler_solve(ctx, speech.data(), tr.hidden, num_fm_steps, cfg_scale, neg_hidden);
+
+        float speech_rms = 0;
+        for (int j = 0; j < ad; j++) speech_rms += speech[j] * speech[j];
+        speech_rms = std::sqrt(speech_rms / ad);
+
+        // Also dump hidden state RMS for conditioning
+        float cond_rms = 0;
+        for (int j = 0; j < (int)hp.fm_hidden; j++) cond_rms += tr.hidden[j] * tr.hidden[j];
+        cond_rms = std::sqrt(cond_rms / hp.fm_hidden);
+
+        if (ctx->params.verbosity >= 2 || (step >= shift && step < shift + 3)) {
+            fprintf(stderr, "  step %d: noise_rms=%.4f speech_rms=%.4f cond_rms=%.4f\n",
+                    step, noise_rms, speech_rms, cond_rms);
+        }
 
         // Free negative hidden state
         if (neg_hidden) { free(neg_hidden); neg_hidden = nullptr; }
@@ -1275,8 +1328,29 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     }
 
     int n_expanded = (int)(expanded.size() / ad);
+    int n_masks_set = 0;
+    for (auto m : token_masks) n_masks_set += m;
 
     if (ctx->params.verbosity >= 1) {
+        fprintf(stderr, "tada: time_before values: [");
+        for (size_t i = 0; i < all_times.size() && i < 20; i++) {
+            fprintf(stderr, "%d%s", all_times[i], i+1<all_times.size()?",":"");
+        }
+        fprintf(stderr, "]\n");
+        fprintf(stderr, "tada: decode_feats=%zu, n_expanded=%d, token_masks=%d/%d\n",
+                decode_feats.size(), n_expanded, n_masks_set, (int)token_masks.size());
+        // Dump expanded feature stats
+        for (int i = 0; i < n_expanded; i++) {
+            if (token_masks[i]) {
+                float rms = 0;
+                for (int d = 0; d < ad; d++) {
+                    float v = expanded[i * ad + d];
+                    rms += v * v;
+                }
+                rms = std::sqrt(rms / ad);
+                fprintf(stderr, "  expanded[%d] rms=%.4f (non-zero)\n", i, rms);
+            }
+        }
         fprintf(stderr, "tada: %zu features → %d expanded frames\n",
                 acoustic_features.size(), n_expanded);
     }
@@ -1320,6 +1394,36 @@ void tada_free(struct tada_context* ctx) {
     if (ctx->ctx_w) ggml_free(ctx->ctx_w);
     if (ctx->backend) ggml_backend_free(ctx->backend);
     delete ctx;
+}
+
+void tada_test_fm_step(struct tada_context* ctx,
+                       const float* noisy_z, const float* t_emb_sin,
+                       const float* cond, float* velocity_out) {
+    if (!ctx) return;
+    const int lat = (int)ctx->hp.fm_latent;
+    const int hid = (int)ctx->hp.fm_hidden;
+
+    ggml_cgraph* gf = build_graph_fm_step(ctx);
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "tada: test_fm_step alloc failed\n");
+        return;
+    }
+
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "noisy_z"), noisy_z, 0,
+                            (size_t)lat * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_emb_sin"), t_emb_sin, 0,
+                            256 * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "fm_cond"), cond, 0,
+                            (size_t)hid * sizeof(float));
+
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "tada: test_fm_step compute failed\n");
+        return;
+    }
+
+    ggml_tensor* vel = ggml_graph_get_tensor(gf, "velocity");
+    ggml_backend_tensor_get(vel, velocity_out, 0, (size_t)lat * sizeof(float));
 }
 
 } // extern "C"

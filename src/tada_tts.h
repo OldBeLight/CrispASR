@@ -68,6 +68,12 @@ float* tada_synthesize(struct tada_context* ctx,
 void tada_pcm_free(float* pcm);
 void tada_free(struct tada_context* ctx);
 
+// Test: run a single FM step with given inputs, return velocity.
+// noisy_z: float[528], t_emb_sin: float[256], cond: float[3072], velocity_out: float[528]
+void tada_test_fm_step(struct tada_context* ctx,
+                       const float* noisy_z, const float* t_emb_sin,
+                       const float* cond, float* velocity_out);
+
 #ifdef __cplusplus
 }
 #endif
