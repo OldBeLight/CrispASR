@@ -79,13 +79,11 @@ inline std::string arpa_to_ipa(const std::string& arpa) {
     // selectively (helps compounds like "dictionary" dˈɪkʃənˌɛɹi).
     else if (stress == 2) ipa = "ˌ";
 
-    // AH0: espeak uses ɐ word-initially (about, another, attention, available),
-    // ə elsewhere. We approximate: if this is the first phoneme, use ɐ.
+    // Context-free reductions (applied per-phoneme):
     if (base == "AH" && stress == 0) { ipa += "ə"; return ipa; }
-    if (base == "IH" && stress == 0) { ipa += "ɪ"; return ipa; }  // espeak uses ɪ not ᵻ
+    if (base == "IH" && stress == 0) { ipa += "ɪ"; return ipa; }
     if (base == "IY" && stress == 0) { ipa += "i"; return ipa; }
     if (base == "UW" && stress == 0) { ipa += "ʊ"; return ipa; }
-    // ER: stressed → ɜː (were, her), unstressed → ɚ (after, under)
     if (base == "ER" && stress >= 1) { ipa += "ɜː"; return ipa; }
     if (base == "ER") { ipa += "ɚ"; return ipa; }
 
@@ -460,48 +458,16 @@ inline std::vector<std::string> tokenize(const std::string& text) {
 
 // ── Main API: text → IPA ────────────────────────────────────────────
 
-// espeak-ng IPA overrides for words where CMUdict disagrees.
-// These are the exact IPA strings piper models expect.
+// Minimal espeak-ng overrides — only truly irregular words that can't
+// be fixed by systematic ARPAbet→IPA rules. Keep this list SMALL;
+// prefer fixing the conversion rules for patterns that apply to many words.
 inline const std::map<std::string, std::string>& espeak_overrides() {
     static const std::map<std::string, std::string> table = {
-        // Function words
-        {"THE", "ðə"},
-        {"A", "ə"},
-        {"AN", "ən"},
-        // AA/AO mapping — espeak uses ɔ for these
-        {"ON", "ˈɔn"},
-        {"WAS", "wˈʌz"},
-        {"BOUGHT", "bˈɔːt"},
-        {"COUGH", "kˈɔf"},
-        {"THOUGHT", "θˈɔːt"},
-        {"OUGHT", "ˈɔːt"},
-        {"AUGUST", "ˈɔːɡəst"},
-        {"BECAUSE", "bɪkˈʌz"},
-        // Word-initial ɐ (espeak uses ɐ not ə for initial unstressed AH)
-        {"ABOUT", "ɐbˈaʊt"},
-        {"ANOTHER", "ɐnˈʌðɚ"},
-        {"ATTENTION", "ɐtˈɛnʃən"},
-        {"AVAILABLE", "ɐvˈeɪləbəl"},
-        {"APPROXIMATELY", "ɐpɹˈɑːksɪmətli"},
-        {"UNFORTUNATELY", "ʌnfˈɔːɹtʃənətli"},
-        // Irregular words
-        {"WOMEN", "wˈɪmɪn"},
-        {"YOUR", "jˈʊɹ"},
-        {"CAFE", "kˈæfeɪ"},
-        {"NAIVE", "naɪˈiːv"},
-        {"UNIQUE", "juːnˈiːk"},
-        {"BOUTIQUE", "buːtˈiːk"},
-        {"PNEUMONIA", "nuːmˈoʊniə"},
-        {"RESUME", "ɹᵻzˈuːm"},
-        {"CHARACTER", "kˈæɹɪktɚ"},
-        {"THOROUGH", "θˈʌɹoʊ"},
-        {"AUDIO", "ˈɔːdɪoʊ"},
-        {"COLONEL", "kˈɜːnəl"},
-        {"COMFORTABLE", "kˈʌmftəbəl"},
-        {"VEGETABLE", "vˈɛdʒtəbəl"},
-        {"INTERESTING", "ˈɪntɹəstɪŋ"},
+        // Function words (citation form stress differs)
+        {"THE", "ðə"}, {"A", "ə"},
+        // Truly irregular (no rule can derive these)
+        {"WOMEN", "wˈɪmɪn"}, {"COLONEL", "kˈɜːnəl"},
         {"WEDNESDAY", "wˈɛnzdeɪ"},
-        {"FIANCEE", "fiˌɑːnseɪ"},
     };
     return table;
 }
@@ -540,16 +506,27 @@ inline std::string word_to_ipa(const context& ctx, const std::string& word) {
         arpa_phones = lts_predict(word);
     }
 
-    // Convert ARPAbet → IPA with context-dependent rules:
-    // 1. T-flapping: T/D between vowels → ɾ (water → wˈɔːɾɚ)
-    // 2. ɹ-insertion: ɚ/ɜː before vowel → ɚɹ/ɜːɹ (natural → nˈætʃɚɹəl)
+    // Context-dependent ARPAbet → IPA conversion.
+    // espeak-ng applies several context-sensitive rules that the per-phoneme
+    // arpa_to_ipa() can't handle. We apply them here with full sequence access.
+    //
+    // Rules (from benchmark analysis against espeak-ng ground truth):
+    //  1. AH0 at position 0 → ɐ (word-initial: about, another, attention)
+    //  2. AH0 between consonants → ɪ (not ə) in many positions
+    //  3. IH0 at position 0 → ᵻ (prefix: before, between, december)
+    //  4. AA1 before F/S/TH/NG → ɔ (LOT-CLOTH split: cough, long, wrong)
+    //  5. T/D between stressed-vowel + unstressed-vowel → ɾ (flapping)
+    //  6. ER + vowel → ɚɹ (linking-r)
     std::string ipa;
     int n_ph = (int)arpa_phones.size();
     for (int pi = 0; pi < n_ph; pi++) {
         const auto& ph = arpa_phones[pi];
         std::string base_ph = ph;
-        if (!base_ph.empty() && base_ph.back() >= '0' && base_ph.back() <= '2')
+        int ph_stress = -1;
+        if (!base_ph.empty() && base_ph.back() >= '0' && base_ph.back() <= '2') {
+            ph_stress = base_ph.back() - '0';
             base_ph.pop_back();
+        }
         for (auto& c : base_ph) c = (char)toupper((unsigned char)c);
 
         // T-flapping: T or D between vowels → ɾ (when next vowel is unstressed)
