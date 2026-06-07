@@ -1554,6 +1554,9 @@ endif()
 if (TARGET orpheus)
     target_link_libraries(crispasr-lib PUBLIC orpheus)
 endif()
+if (TARGET tada-tts)
+    target_link_libraries(crispasr-lib PUBLIC tada-tts)
+endif()
 if (TARGET chatterbox)
     # libcrispasr.so calls chatterbox_set_temperature / set_top_p /
     # set_min_p / set_repetition_penalty / set_max_speech_tokens from

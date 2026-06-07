@@ -13,26 +13,27 @@ static __global__ void conv_transpose_1d_kernel(
         return;
     }
 
-    int out_index = global_index / dst_ne0;
+    const int out_index = global_index / dst_ne0;
+    const int idx = global_index % dst_ne0;
+
+    // Analytical i_min/i_max: for output position idx, only input i in
+    // [i*s0, i*s0+K) contributes.  Iterate the tight range instead of
+    // scanning all src1_ne0 with an if-continue (avoids TDR at TTS scale).
+    const int a = idx - src0_ne0 + 1;
+    const int i_min = a <= 0 ? 0 : (a + s0 - 1) / s0;
+    const int i_max = min(idx / s0, src1_ne0 - 1);
 
     float accumulator = 0;
-
-    for (int c = 0; c < src0_ne2; c++) {
-        int idx = global_index % dst_ne0;
-
-        int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
-        int input_offset = src1_ne0 * c;
-
-        for (int i = 0; i < src1_ne0; i++) {
-            if (!(idx >= i*s0 && idx < i*s0 + src0_ne0)) {
-                continue;
+    if (i_min <= i_max) {
+        for (int c = 0; c < src0_ne2; c++) {
+            const int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
+            const int input_offset = src1_ne0 * c;
+            for (int i = i_min; i <= i_max; i++) {
+                const int weight_idx = idx - i*s0;
+                const float kernel_weight = ggml_cuda_cast<float>(src0[kernel_offset + weight_idx]);
+                const float input_value = src1[input_offset + i];
+                accumulator += kernel_weight * input_value;
             }
-            int weight_idx = idx - i*s0;
-
-            float kernel_weight = ggml_cuda_cast<float>(src0[kernel_offset + weight_idx]);
-            float input_value =  src1[input_offset+i];
-
-            accumulator += kernel_weight * input_value;
         }
     }
     dst[global_index] = accumulator;
