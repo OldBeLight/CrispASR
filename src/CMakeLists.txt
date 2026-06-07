@@ -1060,13 +1060,26 @@ if(NOT CRISPASR_WITH_ESPEAK_NG STREQUAL "OFF")
         include(FetchContent)
         set(BUILD_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})
         set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-        set(COMPILE_INTONATIONS ON CACHE BOOL "" FORCE)
         set(ENABLE_TESTS OFF CACHE BOOL "" FORCE)
         set(USE_MBROLA OFF CACHE BOOL "" FORCE)
         set(USE_LIBPCAUDIO OFF CACHE BOOL "" FORCE)
         set(USE_ASYNC OFF CACHE BOOL "" FORCE)
         set(USE_KLATT OFF CACHE BOOL "" FORCE)
         set(USE_SPEECHPLAYER OFF CACHE BOOL "" FORCE)
+
+        # Cross-compiling (Android NDK, iOS toolchain): espeak-ng needs to
+        # run its own binary to compile phoneme/dict data. That can't work
+        # when the target arch differs from the host. Disable data compilation
+        # and fall back to popen(espeak-ng) or pre-compiled data at runtime.
+        if(CMAKE_CROSSCOMPILING)
+            set(COMPILE_INTONATIONS OFF CACHE BOOL "" FORCE)
+            message(STATUS "espeak-ng: cross-compiling — phoneme data compilation disabled")
+            message(STATUS "  Set CRISPASR_ESPEAK_DATA_PATH at runtime to pre-compiled data,")
+            message(STATUS "  or bundle espeak-ng-data/ in your app's assets.")
+        else()
+            set(COMPILE_INTONATIONS ON CACHE BOOL "" FORCE)
+        endif()
+
         FetchContent_Declare(espeak-ng
             GIT_REPOSITORY https://github.com/espeak-ng/espeak-ng.git
             GIT_TAG        1.52.0
@@ -1087,11 +1100,13 @@ if(NOT CRISPASR_WITH_ESPEAK_NG STREQUAL "OFF")
         set(_espeak_bundled TRUE)
         set(_espeak_lib espeak-ng)
         set(_espeak_include ${espeak-ng_SOURCE_DIR}/src/include)
-        # The bundled build compiles phoneme data into
-        # ${espeak-ng_BINARY_DIR}/espeak-ng-data/. espeak_Initialize expects
-        # the PARENT directory (it appends /espeak-ng-data itself).
-        set(_espeak_data_path "${espeak-ng_BINARY_DIR}")
-        message(STATUS "espeak-ng: bundled build, data at ${_espeak_data_path}")
+        if(NOT CMAKE_CROSSCOMPILING)
+            # The bundled build compiles phoneme data into
+            # ${espeak-ng_BINARY_DIR}/espeak-ng-data/. espeak_Initialize expects
+            # the PARENT directory (it appends /espeak-ng-data itself).
+            set(_espeak_data_path "${espeak-ng_BINARY_DIR}")
+            message(STATUS "espeak-ng: bundled build, data at ${_espeak_data_path}")
+        endif()
     endif()
 
     if(_espeak_found)
@@ -1103,7 +1118,7 @@ if(NOT CRISPASR_WITH_ESPEAK_NG STREQUAL "OFF")
         # PRIVATE: don't leak espeak-ng's compat/ headers (wchar.h shadow)
         # into downstream targets like crispasr-lib.
         target_link_libraries(kokoro PRIVATE ${_espeak_lib})
-        if(_espeak_bundled)
+        if(_espeak_bundled AND _espeak_data_path)
             target_compile_definitions(kokoro PRIVATE
                 "CRISPASR_ESPEAK_DATA_PATH=\"${_espeak_data_path}\"")
             add_dependencies(kokoro data)
@@ -1282,7 +1297,7 @@ if(_espeak_found)
         target_link_directories(piper-tts PRIVATE ${_espeak_libdir})
     endif()
     target_link_libraries(piper-tts PRIVATE ${_espeak_lib})
-    if(_espeak_bundled)
+    if(_espeak_bundled AND _espeak_data_path)
         target_compile_definitions(piper-tts PRIVATE
             "CRISPASR_ESPEAK_DATA_PATH=\"${_espeak_data_path}\"")
         add_dependencies(piper-tts data)
