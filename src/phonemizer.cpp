@@ -5,6 +5,7 @@
 #include "core/g2p_en.h"
 #include "core/g2p_de.h"
 #include "core/g2p_fr.h"
+#include "core/g2p_es.h"
 // Auto-download support — only available when linked with crispasr-lib
 #ifdef CRISPASR_HAS_CACHE
 #include "crispasr_cache.h"
@@ -175,6 +176,50 @@ bool phonemize_builtin_fr(const std::string& lang, const std::string& text, std:
         ensure_fr_dict_loaded();
     }
     out = g2p_fr::text_to_ipa(g_g2p_fr_ctx, text);
+    return !out.empty();
+}
+
+// ── Built-in Spanish G2P (LTS rules + optional IPA dictionary) ───────
+
+static g2p_es::context g_g2p_es_ctx;
+static std::mutex g_g2p_es_mu;
+static bool g_g2p_es_tried = false;
+
+static void ensure_es_dict_loaded() {
+    if (g_g2p_es_ctx.dict.loaded || g_g2p_es_tried) return;
+    g_g2p_es_tried = true;
+    const char* env = std::getenv("CRISPASR_ES_DICT_PATH");
+    if (env && *env) {
+        int n = g2p_es::load_ipa_dict_file(g_g2p_es_ctx.dict, env);
+        if (n > 0) { fprintf(stderr, "g2p: loaded Spanish IPA dict (%d entries) from %s\n", n, env); return; }
+    }
+    const char* home = std::getenv("HOME");
+    if (!home) home = std::getenv("USERPROFILE");
+    if (home) {
+        std::string p = std::string(home) + "/.cache/crispasr/ipa_dict_es.txt";
+        int n = g2p_es::load_ipa_dict_file(g_g2p_es_ctx.dict, p);
+        if (n > 0) { fprintf(stderr, "g2p: loaded Spanish IPA dict (%d entries) from %s\n", n, p.c_str()); return; }
+    }
+#ifdef CRISPASR_HAS_CACHE
+    static const char* ES_DICT_URL =
+        "https://raw.githubusercontent.com/open-dict-data/ipa-dict/refs/heads/master/data/es.txt";
+    std::string path = crispasr_cache::ensure_cached_file(
+        "ipa_dict_es.txt", ES_DICT_URL, /*quiet=*/true, "crispasr", "");
+    if (!path.empty()) {
+        int n = g2p_es::load_ipa_dict_file(g_g2p_es_ctx.dict, path);
+        if (n > 0) { fprintf(stderr, "g2p: loaded Spanish IPA dict (%d entries) from %s\n", n, path.c_str()); return; }
+    }
+#endif
+}
+
+bool phonemize_builtin_es(const std::string& lang, const std::string& text, std::string& out) {
+    if (!lang.empty() && lang.find("es") == std::string::npos)
+        return false;
+    {
+        std::lock_guard<std::mutex> g(g_g2p_es_mu);
+        ensure_es_dict_loaded();
+    }
+    out = g2p_es::text_to_ipa(g_g2p_es_ctx, text);
     return !out.empty();
 }
 

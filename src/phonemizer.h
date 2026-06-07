@@ -51,12 +51,16 @@ bool phonemize_builtin_de(const std::string& lang, const std::string& text, std:
 // Built-in French G2P: LTS rules (always available) + optional IPA dictionary.
 bool phonemize_builtin_fr(const std::string& lang, const std::string& text, std::string& out);
 
+// Built-in Spanish G2P: LTS rules (seseo, lenition, yeísmo) + optional dict.
+bool phonemize_builtin_es(const std::string& lang, const std::string& text, std::string& out);
+
 // Try all available phonemizers in priority order.
-// Order: builtin_en → builtin_de → builtin_fr → espeak_dlopen → espeak_popen
+// Order: builtin_{en,de,fr,es} → espeak_dlopen → espeak_popen
 inline bool phonemize(const std::string& lang, const std::string& text, std::string& out) {
     if (phonemize_builtin_en(lang, text, out)) return true;
     if (phonemize_builtin_de(lang, text, out)) return true;
     if (phonemize_builtin_fr(lang, text, out)) return true;
+    if (phonemize_builtin_es(lang, text, out)) return true;
     if (phonemize_espeak_dlopen(lang, text, out)) return true;
     if (phonemize_espeak_popen(lang, text, out)) return true;
     return false;

@@ -1217,6 +1217,20 @@ catch_discover_tests(test-g2p-fr
     PROPERTIES TIMEOUT 30
 )
 
+# ─── test-g2p-es — Catch2 tests for Spanish G2P ─────────────────────────────
+add_executable(test-g2p-es test-g2p-es.cpp)
+target_include_directories(test-g2p-es PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-g2p-es PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-g2p-es
+    EXTRA_ARGS --colour-mode ansi
+    PROPERTIES LABELS "unit;g2p;spanish"
+    PROPERTIES TIMEOUT 30
+)
+
 # ─── test-espeak-phonemize — Catch2 tests for espeak-ng phonemization ───────
 # Tests espeak availability, piper text/IPA synthesis, input validation.
 # Requires PIPER_TEST_MODEL env var or -DPIPER_TEST_MODEL=... for live tests.
