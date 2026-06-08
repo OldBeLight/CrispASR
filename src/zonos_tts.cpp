@@ -1586,10 +1586,12 @@ float* zonos_tts_run_ar_steps_dump(struct zonos_tts_context* ctx, const char* te
         if (new_tokens[0] == eos_id)
             break;
 
-        // Build delayed embedding (delay pattern: cb_k visible at step >= k)
+        // Build delayed embedding (delay pattern: cb_k has delay k, visible at step >= k-1).
+        // Python apply_delay_pattern delays cb_k by k positions (not k+1): at the first
+        // AR backbone call (step=0), position 1 already has cb0 and cb1 visible (1 >= 0 and 1 >= 1).
         std::vector<int32_t> delayed(n_cb, mask_id);
         for (int k = 0; k < n_cb; k++)
-            if (step >= k)
+            if (step + 1 >= k)
                 delayed[k] = new_tokens[k];
         std::vector<float> embed(d);
         embed_codebook_tokens(ctx, delayed.data(), embed.data());
@@ -1850,26 +1852,48 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
     std::vector<float> cfg_logits_buf((size_t)n_cb * vocab);
 
     for (int step = 0; step < max_steps && !eos_reached; step++) {
-        // Apply CFG: blended = uncond + cfg_scale * (cond - uncond)
-        float* sampling_logits = logits_cond;
+        // Build sampling buffer: CFG blend + EOS masking + repetition penalty.
+        // Always write through cfg_logits_buf so the rep-penalty pass has a
+        // single non-aliased target regardless of whether CFG is active.
         if (use_cfg && logits_uncond) {
-            for (int i = 0; i < n_cb * vocab; i++) {
+            for (int i = 0; i < n_cb * vocab; i++)
                 cfg_logits_buf[i] = logits_uncond[i] + cfg_scale * (logits_cond[i] - logits_uncond[i]);
-            }
-            // Mask padding tokens (index >= 1025) to -inf
+        } else {
+            std::memcpy(cfg_logits_buf.data(), logits_cond, (size_t)n_cb * vocab * sizeof(float));
+        }
+        // Mask padding tokens (index >= head_vocab_size) to -inf
+        for (int k = 0; k < n_cb; k++) {
+            for (int i = (int)hp.head_vocab_size; i < vocab; i++)
+                cfg_logits_buf[(size_t)k * vocab + i] = -INFINITY;
+        }
+        // Only codebook 0 can predict EOS (upstream: logit_bias[:, 1:, eos] = -inf)
+        for (int k = 1; k < n_cb; k++)
+            cfg_logits_buf[(size_t)k * vocab + eos_id] = -INFINITY;
+
+        // Repetition penalty (upstream default: factor=3.0, window=2).
+        // Without this the model loops indefinitely and never emits EOS.
+        {
+            const float rep_factor = 3.0f;
+            const int rep_window = 2;
             for (int k = 0; k < n_cb; k++) {
-                for (int i = (int)hp.head_vocab_size; i < vocab; i++) {
-                    cfg_logits_buf[k * vocab + i] = -INFINITY;
+                const auto& hist = delayed_codes[k];
+                const int start = std::max(0, (int)hist.size() - rep_window);
+                float* cb = &cfg_logits_buf[(size_t)k * vocab];
+                for (int i = start; i < (int)hist.size(); ++i) {
+                    const int tok = hist[i];
+                    if (tok < 0 || tok >= vocab)
+                        continue;
+                    if (cb[tok] <= 0.0f)
+                        cb[tok] *= rep_factor;
+                    else
+                        cb[tok] /= rep_factor;
                 }
             }
-            // Only codebook 0 can predict EOS (upstream: logit_bias[:, 1:, eos] = -inf)
-            for (int k = 1; k < n_cb; k++) {
-                cfg_logits_buf[k * vocab + eos_id] = -INFINITY;
-            }
-            sampling_logits = cfg_logits_buf.data();
         }
 
-        // Sample from (CFG-blended) logits for each codebook
+        float* sampling_logits = cfg_logits_buf.data();
+
+        // Sample from logits for each codebook
         std::vector<int32_t> new_tokens(n_cb);
         for (int k = 0; k < n_cb; k++) {
             const float* cb_logits = &sampling_logits[k * vocab];
@@ -1922,15 +1946,12 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
         }
 
         // Build embedding for next step with the delay pattern applied.
-        // Python's delay pattern shifts codebook k by (k+1) positions: at AR step
-        // `step` (0-indexed), only codebooks 0..step have valid predictions — the
-        // rest are still "in the future" and must use mask_token.  Using all 9
-        // predicted tokens immediately (the old code) causes each codebook to see
-        // its own future code as input, breaking the causal structure and producing
-        // garbage audio.
+        // Python apply_delay_pattern delays cb_k by k positions: cb_k is visible at
+        // position p >= k. After step 0 sampling, position 1 has cb0 and cb1 visible
+        // (1 >= 0 and 1 >= 1), so the condition is step + 1 >= k (not step >= k).
         std::vector<int32_t> delayed_embed(n_cb, mask_id);
         for (int k = 0; k < n_cb; k++) {
-            if (step >= k)
+            if (step + 1 >= k)
                 delayed_embed[k] = new_tokens[k];
         }
         std::vector<float> embed(d);
