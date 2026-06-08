@@ -216,22 +216,73 @@ if wav_exists:
         pass
     kh.step("asr.done", chars=len(asr_text))
 
+# ── Python reference run ────────────────────────────────────────────
+# Run the upstream Zonos Python model on the same text to compare output.
+kh.step("python_ref.start")
+ref_wav = WORK / "ref_output.wav"
+ref_codes = WORK / "ref_codes.txt"
+ref_asr = ""
+
+try:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                           "zonos", "soundfile"], timeout=120)
+    ref_r = subprocess.run([
+        sys.executable,
+        str(REPO / "tools" / "reference_backends" / "zonos_tts_reference.py"),
+        "--text", TTS_TEXT,
+        "--output", str(ref_wav),
+        "--dump-codes", str(ref_codes),
+        "--seed", "42",
+        "--language", "en-us",
+        "--max-tokens", "200",
+    ], capture_output=True, text=True, timeout=300)
+    print(f"Python ref: rc={ref_r.returncode}", flush=True)
+    if ref_r.stderr:
+        for ln in ref_r.stderr.strip().splitlines()[-10:]:
+            print(f"  {ln}", flush=True)
+    ref_ok = ref_wav.exists() and ref_wav.stat().st_size > 1000
+    if ref_ok:
+        print(f"  ref WAV: {ref_wav.stat().st_size} bytes", flush=True)
+        # ASR roundtrip the reference
+        out_stem = WORK / "asr_ref"
+        subprocess.run([
+            str(CLI), "--backend", "parakeet",
+            "-m", str(asr_model), "-f", str(ref_wav),
+            "-of", str(out_stem), "-otxt", "--no-prints",
+        ], env=os.environ, capture_output=True, text=True, timeout=120)
+        txt_path = out_stem.with_suffix(".txt")
+        ref_asr = txt_path.read_text().strip() if txt_path.exists() else ""
+        print(f"  ref ASR: {ref_asr[:150]!r}", flush=True)
+    if ref_codes.exists():
+        for ln in ref_codes.read_text().splitlines()[:2]:
+            print(f"  ref codes: {ln[:80]}", flush=True)
+except Exception as e:
+    print(f"Python ref failed: {e}", flush=True)
+    ref_ok = False
+
+kh.step("python_ref.done", ref_ok=ref_ok, ref_asr_len=len(ref_asr))
+
 # ── Summary ─────────────────────────────────────────────────────────
 print(f"\n{'='*64}", flush=True)
 print(f"SUMMARY — Zonos TTS GPU test — {sha[:8]}", flush=True)
 print(f"{'='*64}", flush=True)
-print(f"  Synthesis: rc={rc}  wav={'OK' if wav_exists else 'FAIL'}  {wav_size} bytes  {elapsed}s", flush=True)
-print(f"  ASR roundtrip: {asr_text[:150]!r}", flush=True)
+print(f"  C++ synthesis: rc={rc}  wav={'OK' if wav_exists else 'FAIL'}  {wav_size} bytes  {elapsed}s", flush=True)
+print(f"  C++ ASR:       {asr_text[:150]!r}", flush=True)
+print(f"  Ref synthesis: {'OK' if ref_ok else 'FAIL'}", flush=True)
+print(f"  Ref ASR:       {ref_asr[:150]!r}", flush=True)
 
-if wav_exists and asr_text:
-    print(f"\n  VERDICT: Zonos TTS produces audio and ASR roundtrip yields text.", flush=True)
-elif wav_exists:
-    print(f"\n  VERDICT: Zonos TTS produces audio but ASR roundtrip empty.", flush=True)
-elif rc == 0:
-    print(f"\n  VERDICT: Zonos TTS ran but produced no audio.", flush=True)
+if ref_ok and ref_asr and len(ref_asr) > 10:
+    print(f"\n  Python reference produces intelligible speech.", flush=True)
+    if asr_text and len(asr_text) > 10:
+        print(f"  C++ also produces intelligible speech. BOTH OK.", flush=True)
+    else:
+        print(f"  C++ does NOT produce intelligible speech. DIFF NEEDED.", flush=True)
+elif not ref_ok:
+    print(f"\n  Python reference also failed — input/model issue, not C++ bug.", flush=True)
 else:
-    print(f"\n  VERDICT: Zonos TTS failed (rc={rc}).", flush=True)
+    print(f"\n  Both C++ and Python produce unintelligible output.", flush=True)
 
-kh.step("summary", wav_ok=wav_exists, asr_len=len(asr_text), sha=sha)
+kh.step("summary", wav_ok=wav_exists, asr_len=len(asr_text),
+        ref_ok=ref_ok, ref_asr_len=len(ref_asr), sha=sha)
 kh._push_progress_to_hf(force=True)
 kh.step("script.end")
