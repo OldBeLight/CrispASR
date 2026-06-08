@@ -753,6 +753,7 @@
         "file": "bark-small-q8_0.gguf",
         "approx_size_mb": 500
       },
+      "voice_preset": "v2/en_speaker_3",
       "tts_phrase": "The quick brown fox jumps over the lazy dog",
       "roundtrip_asr_backend": "parakeet-tdt-0.6b-en",
       "wer_max": 0.20,

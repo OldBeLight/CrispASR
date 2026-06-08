@@ -307,23 +307,28 @@ static bool g_g2p_tried = false;
 static std::string g_g2p_dict_source; // "olaph", "open-dict", or file path
 
 static void g2p_ensure_espeak_dict() {
-    if (g_g2p_ctx.espeak_ipa.loaded) return;
+    if (g_g2p_ctx.espeak_ipa.loaded)
+        return;
     // Try local cache first
     const char* home = getenv("HOME");
-    if (!home) home = getenv("USERPROFILE");
+    if (!home)
+        home = getenv("USERPROFILE");
     if (home) {
         std::string p = std::string(home) + "/.cache/crispasr/espeak_en_us.tsv";
         int n = g2p_en::load_ipa_dict_file(g_g2p_ctx.espeak_ipa, p);
-        if (n > 0) { fprintf(stderr, "piper_tts: espeak IPA dict loaded (%d entries)\n", n); return; }
+        if (n > 0) {
+            fprintf(stderr, "piper_tts: espeak IPA dict loaded (%d entries)\n", n);
+            return;
+        }
     }
     // Auto-download from HuggingFace
     std::string path = crispasr_cache::ensure_cached_file(
-        "espeak_en_us.tsv",
-        "https://huggingface.co/datasets/cstr/g2p-dicts/resolve/main/espeak_en_us.tsv",
+        "espeak_en_us.tsv", "https://huggingface.co/datasets/cstr/g2p-dicts/resolve/main/espeak_en_us.tsv",
         /*quiet=*/true, "crispasr", "");
     if (!path.empty()) {
         int n = g2p_en::load_ipa_dict_file(g_g2p_ctx.espeak_ipa, path);
-        if (n > 0) fprintf(stderr, "piper_tts: espeak IPA dict loaded (%d entries)\n", n);
+        if (n > 0)
+            fprintf(stderr, "piper_tts: espeak IPA dict loaded (%d entries)\n", n);
     }
 }
 

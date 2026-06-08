@@ -25,29 +25,33 @@ inline std::string olaph_to_espeak_en(const std::string& ipa) {
         unsigned char c = (unsigned char)ipa[i];
 
         // --- Skip ZWJ (U+200D = E2 80 8D) ---
-        if (c == 0xE2 && i + 2 < len &&
-            (unsigned char)ipa[i+1] == 0x80 && (unsigned char)ipa[i+2] == 0x8D) {
-            i += 3; continue;
+        if (c == 0xE2 && i + 2 < len && (unsigned char)ipa[i + 1] == 0x80 && (unsigned char)ipa[i + 2] == 0x8D) {
+            i += 3;
+            continue;
         }
 
         // --- 2-byte UTF-8 substitutions (C_ __) ---
         if (c >= 0xC0 && c < 0xE0 && i + 1 < len) {
-            unsigned char c2 = (unsigned char)ipa[i+1];
+            unsigned char c2 = (unsigned char)ipa[i + 1];
             unsigned int cp = ((c & 0x1F) << 6) | (c2 & 0x3F);
 
             switch (cp) {
-            case 0x0250: // ɐ → ɚ (near-open central → rhotacized schwa)
+            case 0x0250:           // ɐ → ɚ (near-open central → rhotacized schwa)
                 out += "\xC9\x9A"; // ɚ
-                i += 2; continue;
-            case 0x0252: // ɒ → ɔ (LOT vowel: British → American)
+                i += 2;
+                continue;
+            case 0x0252:           // ɒ → ɔ (LOT vowel: British → American)
                 out += "\xC9\x94"; // ɔ
-                i += 2; continue;
-            case 0x025D: // ɝ → ɜː (NURSE vowel: rhotacized → plain + length)
+                i += 2;
+                continue;
+            case 0x025D:                   // ɝ → ɜː (NURSE vowel: rhotacized → plain + length)
                 out += "\xC9\x9C\xCB\x90"; // ɜː
-                i += 2; continue;
+                i += 2;
+                continue;
             case 0x026B: // ɫ → l (dark L → plain L)
                 out += "l";
-                i += 2; continue;
+                i += 2;
+                continue;
             default:
                 break;
             }
@@ -56,10 +60,14 @@ inline std::string olaph_to_espeak_en(const std::string& ipa) {
         // --- Pass through everything else ---
         // Determine UTF-8 byte count
         int cp_len = 1;
-        if (c >= 0xF0) cp_len = 4;
-        else if (c >= 0xE0) cp_len = 3;
-        else if (c >= 0xC0) cp_len = 2;
-        if (i + cp_len > len) break;
+        if (c >= 0xF0)
+            cp_len = 4;
+        else if (c >= 0xE0)
+            cp_len = 3;
+        else if (c >= 0xC0)
+            cp_len = 2;
+        if (i + cp_len > len)
+            break;
         out.append(ipa, i, cp_len);
         i += cp_len;
     }
