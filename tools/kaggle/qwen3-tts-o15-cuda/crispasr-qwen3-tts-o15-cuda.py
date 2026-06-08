@@ -163,8 +163,26 @@ def run_tts(label, o15_value, extra_env=None, timeout=300):
     if extra_env:
         env.update(extra_env)
 
-    # Use jfk.wav from the repo as voice reference (qwen3-tts requires a voice)
-    voice_ref = REPO / "samples" / "jfk.wav"
+    # Use jfk.wav from the repo as voice reference (qwen3-tts requires 24kHz)
+    voice_ref_16k = REPO / "samples" / "jfk.wav"
+    voice_ref = WORK / "jfk_24k.wav"
+    if not voice_ref.exists():
+        # Resample 16kHz -> 24kHz using scipy
+        try:
+            import scipy.io.wavfile as swav
+            from scipy.signal import resample_poly
+            sr_in, data = swav.read(str(voice_ref_16k))
+            if sr_in != 24000:
+                data_24k = resample_poly(data.astype("float32"), 24000, sr_in)
+                swav.write(str(voice_ref), 24000, data_24k.astype("int16"))
+            else:
+                import shutil
+                shutil.copy(str(voice_ref_16k), str(voice_ref))
+        except ImportError:
+            # Fallback: use ffmpeg if available
+            subprocess.run(["ffmpeg", "-y", "-i", str(voice_ref_16k),
+                            "-ar", "24000", str(voice_ref)],
+                           capture_output=True, timeout=30)
     ref_text = "And so my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
 
     cmd = [
