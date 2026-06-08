@@ -1759,9 +1759,20 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
             break;
         }
 
-        // Build embedding for next step: sum of all codebook embeddings at new_tokens
+        // Build embedding for next step with the delay pattern applied.
+        // Python's delay pattern shifts codebook k by (k+1) positions: at AR step
+        // `step` (0-indexed), only codebooks 0..step have valid predictions — the
+        // rest are still "in the future" and must use mask_token.  Using all 9
+        // predicted tokens immediately (the old code) causes each codebook to see
+        // its own future code as input, breaking the causal structure and producing
+        // garbage audio.
+        std::vector<int32_t> delayed_embed(n_cb, mask_id);
+        for (int k = 0; k < n_cb; k++) {
+            if (step >= k)
+                delayed_embed[k] = new_tokens[k];
+        }
         std::vector<float> embed(d);
-        embed_codebook_tokens(ctx, new_tokens.data(), embed.data());
+        embed_codebook_tokens(ctx, delayed_embed.data(), embed.data());
 
         // Run backbone for single token — conditioned path
         logits_cond = run_backbone(ctx, embed.data(), 1, n_past, ctx->kv_k, ctx->kv_v);
