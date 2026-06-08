@@ -145,7 +145,7 @@ struct zonos_cond_state {
     float fmax = 22050.0f;
     float pitch_std = 20.0f;
     float speaking_rate = 15.0f;
-    int language_id = 25; // default: en-us (index 25 in the language list)
+    int language_id = 24; // default: en-us (index 24 in the language list)
 
     // Language code strings for lookup
     std::vector<std::string> language_codes;
@@ -305,6 +305,13 @@ struct zonos_tts_context* zonos_tts_init_from_file(const char* path_model, struc
             return nullptr;
         }
         load_language_codes(gguf_ctx, ctx->cond_state);
+        // Fix default language_id by name lookup (hardcoded index is fragile)
+        for (int i = 0; i < (int)ctx->cond_state.language_codes.size(); i++) {
+            if (ctx->cond_state.language_codes[i] == "en-us") {
+                ctx->cond_state.language_id = i;
+                break;
+            }
+        }
         core_gguf::free_metadata(gguf_ctx);
     }
 
@@ -504,6 +511,9 @@ void zonos_tts_set_fmax(struct zonos_tts_context* ctx, float fmax) {
 int zonos_tts_set_language(struct zonos_tts_context* ctx, const char* lang_code) {
     if (!ctx || !lang_code)
         return -1;
+    // "auto" = keep the default (en-us); not a real language code
+    if (strcmp(lang_code, "auto") == 0 || strcmp(lang_code, "") == 0)
+        return 0;
     for (size_t i = 0; i < ctx->cond_state.language_codes.size(); i++) {
         if (ctx->cond_state.language_codes[i] == lang_code) {
             ctx->cond_state.language_id = (int)i;
