@@ -68,10 +68,13 @@ def dump(model_dir: Path, audio: np.ndarray, stages: set, **kwargs) -> dict[str,
     stages: subset of DEFAULT_STAGES to capture.
 
     Env vars:
-      ZONOS_TTS_TEXT        synthesis text (default "Hello world.")
-      ZONOS_TTS_SEED        RNG seed (default 42)
-      ZONOS_TTS_MAX_TOKENS  max AR steps (default 200)
-      ZONOS_TTS_LANGUAGE    eSpeak language code (default "en-us")
+      ZONOS_TTS_TEXT            synthesis text (default "Hello world.")
+      ZONOS_TTS_SEED            RNG seed (default 42)
+      ZONOS_TTS_MAX_TOKENS      max AR steps (default 200)
+      ZONOS_TTS_LANGUAGE        eSpeak language code (default "en-us")
+      ZONOS_SPEAKER_EMB_PATH    path to 128-d float32 binary (int32 dim + 128 floats),
+                                matches the C++ ZONOS_SPEAKER_EMB_PATH env var.
+                                If not set, uses torch.randn (will differ from C++).
     """
     try:
         import torch
@@ -93,7 +96,25 @@ def dump(model_dir: Path, audio: np.ndarray, stages: set, **kwargs) -> dict[str,
     model_str = str(model_dir)
     model = Zonos.from_pretrained(model_str, device=device)
 
-    speaker = torch.randn(1, 1, 128, device=device, dtype=torch.bfloat16)
+    # Load speaker embedding from file if ZONOS_SPEAKER_EMB_PATH is set.
+    # File format: int32 dim (must be 128) followed by 128 float32 values.
+    # This matches the C++ runtime's ZONOS_SPEAKER_EMB_PATH convention so
+    # both sides use an identical embedding for apples-to-apples comparison.
+    spk_path = os.environ.get("ZONOS_SPEAKER_EMB_PATH", "")
+    speaker: torch.Tensor
+    if spk_path and os.path.exists(spk_path):
+        import struct
+        with open(spk_path, "rb") as f:
+            (dim,) = struct.unpack("<i", f.read(4))
+            assert dim == 128, f"expected dim=128, got {dim}"
+            emb = np.frombuffer(f.read(dim * 4), dtype=np.float32).copy()
+        speaker = torch.from_numpy(emb).to(device=device, dtype=torch.bfloat16).view(1, 1, 128)
+        print(f"zonos-ref: loaded speaker embedding from {spk_path}", file=sys.stderr)
+    else:
+        torch.manual_seed(int(os.environ.get("ZONOS_TTS_SEED", "42")))
+        speaker = torch.randn(1, 1, 128, device=device, dtype=torch.bfloat16)
+        print("zonos-ref: using random speaker embedding (set ZONOS_SPEAKER_EMB_PATH for reproducible comparison)",
+              file=sys.stderr)
     cond_dict = make_cond_dict(text=text, language=language, speaker=speaker, device=device)
 
     captures: dict[str, np.ndarray] = {}
