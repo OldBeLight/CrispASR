@@ -1179,8 +1179,8 @@ static ggml_cgraph* build_graph_backbone(zonos_tts_context* ctx, int n_past, int
         /*qk_norm_eps*/ 0.0f,
         /*gqa_mode*/ core_attn::GQA_MANUAL_CONT,
     };
-    // Zonos config: rotary_emb_interleaved=true → consecutive-pair RoPE (GPT-NeoX style)
-    kvp.rope_type = GGML_ROPE_TYPE_NEOX;
+    // Zonos uses consecutive-pair RoPE (x[2i],x[2i+1]) not half-split (x[i],x[i+d/2]).
+    kvp.rope_type = GGML_ROPE_TYPE_NORMAL;
 
     // Helper to upcast F16 tensors to F32 for elementwise ops
     auto cast_f32 = [&](ggml_tensor* t) -> ggml_tensor* {
@@ -1214,10 +1214,19 @@ static ggml_cgraph* build_graph_backbone(zonos_tts_context* ctx, int n_past, int
         cur = ggml_mul(ctx0, cur, cast_f32(layer.ffn_norm_w));
         cur = ggml_add(ctx0, cur, cast_f32(layer.ffn_norm_b));
 
-        // SwiGLU FFN with fused gate+up
-        ggml_tensor* mlp =
-            core_ffn::swiglu_fused_gate_up(ctx0, cur, layer.ffn_gate_up_w, layer.ffn_down_w, (int)hp.ff_dim);
-        cur = ggml_add(ctx0, residual, mlp);
+        // GatedMLP (Zonos): y, gate = fc1(x).chunk(2, dim=-1); fc2(y * silu(gate))
+        // The first chunk is y (no activation), the second is gate (silu).
+        // This is the OPPOSITE of the standard swiglu_fused_gate_up convention
+        // which applies silu to the first chunk.
+        {
+            ggml_tensor* gate_up = ggml_mul_mat(ctx0, layer.ffn_gate_up_w, cur);
+            const int ff = (int)hp.ff_dim;
+            const size_t ts = ggml_type_size(gate_up->type);
+            ggml_tensor* y = ggml_view_2d(ctx0, gate_up, ff, (int)gate_up->ne[1], gate_up->nb[1], 0);
+            ggml_tensor* gate = ggml_view_2d(ctx0, gate_up, ff, (int)gate_up->ne[1], gate_up->nb[1], (size_t)ff * ts);
+            cur = ggml_add(ctx0, residual,
+                           ggml_mul_mat(ctx0, layer.ffn_down_w, ggml_mul(ctx0, y, ggml_silu(ctx0, gate))));
+        }
     }
 
     // Final LayerNorm
@@ -1229,6 +1238,8 @@ static ggml_cgraph* build_graph_backbone(zonos_tts_context* ctx, int n_past, int
     if (T > 1) {
         cur = ggml_view_2d(ctx0, cur, d, 1, cur->nb[1], (size_t)(T - 1) * cur->nb[1]);
     }
+    ggml_set_name(cur, "last_hidden");
+    ggml_build_forward_expand(gf, cur);
 
     // Project to all 9 codebook heads, concatenate logits
     // Each head: (head_vocab_size, d_model) @ (d_model, 1) -> (head_vocab_size, 1)
@@ -1250,8 +1261,11 @@ static ggml_cgraph* build_graph_backbone(zonos_tts_context* ctx, int n_past, int
 
 // Run the backbone graph, return logits for all 9 codebooks at the last position.
 // Returns allocated float array of size (head_vocab_size * n_codebooks). Caller frees.
+// If out_hidden is non-null and points to a buffer of size d_model floats, the
+// last-token hidden state (after final LayerNorm, before head projection) is written there.
 static float* run_backbone(zonos_tts_context* ctx, const float* embeds, int T, int n_past,
-                           ggml_tensor* use_kv_k = nullptr, ggml_tensor* use_kv_v = nullptr) {
+                           ggml_tensor* use_kv_k = nullptr, ggml_tensor* use_kv_v = nullptr,
+                           float* out_hidden = nullptr) {
     if (n_past + T > ctx->kv_max_ctx) {
         fprintf(stderr, "zonos_tts: kv overflow (%d+%d > %d)\n", n_past, T, ctx->kv_max_ctx);
         return nullptr;
@@ -1297,6 +1311,43 @@ static float* run_backbone(zonos_tts_context* ctx, const float* embeds, int T, i
     ggml_tensor* out = ggml_graph_get_tensor(gf, "logits");
     float* r = (float*)malloc((size_t)total_logits * sizeof(float));
     ggml_backend_tensor_get(out, r, 0, (size_t)total_logits * sizeof(float));
+
+    // Read hidden state when requested (programmatic API or dump dir)
+    ggml_tensor* hs = ggml_graph_get_tensor(gf, "last_hidden");
+    if (hs) {
+        if (out_hidden) {
+            ggml_backend_tensor_get(hs, out_hidden, 0, (size_t)d * sizeof(float));
+        } else if (n_past == 0) {
+            const char* ddir = getenv("ZONOS_CPP_DUMP_DIR");
+            if (ddir) {
+                std::vector<float> hs_buf(d);
+                ggml_backend_tensor_get(hs, hs_buf.data(), 0, (size_t)d * sizeof(float));
+                char dp[512];
+                snprintf(dp, sizeof(dp), "%s/cpp_last_hidden_%s.npy", ddir,
+                         (use_kv_k == ctx->kv_k || !use_kv_k) ? "cond" : "uncond");
+                FILE* df = fopen(dp, "wb");
+                if (df) {
+                    const char magic[] = "\x93NUMPY\x01\x00";
+                    fwrite(magic, 1, 8, df);
+                    char hdr[128];
+                    int hlen =
+                        snprintf(hdr, sizeof(hdr), "{'descr': '<f4', 'fortran_order': False, 'shape': (%d,), }", d);
+                    int padded = ((hlen + 10 + 63) / 64) * 64 - 10;
+                    while (hlen < padded)
+                        hdr[hlen++] = ' ';
+                    hdr[hlen - 1] = '\n';
+                    uint16_t hlen16 = (uint16_t)hlen;
+                    fwrite(&hlen16, 2, 1, df);
+                    fwrite(hdr, 1, hlen, df);
+                    fwrite(hs_buf.data(), sizeof(float), d, df);
+                    fclose(df);
+                    fprintf(stderr, "zonos_tts: dumped last_hidden (%s) to %s\n",
+                            (use_kv_k == ctx->kv_k || !use_kv_k) ? "cond" : "uncond", dp);
+                }
+            }
+        }
+    }
+
     return r;
 }
 
@@ -1452,6 +1503,76 @@ float* zonos_tts_build_conditioning_prefix(struct zonos_tts_context* ctx, const 
     return out;
 }
 
+float* zonos_tts_get_prefill_hidden(struct zonos_tts_context* ctx, const char* text, int* out_d_model) {
+    if (!ctx || !text || !out_d_model)
+        return nullptr;
+
+    const auto& hp = ctx->hp;
+    const int d = (int)hp.d_model;
+
+    const char* lang = "en-us";
+    if (ctx->cond_state.language_id >= 0 && ctx->cond_state.language_id < (int)ctx->cond_state.language_codes.size())
+        lang = ctx->cond_state.language_codes[ctx->cond_state.language_id].c_str();
+
+    auto phoneme_ids = tokenize_text_full(text, lang);
+    int cond_len = 0, uncond_len = 0;
+    float* cond_prefix = build_prefix_cpu(ctx, phoneme_ids, false, &cond_len);
+    float* uncond_prefix = build_prefix_cpu(ctx, phoneme_ids, true, &uncond_len);
+    if (!cond_prefix || !uncond_prefix) {
+        free(cond_prefix);
+        free(uncond_prefix);
+        return nullptr;
+    }
+
+    // Append mask frame
+    {
+        std::vector<float> mask_emb(d, 0.0f);
+        std::vector<float> row(d);
+        for (uint32_t k = 0; k < hp.n_codebooks; k++) {
+            tensor_get_row_f32(ctx->emb_w[k], (int)hp.masked_token_id, row.data(), d);
+            for (int i = 0; i < d; i++)
+                mask_emb[i] += row[i];
+        }
+        auto extend = [&](float*& p, int& len) {
+            float* e = (float*)malloc((size_t)(len + 1) * d * sizeof(float));
+            std::memcpy(e, p, (size_t)len * d * sizeof(float));
+            std::memcpy(e + (size_t)len * d, mask_emb.data(), (size_t)d * sizeof(float));
+            free(p);
+            p = e;
+            len++;
+        };
+        extend(cond_prefix, cond_len);
+        extend(uncond_prefix, uncond_len);
+    }
+
+    int kv_need = std::max(cond_len, uncond_len) + 2;
+    if (!kv_alloc(ctx, kv_need)) {
+        free(cond_prefix);
+        free(uncond_prefix);
+        return nullptr;
+    }
+    ggml_backend_buffer_clear(ctx->kv_buf, 0);
+
+    // Return layout: (2, d_model) — row 0 = cond, row 1 = uncond
+    float* out = (float*)malloc((size_t)2 * d * sizeof(float));
+    if (!out) {
+        free(cond_prefix);
+        free(uncond_prefix);
+        return nullptr;
+    }
+
+    float* logits_u =
+        run_backbone(ctx, uncond_prefix, uncond_len, 0, ctx->kv_k_uncond, ctx->kv_v_uncond, out + (size_t)d);
+    free(logits_u);
+    float* logits_c = run_backbone(ctx, cond_prefix, cond_len, 0, ctx->kv_k, ctx->kv_v, out);
+    free(logits_c);
+    free(cond_prefix);
+    free(uncond_prefix);
+
+    *out_d_model = d;
+    return out;
+}
+
 float* zonos_tts_run_ar_steps_dump(struct zonos_tts_context* ctx, const char* text, int n_steps_req, int* out_n_steps,
                                    int* out_n_cb, int* out_vocab) {
     if (!ctx || !text || n_steps_req <= 0 || !out_n_steps || !out_n_cb || !out_vocab)
@@ -1586,12 +1707,14 @@ float* zonos_tts_run_ar_steps_dump(struct zonos_tts_context* ctx, const char* te
         if (new_tokens[0] == eos_id)
             break;
 
-        // Build delayed embedding (delay pattern: cb_k has delay k, visible at step >= k-1).
-        // Python apply_delay_pattern delays cb_k by k positions (not k+1): at the first
-        // AR backbone call (step=0), position 1 already has cb0 and cb1 visible (1 >= 0 and 1 >= 1).
+        // Build delayed embedding.
+        // apply_delay_pattern shifts codebook k by k+1 positions, so codebook k
+        // is first non-masked at delayed position k+1. In the AR loop this means
+        // codebook k is visible starting at AR iteration t >= k (0-indexed), which
+        // maps directly to C++ step >= k.
         std::vector<int32_t> delayed(n_cb, mask_id);
         for (int k = 0; k < n_cb; k++)
-            if (step + 1 >= k)
+            if (step >= k)
                 delayed[k] = new_tokens[k];
         std::vector<float> embed(d);
         embed_codebook_tokens(ctx, delayed.data(), embed.data());
@@ -1870,6 +1993,34 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
         for (int k = 1; k < n_cb; k++)
             cfg_logits_buf[(size_t)k * vocab + eos_id] = -INFINITY;
 
+        // Dump CFG-blended logits at step 0 for comparison with Python
+        if (step == 0) {
+            const char* ddir = getenv("ZONOS_CPP_DUMP_DIR");
+            if (ddir) {
+                char dp[512];
+                snprintf(dp, sizeof(dp), "%s/cpp_cfg_step0_logits.npy", ddir);
+                FILE* df = fopen(dp, "wb");
+                if (df) {
+                    const char magic[] = "\x93NUMPY\x01\x00";
+                    fwrite(magic, 1, 8, df);
+                    char hdr[128];
+                    int hlen =
+                        snprintf(hdr, sizeof(hdr), "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }",
+                                 n_cb, (int)hp.head_vocab_size);
+                    int padded = ((hlen + 10 + 63) / 64) * 64 - 10;
+                    while (hlen < padded)
+                        hdr[hlen++] = ' ';
+                    hdr[hlen - 1] = '\n';
+                    uint16_t hlen16 = (uint16_t)hlen;
+                    fwrite(&hlen16, 2, 1, df);
+                    fwrite(hdr, 1, hlen, df);
+                    fwrite(cfg_logits_buf.data(), sizeof(float), (size_t)n_cb * (int)hp.head_vocab_size, df);
+                    fclose(df);
+                    fprintf(stderr, "zonos_tts: dumped CFG step0 logits to %s\n", dp);
+                }
+            }
+        }
+
         // Repetition penalty (upstream default: factor=3.0, window=2).
         // Without this the model loops indefinitely and never emits EOS.
         {
@@ -1902,6 +2053,20 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
         }
         free(logits_cond);
         logits_cond = nullptr;
+
+        // Per-step debug: print cb0 argmax + EOS logit + all 9 sampled tokens
+        if (ctx->params.verbosity >= 1) {
+            const float* cb0 = &cfg_logits_buf[0];
+            int argmax = 0;
+            for (int i = 1; i < vocab; i++)
+                if (cb0[i] > cb0[argmax])
+                    argmax = i;
+            fprintf(stderr, "zonos_tts: step=%d cb0 argmax=%d (%.2f) eos=%.2f tok=[", step, argmax, cb0[argmax],
+                    cb0[eos_id]);
+            for (int k = 0; k < n_cb; k++)
+                fprintf(stderr, k ? ",%d" : "%d", new_tokens[k]);
+            fprintf(stderr, "]\n");
+        }
 
         // Check EOS on codebook 0 (after delay offset is accounted for)
         if (new_tokens[0] == eos_id) {
@@ -1946,12 +2111,11 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
         }
 
         // Build embedding for next step with the delay pattern applied.
-        // Python apply_delay_pattern delays cb_k by k positions: cb_k is visible at
-        // position p >= k. After step 0 sampling, position 1 has cb0 and cb1 visible
-        // (1 >= 0 and 1 >= 1), so the condition is step + 1 >= k (not step >= k).
+        // apply_delay_pattern shifts codebook k by k+1 positions: codebook k
+        // is non-masked starting at AR iteration t >= k (0-indexed) = C++ step >= k.
         std::vector<int32_t> delayed_embed(n_cb, mask_id);
         for (int k = 0; k < n_cb; k++) {
-            if (step + 1 >= k)
+            if (step >= k)
                 delayed_embed[k] = new_tokens[k];
         }
         std::vector<float> embed(d);

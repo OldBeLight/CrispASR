@@ -56,6 +56,7 @@ _N_AR_STEPS = int(os.environ.get("ZONOS_DIFF_N_STEPS", "10"))
 DEFAULT_STAGES = [
     "conditioning_prefix",   # (2, prefix_len, d_model): cond+uncond stacked
     "phoneme_ids",           # (prefix_len_ph,): int32 token IDs
+    "prefill_hidden",        # (2, d_model): last-token backbone hidden state at prefill [cond, uncond]
     "prefill_logits",        # (n_codebooks, head_vocab_size): CFG-blended logits from prefill
     # Per-AR-step CFG-blended logits (post-logit_bias masking), same as what the
     # sampler sees. Shape (n_codebooks, head_vocab_size) each.
@@ -139,6 +140,28 @@ def dump(model_dir: Path, audio: np.ndarray, stages: set, **kwargs) -> dict[str,
             captures["phoneme_ids"] = np.array(ids, dtype=np.int32)
         except Exception as e:
             print(f"phoneme_ids capture failed: {e}", file=sys.stderr)
+
+    # prefill_hidden — last-token backbone hidden state at prefill: shape (2, d_model)
+    # Captured by hooking model.backbone during _prefill, so the batch-of-2 output
+    # (index 0 = cond, index 1 = uncond) is sliced at the final position.
+    if "prefill_hidden" in stages:
+        _backbone_hidden: list = []
+        def _backbone_hook(module, inp, out):
+            # out: [2, T, d_model]; take last token per batch entry
+            _backbone_hidden.append(out.detach()[:, -1, :].cpu().float().numpy())
+        handle = model.backbone.register_forward_hook(_backbone_hook)
+        try:
+            from zonos.codebook_pattern import apply_delay_pattern as _adp
+            _seed_codes = torch.full((1, 9, max_tokens), -1, device=device)
+            _delayed = _adp(_seed_codes, model.masked_token_id)
+            _delayed_prefix = _delayed[..., :1]
+            _inf_params = model.setup_cache(batch_size=2, max_seqlen=conditioning.shape[1] + max_tokens + 9)
+            with torch.no_grad():
+                model._prefill(conditioning, _delayed_prefix, _inf_params, cfg_scale=2.0)
+        finally:
+            handle.remove()
+        if _backbone_hidden:
+            captures["prefill_hidden"] = _backbone_hidden[0]  # shape (2, d_model)
 
     # prefill_logits + ar_step_K_logits + output_codes — run generate() with hook
     n_steps = _N_AR_STEPS

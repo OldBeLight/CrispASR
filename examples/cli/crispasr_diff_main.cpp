@@ -5241,6 +5241,21 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Stage: prefill_hidden — last-token backbone hidden state (2, d_model)
+        {
+            int d_model = 0;
+            float* hidden = zonos_tts_get_prefill_hidden(ctx, syn_text.c_str(), &d_model);
+            if (!hidden) {
+                printf("[ERR ] prefill_hidden         zonos_tts_get_prefill_hidden returned null\n");
+                n_fail++;
+            } else {
+                auto rep = compare_with_row_width(ref, "prefill_hidden", hidden, (size_t)2 * d_model, d_model);
+                print_row("prefill_hidden", rep, COS_THRESHOLD);
+                record(rep);
+                free(hidden);
+            }
+        }
+
         // Stages: prefill_logits + ar_step_K_logits (K = 0..n_diff_steps-1)
         // Run the AR dump and compare slot by slot.
         {

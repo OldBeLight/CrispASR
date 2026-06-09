@@ -116,6 +116,13 @@ float* zonos_tts_build_conditioning_prefix(struct zonos_tts_context* ctx, const 
 float* zonos_tts_run_ar_steps_dump(struct zonos_tts_context* ctx, const char* text, int n_steps_req, int* out_n_steps,
                                    int* out_n_cb, int* out_vocab);
 
+// Return the last-token backbone hidden state at prefill for diff testing.
+// Runs the prefix conditioner + backbone prefill (same path as synthesize_codes)
+// and returns a float buffer of shape (2, d_model): row 0 = conditioned path,
+// row 1 = unconditioned path (after the final LayerNorm, before head projection).
+// out_d_model receives d_model. Caller frees with free(). Returns nullptr on failure.
+float* zonos_tts_get_prefill_hidden(struct zonos_tts_context* ctx, const char* text, int* out_d_model);
+
 void zonos_tts_set_n_threads(struct zonos_tts_context* ctx, int n_threads);
 void zonos_tts_set_temperature(struct zonos_tts_context* ctx, float temperature);
 void zonos_tts_set_seed(struct zonos_tts_context* ctx, uint64_t seed);
