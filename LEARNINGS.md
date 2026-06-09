@@ -8573,6 +8573,54 @@ UTF-8 symbol splitting. Converter stores original SP scores (not byte-length hac
 Validation: 24/24 description tokens and 13/13 prompt tokens match Python HF tokenizer
 exactly after fix (was 22/24 + 13/13 before).
 
+### Zonos TTS — RoPE mode and GatedMLP chunk ordering are easy to get wrong
+
+Two structural bugs survived until diff-harness validation (2026-06-09):
+
+1. **RoPE type**: x_transformers `apply_rotary_emb` reshapes to `(…, d/2, 2)` and
+   rotates *consecutive pairs* (indices `2i, 2i+1`). This is `GGML_ROPE_TYPE_NORMAL`
+   (mode=0). Using `GGML_ROPE_TYPE_NEOX` (mode=2, half-split: `x[i], x[i+d/2]`)
+   degrades prefill_hidden cosine from 0.996 to 0.984.
+
+2. **GatedMLP chunk ordering**: Zonos uses `fc2(y * silu(gate))` where `y=chunk0`
+   (linear passthrough) and `gate=chunk1` (silu activation). The `swiglu_fused_gate_up`
+   helper applies silu to `chunk0` — the opposite convention. Always verify which chunk
+   gets the activation by reading the upstream Python directly.
+
+### Selective quantization for AR-decoder EOS logits
+
+Uniform Q4_K of any multi-codebook AR TTS model can inflate the EOS logit at AR step 0
+because the per-codebook output heads (`heads.*.weight`) are small (one weight matrix per
+codebook) and are directly multiplied by the noisy backbone hidden state. Even a cosine
+similarity of 0.996 on the hidden state translates to a logit shift of ~0.9 units on EOS
+when head weights also carry Q4_K noise — enough to push P(EOS) from ~38 % to >60 %.
+
+Fix pattern (verified on Zonos, generalises to other multi-codebook AR TTS):
+- Keep `heads.*` (output projections) at F16 — eliminates the head-weight noise component.
+- Keep `embeddings.*` (input codebook lookups) at F16 — stabilises input-side activations.
+- Keep `prefix_conditioner.*` / `speaker.*` / `code_pred.output.*` etc. at F16 — these
+  are small and conditioning-critical.
+- Quantize only the bulk backbone projection tensors (QKV, O-proj, FFN gate/up/down).
+
+The same pattern is already used for: Bark (token/pos embeds + EnCodec), Qwen3-TTS
+(ECAPA speaker, code_pred.output, token_embd), CosyVoice3 (speech_embd, speech_lm_head).
+
+For Zonos specifically: 210 backbone tensors quantized, 36 heads + 36 embeddings + 18
+prefix_conditioner kept F16. Result 931 MB vs 872 MB full-Q4_K; residual step-0 failures
+(~25 % of seeds) resolved by a 3-retry guard that bumps `rng_state` by a prime offset.
+
+### DAC-44kHz standalone GGUF cannot be block-quantized
+
+The standalone `dac-44khz.gguf` (arch=`dac-44khz`) stores Conv1d weights in ggml layout
+`[K, IC, OC]` where `K` (kernel_size) is `ne[0]`. DAC kernels are 1, 4, 7, 8, or 16
+elements wide. The codebook embeddings have `ne[0]=8`. Every weight tensor is below the
+32-element minimum for Q8_0 (256 for Q4_K). The model is 104 MB in F16 and that is the
+minimum achievable size — block quantization is architecturally impossible here.
+
+The `crispasr-quantize` tool detects `arch="dac*"` and prints a specific warning; it also
+reports "0 tensors quantized" at the end of any run that produces a same-size file, so
+this failure mode is no longer silent.
+
 ### DAC audio codec weights are precision-sensitive to quantization
 
 The DAC 44 kHz codec (Snake activations + ConvTranspose1d upsampling stack) reconstructs

@@ -68,7 +68,7 @@ test-all-backends.py passes 18/18 transcribe + 51/54 feature tests (3 stream ski
 | **DONE** | [#105 WhisperX word alignment models](#105-whisperx-word-alignment-models-wav2vec2-ctc-zoo) | Phased | **DONE 2026-05-23.** All 10 WhisperX common languages (fr/es/it/ja/zh/nl/uk/pt/ar/cs) converted, uploaded to `cstr/*-GGUF`, registry aliases wired. Only benchmarking + docs remain. |
 | **DONE** | [#115 mimo-asr baseline broken](#115-mimo-asr-baseline-broken-silent-empty-on-short-segfault-on-long) | Small-Medium | **GPU is the default** (Option B: split-load + prefill-graph decode). k-quant CUDA GET_ROWS fix landed (`3bf9a599`). Option B (10 ms/step) faster than Option C step-graph would be (31 ms/step). Validated on RTX 3090 + Kaggle P100. |
 | **MOSTLY DONE** | [#125 Issue #125 — multi-backend bug sweep from montvid](#125-issue-125--multi-backend-bug-sweep-from-montvid-12-findings) | Medium | External user `montvid` ran every backend on v0.6.10 `eaee2319` on a 50 min EN FLAC + the project's own `samples/jfk.wav`, hardware NVIDIA RTX PRO 6000 Blackwell sm_120. 12 well-attested findings. **P0 mimo-asr CUDA segfault** — bisect reattributed from `6b492b2b` (FA mask, ruled out) to `0f0f0793` (sched src-mutation log without all-exits restore); hardening shipped as `a5a518c8`, awaiting Blackwell retest. **P1 funasr `!`-loop guard + funasr/sensevoice/paraformer registry entries** DONE `f72d3db1`. **P2 firered-asr drop `CAP_UNBOUNDED_INPUT` + length check** DONE `72b74486`. **P3 omniasr-llm chunking gate** DONE `5f0aefc0`. **P4 gemma4-e2b 30s training-window guard** DONE `8bfaff23`. **P5 mimo-asr tokenizer auto-download manifest + docs** DONE `b936b488`. **P6a kyutai-stt silence-tail flush** DONE `ba0e388e`. **P6b kyutai-stt 30s internal chunking** DONE `043b3ae5` (90 s Japanese: 568 s wall = 6.3 s/s, finite + linear vs the previous 14 s/s degradation). **P6c streaming-only design-limit guardrail** DEFERRED (P6b made wallclock predictable, so the cap is now a UX nicety). **Still open**: P0 external Blackwell retest; gemma4-e2b long-audio quality validation under `CRISPASR_GEMMA4_AUTO_CHUNK=1` (env-gated chunking added `9b5a0a2a`). JFK as universal control test is the reporter's #1 methodology contribution. |
-| **IN PROGRESS** | [§130 Zonos TTS](#130-zonos-tts--transformer--dac-codec-apache-20) | Medium | Full pipeline runs on GPU, no crashes. Language fix (eo→en-us) confirmed. ASR roundtrip = hallucination ("Yeah.") — `cb0 argmax=110` constant across all conditioning. Kaggle kernel v8 with Python ref + activation dumps in flight. |
+| **DONE** | [§130 Zonos TTS](#130-zonos-tts--transformer--dac-codec-apache-20) | Medium | **DONE 2026-06-09.** End-to-end synthesis + ASR roundtrip verified. RoPE NORMAL + GatedMLP gate fix. Selective Q4_K (heads/embeddings/prefix_conditioner F16, backbone Q4_K, 931 MB) + step-0 EOS retry guard (20/20 seeds pass). Q8_0 (1.6 GB) default via `-m auto`. GGUFs on `cstr/zonos-v0.1-transformer-GGUF` + `cstr/dac-44khz-GGUF`. Full integration per `docs/contributing.md`. |
 | **DONE** | [§131 OuteTTS](#131-outetts--llm--wavtokenizer-codec-cc-by-40) | S-M | **WORKING — speech output confirmed via ASR roundtrip.** WavTokenizer decoder validated cos≥0.999 all stages. 8 bugs fixed (GroupNorm vs LayerNorm, SiLU vs GELU, AdaNorm/pos_net order, iSTFT padding="same", magnitude clipping, newline token, text lowercasing, repetition penalty). Speaker prompt support via `--voice speaker.json`. Model registry + GGUF detection + docs wired. |
 | **DONE** | [§139 Beam search — remaining ASR backends](#139-beam-search--remaining-asr-backends-issue-136-follow-up) | Phased | **18/24 done** (was 10). All feasible backends shipped 2026-06-01/02. Only mimo-asr remains (blocked on #115); 5 backends N/A (CTC/NAR). |
 | **DONE** | [#156 Permissive G2P phonemizer (replace espeak-ng GPL dep)](#156-permissive-g2p-phonemizer) | Phased | **DONE 2026-06-08**: Pre-generated IPA pronunciation dicts (EN 126K, DE 667K, FR 257K, ES 600K) at cstr/g2p-dicts — 99.5% piper-compatible. Cascade: IPA dict → CMUdict+ARPAbet→IPA (76%) → OLaPh → LTS → dlopen → popen. `--g2p-dict` CLI + C ABI + Go. 174 assertions + 4 live roundtrips. **Remaining**: more langs (PT/IT/NL/SV), GGUF-embedded dicts, frequency-ranked word lists. |
@@ -4557,21 +4557,38 @@ HF repo `cstr/f5-tts-GGUF` has the F16 GGUF only.
 
 ## 130. Zonos TTS — transformer + DAC codec (Apache 2.0)
 
-**Status (2026-06-08):** Full pipeline runs on GPU without crash: AR
-backbone (26L, 2048d, GQA) + CFG (dual KV) + 9-codebook delay pattern +
-DAC decoder (4-block upsampling conv, `core_convt::convt1d_crop`).
-**Bugs found and fixed:** (1) language_id off by one (25=eo not en-us,
-now name-based lookup), (2) DAC `ggml_view_2d` crash (delegated to
-proven `convt1d_crop`), (3) "auto" language code handling.
-**Current issue:** ASR roundtrip produces hallucination ("Yeah.") not
-the input text. Diff harness kernel (`tools/kaggle/zonos-diff/`) pushed
-to compare Python reference vs C++ stage-by-stage. Likely cause: the
-prefill `cb0 argmax=110` is identical across all conditioning variants,
-suggesting the backbone forward pass may not be routing conditioning
-correctly through the KV cache.
-**Remaining:** (a) diff-harness diagnosis of AR output quality,
-(b) speaker encoder (ResNet293) — currently pre-computed embeddings,
-(c) docs/tts.md entry.
+**Status (2026-06-09): DONE.** End-to-end synthesis verified. ASR
+roundtrip: "Hello world." → verbatim; fox sentence → verbatim on Q8_0
+and selective Q4_K.
+
+**Bugs fixed (diff-harness driven):**
+1. RoPE type NEOX → NORMAL (`GGML_ROPE_TYPE_NORMAL`): Zonos uses
+   x_transformers `apply_rotary_emb` which does consecutive-pair
+   rotation. NEOX (half-split) was wrong; fixed prefill_hidden cos
+   0.984 → 0.996.
+2. GatedMLP: `fc2(y * silu(gate))` where y=chunk0, gate=chunk1. Old
+   code used `swiglu_fused_gate_up` which applied silu to chunk0.
+3. Delay pattern offset: `step >= k` (not `step > k`).
+
+**Quantization:**
+- Uniform Q4_K inflates EOS logit at AR step 0 by ~0.9 units
+  (−1.125 → >0), P(EOS) > 60 %, all seeds fail.
+- Fix: selective Q4_K keeps `heads.*` + `embeddings.*` +
+  `prefix_conditioner.*` at F16 (82 MB overhead). Backbone (210
+  projection tensors) quantized. Result: 931 MB, ~25 % of seeds
+  still hit step-0 EOS; resolved by 3-retry guard in
+  `zonos_tts_synthesize` (20/20 seeds pass after ≤ 2 retries).
+- DAC 44kHz codec cannot be block-quantized: all Conv1d weights have
+  kernel-size as ne[0] (≤ 16 < 32 min for Q8_0). F16 only (104 MB).
+
+**GGUFs shipped:** `cstr/zonos-v0.1-transformer-GGUF` (F16 3.0 GB,
+Q8_0 1.6 GB, selective-Q4_K 931 MB) + `cstr/dac-44khz-GGUF` (F16
+104 MB). Default `-m auto` → Q8_0.
+
+**Integration:** `docs/contributing.md` checklist completed:
+backend detection, C ABI sibling discovery + `set_codec_path`,
+model registry, docs/tts.md, docs/architecture.md, README.md,
+Python/Go/Dart binding comments.
 
 Native C++ runtime for [Zyphra/Zonos](https://github.com/Zyphra/Zonos).
 Apache 2.0 licensed. Unique in the lineup for its fine-grained acoustic

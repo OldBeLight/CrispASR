@@ -6,6 +6,46 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-09 §130 Zonos TTS — completed
+
+**§130 Zonos TTS — end-to-end synthesis verified.** ASR roundtrip
+"Hello world." → verbatim (Q8_0 and selective-Q4_K); fox sentence →
+verbatim. Full `docs/contributing.md` integration checklist done.
+
+**Structural bug fixes (diff-harness driven):**
+- **RoPE type** NEOX → NORMAL: Zonos uses x_transformers
+  `apply_rotary_emb` (consecutive-pair rotation, not half-split).
+  Fixed prefill_hidden cosine 0.984 → 0.996.
+- **GatedMLP** chunk ordering: `fc2(y * silu(gate))` — y=chunk0
+  (no activation), gate=chunk1. Old code passed chunk0 to silu.
+- **Delay pattern offset**: `step >= k` (was `step > k`).
+
+**Quantization — two-part fix:**
+1. `crispasr-quantize`: detect `arch="zonos"` and keep `heads.*`,
+   `embeddings.*`, `prefix_conditioner.*` at F16; quantize only the
+   210 backbone projection tensors. Uniform Q4_K inflated EOS logit
+   from −1.125 to >0 at AR step 0; selective precision restores
+   correct range. Result: 931 MB (vs 872 MB full-Q4_K).
+2. 3-retry guard in `zonos_tts_synthesize`: if `synthesize_codes`
+   returns 0 frames (step-0 EOS), bump `rng_state` by a prime offset
+   and retry (≤ 3×). Handles the residual ~25 % of seeds. 20/20 seeds
+   pass with ≤ 2 retries.
+
+**DAC-44kHz codec — unquantizable:** every Conv1d weight has
+kernel-size as `ne[0]` (≤ 16 elements), below the 32-element minimum
+for Q8_0. The `crispasr-quantize` tool now detects `arch="dac*"` and
+warns immediately. F16 (104 MB) is the only viable quant.
+
+**C ABI fixes:**
+- Zonos sibling DAC discovery added (`dac-44khz-f16.gguf` first).
+- `dac-44khz-f16.gguf` added to head of Dia's sibling list too.
+- Zonos + Dia wired into `crispasr_session_set_codec_path`.
+
+**GGUFs shipped to HF:**
+- `cstr/zonos-v0.1-transformer-GGUF`: F16 (3.0 GB), Q8_0 (1.6 GB),
+  selective-Q4_K (931 MB). Default `-m auto` → Q8_0.
+- `cstr/dac-44khz-GGUF`: F16 104 MB only (unquantizable).
+
 ## 2026-06-08 §115/§52/§140 audit + pocket-tts/moonshine GPU migration
 
 **§115 mimo-asr GPU — closed.** Deep audit revealed the item is effectively
