@@ -391,8 +391,13 @@ only predicted on codebook 0; other codebooks have EOS masked to −∞.
 
 **Quantisation floor**: Q4_K inflates the EOS logit at prefill by ~0.9
 units (from −1.125 to −0.21), making P(EOS) jump from ~38 % to ~60 %
-and causing synthesis to terminate with 0 audio frames on every seed. Use
-F16 (or Q8_0 once available). Q4_K is below quality floor for this model.
+and causing synthesis to terminate with 0 audio frames on every seed.
+Use **Q8_0** (1.6 GB, default via `-m auto`) or F16 (3.0 GB). Q4_K is
+below quality floor.
+
+**DAC codec**: the companion `dac-44khz-f16.gguf` (104 MB) is a purely
+convolutional architecture — all weight tensors have kernel-size ≤ 16 as
+ne[0], making block quantization impossible. F16 is the only usable quant.
 
 **Voice cloning**: pass `--voice <ref.wav>` at the CLI or set
 `ZONOS_SPEAKER_EMB_PATH=/path/to/jfk_speaker_emb.bin` (raw float32,
