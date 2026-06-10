@@ -63,15 +63,19 @@ explicitly in the Requirements section.
 
 ## Sending
 
-Send sequentially, not concurrent (new-contributor cap = 1 open PR per
-repo). Order — easiest reviewer call first:
+We are **not** a first-time contributor — PR **04** is merged at
+ggml-org/ggml (#1477) and **02** is filed at ggml-org/llama.cpp (#22944),
+so the new-contributor "1 open PR per repo" cap does not gate us at
+ggml-org/ggml. Still send sequentially per repo as a courtesy and to keep
+reviewer load sane. Order — easiest reviewer call first:
 
 1. ✅ **04** Metal perf → merged at ggml-org/ggml as [#1477](https://github.com/ggml-org/ggml/pull/1477) 2026-05-10
 2. 📤 **02** CUDA im2col → filed at ggml-org/llama.cpp as [#22944](https://github.com/ggml-org/llama.cpp/pull/22944) 2026-05-11 (after ggml#1485 was redirected)
 3. **03** CUDA cpy → file at ggml-org/llama.cpp after #22944 merges; re-derive the kernel-tiling code yourself first
 4. **14** CUDA conv_transpose_1d F16 → file at ggml-org/llama.cpp; small (2 files, ~25 LOC), pure-perf no-regression for existing F32 callers — should be an easy reviewer call
 5. **17** CUDA conv_transpose_1d loop → file at ggml-org/llama.cpp after #14 merges; 1 file, +14/−22 on top of #14; CUDA analog of ggml#1477 — reviewer will recognise the pattern
-6. **01** CPU F16 → file at ggml-org/ggml (touches ggml-cpu/ + ggml.c); design-discussion expected, consider opening an issue first
+6. **18** Metal cpy_tensor → file at ggml-org/ggml (touches `ggml-metal/` only, same path as merged #04); ~10 LOC, no-regression fast path with clean fallback — easy reviewer call, and we have standing there from #1477
+7. **01** CPU F16 → file at ggml-org/ggml (touches ggml-cpu/ + ggml.c); design-discussion expected, consider opening an issue first
 
 Per upstream:
 
