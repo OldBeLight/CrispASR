@@ -1,0 +1,48 @@
+name: Build WASM
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'ggml/**'
+      - 'bindings/javascript/**'
+      - 'crisp_audio/**'
+      - 'CMakeLists.txt'
+      - 'build-wasm.sh'
+      - '.github/workflows/build-wasm.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup emsdk
+        uses: mymindstorm/setup-emsdk@v14
+
+      - name: Build WASM (all backends)
+        run: ./build-wasm.sh --clean
+
+      - name: Verify output
+        run: |
+          ls -lh build-wasm/bin/libwhisper.js build-wasm/bin/libwhisper.wasm
+          echo "JS size: $(wc -c < build-wasm/bin/libwhisper.js) bytes"
+          echo "WASM size: $(wc -c < build-wasm/bin/libwhisper.wasm) bytes"
+          # Sanity: WASM should be < 10 MB (all backends), JS < 200 KB
+          [ $(wc -c < build-wasm/bin/libwhisper.wasm) -lt 10485760 ] || (echo "WASM too large" && exit 1)
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-wasm
+          path: |
+            build-wasm/bin/libwhisper.js
+            build-wasm/bin/libwhisper.wasm
+          retention-days: 30
