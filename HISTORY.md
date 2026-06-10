@@ -6,6 +6,32 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-10 #155 — Vulkan col2im_1d kernel: full-GPU qwen3-tts codec on Vulkan
+
+Follow-up to the #155 codec fix. The codec's ConvTranspose1d was decomposed
+into `mul_mat + col2im_1d` in `5f600f25` (~9× speedup — codec 1200→130ms on
+Rafa's 7900 XTX via HIP, his own PR #160 approach), but only CUDA/HIP, Metal,
+and CPU shipped a `col2im_1d` kernel. On the **Vulkan** backend the op had no
+kernel, so `ggml_backend_sched` fell it back to CPU — a GPU↔CPU hop per call,
+relevant because Rafa flagged the Vulkan path being slow.
+
+Ported `col2im_1d` to Vulkan (`cad7fbac`): a gather compute shader
+(`col2im_1d.comp`, one thread per output element, analytical `t_in` range,
+mirrors the CUDA/CPU impl) + the full wiring — push-constants struct, pipeline
+decl/creation, `get_pipeline`, dispatch element count, op fn, build-graph
+dispatch, `supports_op` — and registration in `vulkan-shaders-gen`. F32 (the
+codec dtype).
+
+**Validated on this M1 via MoltenVK** (Homebrew `vulkan-loader` + `molten-vk` +
+`shaderc`; ICD at `/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json`). A
+standalone CPU-vs-Vulkan harness (`.local/test_col2im_vk.cpp`) ran the op on the
+Apple M1 GPU and matched the CPU reference **bit-exact (maxabs=0.0e+00)** across
+8 codec shapes including the 59-frame case from the issue (K=4/OC=512/stride-2,
+K=16/OC=256/stride-8, `p0` causal-crop variants). With `supports_op` now true,
+the Vulkan codec stays fully on-GPU instead of CPU-falling-back col2im.
+col2im_1d is a CrispASR-custom op (not upstream), so it stays in the fork — no
+upstream PR. See LEARNINGS.
+
 ## 2026-06-10 #161 — cohere CUDA ASR 10× regression: beam-search KV snapshot through host memory
 
 Windows reporter (praxeo) measured cohere ASR ~10× slower on CUDA / ~2× on CPU

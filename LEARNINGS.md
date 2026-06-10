@@ -10,6 +10,30 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## Decompose ConvTranspose1d → mul_mat + col2im_1d; port col2im per-backend (#155)
+
+The native `conv_transpose_1d` GPU kernel is slow (each output thread loops the
+full input). Decomposing into `mul_mat(w_perm, x) + col2im_1d` hands the heavy
+GEMM to the already-optimized backend matmul and leaves only a lightweight
+gather — codec 1200→130ms on a 7900 XTX (#155). But the decomposition is only a
+win where `col2im_1d` has a native kernel: CUDA/HIP, Metal, CPU do; **Vulkan did
+not**, so the sched CPU-fell-back that op (a GPU↔CPU hop per call). When you
+decompose an op, check every backend the op can land on — a missing kernel
+silently degrades to a cross-backend bounce, not an error.
+
+Porting a 1-src→1-dst op to Vulkan = shader `.comp` (mirror the CUDA/CPU math)
++ register in `vulkan-shaders-gen.cpp` + six wiring sites in `ggml-vulkan.cpp`:
+push-const struct, `pipeline_*` decl, `ggml_vk_create_pipeline`, `get_pipeline`
+case, dispatch `elements` case, the op fn + build-graph dispatch + `supports_op`.
+Mirror `timestep_embedding` (single src, 2 buffers) or `conv_transpose_1d`.
+Element count in the dispatch = thread count ÷ the pipeline's wg_denoms.
+
+**Vulkan is testable on the M1 dev box via MoltenVK** — don't assume Vulkan
+needs AMD/NVIDIA hardware. `brew install vulkan-loader molten-vk shaderc`,
+point `VK_ICD_FILENAMES` at MoltenVK's ICD, build `-DGGML_VULKAN=ON`, and a
+tiny `cpu_init()` vs `vk_init(0)` op harness gives a bit-exact diff. col2im_1d
+came out maxabs=0 vs CPU across the codec shapes. (Setup recipe in auto-memory.)
+
 ## Beam-search KV snapshots must stay on-device (#161)
 
 `core_beam_decode::run_with_probs_branched` saves+restores the decoder KV cache
