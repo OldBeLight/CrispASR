@@ -29,7 +29,7 @@ RUN pip3 install --no-cache-dir --break-system-packages -r /space/requirements.t
 
 COPY app.py start.sh /space/
 RUN chmod +x /space/start.sh && \
-  (useradd -m -u 1000 app 2>/dev/null || true) && \
+  id -u 1000 >/dev/null 2>&1 || useradd -m -u 1000 app && \
   mkdir -p /models /cache && \
   chown -R 1000:1000 /space /opt/crispasr /models /cache
 
@@ -40,7 +40,7 @@ ENV CRISPASR_SAMPLES_DIR=/space/samples
 ENV GRADIO_SERVER_NAME=0.0.0.0
 ENV GRADIO_SERVER_PORT=7860
 
-USER app
+USER 1000
 EXPOSE 7860
 EXPOSE 8080
 ENTRYPOINT ["/space/start.sh"]
