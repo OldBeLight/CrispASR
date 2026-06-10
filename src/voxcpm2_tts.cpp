@@ -5107,14 +5107,13 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
     float stop_thresh = 0.5f;
     int step = 0;
 
-    // Effective max_len: cap at user/default max_len, but also apply a
-    // text-length heuristic. At ~160 ms per AR step (48 kHz, 4 frames × 1920
-    // samples), English speech averages ~2–4 AR steps per text token.
-    // Use 8 steps/token as a generous upper bound to prevent runaway generation
-    // when the stop predictor fails. The user can override via VOXCPM2_MAX_LEN.
+    // Effective max_len: Python _generate() caps the AR loop at
+    //   min(int(target_text_length * retry_badcase_ratio_threshold + 10), max_len)
+    // with retry_badcase_ratio_threshold = 6.0 and max_len = 2000.
+    // This prevents runaway generation when the stop predictor fails to fire.
     int n_text_tokens = have_ref ? ((int)pi.all_tokens.size() - pi.T_ref - 2) : (int)pi.all_tokens.size();
-    int text_based_ceil = std::max(20, n_text_tokens * 8);
-    int effective_max = std::min(ctx->max_len, text_based_ceil);
+    int text_based_ceil = (int)(n_text_tokens * 6.0f) + 10;
+    int effective_max = std::min(ctx->max_len, std::max(20, text_based_ceil));
     if (ctx->verbosity >= 2) {
         fprintf(stderr, "voxcpm2: max_len=%d (text_ceil=%d, configured=%d)\n", effective_max, text_based_ceil,
                 ctx->max_len);
@@ -5372,7 +5371,7 @@ struct voxcpm2_context_params voxcpm2_context_default_params(void) {
     p.flash_attn = true;
     p.inference_steps = 10;
     p.cfg_value = 2.0f;
-    p.max_len = 200;
+    p.max_len = 2000;
     p.seed = 0;
     return p;
 }
@@ -5388,7 +5387,7 @@ struct voxcpm2_context* voxcpm2_init_from_file(const char* path_model, struct vo
     ctx->flash_attn = params.flash_attn;
     ctx->inference_steps = params.inference_steps > 0 ? params.inference_steps : 10;
     ctx->cfg_value = params.cfg_value > 0.0f ? params.cfg_value : 2.0f;
-    ctx->max_len = params.max_len > 0 ? params.max_len : 200;
+    ctx->max_len = params.max_len > 0 ? params.max_len : 2000;
     ctx->seed = params.seed;
 
     // Backend pool. With `use_gpu`, init_best picks Metal / Vulkan / CUDA.
