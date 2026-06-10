@@ -28,6 +28,7 @@
 // pass.
 
 #include "kokoro.h"
+#include "phonemizer.h"
 
 #include "core/activation.h"
 #include "core/align.h"
@@ -3052,6 +3053,26 @@ bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::s
     key += text;
     if (ctx->phon_cache.lookup(key, out))
         return true;
+
+    // §156 permissive G2P dicts — try builtin phonemizers first (no GPL dep).
+    // These auto-download IPA dicts from HuggingFace on first call.
+    bool builtin_ok = false;
+    if (lang == "en" || lang == "en-us" || lang == "en-gb")
+        builtin_ok = phonemize_builtin_en(lang, text, out);
+    else if (lang == "de")
+        builtin_ok = phonemize_builtin_de(lang, text, out);
+    else if (lang == "fr" || lang == "fr-fr")
+        builtin_ok = phonemize_builtin_fr(lang, text, out);
+    else if (lang == "es" || lang == "es-es")
+        builtin_ok = phonemize_builtin_es(lang, text, out);
+    if (builtin_ok && !out.empty()) {
+        if (is_cmn_lang(lang))
+            strip_cmn_tone_numbers(out);
+        ctx->phon_cache.insert(key, out);
+        return true;
+    }
+
+    // Fallback: espeak-ng (GPL) — linked, dlopen'd, or popen'd.
 #if defined(CRISPASR_HAVE_ESPEAK_NG) || defined(CRISPASR_ESPEAK_DLOPEN)
     if (phonemize_espeak_lib(lang, text, out)) {
         if (is_cmn_lang(lang))
