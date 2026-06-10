@@ -4,8 +4,7 @@ WORKDIR /space
 RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
       > /etc/apt/apt.conf.d/80-retries && \
   apt-get update && \
-  apt-get install -y --fix-missing bash curl ffmpeg python3 python3-pip \
-      espeak-ng libespeak-ng1 && \
+  apt-get install -y --fix-missing bash curl ffmpeg python3 python3-pip && \
   rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # Pre-built binaries from GitHub Releases — avoids the 6+ minute C++
