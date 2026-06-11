@@ -2779,7 +2779,12 @@ struct pocket_tts_context* pocket_tts_init_from_file(const char* path_model, str
                 srcs[i] = sd.stages[i].convtr_w;
                 dsts[i] = &sd.stages[i].convtr_w_perm;
             }
-            core_convt::permute_convt1d_weights_batch(srcs.data(), dsts.data(), n, ctx->backend_cpu, &ctx->ctx_perm,
+            // Allocate permuted weights on the GPU backend (ctx->backend)
+            // so the ggml scheduler doesn't need cross-backend copies
+            // during mimi_decode_ggml. CPU-resident permuted weights
+            // trigger scheduler cross-backend copy bugs (see upstream
+            // PR #10 / #11) that corrupt the data on Vulkan and Metal.
+            core_convt::permute_convt1d_weights_batch(srcs.data(), dsts.data(), n, ctx->backend, &ctx->ctx_perm,
                                                       &ctx->buf_perm);
         }
     }
@@ -3105,16 +3110,11 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     // 5. Mimi decode: latent sequence -> PCM
     float* pcm = nullptr;
     int pcm_samples = 0;
-    // Always use the CPU Mimi decode path. The ggml graph path
-    // (mimi_decode_ggml) produces noise/garbage on Android Vulkan and iOS
-    // Metal due to strided ConvTranspose1d issues in the SEANet decoder.
-    // The CPU path is the validated reference and fast enough (the AR loop
-    // is the bottleneck, not the decoder). Force the ggml path only via
-    // POCKET_GGML_MIMI=1 for benchmarking / debugging.
-    if (getenv("POCKET_GGML_MIMI")) {
-        mimi_decode_ggml(ctx, latent_sequence.data(), n_gen_frames, &pcm, &pcm_samples);
-    } else {
+    // use_gpu=false forces the manual CPU Mimi path; env POCKET_MANUAL_MIMI=1 also.
+    if (!ctx->params.use_gpu || getenv("POCKET_MANUAL_MIMI")) {
         mimi_decode(ctx, latent_sequence.data(), n_gen_frames, &pcm, &pcm_samples);
+    } else {
+        mimi_decode_ggml(ctx, latent_sequence.data(), n_gen_frames, &pcm, &pcm_samples);
     }
 
     if (!pcm || pcm_samples <= 0) {

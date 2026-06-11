@@ -2519,11 +2519,7 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         piper_tts_params p = piper_tts_default_params();
         p.n_threads = s->n_threads;
         p.verbosity = g_open_verbosity_tls;
-        // Force CPU for piper. The HiFi-GAN decoder uses strided
-        // ConvTranspose1d which crashes on Android Vulkan and produces
-        // artifacts on some Metal backends. Piper models are small
-        // (15-60 MB) so CPU inference is fast enough for real-time.
-        p.use_gpu = false;
+        p.use_gpu = g_open_use_gpu_tls;
         s->piper_ctx = piper_tts_init_from_file(model_path, p);
         if (!s->piper_ctx) {
             delete s;
