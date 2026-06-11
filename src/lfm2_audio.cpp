@@ -655,15 +655,17 @@ float* lfm2_audio_run_encoder(lfm2_audio_context* ctx, const float* mel, int T_m
     auto& hp = model.hparams;
     const int d = (int)hp.enc_d_model;
 
-    // Allocate compute context
-    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), false};
+    // Allocate compute context with gallocr (no_alloc)
+    const size_t n_tens = 4096;
+    ggml_init_params ip = {n_tens * ggml_tensor_overhead() + ggml_graph_overhead_custom(16384, false), nullptr, true};
     ggml_context* ctx0 = ggml_init(ip);
     if (!ctx0)
         return nullptr;
 
     // Mel input: (n_mels, T_mel)
     ggml_tensor* mel_t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_mels, T_mel);
-    memcpy(mel_t->data, mel, sizeof(float) * n_mels * T_mel);
+    ggml_set_name(mel_t, "mel_in");
+    ggml_set_input(mel_t);
 
     // Pre-encode (dw_striding 8×)
     int T_enc = 0;
@@ -673,7 +675,8 @@ float* lfm2_audio_run_encoder(lfm2_audio_context* ctx, const float* mel, int T_m
     // Sinusoidal rel-pos table
     auto pos_vec = core_conformer::make_pos_enc(d, T_enc);
     ggml_tensor* pos_t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, 2 * T_enc - 1);
-    memcpy(pos_t->data, pos_vec.data(), sizeof(float) * d * (2 * T_enc - 1));
+    ggml_set_name(pos_t, "pos_enc");
+    ggml_set_input(pos_t);
 
     // Encoder blocks
     core_conformer::BlockParams bp = {d, (int)hp.enc_n_heads, d / (int)hp.enc_n_heads, (int)hp.enc_conv_kernel, 1e-5f};
@@ -685,18 +688,30 @@ float* lfm2_audio_run_encoder(lfm2_audio_context* ctx, const float* mel, int T_m
 
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
     ggml_build_forward_expand(gf, out);
-    ggml_graph_compute_with_ctx(ctx0, gf, ctx->n_threads);
 
-    // ggml 2D tensor with ne[0]=d, ne[1]=T stores data as T rows of d elements.
-    // This IS already (T_enc, d_model) row-major — just copy.
+    // Allocate via gallocr
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return nullptr;
+    }
+
+    // Set inputs
+    ggml_backend_tensor_set(mel_t, mel, 0, sizeof(float) * n_mels * T_mel);
+    ggml_backend_tensor_set(pos_t, pos_vec.data(), 0, sizeof(float) * d * (2 * T_enc - 1));
+
+    ggml_backend_graph_compute(ctx->backend, gf);
+
     float* result = (float*)malloc(sizeof(float) * T_enc * d);
     if (result)
-        memcpy(result, out->data, sizeof(float) * T_enc * d);
+        ggml_backend_tensor_get(out, result, 0, sizeof(float) * T_enc * d);
 
     if (out_T_enc)
         *out_T_enc = T_enc;
     if (out_d_model)
         *out_d_model = d;
+    ggml_gallocr_free(galloc);
     ggml_free(ctx0);
     return result;
 }
@@ -1322,16 +1337,14 @@ float* lfm2_audio_run_adapter(lfm2_audio_context* ctx, const float* encoder_out,
     auto& model = ctx->model;
     const int hidden = (int)model.hparams.lfm_hidden_size;
 
-    const size_t mem_size = 64 * 1024 * 1024; // 64 MB
-    std::vector<uint8_t> buf(mem_size);
-    ggml_init_params ip = {mem_size, buf.data(), false};
+    ggml_init_params ip = {256 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
     ggml_context* ctx0 = ggml_init(ip);
     if (!ctx0)
         return nullptr;
 
-    // Input: (T_enc, d_model) — ne[0]=d_model, ne[1]=T_enc
     ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_model, T_enc);
-    memcpy(x->data, encoder_out, sizeof(float) * T_enc * d_model);
+    ggml_set_name(x, "adapter_in");
+    ggml_set_input(x);
 
     // LayerNorm
     x = ggml_norm(ctx0, x, 1e-5f);
@@ -1349,14 +1362,23 @@ float* lfm2_audio_run_adapter(lfm2_audio_context* ctx, const float* encoder_out,
 
     ggml_cgraph* gf = ggml_new_graph(ctx0);
     ggml_build_forward_expand(gf, out);
-    ggml_graph_compute_with_ctx(ctx0, gf, ctx->n_threads);
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return nullptr;
+    }
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "adapter_in"), encoder_out, 0, sizeof(float) * T_enc * d_model);
+    ggml_backend_graph_compute(ctx->backend, gf);
 
     float* result = (float*)malloc(sizeof(float) * T_enc * hidden);
     if (result)
-        memcpy(result, out->data, sizeof(float) * T_enc * hidden);
+        ggml_backend_tensor_get(out, result, 0, sizeof(float) * T_enc * hidden);
 
     if (out_hidden_size)
         *out_hidden_size = hidden;
+    ggml_gallocr_free(galloc);
     ggml_free(ctx0);
     return result;
 }
