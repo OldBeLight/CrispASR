@@ -5457,9 +5457,9 @@ gives ~10x decode speedup. English + Japanese, F16/Q5_K/Q4_K verified.
 - CLI `--backend lfm2-audio`, C API, model registry, HF repos.
 - Quantization rules in crispasr-quantize (encoder/adapter/mimi at F16).
 
-### Phase 2 — TTS (text → audio)
+### Phase 2 — TTS (text → audio) — DONE
 
-The model natively supports TTS via the depthformer + Mimi decoder.
+Landed `623b6fc4`–`a903422c`. The model natively supports TTS via the depthformer + Mimi decoder.
 The depthformer (6L, 1024-dim) takes the backbone's hidden state and
 generates 8-codebook Mimi audio tokens autoregressively (one codebook
 at a time). The Mimi decoder then converts codes → 24 kHz PCM.
@@ -5489,24 +5489,17 @@ at a time). The Mimi decoder then converts codes → 24 kHz PCM.
 **Effort**: ~2–3 days. Depthformer is 6 layers of standard transformer
 with tied weights. Mimi decoder is already in the codebase.
 
-### Phase 3 — Speech-to-speech (interleaved mode)
+### Phase 3 — Speech-to-speech (interleaved mode) — DONE
 
-LFM2-Audio supports interleaved generation where text and audio tokens
-alternate in fixed-size chunks (`interleaved_n_text=6, n_audio=9`).
-This enables real-time conversational audio-in → audio-out.
+Landed `b5ae274a`. `lfm2_audio_speech_to_speech()` combines conformer
+encoder (audio input) with interleaved backbone generation (text+audio
+output) + depthformer + detokenizer. Returns both transcript text and
+output PCM at 24 kHz.
 
-**Key pieces:**
-
-1. **Interleaved decode loop** — alternate between generating 6 text
-   tokens and 9 audio tokens. Modality switching controlled by the
-   model's internal tokens (`<|audio_start|>=128`, `<|text_end|>=130`).
-
-2. **Streaming Mimi decode** — decode audio chunks as they're generated
-   (every 9 audio frames = 0.72s of audio at 12.5 Hz Mimi rate).
-
-3. **Audio input + output in same session** — full-duplex pipe.
-
-**Effort**: ~1–2 days on top of Phase 2.
+Remaining stretch goals:
+- Streaming Mimi decode (chunk-by-chunk audio output during generation)
+- Full KV cache for TTS/S2S text prefix generation (currently non-cached)
+- Bidirectional real-time streaming (not yet, needs WebRTC integration)
 
 ### Phase 4 — Performance optimization
 
