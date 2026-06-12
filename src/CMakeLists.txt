@@ -525,6 +525,29 @@ if(WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# Nemotron — nvidia/nemotron-3.5-asr-streaming-0.6b (Cache-Aware FastConformer + RNNT)
+# ---------------------------------------------------------------------------
+add_library(nemotron STATIC
+            nemotron.h
+            nemotron.cpp
+            )
+target_include_directories(nemotron PUBLIC . ../include)
+target_compile_features   (nemotron PUBLIC cxx_std_17)
+set_target_properties(nemotron PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries     (nemotron PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+if(NOT MSVC)
+    target_compile_options(nemotron PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(nemotron PRIVATE GGML_USE_METAL)
+    target_link_libraries(nemotron PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(nemotron PRIVATE GGML_USE_CUDA)
+    target_link_libraries(nemotron PUBLIC ggml-cuda)
+endif()
+
+# ---------------------------------------------------------------------------
 # Parakeet TDT — nvidia/parakeet-tdt-0.6b-v3 (FastConformer encoder + TDT decoder)
 # ---------------------------------------------------------------------------
 add_library(parakeet STATIC
@@ -1538,6 +1561,9 @@ endif()
 # `target_link_libraries(crispasr-lib PUBLIC <target>)` below, (3) add the
 # `crispasr_<backend>_*` wrappers to crispasr_c_api.cpp.
 # ---------------------------------------------------------------------------
+if (TARGET nemotron)
+    target_link_libraries(crispasr-lib PUBLIC nemotron)
+endif()
 if (TARGET parakeet)
     target_link_libraries(crispasr-lib PUBLIC parakeet)
 endif()

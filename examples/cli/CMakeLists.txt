@@ -15,6 +15,7 @@ add_executable(${TARGET}
     cli.cpp
     crispasr_backend.cpp
     crispasr_backend_crispasr.cpp
+    crispasr_backend_nemotron.cpp
     crispasr_backend_parakeet.cpp
     crispasr_backend_canary.cpp
     crispasr_backend_lfm2_audio.cpp

@@ -7,6 +7,7 @@
 // its own crispasr_backend_X.cpp file and compiled only if the backend's
 // library is linked in.
 std::unique_ptr<CrispasrBackend> crispasr_make_whisper_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_nemotron_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_parakeet_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_canary_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_lfm2_audio_backend();
@@ -78,6 +79,9 @@ std::unique_ptr<CrispasrBackend> crispasr_make_csm_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name) {
     if (name == "whisper")
         return crispasr_make_whisper_backend();
+    if (name == "nemotron" || name == "nemotron-streaming" || name == "nemotron-3.5" || name == "nemotron-asr" ||
+        name == "nemotron-speech-streaming")
+        return crispasr_make_nemotron_backend();
     if (name == "parakeet")
         return crispasr_make_parakeet_backend();
     if (name == "canary")
@@ -202,6 +206,7 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
 std::vector<std::string> crispasr_list_backends() {
     return {
         "whisper",
+        "nemotron",
         "parakeet",
         "canary",
         "lfm2-audio",
@@ -590,6 +595,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
             const std::string a = arch;
             if (a == "whisper")
                 result = "whisper";
+            else if (a == "nemotron" || a == "nemotron-asr" || a == "nemotron-streaming")
+                result = "nemotron";
             else if (a == "parakeet")
                 result = "parakeet";
             else if (a == "parakeet-tdt" || a == "parakeet-ja" || a == "parakeet_ja")
