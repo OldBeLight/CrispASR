@@ -18,12 +18,21 @@ public:
 
     uint32_t capabilities() const override {
         // firered-asr's encoder uses relative positional encoding with
-        // pe_maxlen=5000 (~50 s of post-subsample frames). Do NOT declare
-        // CAP_UNBOUNDED_INPUT: the dispatcher's VAD/chunking path keeps
-        // each call well under that window. Reports from issue #125
-        // showed 50 min files going OOB through the PE buffer.
-        return CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD | CAP_BEAM_SEARCH | CAP_TOKEN_CONFIDENCE | CAP_FLASH_ATTN |
-               CAP_DIARIZE;
+        // pe_maxlen=5000 (~200 s of post-subsample frames) and an O(T²)
+        // self-attention, so feeding a long file in one pass is both very
+        // slow and risks running off the PE center window (issue #125: >50 s
+        // audio hung indefinitely on CUDA).
+        //
+        // Declare CAP_UNBOUNDED_INPUT so the issue #89 long-audio dispatch
+        // (crispasr_run.cpp) auto-chunks at 30 s when the user passes neither
+        // --vad nor --chunk-seconds. Without the flag, should_auto_chunk_long()
+        // returns early and the backend receives the whole file in one pass —
+        // the earlier "do NOT declare it" reasoning was inverted (the
+        // dispatcher only chunks unbounded-input backends; bounded ones get
+        // the full audio). Short files still take the single-pass path; the
+        // pe_maxlen guard in firered_asr.cpp remains as a backstop.
+        return CAP_UNBOUNDED_INPUT | CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD | CAP_BEAM_SEARCH | CAP_TOKEN_CONFIDENCE |
+               CAP_FLASH_ATTN | CAP_DIARIZE;
     }
 
     bool init(const whisper_params& params) override {
