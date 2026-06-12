@@ -506,7 +506,11 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
     std::string arg = argv[i];
 #define ARGV_NEXT (((i + 1) < argc) ? argv[++i] : requires_value_error(arg))
 
-    if (arg == "--tts") {
+    if (arg == "--s2s") {
+        params.s2s = true;
+    } else if (arg == "--s2s-output") {
+        params.s2s_output = ARGV_NEXT;
+    } else if (arg == "--tts") {
         params.tts_text = ARGV_NEXT;
     } else if (arg == "--tts-output") {
         params.tts_output = ARGV_NEXT;
@@ -1028,6 +1032,13 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.lcs_min_length);
     fprintf(stderr, "             -m auto                        download a default model for the chosen backend\n");
     // Text-To-Speech (TTS) parameters — vibevoice and qwen3-tts backends
+    fprintf(stderr, "\nSpeech-to-speech (S2S) options:\n");
+    fprintf(stderr,
+            "             --s2s                   [%-7s] speech-to-speech mode: audio input → audio output\n",
+            params.s2s ? "true" : "false");
+    fprintf(stderr, "             --s2s-output FNAME      [%-7s] output WAV path (default: s2s_output.wav)\n",
+            params.s2s_output.c_str());
+
     fprintf(stderr, "\nText-to-speech (TTS) options:\n");
     fprintf(stderr,
             "             --tts \"TEXT\"            synthesise TEXT and write WAV to --tts-output (24 kHz mono)\n");

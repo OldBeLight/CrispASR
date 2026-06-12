@@ -51,7 +51,7 @@ public:
 
     const char* name() const override { return "mini-omni2"; }
 
-    uint32_t capabilities() const override { return CAP_TTS | CAP_AUTO_DOWNLOAD; }
+    uint32_t capabilities() const override { return CAP_TTS | CAP_S2S | CAP_AUTO_DOWNLOAD; }
 
     bool init(const whisper_params& p) override {
         mini_omni2_context_params mp = mini_omni2_context_default_params();
@@ -116,6 +116,30 @@ public:
         free(text);
 
         out.push_back(std::move(seg));
+        return out;
+    }
+
+    std::vector<float> speech_to_speech(const float* samples, int n_samples,
+                                        std::string* out_text,
+                                        const whisper_params& /*params*/) override {
+        if (!ctx_)
+            return {};
+        if (!snac_loaded_) {
+            fprintf(stderr, "crispasr[mini-omni2]: SNAC codec required for S2S. "
+                            "Pass --codec-model snac-24khz.gguf\n");
+            return {};
+        }
+        char* text = nullptr;
+        int out_n = 0;
+        float* pcm = mini_omni2_speech_to_speech(ctx_, samples, n_samples, &text, &out_n);
+        if (text && out_text)
+            *out_text = text;
+        if (text)
+            free(text);
+        if (!pcm || out_n <= 0)
+            return {};
+        std::vector<float> out(pcm, pcm + out_n);
+        free(pcm);
         return out;
     }
 

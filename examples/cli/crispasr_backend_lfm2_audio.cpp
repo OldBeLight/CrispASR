@@ -24,7 +24,7 @@ public:
 
     const char* name() const override { return "lfm2-audio"; }
 
-    uint32_t capabilities() const override { return CAP_AUTO_DOWNLOAD | CAP_UNBOUNDED_INPUT | CAP_TTS; }
+    uint32_t capabilities() const override { return CAP_AUTO_DOWNLOAD | CAP_UNBOUNDED_INPUT | CAP_TTS | CAP_S2S; }
 
     int tts_sample_rate() const override { return 24000; }
 
@@ -37,6 +37,26 @@ public:
         if (!pcm || n <= 0)
             return {};
         std::vector<float> out(pcm, pcm + n);
+        free(pcm);
+        return out;
+    }
+
+    std::vector<float> speech_to_speech(const float* samples, int n_samples,
+                                        std::string* out_text,
+                                        const whisper_params& params) override {
+        if (!ctx_)
+            return {};
+        char* text = nullptr;
+        int out_n = 0;
+        const char* lang = params.language.empty() ? nullptr : params.language.c_str();
+        float* pcm = lfm2_audio_speech_to_speech(ctx_, samples, n_samples, lang, &text, &out_n);
+        if (text && out_text)
+            *out_text = text;
+        if (text)
+            free(text);
+        if (!pcm || out_n <= 0)
+            return {};
+        std::vector<float> out(pcm, pcm + out_n);
         free(pcm);
         return out;
     }

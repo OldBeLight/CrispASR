@@ -305,6 +305,7 @@ static constexpr feature_col kFeatures[] = {
     {"src/tgt lang", CAP_SRC_TGT_LANGUAGE},
     {"auto-dl", CAP_AUTO_DOWNLOAD},
     {"tts", CAP_TTS},
+    {"s2s", CAP_S2S},
     {"voice-clone", CAP_VOICE_CLONING},
 };
 
@@ -379,6 +380,7 @@ static constexpr cap_slug kCapSlugs[] = {
     {"parallel-processors", CAP_PARALLEL_PROCESSORS},
     {"vad-internal", CAP_VAD_INTERNAL},
     {"tts", CAP_TTS},
+    {"s2s", CAP_S2S},
     {"voice-cloning", CAP_VOICE_CLONING},
 };
 

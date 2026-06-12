@@ -1557,6 +1557,67 @@ int crispasr_run_backend(const whisper_params& params_in) {
         return 0;
     }
 
+    // ---- S2S mode: speech-to-speech (audio in → audio out) ----
+    if (params.s2s) {
+        if (!(backend->capabilities() & CAP_S2S)) {
+            fprintf(stderr, "crispasr: error: backend '%s' does not support S2S\n", backend_name.c_str());
+            return 14;
+        }
+        if (params.fname_inp.empty() || params.fname_inp[0].empty()) {
+            fprintf(stderr, "crispasr: error: S2S requires audio input (-f <file>)\n");
+            return 3;
+        }
+
+        // Load input audio (16 kHz mono PCM)
+        std::vector<float> s2s_samples;
+        std::vector<std::vector<float>> s2s_stereo_unused;
+        if (!read_audio_data(params.fname_inp[0], s2s_samples, s2s_stereo_unused, false)) {
+            fprintf(stderr, "crispasr: error: failed to read audio '%s'\n", params.fname_inp[0].c_str());
+            return 20;
+        }
+
+        if (!params.watermark_model.empty()) {
+            crispasr_wm_dispatch::init(params.watermark_model);
+        }
+
+        std::string transcript;
+        auto audio = backend->speech_to_speech(s2s_samples.data(), (int)s2s_samples.size(), &transcript, params);
+        if (audio.empty()) {
+            fprintf(stderr, "crispasr: error: S2S synthesis failed\n");
+            return 15;
+        }
+
+        const int sr_out = backend->tts_sample_rate();
+
+        // Print transcript if available
+        if (!transcript.empty()) {
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr: S2S transcript: %s\n", transcript.c_str());
+            printf("%s\n", transcript.c_str());
+        }
+
+        // Embed watermark
+        crispasr_wm_dispatch::embed(audio.data(), (int)audio.size(), sr_out);
+
+        // Write output WAV
+        std::string out_path = params.s2s_output.empty() ? "s2s_output.wav" : params.s2s_output;
+        std::string wav = crispasr_make_wav_int16(audio.data(), (int)audio.size(), sr_out);
+        crispasr_c2pa_sign_wav(wav, params.c2pa_cert, params.c2pa_key);
+        FILE* fout = fopen(out_path.c_str(), "wb");
+        if (!fout) {
+            fprintf(stderr, "crispasr: error: cannot write '%s'\n", out_path.c_str());
+            return 16;
+        }
+        fwrite(wav.data(), 1, wav.size(), fout);
+        fclose(fout);
+
+        if (!params.no_prints)
+            fprintf(stderr, "crispasr: S2S output written to '%s' (%zu samples @ %d Hz, %.2f sec)\n", out_path.c_str(),
+                    audio.size(), sr_out, (double)audio.size() / (double)sr_out);
+        crispasr_wm_dispatch::shutdown();
+        return 0;
+    }
+
     // Auto-punctuation for CTC backends: when the user hasn't set --punc-model
     // and the backend doesn't natively toggle punctuation, auto-enable
     // FireRedPunc. This gives CTC backends (fc-ctc, wav2vec2, firered-asr,
