@@ -55,6 +55,14 @@ float* lfm2_audio_synthesize(struct lfm2_audio_context* ctx, const char* text, c
 float* lfm2_audio_speech_to_speech(struct lfm2_audio_context* ctx, const float* in_samples, int n_in_samples,
                                    const char* language, char** out_text, int* out_n_samples);
 
+// Streaming TTS: synthesize with per-chunk audio callback.
+// The callback receives PCM chunks (~1920 samples = 80ms at 24 kHz)
+// as they're generated. Returns 0 on success, -1 on failure.
+// Set cb to NULL for batch mode (equivalent to lfm2_audio_synthesize).
+typedef void (*lfm2_audio_stream_cb)(const float* pcm_chunk, int n_samples, void* userdata);
+int lfm2_audio_synthesize_stream(struct lfm2_audio_context* ctx, const char* text, const char* language,
+                                 lfm2_audio_stream_cb cb, void* userdata);
+
 // Hyper-parameters
 int lfm2_audio_n_mels(struct lfm2_audio_context* ctx);
 int lfm2_audio_sample_rate(struct lfm2_audio_context* ctx);

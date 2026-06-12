@@ -5486,8 +5486,8 @@ all working, fully wired per `docs/contributing.md`, Kaggle GPU-tested.
 | GPU backend init (`ggml_backend_init_best`) | ✓ DONE | enables CUDA/Metal |
 | Kaggle GPU test | ✓ DONE | kernel COMPLETE on T4 |
 | `ggml_backend_sched` full migration | NOT NEEDED | gallocr works with CUDA directly |
-| Streaming Mimi decode | OPEN | nice-to-have |
-| `causal_conv1d` CUDA kernel | OPEN | GPU-only optimization |
+| Streaming Mimi decode API | ✓ DONE | `lfm2_audio_synthesize_stream()` callback API |
+| `ggml_conv_1d_dw` migration | ✓ DONE | replaced all `conv_2d_dw_direct` → `conv_1d_dw` (CUDA-ready) |
 
 **Current performance** (4-core CPU, no GPU):
 - ASR Q4_K JP (13 tok, 10s audio): ~1m

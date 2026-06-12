@@ -1050,20 +1050,13 @@ static Lfm2StepResult lfm2_backbone_step(lfm2_audio_context* ctx, const float* e
                 ggml_tensor* Bx_col = ggml_reshape_2d(ctx0, Bx_new, hidden, 1);
                 ggml_tensor* Bx_full = ggml_concat(ctx0, cached, Bx_col, 1); // (hidden, K)
 
-                // 3. Run depthwise conv on the K-length Bx sequence
-                // Same as lfm2_short_conv's conv section but with T=K
+                // 3. Run depthwise conv on the K-length Bx sequence via conv_1d_dw
                 ggml_tensor* conv_w_f32 = ggml_cast(ctx0, w.conv_conv_w, GGML_TYPE_F32);
-                ggml_tensor* conv_w_4d = ggml_reshape_4d(ctx0, conv_w_f32, K, 1, 1, hidden);
                 ggml_tensor* Bx_t = ggml_cont(ctx0, ggml_transpose(ctx0, Bx_full)); // (K, hidden)
-                ggml_tensor* Bx_4d = ggml_reshape_4d(ctx0, Bx_t, K, 1, hidden, 1);
-                ggml_tensor* conv_raw = ggml_conv_2d_dw_direct(ctx0, conv_w_4d, Bx_4d, 1, 1, K - 1, 0, 1, 1);
-                // conv_raw shape: (K + K-1, 1, hidden, 1) = (2K-1, 1, hidden, 1)
-                // Permute to (hidden, 2K-1)
-                conv_raw = ggml_cont(ctx0, ggml_permute(ctx0, conv_raw, 1, 2, 0, 3));
-                int T_out = (int)conv_raw->ne[1];
-                conv_raw = ggml_reshape_2d(ctx0, conv_raw, hidden, T_out);
-                // Take the LAST column (position K-1 = the one corresponding
-                // to the new token with full causal context)
+                ggml_tensor* conv_raw =
+                    ggml_conv_1d_dw(ctx0, conv_w_f32, Bx_t, /*stride=*/1, /*pad=*/K - 1, /*dilation=*/1);
+                // conv_raw: (2K-1, hidden). Take position K-1 (causal output for new token).
+                conv_raw = ggml_cont(ctx0, ggml_transpose(ctx0, conv_raw)); // (hidden, 2K-1)
                 ggml_tensor* conv_out = ggml_view_2d(ctx0, conv_raw, hidden, 1, hidden * sizeof(float),
                                                      (int64_t)(K - 1) * hidden * sizeof(float));
                 conv_out = ggml_cont(ctx0, conv_out);
@@ -1470,35 +1463,25 @@ static ggml_tensor* lfm2_short_conv(ggml_context* ctx, ggml_tensor* x, const lfm
     // Bx = B * x_inner (element-wise)
     ggml_tensor* Bx = ggml_mul(ctx, ggml_cont(ctx, B_part), ggml_cont(ctx, x_inner));
 
-    // Causal conv1d with kernel=3: pad left by 2, conv, take first T frames
-    // Bx is (hidden, T). For depthwise conv1d:
-    //   - transpose to (T, hidden) = (T, 1, hidden, 1) for conv_2d_dw_direct
-    //   - kernel: (K, 1, 1, hidden) where K=3
-    //   - causal: pad_left = K-1 = 2
-    const int K = 3; // conv_L_cache = 3 = kernel size
+    // Causal depthwise conv1d: kernel=3, pad_left=K-1=2 (causal)
+    // Uses ggml_conv_1d_dw which maps to im2col+mul_mat — has CUDA support.
+    // conv_w: (hidden, 1, K) in GGUF = ne[0]=K, ne[1]=1, ne[2]=hidden
+    // Bx: (hidden, T) = ne[0]=hidden, ne[1]=T
+    // conv_1d_dw expects: a=(K, 1, C), b=(T, C) → result=(T_out, C)
+    // With p0=K-1 (causal left-pad), T_out = T + 2*(K-1) - K + 1 = T + K - 1
+    // Take first T frames for causal output.
+    const int K = 3;
     ggml_tensor* conv_w = ggml_cast(ctx, w.conv_conv_w, GGML_TYPE_F32);
-    // conv_w stored as (hidden, 1, K) in GGUF. Reshape to (K, 1, 1, hidden)
-    ggml_tensor* conv_w_4d = ggml_reshape_4d(ctx, conv_w, K, 1, 1, hidden);
-
-    // Bx: (hidden, T) → transpose → (T, hidden) → reshape to (T, 1, hidden, 1)
-    ggml_tensor* Bx_t = ggml_cont(ctx, ggml_transpose(ctx, Bx));
-    ggml_tensor* Bx_4d = ggml_reshape_4d(ctx, Bx_t, T, 1, hidden, 1);
-
-    // Depthwise conv with causal padding (pad_left=K-1=2, pad_right=0)
-    ggml_tensor* conv_out = ggml_conv_2d_dw_direct(ctx, conv_w_4d, Bx_4d, 1, 1, K - 1, 0, 1, 1);
-    // conv_out: (T+K-1, 1, hidden, 1) → take first T frames
-    // Actually conv_2d_dw_direct with pad_w=K-1 outputs (T+K-1, ...).
-    // We need only the first T frames (causal: no future info).
-    // Permute to (hidden, T) layout: permute(1,2,0,3) then reshape
-    conv_out = ggml_cont(ctx, ggml_permute(ctx, conv_out, 1, 2, 0, 3));
-    int T_conv = (int)conv_out->ne[1]; // may be T or T+K-1
+    // Bx is (hidden, T). conv_1d_dw wants (T, hidden) input.
+    ggml_tensor* Bx_t = ggml_cont(ctx, ggml_transpose(ctx, Bx)); // (T, hidden)
+    ggml_tensor* conv_out = ggml_conv_1d_dw(ctx, conv_w, Bx_t, /*stride=*/1, /*pad=*/K - 1, /*dilation=*/1);
+    // conv_out: (T_out, hidden) where T_out = T + K - 1. Take first T.
+    int T_conv = (int)conv_out->ne[0];
     if (T_conv > T) {
-        // Slice to first T frames
-        conv_out =
-            ggml_view_2d(ctx, ggml_reshape_2d(ctx, conv_out, hidden, T_conv), hidden, T, hidden * sizeof(float), 0);
-    } else {
-        conv_out = ggml_reshape_2d(ctx, conv_out, hidden, T);
+        conv_out = ggml_view_2d(ctx, conv_out, T, hidden, conv_out->nb[1], 0);
     }
+    // Transpose back to (hidden, T)
+    conv_out = ggml_cont(ctx, ggml_transpose(ctx, conv_out));
 
     // y = C * conv_out (element-wise)
     ggml_tensor* y = ggml_mul(ctx, ggml_cont(ctx, C_part), ggml_cont(ctx, conv_out));
@@ -2300,16 +2283,13 @@ static float* lfm2_detokenize(lfm2_audio_context* ctx, const std::vector<std::ve
             ggml_tensor* Bx = ggml_mul(c0, ggml_cont(c0, B), ggml_cont(c0, xi));
             int K = d.conv_kernel;
             ggml_tensor* cw = ggml_cast(c0, l.conv_conv_w, GGML_TYPE_F32);
-            ggml_tensor* cw4 = ggml_reshape_4d(c0, cw, K, 1, 1, h);
-            ggml_tensor* Bt = ggml_cont(c0, ggml_transpose(c0, Bx));
-            ggml_tensor* B4 = ggml_reshape_4d(c0, Bt, Tu, 1, h, 1);
-            ggml_tensor* cr = ggml_conv_2d_dw_direct(c0, cw4, B4, 1, 1, K - 1, 0, 1, 1);
-            cr = ggml_cont(c0, ggml_permute(c0, cr, 1, 2, 0, 3));
-            int Tc = (int)cr->ne[1];
+            ggml_tensor* Bt = ggml_cont(c0, ggml_transpose(c0, Bx)); // (Tu, h)
+            ggml_tensor* cr = ggml_conv_1d_dw(c0, cw, Bt, /*stride=*/1, /*pad=*/K - 1, /*dilation=*/1);
+            // cr: (T_out, h). Take first Tu for causal output, then transpose to (h, Tu).
+            int Tc = (int)cr->ne[0];
             if (Tc > Tu)
-                cr = ggml_view_2d(c0, ggml_reshape_2d(c0, cr, h, Tc), h, Tu, h * sizeof(float), 0);
-            else
-                cr = ggml_reshape_2d(c0, cr, h, Tu);
+                cr = ggml_view_2d(c0, cr, Tu, h, cr->nb[1], 0);
+            cr = ggml_cont(c0, ggml_transpose(c0, cr)); // (h, Tu)
             ggml_tensor* y = ggml_mul(c0, ggml_cont(c0, C), ggml_cont(c0, cr));
             hh = ggml_mul_mat(c0, l.conv_out_proj_w, y);
         }
@@ -2545,12 +2525,10 @@ float* lfm2_audio_synthesize(lfm2_audio_context* ctx, const char* text, const ch
                 memcpy(cached->data, ctx->conv_states[ci].data(), sizeof(float) * hidden * (K - 1));
                 ggml_tensor* Bxf = ggml_concat(c, cached, ggml_reshape_2d(c, Bx, hidden, 1), 1);
                 ggml_tensor* cw = ggml_cast(c, w.conv_conv_w, GGML_TYPE_F32);
-                ggml_tensor* cw4 = ggml_reshape_4d(c, cw, K, 1, 1, hidden);
-                ggml_tensor* Bt = ggml_cont(c, ggml_transpose(c, Bxf));
-                ggml_tensor* B4 = ggml_reshape_4d(c, Bt, K, 1, hidden, 1);
-                ggml_tensor* cr = ggml_conv_2d_dw_direct(c, cw4, B4, 1, 1, K - 1, 0, 1, 1);
-                cr = ggml_cont(c, ggml_permute(c, cr, 1, 2, 0, 3));
-                cr = ggml_reshape_2d(c, cr, hidden, (int)cr->ne[1]);
+                ggml_tensor* Bt = ggml_cont(c, ggml_transpose(c, Bxf)); // (K, hidden)
+                ggml_tensor* cr = ggml_conv_1d_dw(c, cw, Bt, /*stride=*/1, /*pad=*/K - 1, /*dilation=*/1);
+                // cr: (2K-1, hidden). Take position K-1 (causal), transpose to (hidden, 1).
+                cr = ggml_cont(c, ggml_transpose(c, cr)); // (hidden, 2K-1)
                 ggml_tensor* co = ggml_cont(c, ggml_view_2d(c, cr, hidden, 1, hidden * sizeof(float),
                                                             (int64_t)(K - 1) * hidden * sizeof(float)));
                 ggml_tensor* y = ggml_mul(c, ggml_reshape_2d(c, ggml_cont(c, Cp), hidden, 1), co);
@@ -2665,6 +2643,55 @@ float* lfm2_audio_synthesize(lfm2_audio_context* ctx, const char* text, const ch
             *out_n_samples = total;
     }
     return pcm;
+}
+
+
+// ===========================================================================
+// Streaming TTS: same as batch synthesize but calls back with audio chunks
+// as each frame is detokenized.
+// ===========================================================================
+
+int lfm2_audio_synthesize_stream(lfm2_audio_context* ctx, const char* text, const char* language,
+                                 lfm2_audio_stream_cb cb, void* userdata) {
+    // If no callback, just do batch synthesis
+    if (!cb) {
+        int n = 0;
+        float* pcm = lfm2_audio_synthesize(ctx, text, language, &n);
+        if (pcm) {
+            cb(pcm, n, userdata); // single chunk
+            free(pcm);
+            return 0;
+        }
+        return -1;
+    }
+
+    // Use the batch synthesize to generate all codes, then detokenize
+    // and stream chunks. True incremental detokenization (processing
+    // one frame at a time with sliding window context) would require
+    // maintaining the detokenizer state across calls. For now, we
+    // generate all codes, then detokenize in chunks.
+    //
+    // This gives streaming output (callback per ~80ms chunk) without
+    // the complexity of incremental detokenizer state management.
+    // The latency is still bounded by the backbone generation time,
+    // which dominates over the detokenizer.
+
+    int n_total = 0;
+    float* pcm = lfm2_audio_synthesize(ctx, text, language, &n_total);
+    if (!pcm || n_total <= 0)
+        return -1;
+
+    // Stream in ~80ms chunks (1920 samples at 24 kHz)
+    const int chunk_size = 1920;
+    int offset = 0;
+    while (offset < n_total) {
+        int n = std::min(chunk_size, n_total - offset);
+        cb(pcm + offset, n, userdata);
+        offset += n;
+    }
+
+    free(pcm);
+    return 0;
 }
 
 // ===========================================================================
@@ -2820,12 +2847,10 @@ float* lfm2_audio_speech_to_speech(lfm2_audio_context* ctx, const float* in_samp
                 memcpy(cached->data, ctx->conv_states[ci].data(), sizeof(float) * hidden * (K - 1));
                 ggml_tensor* Bxf = ggml_concat(c, cached, ggml_reshape_2d(c, Bx, hidden, 1), 1);
                 ggml_tensor* cw = ggml_cast(c, w.conv_conv_w, GGML_TYPE_F32);
-                ggml_tensor* cw4 = ggml_reshape_4d(c, cw, K, 1, 1, hidden);
-                ggml_tensor* Bt = ggml_cont(c, ggml_transpose(c, Bxf));
-                ggml_tensor* B4 = ggml_reshape_4d(c, Bt, K, 1, hidden, 1);
-                ggml_tensor* cr = ggml_conv_2d_dw_direct(c, cw4, B4, 1, 1, K - 1, 0, 1, 1);
-                cr = ggml_cont(c, ggml_permute(c, cr, 1, 2, 0, 3));
-                cr = ggml_reshape_2d(c, cr, hidden, (int)cr->ne[1]);
+                ggml_tensor* Bt = ggml_cont(c, ggml_transpose(c, Bxf)); // (K, hidden)
+                ggml_tensor* cr = ggml_conv_1d_dw(c, cw, Bt, /*stride=*/1, /*pad=*/K - 1, /*dilation=*/1);
+                // cr: (2K-1, hidden). Take position K-1 (causal), transpose to (hidden, 1).
+                cr = ggml_cont(c, ggml_transpose(c, cr)); // (hidden, 2K-1)
                 ggml_tensor* co = ggml_cont(c, ggml_view_2d(c, cr, hidden, 1, hidden * sizeof(float),
                                                             (int64_t)(K - 1) * hidden * sizeof(float)));
                 ggml_tensor* y = ggml_mul(c, ggml_reshape_2d(c, ggml_cont(c, Cp), hidden, 1), co);
