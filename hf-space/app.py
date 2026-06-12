@@ -375,7 +375,7 @@ def list_sample_files() -> list[str]:
         return []
     out = []
     for p in sorted(SAMPLES_DIR.iterdir()):
-        if p.suffix.lower() in {".wav", ".mp3", ".flac", ".ogg", ".m4a"}:
+        if p.suffix.lower() in {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".webm", ".wma"}:
             out.append(str(p))
     return out
 
