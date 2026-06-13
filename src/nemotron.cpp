@@ -1127,31 +1127,19 @@ extern "C" struct nemotron_context* nemotron_init_from_file(const char* path_mod
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    // Backend selection
+    // Backend selection — use ggml_backend_init_best() for portable GPU init
     ctx->backend = nullptr;
-    ctx->backend_cpu = nullptr;
-
-#ifdef GGML_USE_METAL
-    if (params.use_gpu) {
-        ctx->backend = ggml_backend_metal_init();
-        if (ctx->backend && params.verbosity > 0)
-            fprintf(stderr, "nemotron: using Metal backend\n");
-    }
-#endif
-#ifdef GGML_USE_CUDA
-    if (params.use_gpu && !ctx->backend) {
-        ctx->backend = ggml_backend_cuda_init(0);
-        if (ctx->backend && params.verbosity > 0)
-            fprintf(stderr, "nemotron: using CUDA backend\n");
-    }
-#endif
-
-    if (!ctx->backend) {
-        ctx->backend = ggml_backend_cpu_init();
-        if (params.verbosity > 0)
-            fprintf(stderr, "nemotron: using CPU backend\n");
-    }
     ctx->backend_cpu = ggml_backend_cpu_init();
+
+    if (params.use_gpu) {
+        ctx->backend = ggml_backend_init_best();
+    }
+    if (!ctx->backend) {
+        ctx->backend = ctx->backend_cpu;
+    }
+    if (params.verbosity > 0) {
+        fprintf(stderr, "nemotron: backend = %s\n", ggml_backend_name(ctx->backend));
+    }
 
     // compute_meta buffer
     ctx->compute_meta.resize(16 * 1024 * 1024);
