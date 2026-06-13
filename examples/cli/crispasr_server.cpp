@@ -938,6 +938,20 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.no_timestamps = form_bool(req, "no_timestamps", rp.no_timestamps);
         rp.split_on_word = form_bool(req, "split_on_word", rp.split_on_word);
         rp.max_len = form_int(req, "max_len", rp.max_len);
+        rp.split_on_punct = form_bool(req, "split_on_punct", rp.split_on_punct);
+        rp.offset_t_ms = form_int(req, "offset_t_ms", rp.offset_t_ms);
+        rp.duration_ms = form_int(req, "duration_ms", rp.duration_ms);
+        rp.max_context = form_int(req, "max_context", rp.max_context);
+        rp.audio_ctx = form_int(req, "audio_ctx", rp.audio_ctx);
+        rp.word_thold = form_float(req, "word_thold", rp.word_thold);
+        rp.carry_initial_prompt = form_bool(req, "carry_initial_prompt", rp.carry_initial_prompt);
+        rp.chunk_overlap_seconds = form_float(req, "chunk_overlap", rp.chunk_overlap_seconds);
+        rp.lcs_dedup = form_string(req, "lcs_dedup", rp.lcs_dedup);
+        rp.lcs_min_length = form_int(req, "lcs_min_length", rp.lcs_min_length);
+        rp.parakeet_decoder = form_string(req, "parakeet_decoder", rp.parakeet_decoder);
+        rp.no_auto_aligner = form_bool(req, "no_auto_aligner", rp.no_auto_aligner);
+        rp.show_alternatives = form_bool(req, "show_alternatives", rp.show_alternatives);
+        rp.n_alternatives = form_int(req, "alt_n", rp.n_alternatives);
 
         auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp, /*need_timestamps=*/true,
                                     punc_ctx.get(), pcs_ctx.get(), tc_ctx.get(), tc_crf_ctx.get(), tc_lstm_ctx.get());
@@ -1076,6 +1090,20 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.no_timestamps = form_bool(req, "no_timestamps", rp.no_timestamps);
         rp.split_on_word = form_bool(req, "split_on_word", rp.split_on_word);
         rp.max_len = form_int(req, "max_len", rp.max_len);
+        rp.split_on_punct = form_bool(req, "split_on_punct", rp.split_on_punct);
+        rp.offset_t_ms = form_int(req, "offset_t_ms", rp.offset_t_ms);
+        rp.duration_ms = form_int(req, "duration_ms", rp.duration_ms);
+        rp.max_context = form_int(req, "max_context", rp.max_context);
+        rp.audio_ctx = form_int(req, "audio_ctx", rp.audio_ctx);
+        rp.word_thold = form_float(req, "word_thold", rp.word_thold);
+        rp.carry_initial_prompt = form_bool(req, "carry_initial_prompt", rp.carry_initial_prompt);
+        rp.chunk_overlap_seconds = form_float(req, "chunk_overlap", rp.chunk_overlap_seconds);
+        rp.lcs_dedup = form_string(req, "lcs_dedup", rp.lcs_dedup);
+        rp.lcs_min_length = form_int(req, "lcs_min_length", rp.lcs_min_length);
+        rp.parakeet_decoder = form_string(req, "parakeet_decoder", rp.parakeet_decoder);
+        rp.no_auto_aligner = form_bool(req, "no_auto_aligner", rp.no_auto_aligner);
+        rp.show_alternatives = form_bool(req, "show_alternatives", rp.show_alternatives);
+        rp.n_alternatives = form_int(req, "alt_n", rp.n_alternatives);
         if (!prompt.empty())
             rp.prompt = prompt;
 
