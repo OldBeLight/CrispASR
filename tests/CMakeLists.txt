@@ -1395,6 +1395,16 @@ set_tests_properties(test-progress-output PROPERTIES
     LABELS "live;progress"
     TIMEOUT 300)
 
+# ─── test-dry-run-resolve — offline regression: --dry-run-resolve must preview
+# the same model a real `-m <alias>` would load (sub-variant keys, §166).
+# Needs only the built binary (no models / network); SKIPs if absent.
+add_test(NAME test-dry-run-resolve
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-dry-run-resolve.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-dry-run-resolve PROPERTIES
+    LABELS "cli"
+    TIMEOUT 60)
+
 # ─── test-release-workflow — validate release.yml targets (issue #131).
 # Static test: no binary or model needed, just parses YAML.
 add_test(NAME test-release-workflow
