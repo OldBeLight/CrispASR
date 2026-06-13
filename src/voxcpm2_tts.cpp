@@ -1431,17 +1431,17 @@ static std::vector<float> tslm_step_graph(voxcpm2_context* ctx, const float* hid
         return std::vector<float>(d, 0.0f);
     }
 
-    // Output tensor pointers. Bucketed graphs cache these in TslmBucket
-    // (looked up at build time before ggml_gallocr_reserve resets the hash).
-    // Dynamic (non-bucketed) graphs look up fresh each call.
+    // Output tensor pointers. Scan graph nodes directly — ggml_graph_get_tensor
+    // does the same linear scan, but we explicitly search to be robust against
+    // any gallocr hash-table invalidation (#164).
     ggml_tensor* out = nullptr;
     ggml_tensor* sp_tensor = nullptr;
-    if (bucketed) {
-        out = ctx->tslm_buckets[bucket_idx].cached_hidden_out;
-        sp_tensor = ctx->tslm_buckets[bucket_idx].cached_stop_probs;
-    } else {
-        out = ggml_graph_get_tensor(gf, "hidden_out");
-        sp_tensor = ggml_graph_get_tensor(gf, "stop_probs");
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        ggml_tensor* nd = ggml_graph_node(gf, i);
+        if (std::strcmp(nd->name, "hidden_out") == 0)
+            out = nd;
+        else if (std::strcmp(nd->name, "stop_probs") == 0)
+            sp_tensor = nd;
     }
     std::vector<float> result(d);
     if (out) {
