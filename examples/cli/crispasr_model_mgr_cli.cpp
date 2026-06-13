@@ -69,7 +69,14 @@ static CrispasrResolvePreview build_preview(const std::string& model_arg, const 
     if (effective_model_arg == "auto" || effective_model_arg == "default") {
         have_match = crispasr_registry_lookup(backend_name, match, effective_quant);
     } else {
+        // Mirror crispasr_resolve_model's match priority exactly, or the preview
+        // lies: (1) exact filename/companion, (2) backend-key match on the
+        // literal -m arg (so sub-variant keys like parakeet-tdt_ctc-110m resolve
+        // to their own entry rather than being shadowed by the filename-inferred
+        // backend), (3) fallback to the --backend name.
         have_match = crispasr_registry_lookup_by_filename(effective_model_arg, match, effective_quant);
+        if (!have_match)
+            have_match = crispasr_registry_lookup(effective_model_arg, match, effective_quant);
         if (!have_match && !backend_name.empty())
             have_match = crispasr_registry_lookup(backend_name, match, effective_quant);
     }
