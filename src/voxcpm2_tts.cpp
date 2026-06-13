@@ -1938,10 +1938,11 @@ static ggml_cgraph* build_locenc_graph(voxcpm2_context* ctx, ggml_context* arena
         K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
         V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
 
-        // Bidirectional flash-attn (no mask). PREC_F32 NOT set — Metal
-        // refuses FA ops tagged PREC_F32 (see LocDiT graph for rationale).
+        // Bidirectional flash-attn (no mask). PREC_F32 required on P100
+        // (sm_60) to avoid F16 accumulator overflow producing NaN (#164).
         ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, /*mask=*/nullptr, ascale, /*max_bias*/ 0.0f,
                                                 /*logit_softcap*/ 0.0f);
+        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
         attn = ggml_reshape_2d(ctx0, attn, hd * n_q, T);
 
         attn = ggml_mul_mat(ctx0, L.attn_o_w, attn);
@@ -2417,15 +2418,14 @@ static ggml_cgraph* build_locdit_graph(voxcpm2_context* ctx, ggml_context* arena
         K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
         V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
 
-        // Bidirectional flash-attn (no mask). PREC_F32 NOT set here —
-        // Metal's `supports_op` for FLASH_ATTN_EXT refuses any op tagged
-        // PREC_F32 (the chatterbox patch — gpu accumulator drift work),
-        // so leaving the default lets Metal pick its native F16 simdgroup
-        // path. The diff-harness gate (cfm_step0_result cos_mean ≥ 0.93)
-        // tolerates the resulting drift; bit-identical CPU vs Metal isn't
-        // required for voxcpm2.
+        // Bidirectional flash-attn (no mask). PREC_F32 required on P100
+        // (sm_60) to avoid F16 accumulator overflow in the LocDiT attention
+        // that produces NaN from the second AR step onwards (#164). The
+        // LocDiT processes `mu` conditioning derived from the TSLM output,
+        // which can have large values that overflow F16 partial sums.
         ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, /*mask=*/nullptr, ascale, /*max_bias*/ 0.0f,
                                                 /*logit_softcap*/ 0.0f);
+        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
         attn = ggml_reshape_2d(ctx0, attn, hd * n_q, T);
 
         // Output projection (no bias on attn)
