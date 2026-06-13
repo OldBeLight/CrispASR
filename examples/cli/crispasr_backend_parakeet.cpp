@@ -233,10 +233,11 @@ public:
         return out;
     }
 
-    int preferred_chunk_seconds() const override {
-        // Issue #89: parakeet-ja collapses past ~12 s on real audio.
-        // Use 10 s chunks (vs the global 30 s default) for JA models.
-        return is_ja_model_ ? 10 : 0;
+    bool prefers_vad() const override {
+        // Issue #89: parakeet-ja's encoder degenerates on arbitrary chunks
+        // (repetition loops). VAD gives silence-bounded segments matching
+        // the ~10-15 s utterances the model was trained on.
+        return is_ja_model_;
     }
 
     void shutdown() override {

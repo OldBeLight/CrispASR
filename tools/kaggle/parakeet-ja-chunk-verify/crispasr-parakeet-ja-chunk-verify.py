@@ -117,69 +117,53 @@ if not concat_path.exists():
     duration = len(concat_frames) / (params.sampwidth * params.nchannels * params.framerate)
     print(f"Concatenated: {concat_path} ({duration:.1f}s)")
 
-# ── Test 1: Default (should auto-chunk at 10s with fix) ──────────────
+# ── Test 1: Default (should auto-enable VAD for JA model on long audio) ──
 print("\n" + "="*70)
-print("TEST 1: Default mode (auto-chunk should fire at 10s for JA model)")
+print("TEST 1: Default mode (should auto-enable VAD for JA model)")
 print("="*70)
 
 result = subprocess.run(
-    [str(CRISPASR_BIN), "-m", str(model_path), "-f", str(concat_path), "-np"],
+    [str(CRISPASR_BIN), "-m", str(model_path), "-f", str(concat_path)],
     capture_output=True, text=True, timeout=300,
 )
 print(f"stdout: {result.stdout.strip()}")
 print(f"stderr (last 5 lines):")
 for line in result.stderr.strip().split("\n")[-5:]:
     print(f"  {line}")
-
-# Count occurrences of keyword
 transcript_default = result.stdout.strip()
 
-# ── Test 2: Explicit --chunk-seconds 10 (baseline) ───────────────────
+# ── Test 2: Explicit --vad (should match default now) ────────────────
 print("\n" + "="*70)
-print("TEST 2: Explicit --chunk-seconds 10")
+print("TEST 2: Explicit --vad")
 print("="*70)
 
 result = subprocess.run(
-    [str(CRISPASR_BIN), "-m", str(model_path), "-f", str(concat_path),
-     "--chunk-seconds", "10", "-np"],
-    capture_output=True, text=True, timeout=300,
-)
-print(f"stdout: {result.stdout.strip()}")
-transcript_chunk10 = result.stdout.strip()
-
-# ── Test 3: --vad (gold standard) ────────────────────────────────────
-print("\n" + "="*70)
-print("TEST 3: --vad (gold standard)")
-print("="*70)
-
-result = subprocess.run(
-    [str(CRISPASR_BIN), "-m", str(model_path), "-f", str(concat_path),
-     "--vad", "-np"],
+    [str(CRISPASR_BIN), "-m", str(model_path), "-f", str(concat_path), "--vad"],
     capture_output=True, text=True, timeout=300,
 )
 print(f"stdout: {result.stdout.strip()}")
 transcript_vad = result.stdout.strip()
 
-# ── Test 4: Explicit --chunk-seconds 30 (old default, should be worse) ─
+# ── Test 3: Explicit --chunk-seconds 30 (old default, degenerates) ───
 print("\n" + "="*70)
-print("TEST 4: Explicit --chunk-seconds 30 (old default)")
+print("TEST 3: Explicit --chunk-seconds 30 (old default, bypasses VAD)")
 print("="*70)
 
 result = subprocess.run(
     [str(CRISPASR_BIN), "-m", str(model_path), "-f", str(concat_path),
-     "--chunk-seconds", "30", "-np"],
+     "--chunk-seconds", "30"],
     capture_output=True, text=True, timeout=300,
 )
 print(f"stdout: {result.stdout.strip()}")
 transcript_chunk30 = result.stdout.strip()
 
-# ── Test 5: Short clip (14s, should NOT chunk) ───────────────────────
+# ── Test 4: Short clip (14s, should NOT auto-enable VAD) ─────────────
 print("\n" + "="*70)
-print("TEST 5: Short clip (14s, should not auto-chunk)")
+print("TEST 4: Short clip (14s, no auto-VAD)")
 print("="*70)
 
 result = subprocess.run(
-    [str(CRISPASR_BIN), "-m", str(model_path), "-f", str(fixture_path), "-np"],
+    [str(CRISPASR_BIN), "-m", str(model_path), "-f", str(fixture_path)],
     capture_output=True, text=True, timeout=300,
 )
 print(f"stdout: {result.stdout.strip()}")
@@ -189,22 +173,27 @@ transcript_short = result.stdout.strip()
 print("\n" + "="*70)
 print("SUMMARY")
 print("="*70)
-print(f"Default (10s auto):  {len(transcript_default):4d} chars")
-print(f"Explicit chunk=10:   {len(transcript_chunk10):4d} chars")
-print(f"VAD (gold):          {len(transcript_vad):4d} chars")
+print(f"Default (auto-VAD):  {len(transcript_default):4d} chars")
+print(f"Explicit --vad:      {len(transcript_vad):4d} chars")
 print(f"Explicit chunk=30:   {len(transcript_chunk30):4d} chars")
-print(f"Short (14s, no chk): {len(transcript_short):4d} chars")
+print(f"Short (14s, no VAD): {len(transcript_short):4d} chars")
 print()
-print("PASS criteria: default ≈ chunk=10 >> chunk=30")
-print(f"Default vs chunk=10 ratio: {len(transcript_default)/max(1,len(transcript_chunk10)):.2f}")
+print("PASS criteria: default ≈ explicit --vad, both cleaner than chunk=30")
+print(f"Default vs --vad ratio: {len(transcript_default)/max(1,len(transcript_vad)):.2f}")
 print(f"Default vs chunk=30 ratio: {len(transcript_default)/max(1,len(transcript_chunk30)):.2f}")
+
+# Count keyword occurrences
+keyword = "岡本"
+for label, text in [("default", transcript_default), ("vad", transcript_vad),
+                     ("chunk30", transcript_chunk30), ("short", transcript_short)]:
+    count = text.count(keyword)
+    print(f"  {keyword} in {label}: {count}")
 
 # Write results to file for download
 with open(WORK / "results.txt", "w") as f:
-    f.write(f"default: {transcript_default}\n\n")
-    f.write(f"chunk10: {transcript_chunk10}\n\n")
-    f.write(f"vad:     {transcript_vad}\n\n")
-    f.write(f"chunk30: {transcript_chunk30}\n\n")
-    f.write(f"short:   {transcript_short}\n\n")
+    f.write(f"default (auto-VAD): {transcript_default}\n\n")
+    f.write(f"explicit --vad:     {transcript_vad}\n\n")
+    f.write(f"chunk30:            {transcript_chunk30}\n\n")
+    f.write(f"short (14s):        {transcript_short}\n\n")
 
 print("\nDone. Results written to /kaggle/working/results.txt")

@@ -426,23 +426,34 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     // otherwise fire because effective_chunk_seconds == 0 satisfies its
     // "not explicitly chunked" path. Guard with chunk_seconds_explicit.
     constexpr int kLongAudioFallbackChunkSeconds = 30;
-    // Issue #89: backends can request a shorter chunk window via
-    // preferred_chunk_seconds() (e.g. parakeet-ja needs 10 s, not 30 s).
-    const int fallback_chunk =
-        backend.preferred_chunk_seconds() > 0 ? backend.preferred_chunk_seconds() : kLongAudioFallbackChunkSeconds;
+    // Issue #89: backends that degenerate on arbitrary-length chunks
+    // (e.g. parakeet-ja) auto-enable VAD for long audio so the model
+    // gets silence-bounded segments matching its training distribution.
+    const bool is_long_audio = (int)samples.size() > kLongAudioFallbackChunkSeconds * SR;
+    if (backend.prefers_vad() && is_long_audio && !params.vad && params.vad_model.empty() &&
+        !params.chunk_seconds_explicit) {
+        params.vad = true;
+        if (!params.no_prints) {
+            fprintf(stderr,
+                    "crispasr: %s backend auto-enabling --vad on %.1fs audio "
+                    "(this model needs utterance-bounded segments for clean output; "
+                    "pass --chunk-seconds N to override)\n",
+                    backend.name(), (double)samples.size() / SR);
+        }
+    }
     const bool wants_vad = params.vad || !params.vad_model.empty();
     const bool long_audio_no_vad =
         !params.chunk_seconds_explicit &&
         crispasr_long_audio::should_auto_chunk_long(effective_chunk_seconds, wants_vad, backend.capabilities(),
-                                                    (int)samples.size(), SR, fallback_chunk);
+                                                    (int)samples.size(), SR, kLongAudioFallbackChunkSeconds);
     if (long_audio_no_vad) {
-        effective_chunk_seconds = fallback_chunk;
+        effective_chunk_seconds = kLongAudioFallbackChunkSeconds;
         if (!params.no_prints) {
             fprintf(stderr,
                     "crispasr: %s backend on %.1fs audio without --vad or --chunk-seconds — "
                     "auto-chunking at %d s to keep encoder in its safe window "
                     "(pass --vad for finer slicing, or --chunk-seconds 0 for library-internal streaming)\n",
-                    backend.name(), (double)samples.size() / SR, fallback_chunk);
+                    backend.name(), (double)samples.size() / SR, kLongAudioFallbackChunkSeconds);
         }
     } else if (!params.no_prints) {
         if (effective_chunk_seconds == 0 && (backend.capabilities() & CAP_UNBOUNDED_INPUT)) {

@@ -181,10 +181,11 @@ public:
         return {};
     }
 
-    // Per-model preferred auto-chunk window in seconds. Backends that
-    // need a shorter window than the global 30s default (e.g. parakeet-ja
-    // collapses past ~12s) override this. Returns 0 to use the default.
-    virtual int preferred_chunk_seconds() const { return 0; }
+    // Whether the backend should auto-enable VAD for long audio when the
+    // user didn't explicitly set --chunk-seconds or --vad. Backends whose
+    // encoder degenerates on arbitrary-length chunks (e.g. parakeet-ja)
+    // override this to get silence-bounded segments that match training.
+    virtual bool prefers_vad() const { return false; }
 
     // Warmup: run a short dummy transcribe to amortize first-call
     // overhead (graph allocation, GPU kernel compilation, gallocr shape
