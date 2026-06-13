@@ -761,12 +761,21 @@ static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, g
     // NeMo Conformer GLU: first_half=value, second_half=gate → non-swapped siglu
     cnv = ggml_siglu(ctx0, cnv);
 
-    // DW conv (kernel K, causal padding)
+    // DW conv (kernel K, CAUSAL padding: left=K-1, right=0)
+    // ggml_conv_2d_dw_direct only supports symmetric padding, so we use
+    // p0=K-1 (adds K-1 on both sides) then trim the last K-1 time frames.
     ggml_tensor* dw_w_f32 = ggml_cast(ctx0, e.conv_dw_w, GGML_TYPE_F32);
     ggml_tensor* dw_w_4d = ggml_reshape_4d(ctx0, dw_w_f32, K, 1, 1, d);
     cnv = ggml_cont(ctx0, ggml_transpose(ctx0, cnv));
     cnv = ggml_reshape_4d(ctx0, cnv, T, 1, d, 1);
-    cnv = ggml_conv_2d_dw_direct(ctx0, dw_w_4d, cnv, 1, 1, (K - 1) / 2, 0, 1, 1);
+    cnv = ggml_conv_2d_dw_direct(ctx0, dw_w_4d, cnv, 1, 1, K - 1, 0, 1, 1);
+    // Output has T + (K-1) time frames due to excess right padding. Trim to T.
+    // Conv output shape: (T+K-1, 1, d, 1). Take view of first T frames.
+    {
+        int64_t T_conv = cnv->ne[0]; // T + K - 1
+        cnv = ggml_view_4d(ctx0, cnv, T, cnv->ne[1], cnv->ne[2], cnv->ne[3], cnv->nb[1], cnv->nb[2], cnv->nb[3], 0);
+        cnv = ggml_cont(ctx0, cnv);
+    }
     cnv = ggml_cont(ctx0, ggml_permute(ctx0, cnv, 1, 2, 0, 3));
     cnv = ggml_reshape_2d(ctx0, cnv, d, T);
 
