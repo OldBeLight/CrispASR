@@ -1261,42 +1261,11 @@ static ggml_cgraph* build_tslm_step_graph(voxcpm2_context* ctx, int n_past, int 
     // Python checks stop on the FSQ'd output from the PREVIOUS step:
     //   fsq_out = fsq_out_proj(round(tanh(fsq_in_proj(hidden)) * 9) / 9)
     //   stop_probs = softmax(stop_head(silu(stop_proj(fsq_out) + bias)))
-    //
-    // Computing the full chain (FSQ + stop) inside the graph ensures the
-    // stop decision uses the same GPU dequantization + matmul path as the
-    // hidden state. Without FSQ, the stop predictor sees out-of-distribution
-    // inputs and never fires on Vulkan (#164). We implement round(x) as
-    // floor(x + 0.5) to avoid ggml_round, which produces NaN on CUDA.
-    if (W.stop_proj_w && W.stop_proj_b && W.stop_head_w && W.fsq_in_proj_w && W.fsq_out_proj_w) {
-        // FSQ path
-        ggml_tensor* fsq_in = ggml_mul_mat(ctx0, W.fsq_in_proj_w, cur);
-        if (W.fsq_in_proj_b) {
-            fsq_in = ggml_add(ctx0, fsq_in, W.fsq_in_proj_b);
-        }
-        ggml_tensor* th = ggml_tanh(ctx0, fsq_in);
-        th = ggml_scale(ctx0, th, 9.0f);
-        // round(x) = floor(x + 0.5) — avoids ggml_round NaN on CUDA
-        ggml_tensor* half_const = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
-        ggml_set_name(half_const, "fsq_half");
-        ggml_set_input(half_const);
-        th = ggml_add(ctx0, th, half_const);
-        th = ggml_floor(ctx0, th);
-        th = ggml_scale(ctx0, th, 1.0f / 9.0f);
-        ggml_tensor* fsq_out = ggml_mul_mat(ctx0, W.fsq_out_proj_w, th);
-        if (W.fsq_out_proj_b) {
-            fsq_out = ggml_add(ctx0, fsq_out, W.fsq_out_proj_b);
-        }
-
-        ggml_tensor* sp = ggml_mul_mat(ctx0, W.stop_proj_w, fsq_out);
-        sp = ggml_add(ctx0, sp, W.stop_proj_b);
-        sp = ggml_silu(ctx0, sp);
-        ggml_tensor* sl = ggml_mul_mat(ctx0, W.stop_head_w, sp);
-        sl = ggml_soft_max(ctx0, sl);
-        ggml_set_name(sl, "stop_probs");
-        ggml_set_output(sl);
-        ggml_build_forward_expand(gf, sl);
-    } else if (W.stop_proj_w && W.stop_proj_b && W.stop_head_w) {
-        // Fallback without FSQ (missing FSQ weights)
+    // Stop predictor computed from the TSLM hidden output directly.
+    // FSQ in the graph causes SIGABRT (floor+add on 1-element CUDA tensor)
+    // and ggml_round produces NaN on CUDA. The raw hidden state is sufficient
+    // for the stop classifier when all ops stay on the same GPU path (#164).
+    if (W.stop_proj_w && W.stop_proj_b && W.stop_head_w) {
         ggml_tensor* sp = ggml_mul_mat(ctx0, W.stop_proj_w, cur);
         sp = ggml_add(ctx0, sp, W.stop_proj_b);
         sp = ggml_silu(ctx0, sp);
@@ -1442,13 +1411,6 @@ static std::vector<float> tslm_step_graph(voxcpm2_context* ctx, const float* hid
         }
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
                                 mask.size() * sizeof(ggml_fp16_t));
-    }
-
-    // FSQ half-constant for floor(x + 0.5) rounding (#164)
-    ggml_tensor* fsq_half_t = ggml_graph_get_tensor(gf, "fsq_half");
-    if (fsq_half_t) {
-        const float half_val = 0.5f;
-        ggml_backend_tensor_set(fsq_half_t, &half_val, 0, sizeof(float));
     }
 
     if (ggml_backend_is_cpu(ctx->backend)) {
