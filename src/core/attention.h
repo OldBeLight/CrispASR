@@ -740,22 +740,12 @@ static inline ggml_tensor* kv_self_attn(ggml_context* ctx0, ggml_cgraph* gf, ggm
     // entries of each head are rotated; the rest pass through). 0
     // means rotate the entire head_dim, which matches every existing
     // caller's prior behaviour.
-    // Skip RoPE entirely when rope_theta <= 0 — used by models without
-    // positional encoding (e.g. VoxCPM2 RALM). With theta=0, ggml_rope_ext
-    // computes powf(0, negative) = inf → NaN (#164).
-    if (p.rope_theta > 0.0f) {
-        const int n_rot = p.n_rot > 0 ? p.n_rot : hd;
-        Q = ggml_rope_ext(ctx0, Q, positions, p.rope_freq_factors, n_rot, p.rope_type, p.n_ctx_orig, p.rope_theta,
-                          /*freq_scale*/ 1.0f, /*ext_factor*/ 0.0f,
-                          /*attn_factor*/ 1.0f, p.rope_beta_fast, p.rope_beta_slow);
-        K = ggml_rope_ext(ctx0, K, positions, p.rope_freq_factors, n_rot, p.rope_type, p.n_ctx_orig, p.rope_theta, 1.0f,
-                          0.0f, 1.0f, p.rope_beta_fast, p.rope_beta_slow);
-    } else {
-        // Ensure Q/K are contiguous — downstream permute + flash_attn
-        // expect contiguous inputs, which ggml_rope_ext would guarantee.
-        Q = ggml_cont(ctx0, Q);
-        K = ggml_cont(ctx0, K);
-    }
+    const int n_rot = p.n_rot > 0 ? p.n_rot : hd;
+    Q = ggml_rope_ext(ctx0, Q, positions, p.rope_freq_factors, n_rot, p.rope_type, p.n_ctx_orig, p.rope_theta,
+                      /*freq_scale*/ 1.0f, /*ext_factor*/ 0.0f,
+                      /*attn_factor*/ 1.0f, p.rope_beta_fast, p.rope_beta_slow);
+    K = ggml_rope_ext(ctx0, K, positions, p.rope_freq_factors, n_rot, p.rope_type, p.n_ctx_orig, p.rope_theta, 1.0f,
+                      0.0f, 1.0f, p.rope_beta_fast, p.rope_beta_slow);
 
     // ---- Permute new K/V to (hd, T, n_kv) for cache write ----
     ggml_tensor* K_new_perm = ggml_permute(ctx0, K, 0, 2, 1, 3);

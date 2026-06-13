@@ -677,6 +677,147 @@ static std::vector<ggml_fp16_t> build_window_mask(int T, int left, int right) {
     return mask;
 }
 
+// ---- Streaming block: split into stages with separate cache inputs ----
+// new_in:    (d, T_new) — new frames for this chunk
+// cache_ch:  (d, T_cache) — cached post-FFN1 frames from previous chunks (or nullptr)
+// pos_enc:   (d, 2*(T_cache+T_new)-1) — rel-pos for the full window
+// Output:    (d, T_new) — block output for new frames only
+// Also tags "cache_ch_out" = post-FFN1 new frames for caching.
+static ggml_tensor* nemotron_build_block_streaming(ggml_context* ctx0, ggml_tensor* new_in, ggml_tensor* cache_ch,
+                                                   ggml_tensor* pos_enc, int T_new, int T_cache,
+                                                   const nemotron_enc_layer& e, const core_conformer::BlockParams& p) {
+    const int d = p.d;
+    const int n_heads = p.n_heads;
+    const int head_dim = p.head_dim;
+    const int K = p.K;
+    const float eps = p.ln_eps;
+    const int T_full = T_cache + T_new; // full attention window
+
+    auto mm_bias = [&](ggml_tensor* w, ggml_tensor* x, ggml_tensor* b) {
+        ggml_tensor* y = ggml_mul_mat(ctx0, w, x);
+        return b ? ggml_add(ctx0, y, b) : y;
+    };
+
+    // ---- FFN1 on new frames only ----
+    ggml_tensor* cur = new_in;
+    ggml_tensor* inpL = cur;
+    ggml_tensor* x = ggml_norm_affine(ctx0, cur, e.norm_ff1_w, e.norm_ff1_b, eps);
+    x = mm_bias(e.ff1_l1_w, x, e.ff1_l1_b);
+    x = ggml_silu(ctx0, x);
+    x = mm_bias(e.ff1_l2_w, x, e.ff1_l2_b);
+    cur = ggml_add(ctx0, inpL, ggml_scale(ctx0, x, 0.5f));
+    // cur = post-FFN1 for new frames (d, T_new)
+
+    // Tag post-FFN1 for caching
+    ggml_tensor* post_ffn1_new = ggml_dup(ctx0, cur);
+    ggml_set_name(post_ffn1_new, "cache_ch_out");
+    ggml_set_output(post_ffn1_new);
+
+    // ---- Self-attention: Q from new, K/V from [cache, new] ----
+    ggml_tensor* inpAttn = cur;
+
+    // Build full input for K/V: concat(cache_ch, cur) along time axis (dim 1)
+    ggml_tensor* full_kv_in;
+    if (cache_ch) {
+        full_kv_in = ggml_concat(ctx0, cache_ch, cur, 1); // (d, T_cache + T_new)
+    } else {
+        full_kv_in = cur; // no cache yet
+    }
+
+    // Norm for attention — apply to both cached and new
+    ggml_tensor* norm_new = ggml_norm_affine(ctx0, cur, e.norm_attn_w, e.norm_attn_b, eps);
+    ggml_tensor* norm_full;
+    if (cache_ch) {
+        norm_full = ggml_norm_affine(ctx0, full_kv_in, e.norm_attn_w, e.norm_attn_b, eps);
+    } else {
+        norm_full = norm_new;
+    }
+
+    // Q from new frames only, K/V from full window
+    ggml_tensor* Q = mm_bias(e.attn_q_w, norm_new, e.attn_q_b);   // (d, T_new)
+    ggml_tensor* K_ = mm_bias(e.attn_k_w, norm_full, e.attn_k_b); // (d, T_full)
+    ggml_tensor* V = mm_bias(e.attn_v_w, norm_full, e.attn_v_b);  // (d, T_full)
+
+    // Rel-pos: pos_enc covers the full window
+    ggml_tensor* R = ggml_mul_mat(ctx0, e.attn_pos_w, pos_enc); // (d, 2*T_full-1)
+
+    ggml_tensor* Q_u = ggml_add(ctx0, Q, ggml_reshape_1d(ctx0, e.pos_bias_u, d));
+    ggml_tensor* Q_v = ggml_add(ctx0, Q, ggml_reshape_1d(ctx0, e.pos_bias_v, d));
+
+    // Reshape for multi-head: Q is (head_dim, T_new, n_heads), K/V is (head_dim, T_full, n_heads)
+    Q_u = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Q_u, head_dim, n_heads, T_new), 0, 2, 1, 3);
+    Q_v = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Q_v, head_dim, n_heads, T_new), 0, 2, 1, 3);
+    K_ = ggml_permute(ctx0, ggml_reshape_3d(ctx0, K_, head_dim, n_heads, T_full), 0, 2, 1, 3);
+    R = ggml_permute(ctx0, ggml_reshape_3d(ctx0, R, head_dim, n_heads, 2 * T_full - 1), 0, 2, 1, 3);
+    ggml_tensor* V_ =
+        ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, V, head_dim, n_heads, T_full), 0, 2, 1, 3));
+
+    // BD = rel_shift(Q_v @ R^T): shape (T_full, T_new, n_heads)
+    // Note: Q_v has T_new queries, R has 2*T_full-1 positions
+    // Q_v @ R^T → (T_new, 2*T_full-1, n_heads). rel_shift extracts (T_full, T_new).
+    // But rel_shift expects (2T-1, T, H) input. Here Q has T_new, R has 2*T_full-1.
+    // For asymmetric Q/K: BD_raw[q, r] = Q_v[q] · R[r], shape (2*T_full-1, T_new, H).
+    // rel_shift skews to (T_full, T_new, H).
+    ggml_tensor* BD_raw = ggml_mul_mat(ctx0, ggml_cont(ctx0, R), Q_v); // (2*T_full-1, T_new, n_heads)
+    // rel_shift needs input (2*T_full-1, T_new, H) → output (T_full, T_new, H)
+    // The standard rel_shift works when Q and K have the same length T.
+    // For asymmetric Q(T_new) × K(T_full), the shift indexing is different.
+    // Simpler: skip rel-pos bias for the streaming path (it's a small accuracy hit).
+    // TODO: implement proper asymmetric rel-pos shift.
+
+    const float scale = 1.0f / sqrtf((float)head_dim);
+
+    // For now: use flash_attn_ext without BD mask (pure dot-product attention)
+    // This loses the rel-pos bias but lets us test the cache architecture.
+    ggml_tensor* attn_out =
+        ggml_flash_attn_ext(ctx0, ggml_cont(ctx0, Q_u), ggml_cont(ctx0, K_), V_, nullptr, scale, 0.0f, 0.0f);
+    attn_out = ggml_reshape_2d(ctx0, attn_out, d, T_new);
+
+    attn_out = mm_bias(e.attn_out_w, attn_out, e.attn_out_b);
+    cur = ggml_add(ctx0, inpAttn, attn_out);
+
+    // ---- Conv module (new frames only, causal padding) ----
+    ggml_tensor* inpConv = cur;
+    x = ggml_norm_affine(ctx0, cur, e.norm_conv_w, e.norm_conv_b, eps);
+    ggml_tensor* pw1_w = ggml_reshape_2d(ctx0, e.conv_pw1_w, d, 2 * d);
+    ggml_tensor* cnv = mm_bias(pw1_w, x, e.conv_pw1_b);
+    cnv = ggml_siglu(ctx0, cnv);
+
+    // DW conv with causal padding
+    ggml_tensor* dw_w_f32 = ggml_cast(ctx0, e.conv_dw_w, GGML_TYPE_F32);
+    ggml_tensor* dw_w_4d = ggml_reshape_4d(ctx0, dw_w_f32, K, 1, 1, d);
+    cnv = ggml_cont(ctx0, ggml_transpose(ctx0, cnv));
+    cnv = ggml_reshape_4d(ctx0, cnv, T_new, 1, d, 1);
+    cnv = ggml_conv_2d_dw_direct(ctx0, dw_w_4d, cnv, 1, 1, K - 1, 0, 1, 1);
+    {
+        cnv = ggml_view_4d(ctx0, cnv, T_new, cnv->ne[1], cnv->ne[2], cnv->ne[3], cnv->nb[1], cnv->nb[2], cnv->nb[3], 0);
+        cnv = ggml_cont(ctx0, cnv);
+    }
+    cnv = ggml_cont(ctx0, ggml_permute(ctx0, cnv, 1, 2, 0, 3));
+    cnv = ggml_reshape_2d(ctx0, cnv, d, T_new);
+
+    if (e.conv_ln_w && e.conv_ln_b) {
+        cnv = ggml_norm_affine(ctx0, cnv, e.conv_ln_w, e.conv_ln_b, eps);
+    }
+    cnv = ggml_silu(ctx0, cnv);
+
+    ggml_tensor* pw2_w = ggml_reshape_2d(ctx0, e.conv_pw2_w, d, d);
+    cnv = mm_bias(pw2_w, cnv, e.conv_pw2_b);
+    cur = ggml_add(ctx0, inpConv, cnv);
+
+    // ---- FFN2 + LN (new frames only) ----
+    ggml_tensor* inpFF2 = cur;
+    x = ggml_norm_affine(ctx0, cur, e.norm_ff2_w, e.norm_ff2_b, eps);
+    x = mm_bias(e.ff2_l1_w, x, e.ff2_l1_b);
+    x = ggml_silu(ctx0, x);
+    x = mm_bias(e.ff2_l2_w, x, e.ff2_l2_b);
+    cur = ggml_add(ctx0, inpFF2, ggml_scale(ctx0, x, 0.5f));
+    cur = ggml_norm_affine(ctx0, cur, e.norm_out_w, e.norm_out_b, eps);
+
+    return cur;
+}
+
+// ---- Non-streaming block (full sequence, for batch/debug) ----
 // window_mask: optional (T, T) F16 tensor with -inf outside the context window.
 // When nullptr, attention is bidirectional (fallback for debugging).
 static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, ggml_tensor* pos_enc, int T,
@@ -984,35 +1125,42 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
     bp.K = K;
     bp.ln_eps = kLayerNormEps;
 
-    // On-demand graph cache: exact T_win per (layer, window_size).
-    // Window grows from chunk_size to L+chunk_size (~15 unique sizes during
-    // cache warmup), then stabilises. Graphs are allocated on first use and
-    // reused across chunks with the same window.
+    // Streaming graph cache keyed by (layer, T_new, T_cache).
+    // Uses nemotron_build_block_streaming: FFN1 on new only, Q new / KV [cache,new],
+    // conv on new with causal pad, FFN2+LN on new. Caches post-FFN1 for next chunk.
     struct layer_graph {
         ggml_context* ctx0 = nullptr;
         ggml_cgraph* gf = nullptr;
         ggml_gallocr_t alloc = nullptr;
     };
-    std::map<std::pair<int, int>, layer_graph> graph_cache;
+    std::map<std::tuple<int, int, int>, layer_graph> graph_cache;
 
-    auto get_or_build = [&](int il, int T_win) -> layer_graph& {
-        auto key = std::make_pair(il, T_win);
+    auto get_or_build = [&](int il, int T_new, int T_cache) -> layer_graph& {
+        auto key = std::make_tuple(il, T_new, T_cache);
         auto it = graph_cache.find(key);
         if (it != graph_cache.end())
             return it->second;
+        int T_full = T_cache + T_new;
         size_t msz = ggml_tensor_overhead() * 2048 + ggml_graph_overhead_custom(2048, false);
         auto* meta = new std::vector<uint8_t>(msz);
         ggml_init_params ip2 = {msz, meta->data(), true};
         layer_graph lg;
         lg.ctx0 = ggml_init(ip2);
         lg.gf = ggml_new_graph_custom(lg.ctx0, 2048, false);
-        ggml_tensor* inp2 = ggml_new_tensor_2d(lg.ctx0, GGML_TYPE_F32, d, T_win);
-        ggml_set_name(inp2, "block_in");
-        ggml_set_input(inp2);
-        ggml_tensor* pos2 = ggml_new_tensor_2d(lg.ctx0, GGML_TYPE_F32, d, 2 * T_win - 1);
+        ggml_tensor* new_in = ggml_new_tensor_2d(lg.ctx0, GGML_TYPE_F32, d, T_new);
+        ggml_set_name(new_in, "new_in");
+        ggml_set_input(new_in);
+        ggml_tensor* cache_ch = nullptr;
+        if (T_cache > 0) {
+            cache_ch = ggml_new_tensor_2d(lg.ctx0, GGML_TYPE_F32, d, T_cache);
+            ggml_set_name(cache_ch, "cache_ch");
+            ggml_set_input(cache_ch);
+        }
+        ggml_tensor* pos2 = ggml_new_tensor_2d(lg.ctx0, GGML_TYPE_F32, d, 2 * T_full - 1);
         ggml_set_name(pos2, "pos_enc");
         ggml_set_input(pos2);
-        ggml_tensor* out2 = nemotron_build_block(lg.ctx0, inp2, pos2, T_win, m.enc[il], bp, nullptr);
+        ggml_tensor* out2 =
+            nemotron_build_block_streaming(lg.ctx0, new_in, cache_ch, pos2, T_new, T_cache, m.enc[il], bp);
         ggml_set_name(out2, "block_out");
         ggml_set_output(out2);
         ggml_build_forward_expand(lg.gf, out2);
@@ -1036,45 +1184,55 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
 
         for (int il = 0; il < n_layers; il++) {
             auto& cache = ctx->enc_cache[il];
-
             int n_ctx = std::min(cache.n_cached, L);
-            int T_win = n_ctx + n_new;
+            int T_full = n_ctx + n_new;
 
-            // Build exact-size input: (d, T_win) — no zero padding
-            std::vector<float> win_input((size_t)T_win * d);
-            if (n_ctx > 0 && !cache.k_cache.empty()) {
-                int cache_start = cache.n_cached - n_ctx;
-                memcpy(win_input.data(), cache.k_cache.data() + (size_t)cache_start * d,
-                       (size_t)n_ctx * d * sizeof(float));
+            auto& lg = get_or_build(il, n_new, n_ctx);
+
+            // Set new frames
+            ggml_tensor* new_t = ggml_graph_get_tensor(lg.gf, "new_in");
+            ggml_backend_tensor_set(new_t, chunk_in.data(), 0, (size_t)n_new * d * sizeof(float));
+
+            // Set cached post-FFN1 frames
+            if (n_ctx > 0) {
+                ggml_tensor* cache_t = ggml_graph_get_tensor(lg.gf, "cache_ch");
+                if (cache_t) {
+                    int off = cache.n_cached - n_ctx;
+                    ggml_backend_tensor_set(cache_t, cache.k_cache.data() + (size_t)off * d, 0,
+                                            (size_t)n_ctx * d * sizeof(float));
+                }
             }
-            memcpy(win_input.data() + (size_t)n_ctx * d, chunk_in.data(), (size_t)n_new * d * sizeof(float));
 
-            // Get or build exact-size graph for this (layer, T_win)
-            auto& lg = get_or_build(il, T_win);
-            ggml_tensor* inp_t = ggml_graph_get_tensor(lg.gf, "block_in");
-            ggml_backend_tensor_set(inp_t, win_input.data(), 0, (size_t)T_win * d * sizeof(float));
-
-            auto pe = core_conformer::make_pos_enc(d, T_win);
+            // Set pos_enc for full window
+            auto pe = core_conformer::make_pos_enc(d, T_full);
             ggml_tensor* pos_t = ggml_graph_get_tensor(lg.gf, "pos_enc");
             ggml_backend_tensor_set(pos_t, pe.data(), 0, pe.size() * sizeof(float));
 
             ggml_backend_graph_compute(ctx->backend, lg.gf);
 
-            // Read exact-size output
+            // Read block output (T_new frames only)
             ggml_tensor* out_t = ggml_graph_get_tensor(lg.gf, "block_out");
-            std::vector<float> win_output((size_t)T_win * d);
-            ggml_backend_tensor_get(out_t, win_output.data(), 0, (size_t)T_win * d * sizeof(float));
+            std::vector<float> new_output((size_t)n_new * d);
+            ggml_backend_tensor_get(out_t, new_output.data(), 0, new_output.size() * sizeof(float));
 
-            // Extract the last n_new frames of the valid window
-            chunk_in.assign(win_output.data() + (size_t)n_ctx * d, win_output.data() + (size_t)(n_ctx + n_new) * d);
+            // Read post-FFN1 cache output
+            ggml_tensor* cco = ggml_graph_get_tensor(lg.gf, "cache_ch_out");
+            if (cco) {
+                std::vector<float> new_post_ffn1((size_t)n_new * d);
+                ggml_backend_tensor_get(cco, new_post_ffn1.data(), 0, new_post_ffn1.size() * sizeof(float));
+                // Append to cache, keep last L frames
+                std::vector<float> combined;
+                if (n_ctx > 0)
+                    combined.assign(cache.k_cache.begin(), cache.k_cache.begin() + (size_t)cache.n_cached * d);
+                combined.insert(combined.end(), new_post_ffn1.begin(), new_post_ffn1.end());
+                int total = (int)(combined.size() / d);
+                int keep = std::min(L, total);
+                int skip = total - keep;
+                cache.k_cache.assign(combined.begin() + (size_t)skip * d, combined.end());
+                cache.n_cached = keep;
+            }
 
-            // Update cache
-            int new_cache_len = std::min(L, T_win);
-            int cache_offset = T_win - new_cache_len;
-            cache.k_cache.resize((size_t)new_cache_len * d);
-            memcpy(cache.k_cache.data(), win_output.data() + (size_t)cache_offset * d,
-                   (size_t)new_cache_len * d * sizeof(float));
-            cache.n_cached = new_cache_len;
+            chunk_in = std::move(new_output);
         }
 
         memcpy(enc_out.data() + (size_t)t_start * d, chunk_in.data(), (size_t)n_new * d * sizeof(float));

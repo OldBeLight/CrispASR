@@ -1261,11 +1261,42 @@ static ggml_cgraph* build_tslm_step_graph(voxcpm2_context* ctx, int n_past, int 
     // Python checks stop on the FSQ'd output from the PREVIOUS step:
     //   fsq_out = fsq_out_proj(round(tanh(fsq_in_proj(hidden)) * 9) / 9)
     //   stop_probs = softmax(stop_head(silu(stop_proj(fsq_out) + bias)))
-    // Stop predictor computed from the TSLM hidden output directly.
-    // FSQ in the graph causes SIGABRT (floor+add on 1-element CUDA tensor)
-    // and ggml_round produces NaN on CUDA. The raw hidden state is sufficient
-    // for the stop classifier when all ops stay on the same GPU path (#164).
-    if (W.stop_proj_w && W.stop_proj_b && W.stop_head_w) {
+    //
+    // Computing the full chain (FSQ + stop) inside the graph ensures the
+    // stop decision uses the same GPU dequantization + matmul path as the
+    // hidden state. Without FSQ, the stop predictor sees out-of-distribution
+    // inputs and never fires on Vulkan (#164). We implement round(x) as
+    // floor(x + 0.5) to avoid ggml_round, which produces NaN on CUDA.
+    if (W.stop_proj_w && W.stop_proj_b && W.stop_head_w && W.fsq_in_proj_w && W.fsq_out_proj_w) {
+        // FSQ path
+        ggml_tensor* fsq_in = ggml_mul_mat(ctx0, W.fsq_in_proj_w, cur);
+        if (W.fsq_in_proj_b) {
+            fsq_in = ggml_add(ctx0, fsq_in, W.fsq_in_proj_b);
+        }
+        ggml_tensor* th = ggml_tanh(ctx0, fsq_in);
+        th = ggml_scale(ctx0, th, 9.0f);
+        // round(x) = floor(x + 0.5) — avoids ggml_round NaN on CUDA
+        ggml_tensor* half_const = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
+        ggml_set_name(half_const, "fsq_half");
+        ggml_set_input(half_const);
+        th = ggml_add(ctx0, th, half_const);
+        th = ggml_floor(ctx0, th);
+        th = ggml_scale(ctx0, th, 1.0f / 9.0f);
+        ggml_tensor* fsq_out = ggml_mul_mat(ctx0, W.fsq_out_proj_w, th);
+        if (W.fsq_out_proj_b) {
+            fsq_out = ggml_add(ctx0, fsq_out, W.fsq_out_proj_b);
+        }
+
+        ggml_tensor* sp = ggml_mul_mat(ctx0, W.stop_proj_w, fsq_out);
+        sp = ggml_add(ctx0, sp, W.stop_proj_b);
+        sp = ggml_silu(ctx0, sp);
+        ggml_tensor* sl = ggml_mul_mat(ctx0, W.stop_head_w, sp);
+        sl = ggml_soft_max(ctx0, sl);
+        ggml_set_name(sl, "stop_probs");
+        ggml_set_output(sl);
+        ggml_build_forward_expand(gf, sl);
+    } else if (W.stop_proj_w && W.stop_proj_b && W.stop_head_w) {
+        // Fallback without FSQ (missing FSQ weights)
         ggml_tensor* sp = ggml_mul_mat(ctx0, W.stop_proj_w, cur);
         sp = ggml_add(ctx0, sp, W.stop_proj_b);
         sp = ggml_silu(ctx0, sp);
@@ -1411,6 +1442,13 @@ static std::vector<float> tslm_step_graph(voxcpm2_context* ctx, const float* hid
         }
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
                                 mask.size() * sizeof(ggml_fp16_t));
+    }
+
+    // FSQ half-constant for floor(x + 0.5) rounding (#164)
+    ggml_tensor* fsq_half_t = ggml_graph_get_tensor(gf, "fsq_half");
+    if (fsq_half_t) {
+        const float half_val = 0.5f;
+        ggml_backend_tensor_set(fsq_half_t, &half_val, 0, sizeof(float));
     }
 
     if (ggml_backend_is_cpu(ctx->backend)) {
@@ -1900,7 +1938,8 @@ static ggml_cgraph* build_locenc_graph(voxcpm2_context* ctx, ggml_context* arena
         K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
         V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
 
-        // Bidirectional flash-attn (no mask).
+        // Bidirectional flash-attn (no mask). PREC_F32 NOT set — Metal
+        // refuses FA ops tagged PREC_F32 (see LocDiT graph for rationale).
         ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, /*mask=*/nullptr, ascale, /*max_bias*/ 0.0f,
                                                 /*logit_softcap*/ 0.0f);
         attn = ggml_reshape_2d(ctx0, attn, hd * n_q, T);
@@ -2378,7 +2417,13 @@ static ggml_cgraph* build_locdit_graph(voxcpm2_context* ctx, ggml_context* arena
         K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
         V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
 
-        // Bidirectional flash-attn (no mask).
+        // Bidirectional flash-attn (no mask). PREC_F32 NOT set here —
+        // Metal's `supports_op` for FLASH_ATTN_EXT refuses any op tagged
+        // PREC_F32 (the chatterbox patch — gpu accumulator drift work),
+        // so leaving the default lets Metal pick its native F16 simdgroup
+        // path. The diff-harness gate (cfm_step0_result cos_mean ≥ 0.93)
+        // tolerates the resulting drift; bit-identical CPU vs Metal isn't
+        // required for voxcpm2.
         ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, /*mask=*/nullptr, ascale, /*max_bias*/ 0.0f,
                                                 /*logit_softcap*/ 0.0f);
         attn = ggml_reshape_2d(ctx0, attn, hd * n_q, T);
@@ -2553,15 +2598,9 @@ static std::vector<float> cfm_euler_solve(voxcpm2_context* ctx, const float* mu,
     // ~30 per-matmul tiny graphs. Same algebra; one graph build/alloc
     // per locdit call instead of one per matmul.
     const bool use_graph = vox_env_bool_default_on("VOXCPM2_USE_GRAPH");
-    // VOXCPM2_FA_CPU=1 forces LocDiT (and LocEnc) to the legacy CPU path
-    // even when the TSLM step graph runs on GPU. Required on P100 (sm_60)
-    // where flash_attn_ext accumulates in F16 and overflows on the LocDiT's
-    // mu-conditioned attention from the second AR step onwards (#164).
-    // PREC_F32 causes SIGABRT on P100, so CPU fallback is the only option.
-    static const bool fa_cpu = vox_env_bool("VOXCPM2_FA_CPU");
     auto locdit_call = [&](const float* x_tc, const float* mu_in, float t_cur, const float* cond_in,
                            float dt_in) -> std::vector<float> {
-        if (use_graph && !fa_cpu) {
+        if (use_graph) {
             return locdit_forward_graph(ctx, x_tc, mu_in, t_cur, cond_in, dt_in);
         }
         return locdit_forward(ctx, x_tc, mu_in, t_cur, cond_in, dt_in, cpu_be);
@@ -5341,9 +5380,8 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
 
         // 1c. LocEnc on predicted patch
         tb = bench ? vox_now_ms() : 0;
-        static const bool fa_cpu_le = vox_env_bool("VOXCPM2_FA_CPU");
-        std::vector<float> enc_out = (use_graph_tslm && !fa_cpu_le) ? locenc_forward_graph(ctx, patch_tf.data())
-                                                                    : locenc_forward(ctx, patch_tf.data(), cpu_be);
+        std::vector<float> enc_out =
+            use_graph_tslm ? locenc_forward_graph(ctx, patch_tf.data()) : locenc_forward(ctx, patch_tf.data(), cpu_be);
         if (bench)
             sum_locenc += vox_now_ms() - tb;
 
@@ -5359,30 +5397,6 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
         }
         if (bench)
             sum_enc_to_lm += vox_now_ms() - tb;
-
-        // NaN check on the AR loop inputs (#164 diagnosis).
-        if (ctx->verbosity >= 1 && step < 3) {
-            bool cfm_nan = false, enc_nan = false, elm_nan = false;
-            for (float v : patch)
-                if (std::isnan(v)) {
-                    cfm_nan = true;
-                    break;
-                }
-            for (float v : enc_out)
-                if (std::isnan(v)) {
-                    enc_nan = true;
-                    break;
-                }
-            for (float v : enc_lm)
-                if (std::isnan(v)) {
-                    elm_nan = true;
-                    break;
-                }
-            if (cfm_nan || enc_nan || elm_nan) {
-                fprintf(stderr, "voxcpm2: step %d NaN source: cfm=%d locenc=%d enc_lm=%d\n", step, cfm_nan, enc_nan,
-                        elm_nan);
-            }
-        }
 
         // 1e. Collect patch + update cond for next step
         patches.push_back(patch_tf);
