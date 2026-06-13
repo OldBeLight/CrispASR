@@ -1,6 +1,6 @@
 {
-  "id": "chr1s4/crispasr-parakeet-ja-chunk-verify",
-  "title": "CrispASR Parakeet-JA Chunk Verify",
+  "id": "chr1str/crispasr-parakeet-ja-autochunk-10s",
+  "title": "CrispASR Parakeet JA Autochunk 10s",
   "code_file": "crispasr-parakeet-ja-chunk-verify.py",
   "language": "python",
   "kernel_type": "script",
@@ -8,7 +8,7 @@
   "enable_gpu": "true",
   "enable_internet": "true",
   "competition_sources": [],
-  "dataset_sources": ["chr1s4/crispasr-hf-token", "chr1s4/crispasr-ccache"],
+  "dataset_sources": ["chr1str/crispasr-hf-token"],
   "kernel_sources": [],
   "model_sources": []
 }
