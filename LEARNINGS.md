@@ -22,6 +22,18 @@ duplicate, pin the duplicate against the original with a test (here:
 `tests/test-dry-run-resolve.sh`). Same lesson as the §166 punc-model resolver
 being shared across CLI/server/C-ABI rather than copied three times.
 
+## cmake-js defaults its build dir to `build/` — point it elsewhere (§166)
+
+Running `cmake-js compile` from the repo root reconfigured and clobbered the
+ninja `build/` (cmake-js's default `--out` is `build/`), wiping libcrispasr.dylib
++ bin/crispasr that the wrappers and tests link against. Always pass an explicit
+`-O <dir>` (and `-d <project-dir>`) so the Node-addon build lands in its own tree
+(e.g. `build-addon/`). Recovery is just a fresh `cmake -B build` + rebuild
+(ccache keeps it fast), but it's avoidable. The addon's own CMakeLists has no
+`cmake_minimum_required`/`project()` — it's meant to be `add_subdirectory`'d from
+the root under `CMAKE_JS_VERSION`, so cmake-js must run with `-d <root>`, not from
+the addon dir.
+
 ## A WebSocket server that "works in the browser" can still be RFC-broken (§166)
 
 ws_stream's handshake had the RFC 6455 magic GUID mistyped

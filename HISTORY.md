@@ -6,6 +6,36 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-13 §166 cross-surface parity — round 4 (full wrapper setter parity, WASM ASR, cmake-js)
+
+Closed the remaining wrapper/server gaps so every front-end exposes the complete
+`crispasr_session_set_*` surface (`include/crispasr_session.h`).
+
+- **All six native wrappers → full setter parity**, each compile-verified on M1:
+  Python (`set_hotwords`, `set_g2p_dict`), Go (`SetHotwords`), **Rust**
+  (`crispasr-sys`+`crispasr` at the *repo root*, not `bindings/`:
+  `set_punc_model`/`set_hotwords`/`set_g2p_dict`/`set_speaker_id`/`set_instruct`),
+  Dart (`setG2pDict`), Java/JNA (`setSpeakerId`/`setPuncModel`/`setHotwords`/
+  `setG2pDict`), Ruby C-ext (same four). Verified: `cargo build`, Go package
+  build, `dart analyze`, `javac` (JNA), Ruby `cc -fsyntax-only`, Python
+  import+runtime, binding-parity 153.
+- **Server**: exposed the ~14 remaining per-request transcription params on
+  `/inference` + `/v1/audio/transcriptions` (offset/duration, max_context,
+  audio_ctx, word_thold, split_on_punct, carry_initial_prompt, chunk_overlap,
+  lcs_dedup/min_length, parakeet_decoder, no_auto_aligner, show_alternatives,
+  alt_n).
+- **WASM/JS** (`bindings/javascript/emscripten.cpp`): added a backend-agnostic
+  ASR session surface (`asrOpen`/`asrTranscribe`/`asrSet*`) — it was whisper-only.
+  Built with emcc (not in the dev env; verified by inspection + C-ABI decls;
+  builds in the WASM CI).
+- **cmake-js**: ran the official Node-addon build (376 steps) — links libcrispasr
+  + the addon; the produced `.node` loads in node and exports `transcribeSession`.
+  (cmake-js defaults its build dir to `build/` and clobbered the ninja `build/`
+  on a root run; recovered via reconfigure+rebuild, then re-ran with `-O
+  build-addon`. Lesson in LEARNINGS.)
+- Docs: `docs/bindings.md` setter table + parity callout; `docs/contributing.md`
+  "adding a session setter" checklist across all six wrappers + server.
+
 ## 2026-06-13 #164 voxcpm2 VOXCPM2_USE_GRAPH — VAE Vulkan crash fixed, stop predictor WIP
 
 **Issue:** Two bugs in the graph fast path (VOXCPM2_USE_GRAPH=1):
