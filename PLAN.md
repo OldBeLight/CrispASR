@@ -2864,8 +2864,18 @@ Additional fixes along the way:
 - Pre-encode: ggml_pad_ext for true causal padding, F32 weights in converter
 - Chunked_limited attention mask (chunk-based, not banded)
 
-**Remaining:** clean up debug prints, test on F16/Q4_K models, test
-German/other languages, implement proper streaming (chunked) path.
+**Cleanup done (2026-06-15):**
+- Debug prints removed, Q4_K dequant support added to tensor_to_f32
+- F16 and Q4_K both produce correct text (Q4_K ~2x faster: 14s vs 24s)
+- Fixed GGUFs uploaded to HF, broken ref GGUF deleted
+- Streaming block GLU also fixed (ggml_siglu → ggml_siglu_swapped)
+- Bidirectional+mask path is now the default (no NEMOTRON_BATCH needed)
+- Worktree cleaned up, HF README updated with Q4_K recommendation
+- German tested (works on DE audio; EN audio with DE prompt gives
+  expected degradation)
+
+**Remaining:** proper streaming (chunked) path for real-time inference,
+WER benchmarking against NeMo on standard test sets.
 
 ---
 

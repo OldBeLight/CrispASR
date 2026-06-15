@@ -773,7 +773,7 @@ static ggml_tensor* nemotron_build_block_streaming(ggml_context* ctx0, ggml_tens
     x = ggml_norm_affine(ctx0, cur, e.norm_conv_w, e.norm_conv_b, eps);
     ggml_tensor* pw1_w = ggml_reshape_2d(ctx0, e.conv_pw1_w, d, 2 * d);
     ggml_tensor* cnv = mm_bias(pw1_w, x, e.conv_pw1_b);
-    cnv = ggml_siglu(ctx0, cnv);
+    cnv = ggml_siglu_swapped(ctx0, cnv);
 
     // DW conv with causal padding
     ggml_tensor* dw_w_f32 = ggml_cast(ctx0, e.conv_dw_w, GGML_TYPE_F32);
@@ -1606,12 +1606,12 @@ extern "C" struct nemotron_result* nemotron_transcribe_ex(struct nemotron_contex
     if (mel.empty() || T_mel <= 0)
         return nullptr;
 
-    // Run encoder — use cache-aware chunked path (NEMOTRON_BATCH=1 for old bidirectional path)
+    // Run encoder — default: full-sequence with chunked_limited attention mask.
+    // NEMOTRON_CHUNKED=1 selects the per-chunk cache-aware path (WIP).
     std::vector<float> enc_out;
     int T_enc = 0, d_model = 0;
-    const bool use_batch = getenv("NEMOTRON_BATCH");
-    if (use_batch) {
-        // Legacy: full-sequence bidirectional (doesn't produce tokens — for debugging only)
+    const bool use_chunked = getenv("NEMOTRON_CHUNKED");
+    if (!use_chunked) {
         if (!nemotron_run_encoder(ctx, mel.data(), (int)ctx->model.hparams.n_mels, T_mel, enc_out, T_enc, d_model))
             return nullptr;
     } else {
