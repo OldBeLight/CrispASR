@@ -84,6 +84,10 @@ void nemotron_set_language(struct nemotron_context* ctx, const char* lang_code);
 void nemotron_set_temperature(struct nemotron_context* ctx, float temperature, uint64_t seed);
 void nemotron_set_beam_size(struct nemotron_context* ctx, int beam_size);
 
+// MAES (Modified Adaptive Expansion Search) beam decoding. Requires
+// beam_size > 1. enable=false disables (reverts to standard beam search).
+void nemotron_set_maes(struct nemotron_context* ctx, bool enable, int num_steps, float gamma, int beta);
+
 // Vocabulary helpers
 int nemotron_n_vocab(struct nemotron_context* ctx);
 int nemotron_blank_id(struct nemotron_context* ctx);

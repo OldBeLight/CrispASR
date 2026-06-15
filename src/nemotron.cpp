@@ -205,6 +205,12 @@ struct nemotron_context {
     uint64_t decode_seed = 0;
     int decode_beam_size = 1;
 
+    // MAES controls
+    bool decode_maes = false;
+    int maes_num_steps = 2;
+    float maes_gamma = 2.3f;
+    int maes_beta = 2;
+
     // Prompt language map: lang_code -> prompt_id
     std::unordered_map<std::string, int> lang_to_prompt;
 
@@ -1747,6 +1753,139 @@ static std::vector<nemotron_emitted_token> nemotron_rnnt_beam_decode(nemotron_co
 }
 
 // ===========================================================================
+// MAES (Modified Adaptive Expansion Search) for RNNT
+// ===========================================================================
+// Time-synchronous beam search: process ALL beams at the same encoder frame,
+// allow up to maes_num_steps non-blank expansions per frame, prune with
+// gamma-threshold. Blank always advances by 1 frame.
+
+static std::vector<nemotron_emitted_token> nemotron_rnnt_maes_decode(nemotron_context* ctx, const float* enc, int T_enc,
+                                                                     int d_model, int beam_size, int maes_num_steps = 2,
+                                                                     float maes_gamma = 2.3f, int maes_beta = 2) {
+    nemotron_init_pred_weights(ctx);
+    nemotron_init_joint_weights(ctx);
+
+    const auto& W = ctx->pred_w;
+    const auto& J = ctx->joint_w;
+    const int blank_id = (int)ctx->model.hparams.blank_id;
+    const int n_vocab = J.vocab_total;
+    const int B = std::max(1, beam_size);
+    const int topk = B + maes_beta;
+
+    struct Hyp {
+        nemotron_lstm_state lstm;
+        std::vector<float> pred_out;
+        double score = 0.0;
+        std::vector<nemotron_emitted_token> emitted;
+    };
+
+    std::vector<Hyp> kept(1);
+    {
+        auto& h = kept[0];
+        h.lstm.init(W.H);
+        predictor_step(W, blank_id, h.lstm, h.pred_out);
+        h.emitted.reserve(256);
+    }
+
+    std::vector<float> proj_e(J.joint_hidden);
+    std::vector<float> logits(n_vocab);
+
+    for (int t = 0; t < T_enc; t++) {
+        joint_proj_enc(J, enc + (size_t)t * d_model, proj_e);
+
+        std::vector<Hyp> hyps = kept;
+        std::vector<Hyp> list_b;
+
+        for (int n = 0; n < maes_num_steps; n++) {
+            std::vector<Hyp> list_exp;
+
+            for (auto& h : hyps) {
+                joint_step(J, proj_e.data(), h.pred_out.data(), logits);
+
+                // Log-softmax
+                float max_l = logits[0];
+                for (int v = 1; v < n_vocab; v++)
+                    if (logits[v] > max_l)
+                        max_l = logits[v];
+                double logZ = 0.0;
+                for (int v = 0; v < n_vocab; v++)
+                    logZ += std::exp((double)(logits[v] - max_l));
+                logZ = (double)max_l + std::log(logZ);
+
+                // Top-k + gamma pruning
+                std::vector<std::pair<float, int>> topk_pairs(n_vocab);
+                for (int v = 0; v < n_vocab; v++)
+                    topk_pairs[v] = {logits[v], v};
+                std::partial_sort(topk_pairs.begin(), topk_pairs.begin() + std::min(topk, n_vocab), topk_pairs.end(),
+                                  [](const auto& a, const auto& b) { return a.first > b.first; });
+
+                double best_exp = h.score + ((double)topk_pairs[0].first - logZ);
+                for (int k = 0; k < std::min(topk, n_vocab); k++) {
+                    double new_score = h.score + ((double)topk_pairs[k].first - logZ);
+                    if (new_score < best_exp - (double)maes_gamma)
+                        continue;
+
+                    int tok = topk_pairs[k].second;
+                    if (tok == blank_id) {
+                        Hyp bh;
+                        bh.lstm = h.lstm;
+                        bh.pred_out = h.pred_out;
+                        bh.score = new_score;
+                        bh.emitted = h.emitted;
+                        list_b.push_back(std::move(bh));
+                    } else {
+                        Hyp nh;
+                        nh.lstm = h.lstm;
+                        nh.score = new_score;
+                        nh.emitted = h.emitted;
+                        nh.emitted.push_back({tok, t, t + 1, (float)std::exp(new_score - h.score)});
+                        predictor_step(W, tok, nh.lstm, nh.pred_out);
+                        list_exp.push_back(std::move(nh));
+                    }
+                }
+            }
+
+            if (list_exp.empty())
+                break;
+
+            if (n < maes_num_steps - 1) {
+                hyps = std::move(list_exp);
+            } else {
+                // Last expansion step: score remaining expansions with blank
+                for (auto& nh : list_exp) {
+                    joint_step(J, proj_e.data(), nh.pred_out.data(), logits);
+                    float max_l = logits[0];
+                    for (int v = 1; v < n_vocab; v++)
+                        if (logits[v] > max_l)
+                            max_l = logits[v];
+                    double logZ2 = 0.0;
+                    for (int v = 0; v < n_vocab; v++)
+                        logZ2 += std::exp((double)(logits[v] - max_l));
+                    logZ2 = (double)max_l + std::log(logZ2);
+                    nh.score += ((double)logits[blank_id] - logZ2);
+                    list_b.push_back(std::move(nh));
+                }
+            }
+        }
+
+        if ((int)list_b.size() > B) {
+            std::partial_sort(list_b.begin(), list_b.begin() + B, list_b.end(),
+                              [](const Hyp& a, const Hyp& b) { return a.score > b.score; });
+            list_b.resize(B);
+        }
+        kept = std::move(list_b);
+    }
+
+    if (kept.empty())
+        return {};
+    int best = 0;
+    for (int i = 1; i < (int)kept.size(); i++)
+        if (kept[i].score > kept[best].score)
+            best = i;
+    return std::move(kept[best].emitted);
+}
+
+// ===========================================================================
 // Token → text conversion
 // ===========================================================================
 
@@ -2088,8 +2227,11 @@ extern "C" struct nemotron_result* nemotron_transcribe_ex(struct nemotron_contex
 
     // RNN-T decode
     const int beam_sz = ctx->decode_beam_size;
-    auto emitted = (beam_sz > 1) ? nemotron_rnnt_beam_decode(ctx, enc_out.data(), T_enc, d_model, beam_sz)
-                                 : nemotron_rnnt_decode(ctx, enc_out.data(), T_enc, d_model);
+    const bool use_maes = ctx->decode_maes && beam_sz > 1;
+    auto emitted = use_maes        ? nemotron_rnnt_maes_decode(ctx, enc_out.data(), T_enc, d_model, beam_sz,
+                                                               ctx->maes_num_steps, ctx->maes_gamma, ctx->maes_beta)
+                   : (beam_sz > 1) ? nemotron_rnnt_beam_decode(ctx, enc_out.data(), T_enc, d_model, beam_sz)
+                                   : nemotron_rnnt_decode(ctx, enc_out.data(), T_enc, d_model);
 
     if (getenv("CRISPASR_NEMOTRON_DEBUG")) {
         fprintf(stderr, "nemotron: RNNT emitted %zu tokens\n", emitted.size());
@@ -2172,6 +2314,17 @@ extern "C" void nemotron_set_beam_size(struct nemotron_context* ctx, int beam_si
     if (!ctx)
         return;
     ctx->decode_beam_size = beam_size > 0 ? beam_size : 1;
+}
+
+extern "C" void nemotron_set_maes(struct nemotron_context* ctx, bool enable, int num_steps, float gamma, int beta) {
+    if (!ctx)
+        return;
+    ctx->decode_maes = enable;
+    if (enable) {
+        ctx->maes_num_steps = num_steps > 0 ? num_steps : 2;
+        ctx->maes_gamma = gamma > 0.0f ? gamma : 2.3f;
+        ctx->maes_beta = beta > 0 ? beta : 2;
+    }
 }
 
 extern "C" int nemotron_n_vocab(struct nemotron_context* ctx) {
