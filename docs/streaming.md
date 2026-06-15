@@ -262,6 +262,26 @@ step.
 > behaviour. `--stream-keep` is now informational only.
 
 For native streaming-architecture backends (`voxtral4b`,
-`moonshine-streaming`, `kyutai-stt`), the encoder runs incrementally —
-the sliding window flags above still apply but the per-chunk cost is
-lower than for batch backends.
+`moonshine-streaming`, `kyutai-stt`, `nemotron`), the encoder runs
+incrementally — the sliding window flags above still apply but the
+per-chunk cost is lower than for batch backends.
+
+### Nemotron streaming (cache-aware FastConformer)
+
+`nemotron` supports true cache-aware streaming via the NeMo
+`cache_last_channel` + `cache_last_time` architecture. Enable with:
+
+```bash
+CRISPASR_NEMOTRON_STREAMING=1 crispasr --backend nemotron -m model.gguf -f audio.wav
+```
+
+Four context presets trade latency for accuracy:
+
+| Preset | Right-context | Chunk size | Approx latency | Published WER |
+|--------|--------------|------------|----------------|---------------|
+| 0      | 3 frames     | 4 frames   | ~160 ms        | 7.67 %        |
+| 1      | 0 frames     | 1 frame    | ~80 ms         | 8.43 %        |
+| 2      | 6 frames     | 7 frames   | ~560 ms        | 7.07 %        |
+| 3      | 13 frames    | 14 frames  | ~1120 ms       | 6.93 %        |
+
+Set via `CRISPASR_NEMOTRON_CONTEXT_PRESET=N` (default: 0).

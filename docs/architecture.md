@@ -809,6 +809,32 @@ embeddings, and Mimi codec at F16; only backbone + depthformer layers quantized.
 Variants: English (`LiquidAI/LFM2.5-Audio-1.5B`) and Japanese
 (`LiquidAI/LFM2.5-Audio-1.5B-JP`).
 
+### nemotron
+
+NVIDIA Nemotron-3.5-ASR-Streaming (NVOML, 600M): cache-aware streaming
+FastConformer + RNN-T. First truly streaming-native ASR backend — processes
+audio in fixed-size chunks with per-layer state caching.
+
+**Architecture:** 16 kHz mono PCM → 80-mel NeMo spectrogram (no normalization)
+→ causal 4× conv subsampling (pre-encode, asymmetric padding) → 24L
+Cache-Aware FastConformer (1024-dim, 8 heads, chunked_limited attention
+with rel-pos bias, depthwise conv kernel=9) → language prompt kernel
+(39 langs, one-hot conditioning) → 1L LSTM predictor → joint network →
+RNN-T greedy decode (blank=1024, no TDT durations).
+
+**Streaming:** gated by `CRISPASR_NEMOTRON_STREAMING=1`. Per-layer caches:
+- `cache_last_channel`: post-FFN1 output (up to L=56 frames), used as K/V
+  context for asymmetric attention (Q from new frames only)
+- `cache_last_time`: last K-1=8 frames of post-GLU signal before depthwise
+  conv, prepended instead of zero-padding (NeMo's `CausalConv1D.update_cache`)
+
+Four attention context presets (`CRISPASR_NEMOTRON_CONTEXT_PRESET=0..3`)
+trade latency for accuracy: 160ms/7.67% WER to 1120ms/6.93% WER.
+
+GGUF: `cstr/nemotron-3.5-asr-streaming-GGUF`. F16 + Q4_K produce identical
+text. Pre-encode weights kept at F32 in the GGUF (F16 causes 1.56 max
+accumulation error across the 4352-dim projection).
+
 ### bark
 
 Suno Bark (MIT, ~400M): three-stage GPT-2 pipeline — text → semantic tokens

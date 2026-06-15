@@ -5,7 +5,7 @@ CrispASR has two tiers of tests: **unit tests** (no models, fast) and
 
 ## Unit tests
 
-429 unit tests run unconditionally in ~5 seconds with no model files:
+435 unit tests run unconditionally in ~5 seconds with no model files:
 
 ```bash
 ctest --test-dir build -L unit --timeout 30
@@ -58,12 +58,19 @@ other vars derive from it unless individually overridden.
 | `CRISPASR_TEST_TITANET_MODEL` | Diarization (embedder) | titanet-large GGUF |
 | `CRISPASR_TEST_DIARIZE_WAV` | Diarization | Multi-speaker 16kHz mono WAV |
 | `CRISPASR_CHAT_TEST_MODEL` | Chat LLM smoke test | Needs chat template (not harrier) |
+| `CRISPASR_MODEL_NEMOTRON` | Nemotron live tests | Q4_K GGUF (~458 MB) |
+| `CRISPASR_MODEL_NEMOTRON_F16` | Nemotron F16/Q4_K parity | F16 GGUF (~1.3 GB) |
+| `CRISPASR_MODEL_LFM2` | LFM2-Audio live tests | Q5_K GGUF (~1.6 GB). **Not Q4_K** — produces 0 tokens. |
+| `CRISPASR_MODEL_DIA` | Dia TTS live tests | Q4_K GGUF (~892 MB) |
+| `CRISPASR_MODEL_OUTETTS` | OuteTTS live tests | Q4_K GGUF (~600 MB) |
+| `CRISPASR_MODEL_WAVTOK` | WavTokenizer (OuteTTS codec) | F16 GGUF (~100 MB) |
 
 ### Test groups
 
 | Tests | Group | Model | Timeout |
 |---|---|---|---|
 | #100-103 | Paraformer | paraformer-zh-f16.gguf (~422 MB) | 30s |
+| #110-112 | Nemotron | nemotron Q4_K + F16 (~1.7 GB total) | 300s |
 | #218-220 | Beam: whisper | ggml-tiny.bin (~75 MB) | 120s |
 | #221-228 | Beam: other backends | 2-5 GB models | 300s+ (CPU) |
 | #77-78 | Diarize (pyannote + TitaNet) | ~50 MB total | 120s |

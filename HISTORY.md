@@ -31,6 +31,35 @@ Validated on Kaggle against NeMo ground truth: encoder output matches
 per-frame to 4+ decimal places, prompted output min/max within 0.002 of
 NeMo's, transcription text identical.
 
+## 2026-06-15 §168 GPU scheduler migration + #81 streaming encoder
+
+**GPU scheduler migration (§168):** migrated 7 backends from `ggml_gallocr`
+to `ggml_backend_sched`: nemotron, paraformer, dia_tts, outetts_wavtok,
+audioseal, lfm2_audio, core/snac. Each verified with A/B testing (identical
+output). Remaining gallocr uses (voxcpm2_tts, funasr step graph) are
+intentional persistent-reserve performance optimizations.
+
+**Nemotron streaming encoder (#81):** full cache-aware streaming architecture
+implemented and working on all 4 context presets.
+- `nemotron_build_block_streaming`: FFN1 on new frames only, Q from new /
+  K,V from [cache_last_channel + new], conv with cached left context,
+  FFN2+LN on new only.
+- Asymmetric rel-pos bias: `view_3d` stride trick with `(T_new-1)` offset
+  (same formula as symmetric, different offset).
+- Conv cache fix (root cause of blank output): NeMo's `CausalConv1D` prepends
+  last K-1 frames instead of zero-padding. Without this, frames 2+ had
+  destroyed representations.
+- Env vars: `CRISPASR_NEMOTRON_STREAMING=1`, `CRISPASR_NEMOTRON_CONTEXT_PRESET=N`,
+  `CRISPASR_NEMOTRON_DEBUG=1`, `CRISPASR_NEMOTRON_NO_WINDOW_MASK=1`.
+
+**lfm2 Q4_K fix:** Q4_K produces 0 tokens on the hybrid conv+attention
+backbone (too precision-sensitive). Q5_K works identically to F16. Registry
++ HF updated. JP variant Q5_K uploaded.
+
+**Testing:** 3 nemotron live integration tests. Env vars added for all
+migrated backends. 6 regression manifest PLACEHOLDER transcripts filled.
+435 unit tests pass.
+
 ---
 
 ## 2026-06-13 #164 voxcpm2 graph path — NaN + SIGABRT fix
