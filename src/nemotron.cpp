@@ -813,7 +813,7 @@ static ggml_tensor* nemotron_build_block_streaming(ggml_context* ctx0, ggml_tens
 // When nullptr, attention is bidirectional (fallback for debugging).
 static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, ggml_tensor* pos_enc, int T,
                                          const nemotron_enc_layer& e, const core_conformer::BlockParams& p,
-                                         ggml_tensor* window_mask = nullptr) {
+                                         ggml_tensor* window_mask = nullptr, bool debug_tag = false) {
     const int d = p.d;
     const int n_heads = p.n_heads;
     const int head_dim = p.head_dim;
@@ -833,6 +833,10 @@ static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, g
     x = ggml_silu(ctx0, x);
     x = mm_bias(e.ff1_l2_w, x, e.ff1_l2_b);
     cur = ggml_add(ctx0, inpL, ggml_scale(ctx0, x, 0.5f));
+    if (debug_tag) {
+        ggml_set_name(cur, "dbg_ffn1");
+        ggml_set_output(cur);
+    }
 
     ggml_tensor* inpAttn = cur;
 
@@ -883,6 +887,10 @@ static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, g
 
     attn_out = mm_bias(e.attn_out_w, attn_out, e.attn_out_b);
     cur = ggml_add(ctx0, inpAttn, attn_out);
+    if (debug_tag) {
+        ggml_set_name(cur, "dbg_attn");
+        ggml_set_output(cur);
+    }
 
     // ---- Conformer convolution module (with LayerNorm instead of BN) ----
     ggml_tensor* inpConv = cur;
@@ -892,6 +900,10 @@ static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, g
     ggml_tensor* cnv = mm_bias(pw1_w, x, e.conv_pw1_b);
     // NeMo Conformer GLU: first_half=value, second_half=gate → non-swapped siglu
     cnv = ggml_siglu(ctx0, cnv);
+    if (debug_tag) {
+        ggml_set_name(cnv, "dbg_siglu");
+        ggml_set_output(cnv);
+    }
 
     // DW conv (kernel K, CAUSAL padding: left=K-1, right=0)
     // ggml_conv_2d_dw_direct only supports symmetric padding, so we use
@@ -910,6 +922,10 @@ static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, g
     }
     cnv = ggml_cont(ctx0, ggml_permute(ctx0, cnv, 1, 2, 0, 3));
     cnv = ggml_reshape_2d(ctx0, cnv, d, T);
+    if (debug_tag) {
+        ggml_set_name(cnv, "dbg_dwconv");
+        ggml_set_output(cnv);
+    }
 
     // LayerNorm (replaces BN-folded bias add in parakeet)
     if (e.conv_ln_w && e.conv_ln_b) {
@@ -920,6 +936,10 @@ static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, g
     ggml_tensor* pw2_w = ggml_reshape_2d(ctx0, e.conv_pw2_w, d, d);
     cnv = mm_bias(pw2_w, cnv, e.conv_pw2_b);
     cur = ggml_add(ctx0, inpConv, cnv);
+    if (debug_tag) {
+        ggml_set_name(cur, "dbg_conv");
+        ggml_set_output(cur);
+    }
 
     // ---- FFN2 (macaron half) ----
     ggml_tensor* inpFF2 = cur;
@@ -992,7 +1012,8 @@ static ggml_cgraph* nemotron_build_graph_encoder(nemotron_context* ctx, int T_me
     bp.ln_eps = kLayerNormEps;
 
     for (uint32_t il = 0; il < hp.n_layers; il++) {
-        cur = nemotron_build_block(ctx0, cur, pos_enc, T, m.enc[il], bp, window_mask_t);
+        cur = nemotron_build_block(ctx0, cur, pos_enc, T, m.enc[il], bp, window_mask_t,
+                                   /*debug_tag=*/il == 0);
     }
 
     ggml_set_name(cur, "enc_out");
@@ -1077,6 +1098,12 @@ static bool nemotron_run_encoder(nemotron_context* ctx, const float* mel, int n_
     dump_stage("conv3_out");
     dump_stage("conv5_out");
     dump_stage("conv6_out");
+    // Layer 0 sub-module dumps
+    dump_stage("dbg_ffn1");
+    dump_stage("dbg_attn");
+    dump_stage("dbg_siglu");
+    dump_stage("dbg_dwconv");
+    dump_stage("dbg_conv");
 
     // Debug: pre-encode output
     ggml_tensor* pre_enc_t = ggml_graph_get_tensor(gf, "pre_enc_out");
