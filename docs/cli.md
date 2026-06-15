@@ -170,9 +170,19 @@ CRISPASR_PARAKEET_MAES=1 crispasr -m model.gguf -f audio.wav --beam-size 4
 | `CRISPASR_MAES_GAMMA` | 2.3 | Pruning threshold (lower = more aggressive) |
 | `CRISPASR_MAES_BETA` | 2 | Extra candidates beyond beam_size |
 
-Works with both TDT and RNNT parakeet models. CTC beam search is
-separate (activated by `--beam-size N` with CTC models, uses shared
+Works with both TDT and RNNT parakeet models, and nemotron (via
+`CRISPASR_NEMOTRON_MAES=1`). CTC beam search is separate (activated by
+`--beam-size N` with CTC models, uses shared
 `core_ctc::prefix_beam_search`).
+
+**Nemotron MAES** (§167b): same algorithm ported to the nemotron RNNT
+decoder. On JFK 11s, MAES removes spurious `<en-US>` language tags and
+produces proper punctuation vs standard beam.
+
+```bash
+CRISPASR_NEMOTRON_MAES=1 crispasr -m nemotron-3.5-asr-streaming-0.6b-q4_k.gguf \
+  --backend nemotron --beam-size 4 -f audio.wav
+```
 
 ### Parakeet streamed encoding (issue #89)
 
@@ -415,7 +425,7 @@ upstream tools like SubtitleEdit.
 | `-tp F`, `--temperature F` | Sampling temperature. `0` = pure argmax (default, bit-identical). `> 0` enables multinomial sampling for whisper, voxtral, voxtral4b, qwen3, granite |
 | `--seed N` | RNG seed for sampling. `0` = non-deterministic. Used by temperature-sampling ASR backends and TTS backends that sample; CLI values override backend-specific env seeds |
 | `-bo N`, `--best-of N` | Number of best candidates to keep when temperature > 0 (whisper + some AR backends) |
-| `-bs N`, `--beam-size N` | Beam search width. Default 5 for whisper, 1 (greedy) for other backends. 18 backends: whisper, parakeet, canary, cohere, granite, qwen3, voxtral, voxtral4b, glm-asr, kyutai-stt, moonshine, moonshine-streaming, firered-asr, omniasr, gemma4-e2b, funasr, m2m100, madlad/t5. Not applicable to CTC/NAR backends |
+| `-bs N`, `--beam-size N` | Beam search width. Default 5 for whisper, 1 (greedy) for other backends. 21 backends: whisper, parakeet, nemotron, canary, cohere, granite, qwen3, voxtral, voxtral4b, glm-asr, kyutai-stt, moonshine, moonshine-streaming, firered-asr, omniasr, gemma4-e2b, funasr, sensevoice, granite-nle, moss-audio, mimo-asr, m2m100, madlad/t5. Also lfm2-audio (stub). Not applicable to paraformer (NAR) |
 | `-tpi F`, `--temperature-inc F` | Whisper temperature-fallback increment |
 | `-nf`, `--no-fallback` | Disable temperature fallback (equivalent to `--temperature-inc 0`) |
 | `--frequency-penalty F` | Opt-in repeated generated-token penalty for autoregressive ASR backends (`0.0` disabled). Applied to generated output tokens before greedy/sampling selection. |

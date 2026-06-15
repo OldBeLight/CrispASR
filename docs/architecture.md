@@ -820,7 +820,8 @@ audio in fixed-size chunks with per-layer state caching.
 Cache-Aware FastConformer (1024-dim, 8 heads, chunked_limited attention
 with rel-pos bias, depthwise conv kernel=9) → language prompt kernel
 (39 langs, one-hot conditioning) → 1L LSTM predictor → joint network →
-RNN-T greedy decode (blank=1024, no TDT durations).
+RNN-T decode with greedy (default), beam search (`--beam-size N`), or
+MAES (`CRISPASR_NEMOTRON_MAES=1 --beam-size N`).
 
 **Streaming:** gated by `CRISPASR_NEMOTRON_STREAMING=1`. Per-layer caches:
 - `cache_last_channel`: post-FFN1 output (up to L=56 frames), used as K/V
@@ -831,9 +832,10 @@ RNN-T greedy decode (blank=1024, no TDT durations).
 Four attention context presets (`CRISPASR_NEMOTRON_CONTEXT_PRESET=0..3`)
 trade latency for accuracy: 160ms/7.67% WER to 1120ms/6.93% WER.
 
-GGUF: `cstr/nemotron-3.5-asr-streaming-GGUF`. F16 + Q4_K produce identical
-text. Pre-encode weights kept at F32 in the GGUF (F16 causes 1.56 max
-accumulation error across the 4352-dim projection).
+GGUF: `cstr/nemotron-3.5-asr-streaming-0.6b-GGUF`. F16 + Q4_K produce
+identical text. Pre-encode weights kept at F32 in the GGUF (F16 causes
+1.56 max accumulation error across the 4352-dim projection).
+Auto-download: `-m auto --backend nemotron`.
 
 ### bark
 

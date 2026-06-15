@@ -42,6 +42,9 @@ struct ExtraList {
 constexpr Entry k_registry[] = {
     {"whisper", "ggml-base.bin",
      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin", "~147 MB", nullptr, nullptr},
+    {"nemotron", "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
+     "https://huggingface.co/cstr/nemotron-3.5-asr-streaming-0.6b-GGUF/resolve/main/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
+     "~458 MB", nullptr, nullptr},
     {"parakeet", "parakeet-tdt-0.6b-v3-q4_k.gguf",
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF/resolve/main/parakeet-tdt-0.6b-v3-q4_k.gguf", "~467 MB", nullptr, nullptr},
     {"canary", "canary-1b-v2-q4_k.gguf",
