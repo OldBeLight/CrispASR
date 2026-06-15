@@ -54,9 +54,9 @@ constexpr Entry k_registry[] = {
      "~1.6 GB", nullptr, nullptr, nullptr,
      "LFM Open License v1.0 (commercial use OK under $10M revenue; see "
      "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B)"},
-    // Japanese variant — Q4_K is safe for Japanese.
-    {"lfm2-audio", "lfm2-audio-1.5b-jp-q4_k.gguf",
-     "https://huggingface.co/cstr/lfm2-audio-1.5b-jp-GGUF/resolve/main/lfm2-audio-1.5b-jp-q4_k.gguf",
+    // Japanese variant — Q5_K minimum (Q4_K produces 0 tokens on hybrid backbone).
+    {"lfm2-audio", "lfm2-audio-1.5b-jp-q5_k.gguf",
+     "https://huggingface.co/cstr/lfm2-audio-1.5b-jp-GGUF/resolve/main/lfm2-audio-1.5b-jp-q5_k.gguf",
      "~1.5 GB", nullptr, nullptr, nullptr,
      "LFM Open License v1.0 (commercial use OK under $10M revenue; see "
      "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP)"},
