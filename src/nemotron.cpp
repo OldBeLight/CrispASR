@@ -248,8 +248,19 @@ static std::vector<float> tensor_to_f32(ggml_tensor* t) {
         ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(ggml_fp16_t));
         for (int64_t i = 0; i < n; i++)
             out[i] = ggml_fp16_to_fp32(tmp[i]);
+    } else if (ggml_is_quantized(t->type)) {
+        size_t raw_sz = ggml_nbytes(t);
+        std::vector<uint8_t> raw(raw_sz);
+        ggml_backend_tensor_get(t, raw.data(), 0, raw_sz);
+        const auto* traits = ggml_get_type_traits(t->type);
+        if (traits && traits->to_float) {
+            traits->to_float(raw.data(), out.data(), n);
+        } else {
+            fprintf(stderr, "nemotron: no dequant for type %d\n", t->type);
+            out.assign(n, 0.0f);
+        }
     } else {
-        fprintf(stderr, "nemotron: unsupported tensor type %d for CPU conversion\n", t->type);
+        fprintf(stderr, "nemotron: unsupported tensor type %d\n", t->type);
         out.assign(n, 0.0f);
     }
     return out;
@@ -594,34 +605,24 @@ static ggml_tensor* nemotron_build_pre_encode(ggml_context* ctx0, ggml_tensor* m
     // Stage 0: Conv2d(1, C, k=3, s=2) with causal padding
     ggml_tensor* cur = ggml_conv_2d(ctx0, w.conv0_w, causal_pad(mel), 2, 2, 0, 0, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv0_b));
-    ggml_set_name(cur, "conv0_out");
-    ggml_set_output(cur);
     cur = ggml_relu(ctx0, cur);
 
     // Stage 2: DW Conv2d(C, k=3, s=2) with causal padding
     cur = ggml_conv_2d_dw(ctx0, w.conv2_w, causal_pad(cur), 2, 2, 0, 0, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv2_b));
-    ggml_set_name(cur, "conv2_out");
-    ggml_set_output(cur);
 
     // Stage 3: PW Conv2d(C, C, k=1, s=1) — no padding
     cur = ggml_conv_2d(ctx0, w.conv3_w, cur, 1, 1, 0, 0, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv3_b));
-    ggml_set_name(cur, "conv3_out");
-    ggml_set_output(cur);
     cur = ggml_relu(ctx0, cur);
 
     // Stage 5: DW Conv2d(C, k=3, s=2) with causal padding
     cur = ggml_conv_2d_dw(ctx0, w.conv5_w, causal_pad(cur), 2, 2, 0, 0, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv5_b));
-    ggml_set_name(cur, "conv5_out");
-    ggml_set_output(cur);
 
     // Stage 6: PW Conv2d(C, C, k=1, s=1)
     cur = ggml_conv_2d(ctx0, w.conv6_w, cur, 1, 1, 0, 0, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv6_b));
-    ggml_set_name(cur, "conv6_out");
-    ggml_set_output(cur);
     cur = ggml_relu(ctx0, cur);
 
     // Flatten and linear: (OW, OH, C, 1) -> permute to (OH, C, OW, 1) -> reshape to (C*OW, OH)
@@ -813,7 +814,7 @@ static ggml_tensor* nemotron_build_block_streaming(ggml_context* ctx0, ggml_tens
 // When nullptr, attention is bidirectional (fallback for debugging).
 static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, ggml_tensor* pos_enc, int T,
                                          const nemotron_enc_layer& e, const core_conformer::BlockParams& p,
-                                         ggml_tensor* window_mask = nullptr, bool debug_tag = false) {
+                                         ggml_tensor* window_mask = nullptr) {
     const int d = p.d;
     const int n_heads = p.n_heads;
     const int head_dim = p.head_dim;
@@ -833,10 +834,6 @@ static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, g
     x = ggml_silu(ctx0, x);
     x = mm_bias(e.ff1_l2_w, x, e.ff1_l2_b);
     cur = ggml_add(ctx0, inpL, ggml_scale(ctx0, x, 0.5f));
-    if (debug_tag) {
-        ggml_set_name(cur, "dbg_ffn1");
-        ggml_set_output(cur);
-    }
 
     ggml_tensor* inpAttn = cur;
 
@@ -887,10 +884,6 @@ static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, g
 
     attn_out = mm_bias(e.attn_out_w, attn_out, e.attn_out_b);
     cur = ggml_add(ctx0, inpAttn, attn_out);
-    if (debug_tag) {
-        ggml_set_name(cur, "dbg_attn");
-        ggml_set_output(cur);
-    }
 
     // ---- Conformer convolution module (with LayerNorm instead of BN) ----
     ggml_tensor* inpConv = cur;
@@ -898,17 +891,9 @@ static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, g
 
     ggml_tensor* pw1_w = ggml_reshape_2d(ctx0, e.conv_pw1_w, d, 2 * d);
     ggml_tensor* cnv = mm_bias(pw1_w, x, e.conv_pw1_b);
-    if (debug_tag) {
-        ggml_set_name(cnv, "dbg_pw1");
-        ggml_set_output(cnv);
-    }
     // NeMo Conformer GLU: first_half * sigmoid(second_half) = swapped siglu
     // ggml_siglu does sigmoid(first) * second; ggml_siglu_swapped does first * sigmoid(second)
     cnv = ggml_siglu_swapped(ctx0, cnv);
-    if (debug_tag) {
-        ggml_set_name(cnv, "dbg_siglu");
-        ggml_set_output(cnv);
-    }
 
     // DW conv (kernel K, CAUSAL padding: left=K-1, right=0)
     // ggml_conv_2d_dw_direct only supports symmetric padding, so we use
@@ -931,19 +916,11 @@ static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, g
     if (e.conv_ln_w && e.conv_ln_b) {
         cnv = ggml_norm_affine(ctx0, cnv, e.conv_ln_w, e.conv_ln_b, eps);
     }
-    if (debug_tag) {
-        ggml_set_name(cnv, "dbg_postln");
-        ggml_set_output(cnv);
-    }
     cnv = ggml_silu(ctx0, cnv);
 
     ggml_tensor* pw2_w = ggml_reshape_2d(ctx0, e.conv_pw2_w, d, d);
     cnv = mm_bias(pw2_w, cnv, e.conv_pw2_b);
     cur = ggml_add(ctx0, inpConv, cnv);
-    if (debug_tag) {
-        ggml_set_name(cur, "dbg_conv");
-        ggml_set_output(cur);
-    }
 
     // ---- FFN2 (macaron half) ----
     ggml_tensor* inpFF2 = cur;
@@ -986,8 +963,6 @@ static ggml_cgraph* nemotron_build_graph_encoder(nemotron_context* ctx, int T_me
     // ----- Causal pre-encode (asymmetric padding, 17 freq bins) -----
     int T = 0;
     ggml_tensor* cur = nemotron_build_pre_encode(ctx0, mel, m.pre_encode, (int)hp.subsampling_channels, &T);
-    ggml_set_name(cur, "pre_enc_out");
-    ggml_set_output(cur);
 
     // nemotron has xscaling=false, so no scaling step
 
@@ -1016,8 +991,7 @@ static ggml_cgraph* nemotron_build_graph_encoder(nemotron_context* ctx, int T_me
     bp.ln_eps = kLayerNormEps;
 
     for (uint32_t il = 0; il < hp.n_layers; il++) {
-        cur = nemotron_build_block(ctx0, cur, pos_enc, T, m.enc[il], bp, window_mask_t,
-                                   /*debug_tag=*/il == 0);
+        cur = nemotron_build_block(ctx0, cur, pos_enc, T, m.enc[il], bp, window_mask_t);
     }
 
     ggml_set_name(cur, "enc_out");
@@ -1085,40 +1059,6 @@ static bool nemotron_run_encoder(nemotron_context* ctx, const float* mel, int n_
     // Read output: (d_model, T_enc) in column-major → row-major (T_enc, d_model)
     enc_out.resize((size_t)T_enc * d_model_out);
     ggml_backend_tensor_get(enc_out_t, enc_out.data(), 0, enc_out.size() * sizeof(float));
-
-    // Debug: per-stage outputs
-    auto dump_stage = [&](const char* name) {
-        ggml_tensor* t = ggml_graph_get_tensor(gf, name);
-        if (!t)
-            return;
-        fprintf(stderr, "nemotron: %s shape=(%lld,%lld,%lld,%lld)", name, (long long)t->ne[0], (long long)t->ne[1],
-                (long long)t->ne[2], (long long)t->ne[3]);
-        std::vector<float> v(5);
-        ggml_backend_tensor_get(t, v.data(), 0, 5 * sizeof(float));
-        fprintf(stderr, " flat[0:5]=[%.8f,%.8f,%.8f,%.8f,%.8f]\n", v[0], v[1], v[2], v[3], v[4]);
-    };
-    dump_stage("conv0_out");
-    dump_stage("conv2_out");
-    dump_stage("conv3_out");
-    dump_stage("conv5_out");
-    dump_stage("conv6_out");
-    // Layer 0 sub-module dumps
-    dump_stage("dbg_ffn1");
-    dump_stage("dbg_attn");
-    dump_stage("dbg_pw1");
-    dump_stage("dbg_siglu");
-    dump_stage("dbg_postln");
-    dump_stage("dbg_conv");
-
-    // Debug: pre-encode output
-    ggml_tensor* pre_enc_t = ggml_graph_get_tensor(gf, "pre_enc_out");
-    if (pre_enc_t) {
-        int T_pre = (int)pre_enc_t->ne[1];
-        std::vector<float> pre_data(5);
-        ggml_backend_tensor_get(pre_enc_t, pre_data.data(), 0, 5 * sizeof(float));
-        fprintf(stderr, "nemotron: pre_enc T=%d frame0[0:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", T_pre, pre_data[0],
-                pre_data[1], pre_data[2], pre_data[3], pre_data[4]);
-    }
 
     ggml_gallocr_free(alloc);
     return true;
@@ -1665,23 +1605,6 @@ extern "C" struct nemotron_result* nemotron_transcribe_ex(struct nemotron_contex
     auto mel = nemotron_compute_mel_impl(ctx, samples, n_samples, T_mel);
     if (mel.empty() || T_mel <= 0)
         return nullptr;
-    {
-        float mmin = 1e30f, mmax = -1e30f;
-        for (auto v : mel) {
-            if (v < mmin)
-                mmin = v;
-            if (v > mmax)
-                mmax = v;
-        }
-        fprintf(stderr, "nemotron: mel T=%d n_mels=%d min=%.2f max=%.2f mel[0:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", T_mel,
-                (int)ctx->model.hparams.n_mels, mmin, mmax, mel[0], mel[1], mel[2], mel[3], mel[4]);
-        // Dump mel at frame 500 for comparison with NeMo
-        if (T_mel > 500) {
-            int off = 500 * (int)ctx->model.hparams.n_mels;
-            fprintf(stderr, "nemotron: mel frame500[0:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", mel[off], mel[off + 1],
-                    mel[off + 2], mel[off + 3], mel[off + 4]);
-        }
-    }
 
     // Run encoder — use cache-aware chunked path (NEMOTRON_BATCH=1 for old bidirectional path)
     std::vector<float> enc_out;
@@ -1778,15 +1701,6 @@ extern "C" struct nemotron_result* nemotron_transcribe_ex(struct nemotron_contex
     if (T_enc <= 0)
         return nullptr;
 
-    // Debug: encoder frames before prompt
-    fprintf(stderr, "nemotron: enc frame0[0:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", enc_out[0], enc_out[1], enc_out[2],
-            enc_out[3], enc_out[4]);
-    if (T_enc > 50) {
-        int off = 50 * d_model;
-        fprintf(stderr, "nemotron: enc frame50[0:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", enc_out[off], enc_out[off + 1],
-                enc_out[off + 2], enc_out[off + 3], enc_out[off + 4]);
-    }
-
     // Apply prompt kernel (language conditioning) — CPU F32
     // concat(enc_out[d_model], lang_onehot[n_prompts]) → Linear(in→mid) → ReLU → Linear(mid→d_model)
     if (ctx->model.prompt_kernel.l0_w) {
@@ -1836,21 +1750,7 @@ extern "C" struct nemotron_result* nemotron_transcribe_ex(struct nemotron_contex
             }
         }
         enc_out = std::move(prompted);
-        {
-            float pmin = 1e30f, pmax = -1e30f;
-            for (size_t i = 0; i < enc_out.size(); i++) {
-                if (enc_out[i] < pmin)
-                    pmin = enc_out[i];
-                if (enc_out[i] > pmax)
-                    pmax = enc_out[i];
-            }
-            fprintf(stderr, "nemotron: prompt kernel applied (prompt_id=%d) min=%.4f max=%.4f\n", prompt_id, pmin,
-                    pmax);
-            // Debug: dump first 5 values of frame 0 and the lang one-hot
-            fprintf(stderr, "nemotron: prompt frame0[0:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", enc_out[0], enc_out[1],
-                    enc_out[2], enc_out[3], enc_out[4]);
-            fprintf(stderr, "nemotron: pk_in=%d pk_mid=%d d=%d n_prompts=%d\n", pk_in, pk_mid, d_model, n_prompts);
-        }
+        fprintf(stderr, "nemotron: prompt kernel applied (prompt_id=%d)\n", prompt_id);
     }
 
     // RNN-T decode
