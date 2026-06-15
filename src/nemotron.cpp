@@ -744,25 +744,22 @@ static ggml_tensor* nemotron_build_block_streaming(ggml_context* ctx0, ggml_tens
     ggml_tensor* V_ =
         ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, V, head_dim, n_heads, T_full), 0, 2, 1, 3));
 
-    // BD = rel_shift(Q_v @ R^T): shape (T_full, T_new, n_heads)
-    // Note: Q_v has T_new queries, R has 2*T_full-1 positions
-    // Q_v @ R^T → (T_new, 2*T_full-1, n_heads). rel_shift extracts (T_full, T_new).
-    // But rel_shift expects (2T-1, T, H) input. Here Q has T_new, R has 2*T_full-1.
-    // For asymmetric Q/K: BD_raw[q, r] = Q_v[q] · R[r], shape (2*T_full-1, T_new, H).
-    // rel_shift skews to (T_full, T_new, H).
+    // BD = rel_shift(Q_v @ R^T): asymmetric version for Q(T_new) × K(T_full).
+    // BD_raw shape: (2*T_full-1, T_new, n_heads).
+    // Asymmetric rel_shift: BD[k, q, h] = BD_raw[(T_new-1)+k-q, q, h]
+    //   = data[(T_new-1)*s0 + k*s0 + q*(s1-s0) + h*s2]
+    // This is view_3d(BD_raw, T_full, T_new, H, s1-s0, s2, (T_new-1)*s0).
     ggml_tensor* BD_raw = ggml_mul_mat(ctx0, ggml_cont(ctx0, R), Q_v); // (2*T_full-1, T_new, n_heads)
-    // rel_shift needs input (2*T_full-1, T_new, H) → output (T_full, T_new, H)
-    // The standard rel_shift works when Q and K have the same length T.
-    // For asymmetric Q(T_new) × K(T_full), the shift indexing is different.
-    // Simpler: skip rel-pos bias for the streaming path (it's a small accuracy hit).
-    // TODO: implement proper asymmetric rel-pos shift.
+    ggml_tensor* BD = ggml_view_3d(ctx0, BD_raw, T_full, T_new, n_heads, BD_raw->nb[1] - BD_raw->nb[0], BD_raw->nb[2],
+                                   (T_new - 1) * BD_raw->nb[0]);
 
     const float scale = 1.0f / sqrtf((float)head_dim);
+    ggml_tensor* BD_c = ggml_cont(ctx0, BD);
+    ggml_tensor* BD_scaled = ggml_scale(ctx0, BD_c, scale);
+    ggml_tensor* BD_mask = ggml_cast(ctx0, BD_scaled, GGML_TYPE_F16);
 
-    // For now: use flash_attn_ext without BD mask (pure dot-product attention)
-    // This loses the rel-pos bias but lets us test the cache architecture.
     ggml_tensor* attn_out =
-        ggml_flash_attn_ext(ctx0, ggml_cont(ctx0, Q_u), ggml_cont(ctx0, K_), V_, nullptr, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext(ctx0, ggml_cont(ctx0, Q_u), ggml_cont(ctx0, K_), V_, BD_mask, scale, 0.0f, 0.0f);
     attn_out = ggml_reshape_2d(ctx0, attn_out, d, T_new);
 
     attn_out = mm_bias(e.attn_out_w, attn_out, e.attn_out_b);
@@ -972,10 +969,10 @@ static ggml_cgraph* nemotron_build_graph_encoder(nemotron_context* ctx, int T_me
     ggml_set_input(pos_enc);
 
     // ----- Window mask for cache-aware streaming attention -----
-    // NEMOTRON_NO_WINDOW_MASK=1 → bidirectional attention (for A/B testing).
+    // CRISPASR_NEMOTRON_NO_WINDOW_MASK=1 → bidirectional attention (for A/B testing).
     // Default: banded attention with att_context_left/right.
     ggml_tensor* window_mask_t = nullptr;
-    const bool use_window_mask = !getenv("NEMOTRON_NO_WINDOW_MASK");
+    const bool use_window_mask = !getenv("CRISPASR_CRISPASR_NEMOTRON_NO_WINDOW_MASK");
     if (use_window_mask && T > 0) {
         window_mask_t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, T, T);
         ggml_set_name(window_mask_t, "window_mask");
@@ -1052,7 +1049,8 @@ static bool nemotron_run_encoder(nemotron_context* ctx, const float* mel, int n_
         int right = ctx->model.hparams.att_context_right[preset];
         auto wm = build_window_mask(T_enc, left, right);
         ggml_backend_tensor_set(wm_t, wm.data(), 0, wm.size() * sizeof(ggml_fp16_t));
-        fprintf(stderr, "nemotron: streaming attention L=%d R=%d (NEMOTRON_NO_WINDOW_MASK to disable)\n", left, right);
+        fprintf(stderr, "nemotron: streaming attention L=%d R=%d (CRISPASR_NEMOTRON_NO_WINDOW_MASK to disable)\n", left,
+                right);
     }
 
     // Run
@@ -1064,6 +1062,20 @@ static bool nemotron_run_encoder(nemotron_context* ctx, const float* mel, int n_
     // Read output: (d_model, T_enc) in column-major → row-major (T_enc, d_model)
     enc_out.resize((size_t)T_enc * d_model_out);
     ggml_backend_tensor_get(enc_out_t, enc_out.data(), 0, enc_out.size() * sizeof(float));
+
+    if (getenv("CRISPASR_NEMOTRON_DEBUG")) {
+        float emin = 1e30f, emax = -1e30f, esum = 0.0f;
+        for (size_t i = 0; i < enc_out.size(); i++) {
+            float v = enc_out[i];
+            if (v < emin)
+                emin = v;
+            if (v > emax)
+                emax = v;
+            esum += v;
+        }
+        fprintf(stderr, "nemotron: default enc_out T=%d d=%d min=%.4f max=%.4f mean=%.6f\n", T_enc, d_model_out, emin,
+                emax, esum / (float)enc_out.size());
+    }
 
     return true;
 }
@@ -1149,11 +1161,7 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
             ggml_set_input(cache_ch);
         }
 
-        // Pos enc covers the full attention window.
-        // NOTE: pos_enc is currently unused in the streaming block (rel-pos bias
-        // is skipped due to asymmetric Q/K — TODO: implement proper shift).
-        // We still pass it so the block signature is satisfied; it won't be
-        // connected to the output graph and won't be allocated.
+        // Pos enc covers the full attention window
         int T_full = T_cache + T_new;
         ggml_tensor* pos2 = ggml_new_tensor_2d(lg.ctx0, GGML_TYPE_F32, d, 2 * T_full - 1);
         ggml_set_name(pos2, "pos_enc");
@@ -1224,9 +1232,15 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
                                         (size_t)n_ctx * d * sizeof(float));
             }
 
-            // NOTE: pos_enc is not set — rel-pos bias is skipped in the
-            // streaming block (asymmetric Q/K makes rel_shift non-trivial).
-            // TODO: implement proper asymmetric rel-pos for streaming.
+            // Set pos enc for the full attention window (cache + new)
+            int T_full = n_ctx + n_new;
+            auto pe = core_conformer::make_pos_enc(d, T_full);
+            ggml_tensor* pos_t = ggml_graph_get_tensor(lg.gf, "pos_enc");
+            if (!pos_t) {
+                fprintf(stderr, "nemotron: pos_enc tensor missing (il=%d)\n", il);
+                return false;
+            }
+            ggml_backend_tensor_set(pos_t, pe.data(), 0, pe.size() * sizeof(float));
 
             if (ggml_backend_sched_graph_compute(ctx->sched, lg.gf) != GGML_STATUS_SUCCESS) {
                 fprintf(stderr, "nemotron: streaming layer %d compute failed\n", il);
@@ -1255,7 +1269,7 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
             }
 
             // Debug: print per-layer stats for first chunk
-            if (ci == 0) {
+            if (ci == 0 && getenv("CRISPASR_NEMOTRON_DEBUG")) {
                 float lmin = 1e30f, lmax = -1e30f;
                 for (size_t i = 0; i < chunk_in.size(); i++) {
                     if (chunk_in[i] < lmin)
@@ -1280,6 +1294,19 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
         ggml_free(lg.ctx0);
     }
 
+    if (getenv("CRISPASR_NEMOTRON_DEBUG")) {
+        float emin = 1e30f, emax = -1e30f, esum = 0.0f;
+        for (size_t i = 0; i < enc_out.size(); i++) {
+            float v = enc_out[i];
+            if (v < emin)
+                emin = v;
+            if (v > emax)
+                emax = v;
+            esum += v;
+        }
+        fprintf(stderr, "nemotron: chunked enc_out T=%d d=%d min=%.4f max=%.4f mean=%.6f\n", T_enc, d, emin, emax,
+                esum / (float)enc_out.size());
+    }
     fprintf(stderr, "nemotron: chunked encoder done\n");
     return true;
 }
@@ -1603,6 +1630,20 @@ extern "C" struct nemotron_context* nemotron_init_from_file(const char* path_mod
         return nullptr;
     }
 
+    // CRISPASR_NEMOTRON_CONTEXT_PRESET=N selects attention context preset
+    // 0: L=56, R=3  (streaming, chunk=4)
+    // 1: L=56, R=0  (left-only)
+    // 2: L=56, R=6  (chunk=7)
+    // 3: L=56, R=13 (chunk=14, best quality)
+    if (const char* s = getenv("CRISPASR_NEMOTRON_CONTEXT_PRESET")) {
+        int p = atoi(s);
+        if (p >= 0 && p < (int)ctx->model.hparams.n_att_context_presets) {
+            ctx->att_context_preset = p;
+            fprintf(stderr, "nemotron: context preset %d (L=%d, R=%d)\n", p, ctx->model.hparams.att_context_left[p],
+                    ctx->model.hparams.att_context_right[p]);
+        }
+    }
+
     return ctx;
 }
 
@@ -1658,7 +1699,7 @@ extern "C" struct nemotron_result* nemotron_transcribe_ex(struct nemotron_contex
     // NEMOTRON_CHUNKED=1 selects the per-chunk cache-aware path (WIP).
     std::vector<float> enc_out;
     int T_enc = 0, d_model = 0;
-    const bool use_chunked = getenv("NEMOTRON_CHUNKED");
+    const bool use_chunked = getenv("CRISPASR_NEMOTRON_STREAMING");
     if (!use_chunked) {
         if (!nemotron_run_encoder(ctx, mel.data(), (int)ctx->model.hparams.n_mels, T_mel, enc_out, T_enc, d_model))
             return nullptr;
@@ -1791,8 +1832,36 @@ extern "C" struct nemotron_result* nemotron_transcribe_ex(struct nemotron_contex
         fprintf(stderr, "nemotron: prompt kernel applied (prompt_id=%d)\n", prompt_id);
     }
 
+    if (getenv("CRISPASR_NEMOTRON_DEBUG")) {
+        float emin = 1e30f, emax = -1e30f;
+        for (size_t i = 0; i < enc_out.size(); i++) {
+            if (enc_out[i] < emin)
+                emin = enc_out[i];
+            if (enc_out[i] > emax)
+                emax = enc_out[i];
+        }
+        fprintf(stderr, "nemotron: post-prompt enc_out min=%.4f max=%.4f\n", emin, emax);
+        // Dump first 8 values of frames 0, 10, 50, 100
+        for (int tf : {0, 10, 50, 100}) {
+            if (tf < T_enc) {
+                fprintf(stderr, "  frame %d:", tf);
+                for (int k = 0; k < 8; k++)
+                    fprintf(stderr, " %.4f", enc_out[(size_t)tf * d_model + k]);
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+
     // RNN-T decode
     auto emitted = nemotron_rnnt_decode(ctx, enc_out.data(), T_enc, d_model);
+
+    if (getenv("CRISPASR_NEMOTRON_DEBUG")) {
+        fprintf(stderr, "nemotron: RNNT emitted %zu tokens\n", emitted.size());
+        for (size_t i = 0; i < std::min(emitted.size(), (size_t)5); i++) {
+            fprintf(stderr, "  tok %zu: id=%d t=%d-%d p=%.3f\n", i, emitted[i].id, emitted[i].t_start, emitted[i].t_end,
+                    emitted[i].p);
+        }
+    }
 
     // Build result
     auto* r = (nemotron_result*)calloc(1, sizeof(nemotron_result));
