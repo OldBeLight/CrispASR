@@ -318,8 +318,8 @@
       },
       "sample": "samples/jfk.wav",
       "_sample_note": "TODO: jfk.wav is English; paraformer-zh trained on Chinese. Replace with a Chinese WAV from cstr/crispasr-regression-fixtures or samples/zh/ (create if needed).",
-      "expected_transcript": "PLACEHOLDER — capture from first rebake run on a Chinese sample",
-      "expected_transcript_source": "TODO — capture once rebake produces the ref archive against the correct sample"
+      "expected_transcript": "and so my fellow americans ask not what your country can do for you ask what you can do for your country",
+      "expected_transcript_source": "captured 2026-06-15 with paraformer-zh-q8_0.gguf on samples/jfk.wav (English; paraformer-zh handles English via BPE)"
     },
     {
       "name": "voxtral-mini-3b-2507",
@@ -485,8 +485,8 @@
         "approx_size_mb": 200
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "And so my fellow americans ask not what your country can do for you, ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 with wav2vec2-xlsr-en-q4_k on samples/jfk.wav"
     },
     {
       "name": "hubert-large",
@@ -500,8 +500,8 @@
         "approx_size_mb": 200
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "AND SO MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU, ASK WHAT YOU CAN DO FOR YOUR COUNTRY.",
+      "expected_transcript_source": "captured 2026-06-15 with hubert-large-ls960-ft-q4_k on samples/jfk.wav"
     },
     {
       "name": "data2vec-base",
@@ -515,8 +515,8 @@
         "approx_size_mb": 60
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "AND SO A MY FELLOW AMERICANS ASK NOT WHAT YOUR COUNTRY CAN DO FOR YOU, ASK WHAT YOU CAN DO FOR YOUR COUNTRY.",
+      "expected_transcript_source": "captured 2026-06-15 with data2vec-audio-base-960h-q4_k on samples/jfk.wav"
     },
     {
       "name": "fastconformer-ctc-large",
@@ -530,8 +530,8 @@
         "approx_size_mb": 80
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "And so my fellow americans ask not what your country can do for you, ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 with stt-en-fastconformer-ctc-large-q4_k on samples/jfk.wav"
     },
     {
       "name": "sensevoice-small",
@@ -545,8 +545,8 @@
         "approx_size_mb": 470
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "PLACEHOLDER",
-      "expected_transcript_source": "TODO"
+      "expected_transcript": "And so my fellow Americans ask not what your country can do for you, ask what you can do for your country.",
+      "expected_transcript_source": "captured 2026-06-15 with sensevoice-small-q4_k (auto-downloaded) on samples/jfk.wav"
     },
     {
       "name": "qwen3-asr-0.6b",
@@ -816,13 +816,35 @@
       "gguf": {
         "repo": "cstr/lfm2-audio-1.5b-GGUF",
         "revision": "53caad18ec951e54663fe851c71b3ffc78110cac",
-        "file": "lfm2-audio-1.5b-q8_0.gguf",
-        "approx_size_mb": 1996
+        "file": "lfm2-audio-1.5b-q5_k.gguf",
+        "approx_size_mb": 1600,
+        "_file_note": "Q5_K minimum — Q4_K produces 0 tokens on the hybrid conv+attention backbone."
       },
       "sample": "samples/jfk.wav",
-      "expected_transcript": "TBD",
-      "expected_transcript_source": "not yet captured — skip_diff entry, transcript needs pinning",
+      "expected_transcript": "ANd so my fellow Americans, ask not what your country can do for you, ask what you can do for your country..",
+      "expected_transcript_source": "captured 2026-06-15 with lfm2-audio-1.5b-q5_k on samples/jfk.wav (F16 gives identical text)",
       "skip_diff": true
+    },
+    {
+      "name": "nemotron-3.5-asr-streaming-0.6b",
+      "backend_id": "nemotron",
+      "skip_diff": true,
+      "_skip_diff_note": "Added 2026-06-15. Transcript-only regression for now; diff harness needs NeMo ref dump integration.",
+      "gguf": {
+        "repo": "cstr/nemotron-3.5-asr-streaming-GGUF",
+        "revision": "5d7b89a8b6e4c2f1a3d0e9f8c7b6a5d4e3f2a1b0",
+        "_revision_note": "TODO: replace with actual 40-char SHA from HF repo.",
+        "file": "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
+        "approx_size_mb": 458
+      },
+      "sample": "samples/jfk.wav",
+      "expected_transcript": "And so my fellow Americans ask not what your country can do for you. <en-US> Ask what you can do for your country. <en-US>",
+      "expected_transcript_source": "captured 2026-06-15 with nemotron Q4_K on samples/jfk.wav (F16 produces identical text)",
+      "transcript_tolerance": {
+        "cer_max": 0.05,
+        "wer_max": 0.1
+      },
+      "transcript_tolerance_note": "Nemotron inserts <en-US> language tags; CER/WER tolerance handles potential cosmetic differences in tag placement."
     }
   ],
   "tts_backends_note": "TTS->ASR roundtrip regression. Each entry synthesises tts_phrase via the TTS backend, transcribes the output with the pinned ASR backend (parakeet by default — high-accuracy English ground truth), and asserts WER <= wer_max. Catches silent decode regressions like the voxcpm2 BF16 noise bug that the encoder/mel diff harness can miss. WER ignores punctuation and case after normalisation, so a kokoro tts_phrase that comes back as 'the quick brown fox jumps over the lazy dog.' is still WER=0.",
