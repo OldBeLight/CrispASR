@@ -41,7 +41,7 @@ def main():
             break
 
     # Clone CrispASR (for converter + JFK sample)
-    cdir = WORK / "CrispASR"
+    cdir = Path("/tmp/CrispASR")
     if not cdir.exists():
         subprocess.check_call(["git", "clone", "--depth", "1",
             "https://github.com/CrispStrobe/CrispASR.git", str(cdir)])
@@ -225,3 +225,10 @@ if __name__ == "__main__":
         save()
         log(f"CRASH: {e}")
         traceback.print_exc()
+
+# Cleanup: remove large files so kernels_output only has results.json + progress.txt
+import shutil
+for p in [Path("/tmp/CrispASR"), WORK / "models", WORK / ".hf"]:
+    shutil.rmtree(str(p), ignore_errors=True)
+for f in WORK.glob("*.gguf"):
+    f.unlink(missing_ok=True)
