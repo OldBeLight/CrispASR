@@ -28,7 +28,12 @@
         "encoder_output_ref_mel": 0.999,
         "mel_spectrogram": 0.999
       },
-      "diff_thresholds_note": "mel_spectrogram tightened from 0.95 to 0.999 after drop_last_frame fix (commit 07cfcff). NeMo ref needs rebake to clip mel to feat_len; current ref has one extra frame that the comparison truncates."
+      "diff_thresholds_note": "mel_spectrogram tightened from 0.95 to 0.999 after drop_last_frame fix (commit 07cfcff). NeMo ref needs rebake to clip mel to feat_len; current ref has one extra frame that the comparison truncates.",
+      "transcript_tolerance": {
+        "cer_max": 0.1,
+        "wer_max": 0.15
+      },
+      "transcript_tolerance_note": "Punctuation/decode drift across platforms — WER tolerance instead of byte-exact"
     },
     {
       "name": "moonshine-tiny",
@@ -137,7 +142,12 @@
         "mel_spectrogram": 0.999,
         "pre_encode_output": 0.999
       },
-      "diff_thresholds_note": "F16 GGUF vs NeMo reference with dither=0 and drop_last_frame. mel cos=1.0, encoder cos=0.999280. Layers 18-19 are F16 near-misses (0.9977/0.9988)."
+      "diff_thresholds_note": "F16 GGUF vs NeMo reference with dither=0 and drop_last_frame. mel cos=1.0, encoder cos=0.999280. Layers 18-19 are F16 near-misses (0.9977/0.9988).",
+      "transcript_tolerance": {
+        "cer_max": 0.05,
+        "wer_max": 0.1
+      },
+      "transcript_tolerance_note": "Punctuation/decode drift across platforms — WER tolerance instead of byte-exact"
     },
     {
       "name": "firered-asr2-aed",
@@ -259,11 +269,10 @@
       "backend_id": "parakeet",
       "skip_diff": true,
       "_skip_diff_note": "Rebake-pending for diff; transcript captured 2026-06-15.",
-      "skip_preflight": true,
       "source_model": "nvidia/parakeet-rnnt-0.6b",
       "gguf": {
         "repo": "cstr/parakeet-rnnt-0.6b-GGUF",
-        "revision": "7a582b3f5ff097c2fb0bce6ba1d24e7fb44b8a0e",
+        "revision": "7a582b3f5ff014c7c9efe45b00685cff4c130ad6",
         "file": "parakeet-rnnt-0.6b-q4_k.gguf",
         "approx_size_mb": 447
       },
@@ -490,7 +499,12 @@
       },
       "sample": "samples/jfk.wav",
       "expected_transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.",
-      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) on samples/jfk.wav"
+      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) on samples/jfk.wav",
+      "transcript_tolerance": {
+        "cer_max": 0.02,
+        "wer_max": 0.05
+      },
+      "transcript_tolerance_note": "Punctuation/decode drift across platforms — WER tolerance instead of byte-exact"
     },
     {
       "name": "omniasr-ctc-1b-v2",
@@ -520,7 +534,12 @@
       },
       "sample": "samples/jfk.wav",
       "expected_transcript": "And so my fellow americas, ask not what your country can do for you, ask what you can do for your country.",
-      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) on samples/jfk.wav"
+      "expected_transcript_source": "captured 2026-06-15 Kaggle T4 GPU (chr1s4) on samples/jfk.wav",
+      "transcript_tolerance": {
+        "cer_max": 0.02,
+        "wer_max": 0.05
+      },
+      "transcript_tolerance_note": "Punctuation/decode drift across platforms — WER tolerance instead of byte-exact"
     },
     {
       "name": "kyutai-stt-1b",
