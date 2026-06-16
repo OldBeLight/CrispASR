@@ -2069,7 +2069,7 @@ extern "C" struct nemotron_result* nemotron_transcribe_ex(struct nemotron_contex
         return nullptr;
 
     // Run encoder — default: full-sequence with chunked_limited attention mask.
-    // NEMOTRON_CHUNKED=1 selects the per-chunk cache-aware path (WIP).
+    // CRISPASR_NEMOTRON_STREAMING=1 selects the cache-aware streaming path.
     std::vector<float> enc_out;
     int T_enc = 0, d_model = 0;
     const bool use_chunked = getenv("CRISPASR_NEMOTRON_STREAMING");
