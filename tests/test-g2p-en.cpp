@@ -392,15 +392,15 @@ TEST_CASE("strip espeak language markers", "[phonemizer][espeak]") {
     using crispasr::strip_espeak_lang_markers;
 
     SECTION("basic (en) and (it) markers") {
-        std::string s = "lassist\xc9\x9bnte vok\xca\x88ale d\xc9\xaa (en)w\xcb\x88e\xc9\xaa(it)";
+        std::string s = "lassistɛnte vokʈale dɪ (en)wˈeɪ(it)";
         strip_espeak_lang_markers(s);
         CHECK(s.find("(en)") == std::string::npos);
         CHECK(s.find("(it)") == std::string::npos);
-        CHECK(s.find("w\xcb\x88e\xc9\xaa") != std::string::npos); // IPA preserved
+        CHECK(s.find("wˈeɪ") != std::string::npos); // IPA preserved
     }
 
     SECTION("region codes (de-AT), (pt-BR)") {
-        std::string s = "f\xc3\xbc(de-AT)nf (pt-BR)teste";
+        std::string s = "fü(de-AT)nf (pt-BR)teste";
         strip_espeak_lang_markers(s);
         CHECK(s.find("(de-AT)") == std::string::npos);
         CHECK(s.find("(pt-BR)") == std::string::npos);
@@ -416,7 +416,7 @@ TEST_CASE("strip espeak language markers", "[phonemizer][espeak]") {
     }
 
     SECTION("no markers passes through unchanged") {
-        std::string s = "h\xc9\x99l\xcb\x88o\xca\x8a w\xcb\x88\xc9\x9c\xcb\x90ld";
+        std::string s = "həlˈoʊ wˈɜːld";
         std::string orig = s;
         strip_espeak_lang_markers(s);
         CHECK(s == orig);
