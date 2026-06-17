@@ -548,10 +548,28 @@ def write_t3_gguf(
         print(f"  Precomputed conds loaded")
 
     # ── Load T3 weights ──
-    t3_path = model_dir / "t3_cfg.safetensors"
+    # Prefer multilingual T3 (t3_mtl*) over base (t3_cfg) — the mtl
+    # variant has a larger text embedding (2352 vs 704) needed for
+    # non-English languages (#170).
+    t3_path = None
+    for candidate in sorted(model_dir.glob("t3_mtl*.safetensors")):
+        t3_path = candidate
+        break
+    if t3_path is None:
+        t3_path = model_dir / "t3_cfg.safetensors"
     if not t3_path.exists():
-        sys.exit(f"Missing {t3_path}")
+        sys.exit(f"Missing T3 weights (tried t3_mtl*.safetensors and t3_cfg.safetensors in {model_dir})")
+    print(f"  T3 weights: {t3_path.name}")
     t3_tensors = load_safetensors(t3_path)
+
+    # Infer text_vocab_size from the actual embedding tensor — the
+    # multilingual T3 has 2352 tokens vs 704 for the base model (#170).
+    if "text_embedding.weight" in t3_tensors:
+        actual_vocab = t3_tensors["text_embedding.weight"].shape[0]
+        if actual_vocab != T3_HPARAMS["text_vocab_size"]:
+            print(f"  text_vocab_size: {T3_HPARAMS['text_vocab_size']} -> {actual_vocab} (from embedding)")
+            T3_HPARAMS["text_vocab_size"] = actual_vocab
+
     n_t3 = 0
     for hf_name, tensor in sorted(t3_tensors.items()):
         gguf_name = map_t3_name(hf_name)
