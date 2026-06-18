@@ -4089,24 +4089,23 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     };
 
     bool dumped_prefill_hidden = false;
-    if (!has_voice) {
-        // No voice loaded: prefix_embeds holds the full chat-template prompt (system + user
-        // with the entire text + assistant header) with type embeddings already added and
-        // base-LM hidden states spliced at the text positions. Prefill the whole thing
-        // through the TTS LM at pos 0..prefix_len-1; subsequent iterations only generate
-        // speech frames (no more text windows — all text is in this prefix).
+    if (!has_voice && !has_tts_lm) {
+        // Base model (no TTS LM), no voice: use the chat-template prefix as the full
+        // prefill. This path is for the 1.5B/7B models which don't have a separate TTS LM.
         if (verbosity >= 1)
-            fprintf(stderr, "vibevoice TTS (no-voice): prefilling chat template (%d tokens) through TTS LM\n",
+            fprintf(stderr, "vibevoice TTS (no-voice, base-lm only): prefilling chat template (%d tokens)\n",
                     prefix_len);
         if (!run_lm_step(prefix_embeds.data(), prefix_len, 0, hidden, /*kv_sel=*/0)) {
             fprintf(stderr, "vibevoice TTS: no-voice TTS LM prefill failed\n");
             return nullptr;
         }
         n_past = prefix_len;
-        text_cursor = (int)text_ids.size(); // skip subsequent text windows
+        text_cursor = (int)text_ids.size();
         vibevoice_dump_f32(dump_dir, "tts_prefill_hidden", hidden.data(), hidden.size());
         dumped_prefill_hidden = true;
     }
+    // For Realtime (has_tts_lm), no voice: n_past=0, text_cursor=0, all_base_hidden set above.
+    // The interleaved text-window loop below processes text in windows exactly like voice mode.
     vibevoice_dump_f32(dump_dir, "tts_neg_condition_frame0", neg_condition.data(), neg_condition.size());
 
     const auto t_prefill_done = std::chrono::high_resolution_clock::now();
@@ -4194,7 +4193,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     int bench_frames = 0;
 
     while (!finished && total_frames < n_frames) {
-        if (has_voice && text_cursor < (int)text_ids.size()) {
+        if (text_cursor < (int)text_ids.size()) {
             int next_win = std::min((int)text_ids.size() - text_cursor, TEXT_WINDOW);
             if (verbosity >= 1)
                 fprintf(stderr, "  text window: %d tokens (cursor %d/%d), pos %d\n", next_win, text_cursor,
