@@ -189,6 +189,9 @@ struct whisper_params {
     // --ws-port: real-time WebSocket ASR streaming on a second port.
     //   -1 = disabled (default), 0 = server_port + 1, N = port N.
     int32_t server_ws_port = -1;
+    // --wyoming-port: Wyoming protocol (Home Assistant Assist) TCP server.
+    //   -1 = disabled (default), N = port N.
+    int32_t wyoming_port = -1;
     int32_t stream_step_ms = 3000;
     int32_t stream_length_ms = 10000;
     int32_t stream_keep_ms = 200;

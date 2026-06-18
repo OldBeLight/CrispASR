@@ -77,6 +77,8 @@ add_executable(${TARGET}
     # (examples/server). Wired into `crispasr --server` via --ws-port.
     ${CMAKE_CURRENT_SOURCE_DIR}/../server/ws_stream.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../server/realtime_server.cpp
+    # Wyoming protocol TCP server (issue #172) — Home Assistant Assist STT+TTS.
+    wyoming.cpp
 )
 
 # ---------------------------------------------------------------------------

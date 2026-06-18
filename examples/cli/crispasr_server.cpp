@@ -42,6 +42,7 @@
 #include "crispasr_chat.h"             // /v1/chat/completions
 #include "../server/ws_stream.h"       // real-time WebSocket ASR streaming (--ws-port)
 #include "../server/realtime_server.h" // vLLM Realtime API
+#include "wyoming.h"                   // Wyoming protocol for Home Assistant Assist (--wyoming-port)
 #include "crispasr_c2pa.h"
 #include "crispasr_tts_chunking.h"
 #include "crispasr_tts_disclaimer.h"
@@ -2408,6 +2409,17 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     // float32 PCM and receive JSON partial/final text events. Whisper-only today.
     bool ws_started = false;
     bool rt_started = false;
+    bool wyoming_started = false;
+    if (params.wyoming_port > 0) {
+        if (wyoming_start(backend.get(), model_mutex, params, params.wyoming_port) == 0) {
+            wyoming_started = true;
+            fprintf(stderr, "  TCP  %s:%d                  — Wyoming protocol (Home Assistant Assist STT+TTS)\n",
+                    host.c_str(), params.wyoming_port);
+        } else {
+            fprintf(stderr, "crispasr-server: warning: failed to start Wyoming server on port %d\n",
+                    params.wyoming_port);
+        }
+    }
     if (params.server_ws_port >= 0) {
         const int ws_port = params.server_ws_port == 0 ? port + 1 : params.server_ws_port;
         if (ws_stream_start(params.model.c_str(), ws_port, params.n_threads) == 0) {
@@ -2430,6 +2442,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
 
     svr.listen(host, port);
 
+    if (wyoming_started)
+        wyoming_stop();
     if (ws_started)
         ws_stream_stop();
     if (rt_started)
