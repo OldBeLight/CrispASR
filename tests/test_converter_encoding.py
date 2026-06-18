@@ -14,7 +14,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 MODELS_DIR = ROOT / "models"
 sys.path.insert(0, str(MODELS_DIR))
 
-from chatterbox_paths import select_chatterbox_t3_checkpoint
+from chatterbox_paths import (
+    select_chatterbox_s3gen_checkpoint,
+    select_chatterbox_t3_checkpoint,
+    select_chatterbox_tokenizer,
+)
 
 
 def _text_opens_without_encoding(path: pathlib.Path) -> list[tuple[int, str]]:
@@ -78,6 +82,21 @@ class TestConverterEncoding(unittest.TestCase):
             model_dir = pathlib.Path(td)
             (model_dir / "t3_cfg.safetensors").touch()
             self.assertEqual(select_chatterbox_t3_checkpoint(model_dir).name, "t3_cfg.safetensors")
+
+    def test_chatterbox_s3gen_checkpoint_selection_prefers_v3(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = pathlib.Path(td)
+            (model_dir / "s3gen.safetensors").touch()
+            (model_dir / "s3gen_v3.safetensors").touch()
+            self.assertEqual(select_chatterbox_s3gen_checkpoint(model_dir).name, "s3gen_v3.safetensors")
+
+    def test_chatterbox_tokenizer_selection_prefers_upstream_multilingual_graphemes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = pathlib.Path(td)
+            (model_dir / "tokenizer.json").touch()
+            (model_dir / "mtl_tokenizer.json").touch()
+            (model_dir / "grapheme_mtl_merged_expanded_v1.json").touch()
+            self.assertEqual(select_chatterbox_tokenizer(model_dir).name, "grapheme_mtl_merged_expanded_v1.json")
 
 
 if __name__ == "__main__":

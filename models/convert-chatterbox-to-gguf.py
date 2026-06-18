@@ -39,7 +39,11 @@ from pathlib import Path
 
 import numpy as np
 
-from chatterbox_paths import select_chatterbox_t3_checkpoint
+from chatterbox_paths import (
+    select_chatterbox_s3gen_checkpoint,
+    select_chatterbox_t3_checkpoint,
+    select_chatterbox_tokenizer,
+)
 
 try:
     from gguf import GGUFWriter, GGMLQuantizationType
@@ -511,10 +515,17 @@ def write_t3_gguf(
             for token, idx in vocab.items():
                 if idx < len(tokens):
                     tokens[idx] = token
+            expected_vocab = int(T3_HPARAMS["text_vocab_size"])
+            if len(tokens) != expected_vocab:
+                sys.exit(
+                    f"Tokenizer vocab size mismatch for {tokenizer_path.name}: "
+                    f"{len(tokens)} tokens vs T3 text_vocab_size={expected_vocab}. "
+                    "Use the tokenizer paired with the selected T3 checkpoint."
+                )
             writer.add_array("tokenizer.ggml.tokens", tokens)
             # Keep legacy field for older runtimes, but prefer tokenizer.ggml.tokens.
             writer.add_array("chatterbox.t3.text_tokens", tokens)
-            print(f"  Tokenizer: {len(tokens)} tokens from tokenizer.json")
+            print(f"  Tokenizer: {len(tokens)} tokens from {tokenizer_path.name}")
 
             merges = model.get('merges', [])
             if merges:
@@ -892,7 +903,7 @@ def write_kartoffelbox_t3_gguf(
 def write_s3gen_gguf(
     model_dir: Path,
     output_path: Path,
-    s3gen_filename: str = "s3gen.safetensors",
+    s3gen_filename: str | None = None,
 ):
     print(f"\n=== Writing S3Gen GGUF: {output_path} ===")
 
@@ -909,7 +920,10 @@ def write_s3gen_gguf(
             writer.add_string(key, v)
 
     # ── Load S3Gen weights ──
-    s3gen_path = model_dir / s3gen_filename
+    if s3gen_filename is None:
+        s3gen_path = select_chatterbox_s3gen_checkpoint(model_dir)
+    else:
+        s3gen_path = model_dir / s3gen_filename
     if not s3gen_path.exists():
         sys.exit(f"Missing {s3gen_path}")
     s3gen_tensors = load_safetensors(s3gen_path)
@@ -1000,11 +1014,7 @@ def main():
         return
 
     conds_path = model_dir / "conds.pt"
-    # Prefer multilingual tokenizer (mtl_tokenizer.json) over base
-    # tokenizer.json — the mtl variant has language tags ([ar], [de], etc.)
-    # and extended Unicode graphemes needed for non-English TTS (#170).
-    mtl_tokenizer_path = model_dir / "mtl_tokenizer.json"
-    tokenizer_path = mtl_tokenizer_path if mtl_tokenizer_path.exists() else model_dir / "tokenizer.json"
+    tokenizer_path = select_chatterbox_tokenizer(model_dir)
 
     if not args.s3gen_only:
         write_t3_gguf(

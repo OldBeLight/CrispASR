@@ -7830,6 +7830,29 @@ That closes the obvious `-l fr` / `-l ar` drift in the C++ path, but it
 does not yet implement Python's full Unicode NFKD / script-specific
 normalizers for zh/ja/he/ko/ru.
 
+### Root cause — the published q4_k multilingual GGUF used the wrong tokenizer (2026-06-18)
+
+The `cstr/chatterbox-GGUF/chatterbox-t3-q4_k.gguf` artifact tested on
+2026-06-18 is internally inconsistent: `chatterbox.t3.text_vocab_size`
+is 2454 from `t3_mtl23ls_v3.safetensors`, but the embedded
+`tokenizer.ggml.tokens` array has only 2352 entries. That file was
+converted with `mtl_tokenizer.json`; upstream
+`ChatterboxMultilingualTTS.from_local()` loads
+`grapheme_mtl_merged_expanded_v1.json` for multilingual inference.
+
+Audible symptom: no-language prompts like `"Justice justice."` and
+`"Bonjour tout le monde."` synthesize intelligibly, but adding `-l fr`
+produces a spoken leading artifact before the real phrase, and `-l ar`
+produces gibberish. This is a TTS/model artifact issue, not ASR.
+
+Fixes:
+
+- converter tokenizer selection now prefers
+  `grapheme_mtl_merged_expanded_v1.json`;
+- conversion fails if tokenizer length differs from T3 `text_vocab_size`;
+- runtime load fails on the same mismatch so broken GGUFs cannot produce
+  plausible but invalid multilingual audio.
+
 ### Operational note — the regen variants already have merges
 
 The `chatterbox-t3-q8_0-regen.gguf` and `chatterbox-t3-q4_k-regen.gguf`

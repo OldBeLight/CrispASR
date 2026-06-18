@@ -2266,6 +2266,15 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
 
     const bool is_gpt2 = (c->hp.arch == "chatterbox_turbo" || c->hp.arch == "kartoffelbox");
 
+    if (!c->tokenizer.id_to_token.empty() && c->tokenizer.id_to_token.size() != c->hp.text_vocab_size) {
+        fprintf(stderr,
+                "chatterbox: tokenizer/model vocab mismatch: tokenizer has %zu tokens, "
+                "T3 text_vocab_size=%u. Re-convert with the tokenizer paired to this T3 checkpoint.\n",
+                c->tokenizer.id_to_token.size(), c->hp.text_vocab_size);
+        delete c;
+        return nullptr;
+    }
+
     // Issue #94 follow-up: chatterbox-turbo's Python tts_turbo.generate()
     // explicitly disables CFG (cfg_weight=0.0 default, plus a log line
     // "CFG, min_p and exaggeration are not supported by Turbo version"
