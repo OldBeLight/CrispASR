@@ -447,7 +447,7 @@ static ggml_tensor* aa_snake_beta_native(ggml_context* ctx, ggml_tensor* x, ggml
     const int up_pad_right = up_pad * 2 + (K - 2 + 1) / 2; // 15
     const int ds_pad_left = K / 2 - 1;                     // 5
     const int ds_pad_right = K / 2;                        // 6
-    const int conv1d_pad_up = K - 1;                       // 11 — closes the K-1 length gap vs torch conv_transpose_1d
+    const int conv1d_pad_up = K - 1; // 11 — closes the K-1 length gap vs torch conv_transpose_1d
 
     // ── 1. Replicate-pad x by up_pad along ne[0] ──────────────────
     ggml_tensor* x_first = ggml_view_2d(ctx, x, 1, C, x->nb[1], 0);

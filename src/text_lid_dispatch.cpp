@@ -182,7 +182,7 @@ extern "C" const char* text_lid_backend(const struct text_lid_context* ctx) {
 namespace {
 
 bool path_exists(const std::string& p) {
-    struct stat st{};
+    struct stat st {};
     return ::stat(p.c_str(), &st) == 0 && st.st_size > 0;
 }
 

@@ -149,7 +149,7 @@ extern "C" bool speaker_db_enroll(const char* dir_path, const char* name, const 
     if (!dir_path || !name || !embedding || dim <= 0)
         return false;
 
-    // Ensure directory exists
+        // Ensure directory exists
 #ifdef _WIN32
     CreateDirectoryA(dir_path, nullptr);
 #else

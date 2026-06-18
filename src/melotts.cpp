@@ -234,10 +234,7 @@ static std::string to_upper(const std::string& s) {
 static std::string post_replace_ph(const std::string& ph, const std::map<std::string, int>& sym2id) {
     // Map punctuation and special phonemes (matches Python's post_replace_ph)
     static const std::map<std::string, std::string> rep = {
-        {":", ","},
-        {";", ","},
-        {"\n", "."},
-        {"v", "V"}, // MeloTTS uses uppercase V for the /v/ phoneme
+        {":", ","}, {";", ","}, {"\n", "."}, {"v", "V"}, // MeloTTS uses uppercase V for the /v/ phoneme
     };
     auto it = rep.find(ph);
     if (it != rep.end()) {

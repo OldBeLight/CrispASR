@@ -289,7 +289,7 @@ void crispasr_print_devices(FILE* out) {
     std::fprintf(out, "  registered devices : %zu\n", n_dev);
     for (size_t i = 0; i < n_dev; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        struct ggml_backend_dev_props p{};
+        struct ggml_backend_dev_props p {};
         ggml_backend_dev_get_props(dev, &p);
         const char* type_str = "?";
         switch (p.type) {

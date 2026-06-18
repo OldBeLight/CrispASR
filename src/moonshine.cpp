@@ -943,9 +943,7 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
     ctx->timing.encode_ms = std::chrono::duration<double, std::milli>(t_encode_done - t_start).count();
 
     // Encoder output no longer needed after cross-KV precompute
-    {
-        std::vector<float>().swap(ctx->encoder_out);
-    }
+    { std::vector<float>().swap(ctx->encoder_out); }
 
     // 4. Decode loop (sched handles per-step allocation). Picks via argmax when temperature == 0, otherwise
     // softmax(logits/T) + multinomial sample. Beam search (beam_size > 1)

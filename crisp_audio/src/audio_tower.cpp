@@ -504,7 +504,7 @@ ggml_cgraph* build_graph_qwen_omni(crisp_audio_context& ctx, int T_chunk, int nu
 extern "C" {
 
 struct crisp_audio_params crisp_audio_params_default(void) {
-    struct crisp_audio_params p{};
+    struct crisp_audio_params p {};
     p.n_threads = 4;
     p.verbosity = 1;
     p.use_gpu = true;

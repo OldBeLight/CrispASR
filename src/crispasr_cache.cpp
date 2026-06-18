@@ -401,7 +401,7 @@ bool fetch(const std::string& url, const std::string& dest, bool quiet) {
         fprintf(stderr, "crispasr: libcurl failed, falling back to curl CLI...\n");
 #endif
 
-    // ── curl/wget CLI (not available on iOS/Android) ────────────────────────
+        // ── curl/wget CLI (not available on iOS/Android) ────────────────────────
 #if !defined(__APPLE__) || !defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE
     {
         std::string curl_cmd = "curl -fL ";

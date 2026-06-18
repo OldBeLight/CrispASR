@@ -6842,7 +6842,7 @@ CA_EXPORT int crispasr_session_set_punctuation(crispasr_session* s, int enable) 
 CA_EXPORT int crispasr_session_set_punc_model(crispasr_session* s, const char* punc_model) {
     if (!s)
         return -1;
-    // Unload any currently-resident context first.
+        // Unload any currently-resident context first.
 #ifdef CA_HAVE_FIREREDPUNC
     if (s->punc_ctx) {
         fireredpunc_free((fireredpunc_context*)s->punc_ctx);
