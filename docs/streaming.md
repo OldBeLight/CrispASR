@@ -262,10 +262,33 @@ step.
 > and drop the oldest frame on overflow, which matches the documented
 > behaviour. `--stream-keep` is now informational only.
 
+### Per-token streaming backends
+
+All autoregressive ASR backends implement `transcribe_streaming` and emit
+tokens to the `--stream` callback as they are generated, without waiting for
+the full decode to finish:
+
+| Backend | Token decode type | Notes |
+|---|---|---|
+| `granite-speech` | LLM greedy (Granite LLM) | Standard `run_with_probs_cb` |
+| `voxtral4b` | LLM greedy (Mistral LLM) | Per-step encoder-frame injection via `pre_hook` |
+| `glm-asr` | LLM greedy (GLM BPE) | Adapter-side greedy loop using exported step APIs |
+| `moss-audio` | LLM greedy (GPT-2 BPE) | Via `moss_audio_process_cb` |
+| `gemma4-e2b` | LLM greedy (SentencePiece) | Via `gemma4_e2b_transcribe_cb`; control tokens filtered |
+| `moonshine-streaming` | LLM greedy (SentencePiece) | Via `moonshine_streaming_transcribe_cb` |
+| `kyutai-stt` | LLM greedy (SentencePiece) | Via `kyutai_stt_transcribe_cb`; padding tokens filtered in C lib |
+| `mimo-asr` | LLM greedy (GPT-2 BPE) | Via `mimo_asr_transcribe_cb` |
+| `nemotron` | RNN-T (per non-blank frame) | Via `nemotron_transcribe_cb`; fires per emitted frame |
+| `qwen3-asr` | LLM greedy (Qwen3) | Native |
+| `voxtral` | LLM greedy (Mistral LLM) | Native |
+
+For these backends, `--stream` output grows one token at a time. For batch
+backends (whisper, parakeet, canary, funasr, etc.), each full chunk produces
+one update.
+
 For native streaming-architecture backends (`voxtral4b`,
-`moonshine-streaming`, `kyutai-stt`, `nemotron`), the encoder runs
-incrementally — the sliding window flags above still apply but the
-per-chunk cost is lower than for batch backends.
+`moonshine-streaming`, `kyutai-stt`, `nemotron`), the encoder also runs
+incrementally — the sliding window cost is lower than for batch backends.
 
 ### Nemotron streaming (cache-aware FastConformer)
 

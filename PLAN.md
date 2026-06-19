@@ -60,7 +60,9 @@ test-all-backends.py passes 18/18 transcribe + 51/54 feature tests (3 stream ski
 | **DONE** | [#43 Fun-ASR-Nano](#43-fun-asr-nano) | Medium | **DONE 2026-05-20.** Full LLM-decoder runtime shipped; GGUFs at `cstr/funasr-{nano,mlt-nano}-GGUF`; byte-identical diffs; ~9× RT on M1 Metal. CTC two-pass rescore is a separate low-pri follow-up. |
 | **DONE** | [#80 nano-cohere-transcribe-inspired tweaks](#80-nano-cohere-transcribe-inspired-perf--chunking-tweaks) | Small | 80a parked; **80b DONE**; **80c DONE**; **80d DONE** 2026-05-23 (audit: no fixes needed — all backends use energy chunker); 80e low-priority warmup deferred |
 | **DONE** | [#81 Nemotron-Speech-Streaming-EN-0.6B](#81-nemotron-speech-streaming-en-06b--first-cache-aware-streaming-native-asr) | M-L | **DONE 2026-06-15.** All 4 streaming presets working. Conv cache fix, asymmetric rel-pos, sched migration, C ABI + bindings, 3 live tests, HF READMEs. → HISTORY 2026-06-15. |
-| **DONE** | [#157 Add streaming capabilities for other runtimes](#157-add-streaming-capabilities-for-other-runtimes) | — | Granite + Voxtral4b done 2026-06-19; greedy_decode.h got dual-hook run_with_probs_cb. |
+| **DONE** | [#157 Add streaming capabilities for other runtimes](#157-add-streaming-capabilities-for-other-runtimes) | — | Granite + Voxtral4b done 2026-06-19; greedy_decode.h got dual-hook run_with_probs_cb. → HISTORY 2026-06-19. |
+| **DONE** | [#172 Wyoming protocol server — Home Assistant Assist](#172-wyoming-protocol-server--home-assistant-assist) | Small | **DONE 2026-06-19.** `--wyoming-port N` starts a Wyoming JSONL/TCP server alongside HTTP. Handles describe/transcribe/synthesize events. → `55bc0039`, HISTORY 2026-06-19. |
+| **DONE** | [#173 `--tts-play` / `--tts-play-device`](#173-tts-play--tts-play-device--local-speaker-output) | Small | **DONE 2026-06-19.** `crispasr_speaker.{h,cpp}` wraps miniaudio playback; pre-resamples to hardware-native rate (avoids 4× upsampler artefacts). Watermark always applied before playback. → `c6021b43` + `e78ad149`, HISTORY 2026-06-19. |
 | **DONE** | [#158 transcribe_streaming for opaque-C-library backends](#158-transcribe_streaming-for-opaque-c-library-backends) | Medium | **DONE 2026-06-19.** All 7 backends done: `_transcribe_cb` C entry points added to moss_audio, gemma4_e2b, moonshine_streaming, kyutai_stt, mimo_asr, nemotron; GLM-ASR uses exported step APIs directly. Token-callback lambda trampolines with GPT-2/SentencePiece BPE decode in all 7 adapters. → `7f2c1f3a`. |
 | **DONE** | [#86 Per-backend flash-attention wiring](#86-per-backend-flash-attention-wiring-crisperweaver-driven) | — | All backends now route through core helpers (`core_attn`, `core_sanm`, `core_conformer`) that unconditionally use `ggml_flash_attn_ext`. Only t5_translate excluded (T5 rel-pos bias incompatible). |
 | **LOW** | [#87 `gpu_backend` runtime selector](#87-gpu_backend-runtime-selector-multi-backend-ggml-build) | ~1 week | Needs ggml-side multi-backend dispatch to land first. CrisperWeaver UI placeholder ready when the C-side is. |
@@ -6107,3 +6109,22 @@ not `text` in the callback, since text lookup via `*_token_text()` is done in th
 
 Forward-declaration fix needed for nemotron: `nemotron_transcribe` called `nemotron_transcribe_impl` before
 its definition — added a static forward decl.
+
+## 172. Wyoming protocol server — Home Assistant Assist
+
+**DONE 2026-06-19** (`55bc0039`). `--wyoming-port N` starts a Wyoming
+peer-to-peer JSONL/TCP server alongside the HTTP API. One `crispasr-server`
+instance replaces both `wyoming-faster-whisper` and `wyoming-piper` for HA.
+
+See HISTORY 2026-06-19 and `docs/server.md#wyoming-protocol-home-assistant-assist`.
+
+## 173. `--tts-play` / `--tts-play-device` — local speaker output
+
+**DONE 2026-06-19** (`c6021b43` + `e78ad149`). Plays TTS output through the
+local speaker immediately after synthesis, with the watermark already embedded.
+
+Device is opened at hardware-native rate (sampleRate=0); the PCM is pre-resampled
+via linear interpolation before the device starts — avoids miniaudio's 4×
+upsampler artefacts at 24→96 kHz on Core Audio devices.
+
+See HISTORY 2026-06-19 and `docs/tts.md#local-speaker-output-tts-play`.

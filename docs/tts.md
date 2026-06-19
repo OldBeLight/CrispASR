@@ -812,6 +812,33 @@ N tokens`).
 
 ---
 
+## Local speaker output (`--tts-play`)
+
+Pass `--tts-play` to play TTS output through the local speaker immediately
+after synthesis, in addition to (or instead of) writing a file. The
+spread-spectrum watermark is always embedded before playback, so the audio
+leaving the speaker carries the provenance marker.
+
+```bash
+# Synthesize and play through default speaker
+crispasr --tts --tts-play -m model.gguf "Hello world."
+
+# Write file AND play
+crispasr --tts --tts-play -m model.gguf -o output.wav "Hello world."
+
+# Select a non-default output device (index from --list-audio-devices)
+crispasr --tts --tts-play --tts-play-device 2 -m model.gguf "Hello world."
+```
+
+Playback is synchronous — the CLI blocks until audio drains, then exits.
+Device -1 (the default) selects the system default output device.
+
+**Implementation note:** the device is opened at the hardware-native sample
+rate (`sampleRate=0 / channels=0`). The model's mono float32 PCM is
+pre-resampled via linear interpolation before the device starts. This avoids
+miniaudio's 4× upsampler artefacts on devices that run natively at 96 kHz
+(MacBook Air Speakers and many Core Audio devices).
+
 ## AI-generated audio provenance & watermarking
 
 All TTS output is automatically marked as AI-generated through multiple

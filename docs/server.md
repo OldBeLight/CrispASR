@@ -500,6 +500,50 @@ docker pull ghcr.io/crispstrobe/crispasr:main-cuda      # modern hosts
 docker pull ghcr.io/crispstrobe/crispasr:main-cuda-12   # legacy driver
 ```
 
+## Wyoming protocol (Home Assistant Assist)
+
+Pass `--wyoming-port N` to start a Wyoming peer-to-peer JSONL/TCP server
+alongside the HTTP API. One `crispasr-server` instance then replaces both
+`wyoming-faster-whisper` (STT) and `wyoming-piper` (TTS) in a Home Assistant
+Assist pipeline — no extra containers needed.
+
+```bash
+# Start server with Wyoming on port 10300 (HA default)
+crispasr-server -m model.gguf --port 8080 --wyoming-port 10300
+```
+
+### Wire format
+
+Each message is a JSON header line followed by an optional binary payload:
+
+```
+{"type":"...","data":{...},"payload_length":N}\n
+<N bytes of binary payload>
+```
+
+### Events handled
+
+| Incoming event | What CrispASR does |
+|---|---|
+| `describe` | Replies with `info` — advertises ASR + TTS capabilities |
+| `transcribe` + `audio-start` + `audio-chunk` + `audio-stop` | Buffers int16 PCM chunks, resamples to 16 kHz float32 via linear interpolation after `audio-stop`, runs `backend->transcribe()`, returns `transcript` |
+| `synthesize` | Calls `backend->synthesize()` under `model_mutex`, converts float32 → int16, streams back as `audio-start` / `audio-chunk*` / `audio-stop` at the model's native sample rate |
+
+HA handles resampling from the model's native rate (e.g. 24 kHz for vibevoice)
+to its playback device — no server-side downsampling needed.
+
+### HA integration
+
+In Home Assistant `configuration.yaml`:
+
+```yaml
+wyoming:
+  - uri: tcp://<host>:10300
+```
+
+The server advertises both STT and TTS under the same URI. HA will automatically
+use CrispASR for both directions once the integration is added.
+
 ## Hugging Face Space wrapper
 
 There is also a Gradio-based Hugging Face Space wrapper under

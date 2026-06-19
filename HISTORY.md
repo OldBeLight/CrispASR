@@ -6,6 +6,53 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-19 §172 Wyoming protocol server — Home Assistant Assist integration
+
+`--wyoming-port N` starts a Wyoming peer-to-peer JSONL/TCP server alongside the
+existing HTTP API (`55bc0039`). One `crispasr-server` instance now replaces both
+`wyoming-faster-whisper` (STT) and `wyoming-piper` (TTS) for Home Assistant.
+
+Wire format: `{"type":"...","data":{...},"payload_length":N}\n` + binary payload.
+
+Events handled:
+
+| Wyoming event | CrispASR response |
+|---|---|
+| `describe` | `info` — advertises ASR + TTS capabilities |
+| `transcribe` + `audio-start` + `audio-chunk` + `audio-stop` | buffers int16 PCM, resamples to 16 kHz float32, calls `backend->transcribe()`, returns `transcript` |
+| `synthesize` | calls `backend->synthesize()`, converts float32 → int16, streams back as `audio-start / audio-chunk* / audio-stop` at the model's native rate |
+
+Architecture mirrors `ws_stream.cpp`: one listener thread, per-connection threads,
+`model_mutex` serialises backend access shared with HTTP requests. No new deps.
+
+## 2026-06-19 §173 `--tts-play` / `--tts-play-device` — local speaker output
+
+New `crispasr_speaker.{h,cpp}` wraps miniaudio `ma_device` playback (`c6021b43`,
+`e78ad149`). The CLI plays the already-watermarked PCM buffer through the local
+speaker when `--tts-play` is passed; `--tts-play-device N` selects a non-default
+device (-1 = system default). Playback is synchronous.
+
+The watermark is always embedded before the playback hook, so audio leaving the
+speaker carries the provenance marker.
+
+Key implementation detail: device is configured with `sampleRate=0 / channels=0`
+(hardware-native) and the app's mono float32 buffer is pre-resampled via linear
+interpolation before the device starts — the callback becomes a straight memcpy.
+This avoids miniaudio's 4× upsampler artefacts at 24 kHz → 96 kHz
+(MacBook Air Speakers and many Core Audio devices run natively at 96 kHz stereo).
+
+## 2026-06-19 §157 transcribe_streaming for Granite and Voxtral4b
+
+`granite-speech` and `voxtral4b` now implement `transcribe_streaming` (`b53eea71`).
+
+`greedy_decode.h` gained a `run_with_probs_cb` 5-arg overload with `pre_hook` +
+`on_token` callbacks. Voxtral4b needs both simultaneously: `pre_hook` injects
+encoder frames into the tail of the KV embedding at each decode step; `on_token`
+fires the `on_text` streaming callback. Without the dual-hook API, one or the
+other would have had to move out of `greedy_decode.h` into the adapter.
+
+Granite uses the simpler `on_token`-only path (no per-step encoder injection).
+
 ## 2026-06-19 §158 transcribe_streaming for all opaque-C-library backends
 
 All 7 remaining autoregressive ASR backends now implement `transcribe_streaming`
