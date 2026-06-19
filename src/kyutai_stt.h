@@ -142,6 +142,14 @@ int kyutai_stt_stream_flush(struct kyutai_stt_stream* s);
 
 void kyutai_stt_stream_close(struct kyutai_stt_stream* s);
 
+// Per-token streaming callback.
+typedef void (*kyutai_stt_token_cb)(int tok_id, float prob, void* userdata);
+
+// Like kyutai_stt_transcribe() but fires cb for each emitted (non-pad) text token.
+// Falls back to greedy decode (beam_size ignored).
+void kyutai_stt_transcribe_cb(struct kyutai_stt_context* ctx, const float* samples, int n_samples,
+                              kyutai_stt_token_cb cb, void* userdata);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1667,7 +1667,8 @@ static float* mimo_asr_run_lm(mimo_asr_context* ctx, const int32_t* input_ids_9x
 // the emitted tokens (one entry per greedy step, including the EOS-trimmed
 // trailing token). Returns a malloc'd char* matching the visible transcript.
 static char* mimo_asr_transcribe_impl(struct mimo_asr_context* ctx, const float* pcm, int n_samples,
-                                      std::vector<int32_t>* out_token_ids, std::vector<float>* out_token_probs) {
+                                      std::vector<int32_t>* out_token_ids, std::vector<float>* out_token_probs,
+                                      mimo_asr_token_cb on_tok = nullptr, void* on_tok_ud = nullptr) {
     if (!ctx || !pcm || n_samples <= 0)
         return nullptr;
 
@@ -1786,11 +1787,13 @@ static char* mimo_asr_transcribe_impl(struct mimo_asr_context* ctx, const float*
     if (capture_probs)
         generated_probs.reserve((size_t)max_new);
     float prob = 0.0f;
-    int next = pick(logits, capture_probs ? &prob : nullptr);
+    int next = pick(logits, (capture_probs || on_tok) ? &prob : nullptr);
     free(logits);
     generated.push_back(next);
     if (capture_probs)
         generated_probs.push_back(prob);
+    if (on_tok && next != ctx->id_im_end && next != ctx->id_eos)
+        on_tok(next, prob, on_tok_ud);
 
     // 6. Greedy decode loop. Each step uses the lightweight T=1 step
     //    graph (51b/51b'): no audio path, fixed Lk for cached-graph
@@ -1805,12 +1808,14 @@ static char* mimo_asr_transcribe_impl(struct mimo_asr_context* ctx, const float*
         float* L = mimo_asr_run_lm_step(ctx, next, n_past_groups);
         if (!L)
             return nullptr;
-        next = pick(L, capture_probs ? &prob : nullptr);
+        next = pick(L, (capture_probs || on_tok) ? &prob : nullptr);
         free(L);
         n_past_groups++;
         generated.push_back(next);
         if (capture_probs)
             generated_probs.push_back(prob);
+        if (on_tok && next != ctx->id_im_end && next != ctx->id_eos)
+            on_tok(next, prob, on_tok_ud);
         decode_steps++;
     }
     const double t_decode1 = bench ? now_ms() : 0.0;
@@ -1885,6 +1890,14 @@ extern "C" void mimo_asr_free(struct mimo_asr_context* ctx) {
     if (ctx->backend_cpu)
         ggml_backend_free(ctx->backend_cpu);
     delete ctx;
+}
+
+extern "C" void mimo_asr_transcribe_cb(struct mimo_asr_context* ctx, const float* pcm, int n_samples,
+                                       mimo_asr_token_cb cb, void* userdata) {
+    if (!ctx || !pcm || n_samples <= 0 || !cb)
+        return;
+    char* s = mimo_asr_transcribe_impl(ctx, pcm, n_samples, nullptr, nullptr, cb, userdata);
+    free(s);
 }
 
 extern "C" char* mimo_asr_transcribe(struct mimo_asr_context* ctx, const float* pcm, int n_samples) {

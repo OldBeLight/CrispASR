@@ -151,6 +151,37 @@ public:
         return {seg};
     }
 
+    void transcribe_streaming(const float* samples, int n_samples, int64_t /*t_offset_cs*/,
+                              const whisper_params& params, crispasr_stream_callback on_text) override {
+        if (!ctx_) {
+            CrispasrBackend::transcribe_streaming(samples, n_samples, 0, params, on_text);
+            return;
+        }
+        const char* prompt = params.prompt.empty() ? "Transcribe this audio." : params.prompt.c_str();
+        std::string accumulated;
+        bool first_tok = true;
+        auto cb = [&](int tok_id, float /*prob*/, void* /*ud*/) {
+            const char* raw = moss_audio_token_text(ctx_, tok_id);
+            if (!raw)
+                return;
+            std::string piece = decode_token(std::string(raw));
+            if (first_tok) {
+                size_t sp = 0;
+                while (sp < piece.size() && (piece[sp] == ' ' || piece[sp] == '\n'))
+                    sp++;
+                piece = piece.substr(sp);
+                if (!piece.empty())
+                    first_tok = false;
+            }
+            accumulated += piece;
+            if (!accumulated.empty())
+                on_text(accumulated.c_str(), false);
+        };
+        auto cb_fn = [](int tok_id, float prob, void* ud) { (*static_cast<decltype(cb)*>(ud))(tok_id, prob, nullptr); };
+        moss_audio_process_cb(ctx_, samples, n_samples, prompt, cb_fn, &cb);
+        on_text(accumulated.c_str(), true);
+    }
+
     void shutdown() override {
         if (ctx_) {
             moss_audio_free(ctx_);

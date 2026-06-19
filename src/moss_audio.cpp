@@ -1630,8 +1630,8 @@ static std::vector<int32_t> moss_audio_build_prompt(moss_audio_context* ctx, con
     return ids;
 }
 
-extern "C" char* moss_audio_process(struct moss_audio_context* ctx, const float* samples, int n_samples,
-                                    const char* prompt) {
+static char* moss_audio_process_impl(struct moss_audio_context* ctx, const float* samples, int n_samples,
+                                     const char* prompt, moss_audio_token_cb on_tok, void* userdata) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
     if (!prompt)
@@ -1910,6 +1910,13 @@ extern "C" char* moss_audio_process(struct moss_audio_context* ctx, const float*
                     best_id = i;
                 }
             }
+            float tok_prob = 0.0f;
+            if (on_tok && best_id != (int)hp.eos_token_id) {
+                float s = 0.0f;
+                for (int i = 0; i < vocab; i++)
+                    s += expf(logits[i] - best_val);
+                tok_prob = (s > 0.0f) ? (1.0f / s) : 0.0f;
+            }
             free(logits);
             logits = nullptr;
 
@@ -1921,6 +1928,8 @@ extern "C" char* moss_audio_process(struct moss_audio_context* ctx, const float*
             if (best_id == (int)hp.eos_token_id)
                 break;
             generated.push_back(best_id);
+            if (on_tok)
+                on_tok(best_id, tok_prob, userdata);
 
             float* next_emb = moss_audio_embed_tokens(ctx, &best_id, 1);
             if (!next_emb)
@@ -1952,8 +1961,19 @@ extern "C" char* moss_audio_process(struct moss_audio_context* ctx, const float*
     return out;
 }
 
+extern "C" char* moss_audio_process(struct moss_audio_context* ctx, const float* samples, int n_samples,
+                                    const char* prompt) {
+    return moss_audio_process_impl(ctx, samples, n_samples, prompt, nullptr, nullptr);
+}
+
+extern "C" void moss_audio_process_cb(struct moss_audio_context* ctx, const float* samples, int n_samples,
+                                      const char* prompt, moss_audio_token_cb cb, void* userdata) {
+    char* s = moss_audio_process_impl(ctx, samples, n_samples, prompt, cb, userdata);
+    free(s);
+}
+
 extern "C" char* moss_audio_transcribe(struct moss_audio_context* ctx, const float* samples, int n_samples) {
-    return moss_audio_process(ctx, samples, n_samples, "Transcribe this audio.");
+    return moss_audio_process_impl(ctx, samples, n_samples, "Transcribe this audio.", nullptr, nullptr);
 }
 
 // ===========================================================================

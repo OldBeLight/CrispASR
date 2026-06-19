@@ -693,7 +693,9 @@ static int run_encoder(moonshine_streaming_context* ctx, const float* frontend_o
 // `moonshine_streaming_transcribe` calls this with nullptr out-vectors.
 static char* moonshine_streaming_transcribe_impl(struct moonshine_streaming_context* ctx, const float* pcm,
                                                  int n_samples, std::vector<int32_t>* out_token_ids,
-                                                 std::vector<float>* out_token_probs) {
+                                                 std::vector<float>* out_token_probs,
+                                                 moonshine_streaming_token_cb on_tok = nullptr,
+                                                 void* on_tok_ud = nullptr) {
     if (!ctx || !pcm || n_samples <= 0)
         return nullptr;
 
@@ -1053,13 +1055,19 @@ static char* moonshine_streaming_transcribe_impl(struct moonshine_streaming_cont
             if (best == (int)hp.eos_token_id)
                 break;
             tokens.push_back(best);
-            if (capture_probs) {
+            float tok_prob = 0.0f;
+            if (capture_probs || on_tok) {
                 float s = 0.f;
                 for (int i = 0; i < vocab; i++)
                     s += expf(logits_data[i] - bv);
-                out_token_ids->push_back(best);
-                out_token_probs->push_back((s > 0.f) ? (1.0f / s) : 0.0f);
+                tok_prob = (s > 0.f) ? (1.0f / s) : 0.0f;
+                if (capture_probs) {
+                    out_token_ids->push_back(best);
+                    out_token_probs->push_back(tok_prob);
+                }
             }
+            if (on_tok)
+                on_tok(best, tok_prob, on_tok_ud);
             cur_token = best;
 
             if (ctx->verbosity >= 2 && step < 3)
@@ -1142,6 +1150,14 @@ extern "C" int moonshine_streaming_encode(struct moonshine_streaming_context* ct
 extern "C" char* moonshine_streaming_transcribe(struct moonshine_streaming_context* ctx, const float* pcm,
                                                 int n_samples) {
     return moonshine_streaming_transcribe_impl(ctx, pcm, n_samples, nullptr, nullptr);
+}
+
+extern "C" void moonshine_streaming_transcribe_cb(struct moonshine_streaming_context* ctx, const float* pcm,
+                                                  int n_samples, moonshine_streaming_token_cb cb, void* userdata) {
+    if (!ctx || !pcm || n_samples <= 0 || !cb)
+        return;
+    char* s = moonshine_streaming_transcribe_impl(ctx, pcm, n_samples, nullptr, nullptr, cb, userdata);
+    free(s);
 }
 
 extern "C" struct moonshine_streaming_result* moonshine_streaming_transcribe_with_probs(

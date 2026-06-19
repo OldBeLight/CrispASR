@@ -89,6 +89,14 @@ void mimo_asr_set_ask(struct mimo_asr_context* ctx, const char* prompt);
 // core_beam_decode replay-from-prefix (§167f, needs Kaggle for testing).
 void mimo_asr_set_beam_size(struct mimo_asr_context* ctx, int beam_size);
 
+// Per-token streaming callback.
+typedef void (*mimo_asr_token_cb)(int tok_id, float prob, void* userdata);
+
+// Like mimo_asr_transcribe() but fires cb for each generated token.
+// Falls back to greedy decode (beam_size ignored).
+void mimo_asr_transcribe_cb(struct mimo_asr_context* ctx, const float* pcm, int n_samples, mimo_asr_token_cb cb,
+                            void* userdata);
+
 #ifdef __cplusplus
 }
 #endif

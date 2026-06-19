@@ -98,6 +98,14 @@ int nemotron_frame_dur_cs(struct nemotron_context* ctx);
 int nemotron_n_mels(struct nemotron_context* ctx);
 int nemotron_sample_rate(struct nemotron_context* ctx);
 
+// Per-token streaming callback. For RNN-T, fires once per emitted (non-blank) token.
+typedef void (*nemotron_token_cb)(int tok_id, float prob, void* userdata);
+
+// Like nemotron_transcribe() but fires cb for each non-blank token emitted by RNN-T.
+// Uses greedy RNN-T decode regardless of beam_size setting.
+void nemotron_transcribe_cb(struct nemotron_context* ctx, const float* samples, int n_samples, nemotron_token_cb cb,
+                            void* userdata);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1087,7 +1087,8 @@ static bool kyutai_lm_step(struct kyutai_stt_context* ctx, int32_t text_token,
 // are non-null.
 static char* kyutai_stt_transcribe_impl(struct kyutai_stt_context* ctx, const float* samples, int n_samples,
                                         std::vector<int32_t>* out_token_ids, std::vector<float>* out_token_probs,
-                                        std::vector<int32_t>* out_frame_indices = nullptr) {
+                                        std::vector<int32_t>* out_frame_indices = nullptr,
+                                        kyutai_stt_token_cb on_tok = nullptr, void* on_tok_ud = nullptr) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
 
@@ -1153,6 +1154,8 @@ static char* kyutai_stt_transcribe_impl(struct kyutai_stt_context* ctx, const fl
             }
             if (out_frame_indices)
                 out_frame_indices->push_back(frame_idx);
+            if (on_tok)
+                on_tok(tok, prob, on_tok_ud);
         }
     };
 
@@ -1250,6 +1253,14 @@ static char* kyutai_stt_transcribe_impl(struct kyutai_stt_context* ctx, const fl
 
 extern "C" char* kyutai_stt_transcribe(struct kyutai_stt_context* ctx, const float* samples, int n_samples) {
     return kyutai_stt_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr);
+}
+
+extern "C" void kyutai_stt_transcribe_cb(struct kyutai_stt_context* ctx, const float* samples, int n_samples,
+                                         kyutai_stt_token_cb cb, void* userdata) {
+    if (!ctx || !samples || n_samples <= 0 || !cb)
+        return;
+    char* s = kyutai_stt_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr, nullptr, cb, userdata);
+    free(s);
 }
 
 extern "C" struct kyutai_stt_result* kyutai_stt_transcribe_with_probs(struct kyutai_stt_context* ctx,

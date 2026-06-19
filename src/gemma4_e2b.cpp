@@ -1469,7 +1469,8 @@ static std::vector<int32_t> g4e_build_text_prompt_ids(gemma4_e2b_context* ctx, c
 
 static char* g4e_run_prompt(gemma4_e2b_context* ctx, const std::vector<int32_t>& prompt_ids, int audio_insert_pos,
                             int n_audio, const float* audio_emb, int audio_dim, std::vector<int32_t>* out_token_ids,
-                            std::vector<float>* out_token_probs) {
+                            std::vector<float>* out_token_probs, gemma4_e2b_token_cb on_tok = nullptr,
+                            void* on_tok_ud = nullptr) {
     if (!ctx || prompt_ids.empty())
         return nullptr;
     auto& m = ctx->model;
@@ -1578,10 +1579,18 @@ static char* g4e_run_prompt(gemma4_e2b_context* ctx, const std::vector<int32_t>&
         cfg.eos_id = eos;
         cfg.vocab_size = vocab;
         cfg.temperature = ctx->temperature;
-        auto gr =
-            core_greedy_decode::run_with_probs(ctx, first_token, first_p, total, g4e_embed_tokens, g4e_run_llm_kv, cfg);
-        dec_tokens = std::move(gr.tokens);
-        dec_probs = std::move(gr.probs);
+        if (on_tok) {
+            auto gr = core_greedy_decode::run_with_probs_cb(
+                ctx, first_token, first_p, total, g4e_embed_tokens, g4e_run_llm_kv,
+                [on_tok, on_tok_ud](int32_t id, float p) { on_tok(id, p, on_tok_ud); }, cfg);
+            dec_tokens = std::move(gr.tokens);
+            dec_probs = std::move(gr.probs);
+        } else {
+            auto gr = core_greedy_decode::run_with_probs(ctx, first_token, first_p, total, g4e_embed_tokens,
+                                                         g4e_run_llm_kv, cfg);
+            dec_tokens = std::move(gr.tokens);
+            dec_probs = std::move(gr.probs);
+        }
     }
     free(prefill_logits);
 
@@ -2050,7 +2059,8 @@ extern "C" struct gemma4_e2b_context* gemma4_e2b_init_from_file(const char* path
 // tokens. The legacy `gemma4_e2b_transcribe` calls this with nullptr out.
 static char* gemma4_e2b_transcribe_impl(struct gemma4_e2b_context* ctx, const float* pcm, int n_samples, bool translate,
                                         const char* source_lang, const char* target_lang,
-                                        std::vector<int32_t>* out_token_ids, std::vector<float>* out_token_probs) {
+                                        std::vector<int32_t>* out_token_ids, std::vector<float>* out_token_probs,
+                                        gemma4_e2b_token_cb on_tok = nullptr, void* on_tok_ud = nullptr) {
     if (!ctx || !pcm || n_samples <= 0)
         return nullptr;
 
@@ -2311,7 +2321,7 @@ static char* gemma4_e2b_transcribe_impl(struct gemma4_e2b_context* ctx, const fl
     int audio_insert_pos = 0;
     std::vector<int32_t> prompt_ids = g4e_build_audio_prompt_ids(ctx, user_body, N_audio, &audio_insert_pos);
     return g4e_run_prompt(ctx, prompt_ids, audio_insert_pos, N_audio, audio_emb.data(), proj_dim, out_token_ids,
-                          out_token_probs);
+                          out_token_probs, on_tok, on_tok_ud);
 }
 
 extern "C" char* gemma4_e2b_transcribe(struct gemma4_e2b_context* ctx, const float* pcm, int n_samples) {
@@ -2342,6 +2352,20 @@ extern "C" struct gemma4_e2b_result* gemma4_e2b_transcribe_with_probs(struct gem
         }
     }
     return r;
+}
+
+extern "C" int gemma4_e2b_is_control_token(struct gemma4_e2b_context* ctx, int id) {
+    if (!ctx)
+        return 0;
+    return (id == ctx->bos_id || id == ctx->eos_id || id == ctx->start_of_turn_id || id == ctx->end_of_turn_id) ? 1 : 0;
+}
+
+extern "C" void gemma4_e2b_transcribe_cb(struct gemma4_e2b_context* ctx, const float* pcm, int n_samples,
+                                         gemma4_e2b_token_cb cb, void* userdata) {
+    if (!ctx || !pcm || n_samples <= 0 || !cb)
+        return;
+    char* s = gemma4_e2b_transcribe_impl(ctx, pcm, n_samples, false, nullptr, nullptr, nullptr, nullptr, cb, userdata);
+    free(s);
 }
 
 extern "C" char* gemma4_e2b_translate_text(struct gemma4_e2b_context* ctx, const char* text, const char* source_lang,

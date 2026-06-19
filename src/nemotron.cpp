@@ -1548,7 +1548,8 @@ struct nemotron_emitted_token {
 };
 
 static std::vector<nemotron_emitted_token> nemotron_rnnt_decode(nemotron_context* ctx, const float* enc, int T_enc,
-                                                                int d_model) {
+                                                                int d_model, nemotron_token_cb on_tok = nullptr,
+                                                                void* on_tok_ud = nullptr) {
     nemotron_init_pred_weights(ctx);
     nemotron_init_joint_weights(ctx);
 
@@ -1602,6 +1603,8 @@ static std::vector<nemotron_emitted_token> nemotron_rnnt_decode(nemotron_context
             et.t_end = t + 1;
             et.p = logits[tok];
             emitted.push_back(et);
+            if (on_tok)
+                on_tok(tok, logits[tok], on_tok_ud);
 
             predictor_step(W, tok, state, pred_out);
             sym_count++;
@@ -2072,8 +2075,11 @@ extern "C" void nemotron_result_free(struct nemotron_result* r) {
     free(r);
 }
 
+static nemotron_result* nemotron_transcribe_impl(nemotron_context* ctx, const float* samples, int n_samples,
+                                                 int64_t t_offset_cs, nemotron_token_cb on_tok, void* on_tok_ud);
+
 extern "C" char* nemotron_transcribe(struct nemotron_context* ctx, const float* samples, int n_samples) {
-    nemotron_result* r = nemotron_transcribe_ex(ctx, samples, n_samples, 0);
+    nemotron_result* r = nemotron_transcribe_impl(ctx, samples, n_samples, 0, nullptr, nullptr);
     if (!r)
         return nullptr;
     char* text = r->text;
@@ -2082,8 +2088,8 @@ extern "C" char* nemotron_transcribe(struct nemotron_context* ctx, const float* 
     return text;
 }
 
-extern "C" struct nemotron_result* nemotron_transcribe_ex(struct nemotron_context* ctx, const float* samples,
-                                                          int n_samples, int64_t t_offset_cs) {
+static nemotron_result* nemotron_transcribe_impl(nemotron_context* ctx, const float* samples, int n_samples,
+                                                 int64_t t_offset_cs, nemotron_token_cb on_tok, void* on_tok_ud) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
 
@@ -2256,7 +2262,7 @@ extern "C" struct nemotron_result* nemotron_transcribe_ex(struct nemotron_contex
     auto emitted = use_maes        ? nemotron_rnnt_maes_decode(ctx, enc_out.data(), T_enc, d_model, beam_sz,
                                                                ctx->maes_num_steps, ctx->maes_gamma, ctx->maes_beta)
                    : (beam_sz > 1) ? nemotron_rnnt_beam_decode(ctx, enc_out.data(), T_enc, d_model, beam_sz)
-                                   : nemotron_rnnt_decode(ctx, enc_out.data(), T_enc, d_model);
+                                   : nemotron_rnnt_decode(ctx, enc_out.data(), T_enc, d_model, on_tok, on_tok_ud);
 
     if (getenv("CRISPASR_NEMOTRON_DEBUG")) {
         fprintf(stderr, "nemotron: RNNT emitted %zu tokens\n", emitted.size());
@@ -2306,6 +2312,19 @@ extern "C" struct nemotron_result* nemotron_transcribe_ex(struct nemotron_contex
     }
 
     return r;
+}
+
+extern "C" struct nemotron_result* nemotron_transcribe_ex(struct nemotron_context* ctx, const float* samples,
+                                                          int n_samples, int64_t t_offset_cs) {
+    return nemotron_transcribe_impl(ctx, samples, n_samples, t_offset_cs, nullptr, nullptr);
+}
+
+extern "C" void nemotron_transcribe_cb(struct nemotron_context* ctx, const float* samples, int n_samples,
+                                       nemotron_token_cb cb, void* userdata) {
+    if (!ctx || !samples || n_samples <= 0 || !cb)
+        return;
+    nemotron_result* r = nemotron_transcribe_impl(ctx, samples, n_samples, 0, cb, userdata);
+    nemotron_result_free(r);
 }
 
 extern "C" void nemotron_set_context_preset(struct nemotron_context* ctx, int preset) {
