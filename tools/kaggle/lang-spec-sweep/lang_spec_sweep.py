@@ -301,25 +301,26 @@ CRISPASR_BIN = BUILD / "bin" / "crispasr"
 assert CRISPASR_BIN.exists(), "crispasr binary not found after build"
 step("build.done")
 
-# ── Download audio fixtures ──────────────────────────────────────────────────
-step("fixtures.download")
-FIXTURES_REPO = "cstr/crispasr-regression-fixtures"
-FIXTURES_REV = "b61b03014bc9"  # pinned
-
+# ── Audio fixtures ───────────────────────────────────────────────────────────
+# jfk.wav is shipped with the CrispASR repo itself (samples/jfk.wav).
+# The JA audio is in the fixtures HF model repo (pinned full SHA).
+step("fixtures.prepare")
 from huggingface_hub import hf_hub_download
 
-def get_fixture(path_in_repo: str) -> Path:
-    local = Path(hf_hub_download(
-        repo_id=FIXTURES_REPO,
-        filename=path_in_repo,
-        revision=FIXTURES_REV,
-        local_dir=str(AUDIO_DIR),
-        token=hf_token,
-    ))
-    return local
+JFK_WAV = REPO / "samples" / "jfk.wav"
+assert JFK_WAV.exists(), f"jfk.wav missing from cloned repo at {JFK_WAV}"
 
-JFK_WAV = get_fixture("samples/jfk.wav")
-JA_WAV  = get_fixture("parakeet-tdt-0.6b-ja/reazon_baseball_14s/audio.wav")
+FIXTURES_REPO = "cstr/crispasr-regression-fixtures"
+FIXTURES_REV  = "b61b03014bc99ecce18ac8f99988d5110c83f2d2"  # full SHA, repo_type=model
+
+JA_WAV = Path(hf_hub_download(
+    repo_id=FIXTURES_REPO,
+    repo_type="model",
+    filename="parakeet-tdt-0.6b-ja/reazon_baseball_14s/audio.wav",
+    revision=FIXTURES_REV,
+    local_dir=str(AUDIO_DIR),
+    token=hf_token,
+))
 step("fixtures.done", jfk=str(JFK_WAV), ja=str(JA_WAV))
 
 # ── Test plan ────────────────────────────────────────────────────────────────
