@@ -99,6 +99,7 @@ public:
         if (flow_path.empty() || flow_path == "auto" || flow_path == "default") {
             flow_path = discover_sibling(base_dir, {
                                                        "cosyvoice3-flow-f16.gguf",
+                                                       "cosyvoice3-flow-q8_0.gguf",
                                                        "cosyvoice3-flow.gguf",
                                                    });
         }
