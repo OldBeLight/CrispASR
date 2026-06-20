@@ -250,6 +250,12 @@ struct kyutai_stt_context {
     ggml_tensor* kv_v = nullptr;
 
     int n_threads = 4;
+
+    // §176s: cached Mimi encoder graph — reused when n_samples matches.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    ggml_context* cached_enc_ctx = nullptr;
+    std::vector<uint8_t> cached_enc_meta;
+    int cached_enc_n_samples = 0;
 };
 
 // ===========================================================================
@@ -553,6 +559,8 @@ extern "C" struct kyutai_stt_context* kyutai_stt_init_from_file(const char* path
 extern "C" void kyutai_stt_free(struct kyutai_stt_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->cached_enc_ctx)
+        ggml_free(ctx->cached_enc_ctx);
     if (ctx->kv_buf)
         ggml_backend_buffer_free(ctx->kv_buf);
     if (ctx->kv_ctx)
@@ -814,74 +822,69 @@ static bool mimi_encode(kyutai_stt_context* sctx, const float* pcm_24k, int n_sa
     auto& m = sctx->model;
     auto& hp = m.hp;
 
-    // Build graph for SEANet + transformer + downsample
-    struct ggml_init_params gp = {
-        /*.mem_size   =*/sctx->compute_meta.size(),
-        /*.mem_buffer =*/sctx->compute_meta.data(),
-        /*.no_alloc   =*/true,
-    };
-    ggml_context* ctx0 = ggml_init(gp);
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
+    // §176s: reuse cached Mimi encoder graph when n_samples matches.
+    ggml_cgraph* gf;
+    if (sctx->cached_enc_gf && sctx->cached_enc_n_samples == n_samples) {
+        gf = sctx->cached_enc_gf;
+    } else {
+        if (sctx->cached_enc_ctx) {
+            ggml_free(sctx->cached_enc_ctx);
+            sctx->cached_enc_ctx = nullptr;
+            sctx->cached_enc_gf = nullptr;
+        }
+        sctx->cached_enc_meta.assign(sctx->compute_meta.size(), 0);
+        struct ggml_init_params gp = {
+            /*.mem_size   =*/sctx->cached_enc_meta.size(),
+            /*.mem_buffer =*/sctx->cached_enc_meta.data(),
+            /*.no_alloc   =*/true,
+        };
+        sctx->cached_enc_ctx = ggml_init(gp);
+        ggml_context* ctx0 = sctx->cached_enc_ctx;
+        gf = ggml_new_graph_custom(ctx0, 16384, false);
 
-    // Input PCM as a 1D tensor
-    ggml_tensor* pcm = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_samples);
-    ggml_set_name(pcm, "pcm_input");
-    ggml_set_input(pcm);
+        ggml_tensor* pcm = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_samples);
+        ggml_set_name(pcm, "pcm_input");
+        ggml_set_input(pcm);
 
-    // SEANet encoder
-    ggml_tensor* enc = build_seanet_encoder(ctx0, m.seanet, pcm);
-    ggml_set_name(enc, "seanet_out");
+        ggml_tensor* enc = build_seanet_encoder(ctx0, m.seanet, pcm);
+        ggml_set_name(enc, "seanet_out");
+        enc = build_mimi_transformer(ctx0, m.mimi_layers, enc, hp.mimi_num_heads, hp.mimi_head_dim);
+        ggml_set_name(enc, "enc_transformer_out");
+        enc = ggml_cont(ctx0, ggml_transpose(ctx0, enc));
+        enc = conv1d_fwd(ctx0, m.downsample, enc, 2);
+        ggml_set_name(enc, "downsampled");
+        ggml_tensor* proj_first = conv1d_fwd(ctx0, m.rvq_first.input_proj, enc, 1);
+        ggml_set_name(proj_first, "rvq_first_proj");
+        ggml_tensor* proj_rest = conv1d_fwd(ctx0, m.rvq_rest.input_proj, enc, 1);
+        ggml_set_name(proj_rest, "rvq_rest_proj");
+        ggml_set_output(proj_first);
+        ggml_set_output(proj_rest);
+        ggml_build_forward_expand(gf, proj_first);
+        ggml_build_forward_expand(gf, proj_rest);
 
-    // enc is now [mimi_dim, T_enc] (transposed for transformer)
-    // Encoder transformer expects [dim, T]
-    enc = build_mimi_transformer(ctx0, m.mimi_layers, enc, hp.mimi_num_heads, hp.mimi_head_dim);
-    ggml_set_name(enc, "enc_transformer_out");
-
-    // Transpose back to [T, channels] for conv1d
-    enc = ggml_cont(ctx0, ggml_transpose(ctx0, enc)); // [T_enc, mimi_dim]
-
-    // Downsample: Conv1d(512→512, k=4, s=2)
-    // Padding: (kernel_size - stride) / 2 = (4-2)/2 = 1
-    enc = conv1d_fwd(ctx0, m.downsample, enc, 2);
-    ggml_set_name(enc, "downsampled");
-    // enc is [T_frames, mimi_dim]
-
-    // RVQ input projection (Conv1d, kernel=1, stride=1)
-    ggml_tensor* proj_first = conv1d_fwd(ctx0, m.rvq_first.input_proj, enc, 1);
-    ggml_set_name(proj_first, "rvq_first_proj");
-    // proj_first is [T_frames, codebook_dim]
-
-    ggml_tensor* proj_rest = conv1d_fwd(ctx0, m.rvq_rest.input_proj, enc, 1);
-    ggml_set_name(proj_rest, "rvq_rest_proj");
-    // proj_rest is [T_frames, codebook_dim]
-
-    // Mark outputs
-    ggml_set_output(proj_first);
-    ggml_set_output(proj_rest);
-
-    ggml_build_forward_expand(gf, proj_first);
-    ggml_build_forward_expand(gf, proj_rest);
+        sctx->cached_enc_gf = gf;
+        sctx->cached_enc_n_samples = n_samples;
+    }
 
     // Allocate and compute
     ggml_backend_sched_reset(sctx->sched);
     if (!ggml_backend_sched_alloc_graph(sctx->sched, gf)) {
         fprintf(stderr, "kyutai_stt: failed to alloc mimi encoder graph\n");
-        ggml_free(ctx0);
         return false;
     }
 
     // Set input data
-    ggml_backend_tensor_set(pcm, pcm_24k, 0, n_samples * sizeof(float));
-
-    // Set position indices for transformer (ggml_arange handles this internally)
+    ggml_tensor* pcm_t = ggml_graph_get_tensor(gf, "pcm_input");
+    ggml_backend_tensor_set(pcm_t, pcm_24k, 0, n_samples * sizeof(float));
 
     if (ggml_backend_sched_graph_compute(sctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "kyutai_stt: mimi encoder compute failed\n");
-        ggml_free(ctx0);
         return false;
     }
 
-    // Get T_frames from output shape: [T, codebook_dim]
+    // Get T_frames from output shape
+    ggml_tensor* proj_first = ggml_graph_get_tensor(gf, "rvq_first_proj");
+    ggml_tensor* proj_rest = ggml_graph_get_tensor(gf, "rvq_rest_proj");
     T_frames = (int)proj_first->ne[0];
     int cdim = (int)proj_first->ne[1];
 
@@ -894,7 +897,7 @@ static bool mimi_encode(kyutai_stt_context* sctx, const float* pcm_24k, int n_sa
     rvq_encode_group(sctx, proj_first, m.rvq_first, hp.n_q_semantic, codes, T_frames);
     rvq_encode_group(sctx, proj_rest, m.rvq_rest, hp.n_q_acoustic, codes, T_frames);
 
-    ggml_free(ctx0);
+    // Do NOT free — cached (§176s).
     return true;
 }
 
