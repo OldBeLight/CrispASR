@@ -416,23 +416,29 @@ def kaggle_token_from_dataset(filename: str = "hf_token.txt") -> str | None:
     candidates: list[Path] = [
         Path("/kaggle/input/crispasr-hf-token") / filename,
     ]
-    # Scan all known mount roots
-    roots = [
-        Path("/kaggle/input"),
-        Path("/kaggle/input/datasets"),
-        Path("/kaggle/input/datasets/chr1str"),
-    ]
-    for root in roots:
-        if not root.exists():
-            continue
-        for sub in root.iterdir():
-            if "hf-token" in sub.name or "hf_token" in sub.name:
-                p = sub / filename
-                if p not in candidates:
-                    candidates.append(p)
-            # Also check for the token file directly in the subdir
-            p = sub / filename
-            if p not in candidates and sub.is_dir():
+    # Owner-agnostic scan: probe <filename> in EVERY mounted dataset dir, at
+    # both the classic depth (/kaggle/input/<slug>/) and the newer nested depth
+    # (/kaggle/input/datasets/<owner>/<slug>/). The old code only matched owner
+    # names containing "hf-token" and hard-coded chr1str, so a chr1s4 kernel on
+    # the newer mount path (/kaggle/input/datasets/chr1s4/crispasr-hf-token/)
+    # never had its token file scanned → token silently unresolved (the
+    # 2026-06-20 v2/v3 full-sweep runs). Don't filter by dir name — probe the file.
+    dataset_dirs: list[Path] = []
+    inp = Path("/kaggle/input")
+    if inp.exists():
+        for sub in inp.iterdir():
+            if not sub.is_dir():
+                continue
+            if sub.name == "datasets":
+                for owner in sub.iterdir():  # nested <owner>/<slug>
+                    if owner.is_dir():
+                        dataset_dirs.extend(s for s in owner.iterdir() if s.is_dir())
+            else:
+                dataset_dirs.append(sub)  # classic /kaggle/input/<slug>
+    for d in dataset_dirs:
+        for fn in (filename, "hf_token.txt", "token", "access_token"):
+            p = d / fn
+            if p not in candidates:
                 candidates.append(p)
     # Also try the flat file variants
     candidates.append(Path("/kaggle/input/crispasr-hf-token") / "token")
