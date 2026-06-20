@@ -131,8 +131,7 @@ struct crisp_audio_context {
 
     ggml_context* model_ctx = nullptr;
     ggml_backend_buffer_t model_buf = nullptr;
-    // std::map to match core_gguf::WeightLoader::tensors (moved-from below).
-    std::map<std::string, ggml_tensor*> tensors;
+    std::unordered_map<std::string, ggml_tensor*> tensors;
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
