@@ -224,6 +224,12 @@ struct voxtral4b_context {
     int n_threads = 4;
     int delay_tokens = 6;          // 480ms default
     std::vector<float> ada_scales; // (n_layers × d_model), precomputed
+
+    // §176s: cached encoder graph — reused when T_mel matches.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    ggml_context* cached_enc_ctx = nullptr;
+    std::vector<uint8_t> cached_enc_meta;
+    int cached_enc_T_mel = 0;
 };
 
 // ===========================================================================
@@ -577,7 +583,8 @@ extern "C" float* voxtral4b_compute_mel(voxtral4b_context* ctx, const float* sam
 
 static const float kRmsEps = 1e-5f;
 
-static ggml_cgraph* voxtral4b_build_graph_encoder(voxtral4b_context* ctx, int T_mel) {
+static ggml_cgraph* voxtral4b_build_graph_encoder(voxtral4b_context* ctx, int T_mel,
+                                                  ggml_context* arena_ctx = nullptr) {
     const auto& m = ctx->model;
     const auto& hp = m.hparams;
     const int d = (int)hp.audio_d_model;
@@ -591,12 +598,13 @@ static ggml_cgraph* voxtral4b_build_graph_encoder(voxtral4b_context* ctx, int T_
     // so the build stays warning-free.
     const float attn_scale = 1.0f / std::sqrt((float)head_dim);
 
-    ggml_init_params ip = {
-        ctx->compute_meta.size(),
-        ctx->compute_meta.data(),
-        true,
-    };
-    ggml_context* ctx0 = ggml_init(ip);
+    ggml_context* ctx0;
+    if (arena_ctx) {
+        ctx0 = arena_ctx;
+    } else {
+        ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+        ctx0 = ggml_init(ip);
+    }
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
     // Input: mel spectrogram (n_mels=128, T_mel=3000) F32
@@ -699,7 +707,8 @@ static ggml_cgraph* voxtral4b_build_graph_encoder(voxtral4b_context* ctx, int T_
 
     ggml_set_name(cur, "encoder_out");
     ggml_build_forward_expand(gf, cur);
-    ggml_free(ctx0);
+    if (!arena_ctx)
+        ggml_free(ctx0);
     return gf;
 }
 
@@ -1034,6 +1043,8 @@ extern "C" struct voxtral4b_context* voxtral4b_init_from_file(const char* path,
 extern "C" void voxtral4b_free(voxtral4b_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->cached_enc_ctx)
+        ggml_free(ctx->cached_enc_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->kv_buf)
@@ -1240,7 +1251,23 @@ extern "C" float* voxtral4b_run_encoder(voxtral4b_context* ctx, const float* mel
     const int N_out = T_enc_ds / 4;
     const int dim = (int)ctx->model.hparams.proj_out_dim;
 
-    ggml_cgraph* gf = voxtral4b_build_graph_encoder(ctx, T_mel);
+    // §176s: reuse cached encoder graph when T_mel matches.
+    ggml_cgraph* gf;
+    if (ctx->cached_enc_gf && ctx->cached_enc_T_mel == T_mel) {
+        gf = ctx->cached_enc_gf;
+    } else {
+        if (ctx->cached_enc_ctx) {
+            ggml_free(ctx->cached_enc_ctx);
+            ctx->cached_enc_ctx = nullptr;
+            ctx->cached_enc_gf = nullptr;
+        }
+        ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
+        ggml_init_params aip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
+        ctx->cached_enc_ctx = ggml_init(aip);
+        gf = voxtral4b_build_graph_encoder(ctx, T_mel, ctx->cached_enc_ctx);
+        ctx->cached_enc_gf = gf;
+        ctx->cached_enc_T_mel = T_mel;
+    }
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
         return nullptr;

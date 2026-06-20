@@ -181,6 +181,12 @@ struct glm_asr_context {
 
     int n_threads = 4;
     std::string ask; // custom instruction (empty = use default)
+
+    // §176s: cached encoder graph — reused when T_mel matches.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    ggml_context* cached_enc_ctx = nullptr;
+    std::vector<uint8_t> cached_enc_meta;
+    int cached_enc_T_mel = 0;
 };
 
 // ===========================================================================
@@ -465,6 +471,8 @@ extern "C" struct glm_asr_context* glm_asr_init_from_file(const char* path_model
 extern "C" void glm_asr_free(struct glm_asr_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->cached_enc_ctx)
+        ggml_free(ctx->cached_enc_ctx);
     if (ctx->kv_buf)
         ggml_backend_buffer_free(ctx->kv_buf);
     if (ctx->kv_ctx)
@@ -1058,7 +1066,7 @@ extern "C" void glm_asr_kv_reset(struct glm_asr_context* ctx) {
     ggml_backend_buffer_clear(ctx->kv_buf, 0);
 }
 
-static ggml_cgraph* glm_build_encoder(glm_asr_context* ctx, int T_mel) {
+static ggml_cgraph* glm_build_encoder(glm_asr_context* ctx, int T_mel, ggml_context* arena_ctx = nullptr) {
     const auto& m = ctx->model;
     const auto& hp = m.hp;
     const int d = hp.enc_hidden;          // 1280
@@ -1069,7 +1077,7 @@ static ggml_cgraph* glm_build_encoder(glm_asr_context* ctx, int T_mel) {
     const float scale = 1.0f / std::sqrt((float)hd);
 
     ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
-    ggml_context* ctx0 = ggml_init(ip);
+    ggml_context* ctx0 = arena_ctx ? arena_ctx : ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
     // Input mel (n_mels, T_mel)
@@ -1219,7 +1227,8 @@ static ggml_cgraph* glm_build_encoder(glm_asr_context* ctx, int T_mel) {
 
     ggml_set_name(cur, "encoder_out");
     ggml_build_forward_expand(gf, cur);
-    ggml_free(ctx0);
+    if (!arena_ctx)
+        ggml_free(ctx0);
     return gf;
 }
 
@@ -1233,7 +1242,23 @@ extern "C" float* glm_asr_run_encoder(struct glm_asr_context* ctx, const float* 
     const int T_proj = T_enc / 4;
     const int llm_d = hp.llm_hidden; // 2048
 
-    ggml_cgraph* gf = glm_build_encoder(ctx, T_mel);
+    // §176s: reuse cached encoder graph when T_mel matches.
+    ggml_cgraph* gf;
+    if (ctx->cached_enc_gf && ctx->cached_enc_T_mel == T_mel) {
+        gf = ctx->cached_enc_gf;
+    } else {
+        if (ctx->cached_enc_ctx) {
+            ggml_free(ctx->cached_enc_ctx);
+            ctx->cached_enc_ctx = nullptr;
+            ctx->cached_enc_gf = nullptr;
+        }
+        ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
+        ggml_init_params aip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
+        ctx->cached_enc_ctx = ggml_init(aip);
+        gf = glm_build_encoder(ctx, T_mel, ctx->cached_enc_ctx);
+        ctx->cached_enc_gf = gf;
+        ctx->cached_enc_T_mel = T_mel;
+    }
     if (!gf)
         return nullptr;
 
