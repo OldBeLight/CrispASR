@@ -19,9 +19,9 @@ import (
 // new target_link_libraries(crispasr PUBLIC <X>) in src/CMakeLists.txt, re-run
 // the sync script to update these lines automatically.
 #cgo CFLAGS: -I${SRCDIR}/../../include -I${SRCDIR}/../../ggml/include
-#cgo LDFLAGS: -L${SRCDIR}/../../build-ninja-compile/src -L${SRCDIR}/../../build-ninja-compile/crisp_audio -L${SRCDIR}/../../build-ninja-compile/ggml/src
-#cgo LDFLAGS: -L${SRCDIR}/../../build/src -L${SRCDIR}/../../build/crisp_audio -L${SRCDIR}/../../build/ggml/src
-#cgo LDFLAGS: -L${SRCDIR}/../../build_go/src -L${SRCDIR}/../../build_go/crisp_audio -L${SRCDIR}/../../build_go/ggml/src
+#cgo LDFLAGS: -L${SRCDIR}/../../build-ninja-compile/src -L${SRCDIR}/../../build-ninja-compile/crisp_audio -L${SRCDIR}/../../build-ninja-compile/crisp_lid -L${SRCDIR}/../../build-ninja-compile/crisp_punc -L${SRCDIR}/../../build-ninja-compile/crisp_truecase -L${SRCDIR}/../../build-ninja-compile/ggml/src
+#cgo LDFLAGS: -L${SRCDIR}/../../build/src -L${SRCDIR}/../../build/crisp_audio -L${SRCDIR}/../../build/crisp_lid -L${SRCDIR}/../../build/crisp_punc -L${SRCDIR}/../../build/crisp_truecase -L${SRCDIR}/../../build/ggml/src
+#cgo LDFLAGS: -L${SRCDIR}/../../build_go/src -L${SRCDIR}/../../build_go/crisp_audio -L${SRCDIR}/../../build_go/crisp_lid -L${SRCDIR}/../../build_go/crisp_punc -L${SRCDIR}/../../build_go/crisp_truecase -L${SRCDIR}/../../build_go/ggml/src
 #cgo darwin LDFLAGS: -L${SRCDIR}/../../build-ninja-compile/ggml/src/ggml-blas -L${SRCDIR}/../../build-ninja-compile/ggml/src/ggml-metal
 #cgo darwin LDFLAGS: -L${SRCDIR}/../../build/ggml/src/ggml-blas -L${SRCDIR}/../../build/ggml/src/ggml-metal
 #cgo darwin LDFLAGS: -L${SRCDIR}/../../build_go/ggml/src/ggml-blas -L${SRCDIR}/../../build_go/ggml/src/ggml-metal
