@@ -3161,9 +3161,11 @@ static bool is_cmn_lang(const std::string& lang) {
     return lang == "cmn" || lang == "zh" || lang == "zh-cn" || lang == "zh_cn" || lang == "cmn-latn-pinyin";
 }
 
+#if defined(CRISPASR_HAVE_ESPEAK_NG) || defined(CRISPASR_ESPEAK_DLOPEN)
 static bool is_ja_lang(const std::string& lang) {
     return lang == "ja" || lang == "ja-jp" || lang == "ja_jp";
 }
+#endif
 
 bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::string& text, std::string& out) {
     std::string key = lang;
@@ -3177,12 +3179,18 @@ bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::s
     // pronunciation for kanji (e.g. 日本語 → "Chinese letter"). MeCab
     // converts kanji → katakana reading which espeak then IPA-phonemizes.
     std::string effective_text = text;
+    // The JA kanji→kana pre-step (MeCab) is compiled under the same guard as
+    // espeak (both live in the espeak #if block above), and it only matters as a
+    // pre-step before espeak phonemization — so skip it cleanly on no-espeak
+    // builds where kanji_to_kana / is_ja_lang aren't compiled.
+#if defined(CRISPASR_HAVE_ESPEAK_NG) || defined(CRISPASR_ESPEAK_DLOPEN)
     if (is_ja_lang(lang)) {
         std::string kana;
         if (kanji_to_kana(text, kana)) {
             effective_text = kana;
         }
     }
+#endif
 
     // §156 permissive G2P dicts — try builtin phonemizers first (no GPL dep).
     // These auto-download IPA dicts from HuggingFace on first call.
