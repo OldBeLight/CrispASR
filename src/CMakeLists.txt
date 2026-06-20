@@ -782,6 +782,14 @@ if(GGML_CUDA)
     target_compile_definitions(granite_speech PRIVATE GGML_USE_CUDA)
     target_link_libraries(granite_speech PUBLIC ggml-cuda)
 endif()
+# §176d: Accelerate cblas_sgemm for cpu_linear.
+if(APPLE)
+    if(NOT ACCELERATE_LIB)
+        find_library(ACCELERATE_LIB Accelerate REQUIRED)
+    endif()
+    target_link_libraries(granite_speech PUBLIC ${ACCELERATE_LIB})
+    target_compile_definitions(granite_speech PRIVATE HAVE_ACCELERATE ACCELERATE_NEW_LAPACK)
+endif()
 
 # ---------------------------------------------------------------------------
 # granite_nle — runtime for ibm-granite/granite-speech-4.1-2b-nar

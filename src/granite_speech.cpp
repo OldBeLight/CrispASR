@@ -25,6 +25,18 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 
+#if defined(HAVE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#endif
+
+// §176d: env-gated fallback to scalar cpu_linear for A/B testing.
+static bool granite_force_scalar() {
+    static int v = -1;
+    if (v < 0)
+        v = (std::getenv("GRANITE_FORCE_SCALAR") != nullptr) ? 1 : 0;
+    return v != 0;
+}
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -965,12 +977,22 @@ static void depthwise_conv_1d_cpu(float* out, const float* in, const float* weig
 // which doesn't need the context.
 static void cpu_linear(granite_speech_context* /*ctx*/, float* out, const float* x, ggml_tensor* W, ggml_tensor* bias,
                        int d_in, int d_out, int T) {
-    // Simple CPU matmul (no ggml graph overhead for small ops)
-    // W in ggml: ne[0]=d_in, ne[1]=d_out. W[i,j] = data[j * d_in + i]
-    // ggml_mul_mat(W, x) computes W^T @ x
-    // For F32 weights, do it directly:
+    // W in ggml: ne[0]=d_in, ne[1]=d_out. Row-major: W[o * d_in + i].
+    // out[o + t * d_out] = sum_i W[o * d_in + i] * x[i + t * d_in] + bias[o]
+    // = W @ x^T in BLAS terms: C(d_out, T) = W(d_out, d_in) * x^T(d_in, T)
+
+    // Dequantize weight to F32.
     std::vector<float> w_f32((size_t)d_in * d_out);
-    ggml_backend_tensor_get(W, w_f32.data(), 0, w_f32.size() * sizeof(float));
+    if (W->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(W, w_f32.data(), 0, w_f32.size() * sizeof(float));
+    } else {
+        const size_t row_bytes = ggml_row_size(W->type, d_in);
+        std::vector<uint8_t> raw(row_bytes * (size_t)d_out);
+        ggml_backend_tensor_get(W, raw.data(), 0, raw.size());
+        for (int o = 0; o < d_out; o++)
+            ggml_get_type_traits(W->type)->to_float(raw.data() + (size_t)o * row_bytes, w_f32.data() + (size_t)o * d_in,
+                                                    d_in);
+    }
 
     std::vector<float> b_f32;
     if (bias) {
@@ -978,16 +1000,39 @@ static void cpu_linear(granite_speech_context* /*ctx*/, float* out, const float*
         ggml_backend_tensor_get(bias, b_f32.data(), 0, d_out * sizeof(float));
     }
 
-    // out[o, t] = sum_i W[i, o] * x[i, t] + bias[o]
-    // = sum_i w_f32[o * d_in + i] * x[i + t * d_in] + b[o]
-    for (int t = 0; t < T; t++) {
-        for (int o = 0; o < d_out; o++) {
-            float sum = 0.0f;
-            for (int i = 0; i < d_in; i++)
-                sum += w_f32[(size_t)o * d_in + i] * x[(size_t)i + (size_t)t * d_in];
-            if (bias)
-                sum += b_f32[o];
-            out[(size_t)o + (size_t)t * d_out] = sum;
+#if defined(HAVE_ACCELERATE)
+    if (!granite_force_scalar()) {
+        // C(d_out, T) = W(d_out, d_in) * X(d_in, T)
+        // X is stored as x[t * d_in + i], so X is (T, d_in) row-major = (d_in, T) col-major.
+        // W is (d_out, d_in) row-major.
+        // out is (T, d_out) row-major → we want out[t * d_out + o].
+        // BLAS: C = alpha * A * B + beta * C
+        //   A = W (d_out × d_in, row-major)
+        //   B = X^T (d_in × T, but X is row-major (T × d_in))
+        // Use CblasRowMajor, CblasNoTrans for A, CblasTrans for B:
+        //   C(d_out, T) = W(d_out, d_in) * X^T(d_in, T) but we want (T, d_out) output.
+        // Easier: transpose the whole thing.
+        // out^T(d_out, T) = W(d_out, d_in) @ x^T(d_in, T)
+        // Then transpose out to (T, d_out).
+        std::vector<float> tmp((size_t)d_out * T);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, d_out, T, d_in, 1.0f, w_f32.data(), d_in, x, d_in, 0.0f,
+                    tmp.data(), T);
+        // tmp is (d_out, T) row-major → transpose to (T, d_out) into out.
+        for (int t = 0; t < T; t++)
+            for (int o = 0; o < d_out; o++)
+                out[(size_t)t * d_out + o] = tmp[(size_t)o * T + t] + (bias ? b_f32[o] : 0.0f);
+    } else
+#endif
+    {
+        for (int t = 0; t < T; t++) {
+            for (int o = 0; o < d_out; o++) {
+                float sum = 0.0f;
+                for (int i = 0; i < d_in; i++)
+                    sum += w_f32[(size_t)o * d_in + i] * x[(size_t)i + (size_t)t * d_in];
+                if (bias)
+                    sum += b_f32[o];
+                out[(size_t)o + (size_t)t * d_out] = sum;
+            }
         }
     }
 }
