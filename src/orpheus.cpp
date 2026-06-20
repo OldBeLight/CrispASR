@@ -36,6 +36,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cmath>
