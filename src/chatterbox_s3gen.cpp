@@ -1822,6 +1822,276 @@ static ggml_tensor* basic_transformer_block(ggml_context* ctx, ggml_tensor* x, /
     return ggml_cont(ctx, ggml_transpose(ctx, xt));
 }
 
+// ── Batch=2 UNet helpers (cond + uncond in one graph) ───────────────────────
+//
+// Tensors are 3D: (T, C, 2) where ne[2]=2 is the batch axis.
+// batch=0 = conditioned pass, batch=1 = unconditioned pass.
+// All ggml_mul_mat operations handle ne[2] as an outer batch dim natively,
+// so attention GEMMs (≈90% of UNet compute) run as batch=2 Metal dispatches.
+// Convolutions cannot easily be batched (ggml_conv_1d does not guarantee ne[2]
+// support), so causal_conv1d_b2 slices, runs two 2-D convs, and stacks.
+
+// Causal conv1d for batch=2 input: slice each batch item, run 2D conv, concat.
+static ggml_tensor* causal_conv1d_b2(ggml_context* ctx, ggml_tensor* x, // (T, C_in, 2)
+                                     ggml_tensor* weight, ggml_tensor* bias) {
+    int T = (int)x->ne[0];
+    int C_in = (int)x->ne[1];
+    // Contiguous 2D views of each batch slice.
+    ggml_tensor* x0 = ggml_view_2d(ctx, x, T, C_in, x->nb[1], 0);
+    ggml_tensor* x1 = ggml_view_2d(ctx, x, T, C_in, x->nb[1], x->nb[2]);
+    ggml_tensor* y0 = causal_conv1d(ctx, x0, weight, bias); // (T, C_out)
+    ggml_tensor* y1 = causal_conv1d(ctx, x1, weight, bias); // (T, C_out)
+    int T_out = (int)y0->ne[0];
+    int C_out = (int)y0->ne[1];
+    y0 = ggml_reshape_3d(ctx, y0, T_out, C_out, 1);
+    y1 = ggml_reshape_3d(ctx, y1, T_out, C_out, 1);
+    return ggml_concat(ctx, y0, y1, 2); // (T_out, C_out, 2)
+}
+
+// CausalBlock1D for batch=2. Skips the per-call debug probing machinery.
+static ggml_tensor* causal_block1d_b2(ggml_context* ctx, ggml_tensor* x, // (T, C_in, 2)
+                                      ggml_tensor* conv_w, ggml_tensor* conv_b, ggml_tensor* ln_w, ggml_tensor* ln_b) {
+    x = causal_conv1d_b2(ctx, x, conv_w, conv_b); // (T, C_out, 2)
+    x = ggml_cont(ctx, ggml_transpose(ctx, x));   // (C_out, T, 2)
+    x = ggml_norm(ctx, x, 1e-5f);                 // norm over C_out for each (T, batch)
+    if (ln_w)
+        x = ggml_mul(ctx, x, ln_w); // (C_out,) broadcasts ✓
+    if (ln_b)
+        x = ggml_add(ctx, x, ln_b);
+    x = ggml_cont(ctx, ggml_transpose(ctx, x)); // (T, C_out, 2)
+    x = ggml_mish(ctx, x);
+    return x;
+}
+
+// CausalResnetBlock1D for batch=2.
+// t_emb is (1024,) — same time step for both passes, broadcast to both.
+static ggml_tensor* causal_resnet_block_b2(ggml_context* ctx, ggml_tensor* x, ggml_tensor* t_emb,
+                                           chatterbox_s3gen_context* c, const char* prefix, ggml_tensor* /*mask*/) {
+    char key[64];
+    auto W = [&](const char* suffix) -> ggml_tensor* {
+        std::snprintf(key, sizeof(key), "%s.%s", prefix, suffix);
+        return core_gguf::try_get(c->tensors, key);
+    };
+
+    ggml_tensor* residual = x; // (T, C_in, 2)
+
+    x = causal_block1d_b2(ctx, x, W("b1.0.weight"), W("b1.0.bias"), W("b1.2.weight"), W("b1.2.bias"));
+
+    // Time MLP — same t_emb for both passes (identical time step); broadcast to all T and both batch items.
+    ggml_tensor* t_proj_in = ggml_mish(ctx, t_emb);                      // (1024,)
+    ggml_tensor* t_proj = mul_mat_hp(ctx, W("mlp.1.weight"), t_proj_in); // (C_out,)
+    ggml_tensor* t_b = W("mlp.1.bias");
+    if (t_b)
+        t_proj = ggml_add(ctx, t_proj, t_b);
+    t_proj = ggml_reshape_2d(ctx, t_proj, 1, (int)t_proj->ne[0]); // (1, C_out) broadcasts over (T, C_out, 2)
+    x = ggml_add(ctx, x, t_proj);
+
+    x = causal_block1d_b2(ctx, x, W("b2.0.weight"), W("b2.0.bias"), W("b2.2.weight"), W("b2.2.bias"));
+
+    ggml_tensor* rc_w = W("rc.weight");
+    if (rc_w) {
+        ggml_tensor* rc_b = W("rc.bias");
+        if (rc_w->ne[0] == 1) {
+            // k=1 pointwise: use mul_mat so batch dim flows naturally.
+            ggml_tensor* rc_w_2d = ggml_reshape_2d(ctx, rc_w, rc_w->ne[1], rc_w->ne[2]); // (C_in, C_out)
+            ggml_tensor* res_T = ggml_cont(ctx, ggml_transpose(ctx, residual));          // (C_in, T, 2)
+            residual = mul_mat_hp(ctx, rc_w_2d, res_T);               // (C_out, T, 2) — batch=2 supported
+            residual = ggml_cont(ctx, ggml_transpose(ctx, residual)); // (T, C_out, 2)
+            if (rc_b) {
+                ggml_tensor* rb2d = ggml_reshape_2d(ctx, rc_b, 1, (int)rc_b->ne[0]);
+                residual = ggml_add(ctx, residual, rb2d);
+            }
+        } else {
+            // k>1 conv: slice and stack.
+            residual = causal_conv1d_b2(ctx, residual, rc_w, rc_b);
+        }
+    }
+
+    return ggml_add(ctx, x, residual);
+}
+
+// BasicTransformerBlock for batch=2.
+// Key change: Q/K/V are reshaped to 4D (hd, nh, T, B) and permuted to (hd, T, nh, B)
+// so flash_attn_ext sees them as (D, N, H, B) — its standard batched layout.
+static ggml_tensor* basic_transformer_block_b2(ggml_context* ctx, ggml_tensor* x, // (T, C, 2)
+                                               chatterbox_s3gen_context* c, const char* prefix,
+                                               ggml_tensor* /*attn_mask*/, int n_heads, int head_dim) {
+    char key[64];
+    auto W = [&](const char* suffix) -> ggml_tensor* {
+        std::snprintf(key, sizeof(key), "%s.%s", prefix, suffix);
+        return core_gguf::try_get(c->tensors, key);
+    };
+
+    int TT = (int)x->ne[0]; // T_mel
+    int B = (int)x->ne[2];  // batch size (2)
+
+    ggml_tensor* xt = ggml_cont(ctx, ggml_transpose(ctx, x)); // (C, T, 2)
+
+    // norm1 → self-attention
+    ggml_tensor* residual = xt;
+    ggml_tensor* xn = ggml_norm(ctx, xt, 1e-5f); // (C, T, 2) — norms over ne[0]=C ✓
+    ggml_tensor* n1w = W("norm1.weight");
+    ggml_tensor* n1b = W("norm1.bias");
+    if (n1w)
+        xn = ggml_mul(ctx, xn, n1w); // (C,) broadcasts ✓
+    if (n1b)
+        xn = ggml_add(ctx, xn, n1b);
+
+    int proj_dim = n_heads * head_dim;                         // 512
+    ggml_tensor* Q = mul_mat_hp(ctx, W("attn1.q.weight"), xn); // (proj_dim, T, 2)
+    ggml_tensor* K = mul_mat_hp(ctx, W("attn1.k.weight"), xn);
+    ggml_tensor* V = mul_mat_hp(ctx, W("attn1.v.weight"), xn);
+
+    // Reshape to 4D: (hd, nh, T, B) then permute to (hd, T, nh, B) for flash_attn (D, N, H, B).
+    Q = ggml_reshape_4d(ctx, Q, head_dim, n_heads, TT, B);
+    K = ggml_reshape_4d(ctx, K, head_dim, n_heads, TT, B);
+    V = ggml_reshape_4d(ctx, V, head_dim, n_heads, TT, B);
+
+    Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3)); // (hd, T, nh, B)
+    K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
+    V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
+
+    float scale = 1.0f / std::sqrt((float)head_dim);
+    ggml_tensor* attn = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+    // attn: (hd, T, nh, B)
+
+    attn = ggml_reshape_3d(ctx, attn, proj_dim, TT, B); // (proj_dim, T, 2)
+    attn = mul_mat_hp(ctx, W("attn1.o.weight"), attn);  // (proj_dim, T, 2) — batch flows ✓
+    ggml_tensor* o_b = W("attn1.o.bias");
+    if (o_b)
+        attn = ggml_add(ctx, attn, o_b); // (proj_dim,) broadcasts ✓
+
+    xt = ggml_add(ctx, residual, attn);
+
+    // norm3 → FF (GELU up/down)
+    residual = xt;
+    xn = ggml_norm(ctx, xt, 1e-5f);
+    if (W("norm3.weight"))
+        xn = ggml_mul(ctx, xn, W("norm3.weight"));
+    if (W("norm3.bias"))
+        xn = ggml_add(ctx, xn, W("norm3.bias"));
+
+    ggml_tensor* ff_up = mul_mat_hp(ctx, W("ff.up.weight"), xn); // (4C, T, 2)
+    if (W("ff.up.bias"))
+        ff_up = ggml_add(ctx, ff_up, W("ff.up.bias"));
+    ff_up = ggml_gelu(ctx, ff_up);
+
+    ggml_tensor* ff_out = mul_mat_hp(ctx, W("ff.down.weight"), ff_up); // (C, T, 2)
+    if (W("ff.down.bias"))
+        ff_out = ggml_add(ctx, ff_out, W("ff.down.bias"));
+
+    xt = ggml_add(ctx, residual, ff_out);
+    return ggml_cont(ctx, ggml_transpose(ctx, xt)); // (T, C, 2)
+}
+
+// Build the UNet1D denoiser graph for cond + uncond in one Metal pass (CFG).
+// x_in: (T, 320, 2) where batch=0=conditioned, batch=1=unconditioned
+// t_emb: (1024,) — same time step for both
+// Returns: (T, 80, 2) velocity predictions — read back as [cond | uncond]
+static ggml_cgraph* build_graph_unet1d_b2(chatterbox_s3gen_context* c, int T_mel) {
+    ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 32768, false);
+
+    ggml_tensor* x_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, T_mel, 320, 2);
+    ggml_set_name(x_in, "unet_input_b2");
+    ggml_set_input(x_in);
+
+    ggml_tensor* t_emb = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1024);
+    ggml_set_name(t_emb, "time_emb");
+    ggml_set_input(t_emb);
+
+    ggml_tensor* mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T_mel, 1);
+    ggml_set_name(mask, "mask");
+    ggml_set_input(mask);
+
+    ggml_tensor* x = x_in;
+    ggml_tensor* hidden = nullptr;
+
+    // ---- Down block ----
+    {
+        x = causal_resnet_block_b2(ctx0, x, t_emb, c, "s3.fd.db.0.0", mask);
+        for (int j = 0; j < 4; j++) {
+            char prefix[48];
+            std::snprintf(prefix, sizeof(prefix), "s3.fd.db.0.1.%d", j);
+            x = basic_transformer_block_b2(ctx0, x, c, prefix, nullptr, 8, 64);
+        }
+        hidden = x; // save for skip connection
+        ggml_tensor* ds_w = T(c, "s3.fd.db.0.2.weight");
+        ggml_tensor* ds_b = T(c, "s3.fd.db.0.2.bias");
+        if (ds_w)
+            x = causal_conv1d_b2(ctx0, x, ds_w, ds_b);
+    }
+
+    // ---- Mid blocks (12) ----
+    for (int i = 0; i < 12; i++) {
+        char prefix[48];
+        std::snprintf(prefix, sizeof(prefix), "s3.fd.mb.%d.0", i);
+        x = causal_resnet_block_b2(ctx0, x, t_emb, c, prefix, mask);
+        for (int j = 0; j < 4; j++) {
+            char tb_prefix[48];
+            std::snprintf(tb_prefix, sizeof(tb_prefix), "s3.fd.mb.%d.1.%d", i, j);
+            x = basic_transformer_block_b2(ctx0, x, c, tb_prefix, nullptr, 8, 64);
+        }
+    }
+
+    // ---- Up block ----
+    {
+        if (hidden) {
+            int T_x = (int)x->ne[0];
+            int T_h = (int)hidden->ne[0];
+            if (T_x < T_h) {
+                hidden = ggml_view_3d(ctx0, hidden, T_x, (int)hidden->ne[1], 2, hidden->nb[1], hidden->nb[2], 0);
+                hidden = ggml_cont(ctx0, hidden);
+            }
+            x = ggml_concat(ctx0, x, hidden, 1); // concat along C dim → (T, 2C, 2)
+        }
+        x = causal_resnet_block_b2(ctx0, x, t_emb, c, "s3.fd.ub.0.0", mask);
+        for (int j = 0; j < 4; j++) {
+            char prefix[48];
+            std::snprintf(prefix, sizeof(prefix), "s3.fd.ub.0.1.%d", j);
+            x = basic_transformer_block_b2(ctx0, x, c, prefix, nullptr, 8, 64);
+        }
+        ggml_tensor* us_w = T(c, "s3.fd.ub.0.2.weight");
+        ggml_tensor* us_b = T(c, "s3.fd.ub.0.2.bias");
+        if (us_w)
+            x = causal_conv1d_b2(ctx0, x, us_w, us_b);
+    }
+
+    // ---- Final block ----
+    {
+        ggml_tensor* fb_w = T(c, "s3.fd.fb.block.0.weight");
+        ggml_tensor* fb_b = T(c, "s3.fd.fb.block.0.bias");
+        ggml_tensor* fb_ln_w = T(c, "s3.fd.fb.block.2.weight");
+        ggml_tensor* fb_ln_b = T(c, "s3.fd.fb.block.2.bias");
+        if (fb_w)
+            x = causal_block1d_b2(ctx0, x, fb_w, fb_b, fb_ln_w, fb_ln_b);
+        if (mask)
+            x = ggml_mul(ctx0, x, mask); // (T, 1) broadcasts ✓
+
+        // Final projection: k=1 conv → use mul_mat to handle batch=2 correctly.
+        ggml_tensor* fp_w = T(c, "s3.fd.fp.weight"); // (1, C_in, 80)
+        ggml_tensor* fp_b = T(c, "s3.fd.fp.bias");
+        if (fp_w) {
+            ggml_tensor* fp_w_2d = ggml_reshape_2d(ctx0, fp_w, fp_w->ne[1], fp_w->ne[2]); // (C_in, 80)
+            x = ggml_cont(ctx0, ggml_transpose(ctx0, x));                                 // (C_in, T, 2)
+            x = mul_mat_hp(ctx0, fp_w_2d, x);                                             // (80, T, 2)
+            x = ggml_cont(ctx0, ggml_transpose(ctx0, x));                                 // (T, 80, 2)
+            if (fp_b) {
+                ggml_tensor* b2d = ggml_reshape_2d(ctx0, fp_b, 1, (int)fp_b->ne[0]);
+                x = ggml_add(ctx0, x, b2d);
+            }
+        }
+    }
+
+    if (mask)
+        x = ggml_mul(ctx0, x, mask); // (T, 1) broadcasts over (T, 80, 2) ✓
+    ggml_set_name(x, "denoiser_out_b2");
+    ggml_build_forward_expand(gf, x);
+    ggml_free(ctx0);
+    return gf;
+}
+
 // Build the full UNet1D denoiser graph for one CFM step.
 // x_in: (320, T) = concat[x(80), mu(80), spks(80), cond(80)]
 // t_emb: (1024,) time embedding
@@ -2116,43 +2386,114 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
         }
     }
 
+    // When cfg_rate > 0 and not meanflow we run two UNet passes per step (cond + uncond).
+    // The batch=2 graph fuses both into one Metal dispatch so attention GEMMs (≈90% of
+    // compute) run as batched matmuls rather than two sequential single-batch calls.
+    // Opt out with CRISPASR_S3GEN_UNET_CFG_SINGLE=1 to force the old sequential path.
+    const bool use_cfg_b2 = (cfg_rate > 0.0f && !meanflow) && !std::getenv("CRISPASR_S3GEN_UNET_CFG_SINGLE");
+
+    // Reusable input buffer for batch=2: (T, 320, 2) — cond in batch 0, uncond in batch 1.
+    std::vector<float> b2_input(use_cfg_b2 ? T_mel * 320 * 2 : 0, 0.0f);
+
     // Euler ODE steps
     for (int step = 0; step < n_steps; step++) {
         float t_val = t_span[step];
         float r_val = t_span[step + 1];
-        // Rebuild the graph each step — gallocr's alloc state is tied to the
-        // tensor backend_buffer fields and cannot safely survive a reset on
-        // a previously-alloc'd graph (stale pointers crash the next alloc).
-        ggml_cgraph* gf = build_graph_unet1d(c, T_mel);
         float dt = r_val - t_val;
 
-        // Build conditioned input: [x, mu, spks, cond] concatenated along channels
-        // ggml tensor ne=(T_mel, 320): data stored as data[ch * T_mel + t]
-        // (channel-first, T is fast axis)
+        // Time embedding — pre-computed; same for both cond and uncond passes.
+        const std::vector<float>& t_sin = meanflow ? mixed_embs[step] : t_embs[step];
+
+        // Build conditioned input: [x, mu, spks, cond] concatenated along channels.
+        // ggml layout: ne=(T_mel, 320), data[ch * T_mel + t].
         std::vector<float> unet_input(T_mel * 320, 0.0f);
         for (int ch = 0; ch < 80; ch++) {
             for (int t = 0; t < T_mel; t++) {
                 unet_input[(ch + 0) * T_mel + t] = x[ch * T_mel + t];
                 unet_input[(ch + 80) * T_mel + t] = mu[ch * T_mel + t];
-                unet_input[(ch + 160) * T_mel + t] = spk_emb[ch]; // broadcast over T
+                unet_input[(ch + 160) * T_mel + t] = spk_emb[ch];
                 unet_input[(ch + 240) * T_mel + t] = cond[ch * T_mel + t];
             }
         }
 
-        // Build unconditioned input for CFG: [x, 0, 0, 0]
-        std::vector<float> unet_uncond(T_mel * 320, 0.0f);
-        if (cfg_rate > 0.0f) {
-            for (int ch = 0; ch < 80; ch++) {
-                for (int t = 0; t < T_mel; t++) {
-                    unet_uncond[ch * T_mel + t] = x[ch * T_mel + t];
+        // ── Batch=2 CFG path ──────────────────────────────────────────────────
+        if (use_cfg_b2) {
+            // Stack cond (batch 0) and uncond (batch 1) into b2_input.
+            // Uncond input: [x, 0, 0, 0] — channels 80..319 remain zero.
+            std::memcpy(b2_input.data(), unet_input.data(), T_mel * 320 * sizeof(float));
+            for (int ch = 0; ch < 80; ch++)
+                for (int t = 0; t < T_mel; t++)
+                    b2_input[T_mel * 320 + ch * T_mel + t] = x[ch * T_mel + t];
+            // channels 80..319 of uncond stay zero — b2_input was zero-init'd above
+            // and zeroed out each step (only the x-channels are non-zero for uncond).
+            // Faster: just zero the uncond non-x region explicitly.
+            std::fill(b2_input.begin() + T_mel * 320 + 80 * T_mel, b2_input.begin() + T_mel * 320 * 2, 0.0f);
+
+            // Rebuild graph each step (same reason as b1: gallocr state is not reusable).
+            ggml_cgraph* gf_b2 = build_graph_unet1d_b2(c, T_mel);
+            ggml_backend_sched_reset(c->sched);
+            s3gen_maybe_pin_graph_to_cpu(c, gf_b2, s3gen_subgraph::unet);
+            if (!ggml_backend_sched_alloc_graph(c->sched, gf_b2)) {
+                fprintf(stderr, "s3gen: failed to alloc UNet1D b2 graph\n");
+                break;
+            }
+            static int b2_diag_seen = 0;
+            if (!b2_diag_seen && c->verbosity >= 1) {
+                fprintf(stderr, "s3gen: [unet-b2 step 0] n_nodes=%d n_splits=%d\n", ggml_graph_n_nodes(gf_b2),
+                        ggml_backend_sched_get_n_splits(c->sched));
+                b2_diag_seen = 1;
+            }
+
+            ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "unet_input_b2"), b2_input.data(), 0,
+                                    b2_input.size() * sizeof(float));
+            ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "time_emb"), t_sin.data(), 0,
+                                    t_sin.size() * sizeof(float));
+            ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "mask"), mask_data.data(), 0,
+                                    mask_data.size() * sizeof(float));
+
+            if (ggml_backend_sched_graph_compute(c->sched, gf_b2) != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "s3gen: UNet1D b2 compute failed\n");
+                break;
+            }
+
+            // Output: (T, 80, 2) — batch 0 = cond, batch 1 = uncond.
+            ggml_tensor* out_b2 = ggml_graph_get_tensor(gf_b2, "denoiser_out_b2");
+            if (step == 0 && c->verbosity >= 1) {
+                fprintf(stderr, "s3gen: [b2] denoiser out ne=(%d, %d, %d)\n", (int)out_b2->ne[0], (int)out_b2->ne[1],
+                        (int)out_b2->ne[2]);
+            }
+            const size_t nb_b2 = ggml_nbytes(out_b2);
+            std::vector<float> vb2(nb_b2 / sizeof(float));
+            ggml_backend_tensor_get(out_b2, vb2.data(), 0, nb_b2);
+
+            // vb2 layout: [cond: T*80 floats | uncond: T*80 floats]
+            // data[ch * T + t] for cond; data[T*80 + ch * T + t] for uncond.
+            int out_T = (int)out_b2->ne[0];
+            int use_T = std::min(out_T, T_mel);
+            int use_C = std::min((int)out_b2->ne[1], 80);
+
+            for (int ch = 0; ch < use_C; ch++) {
+                for (int t = 0; t < use_T; t++) {
+                    float vc = vb2[ch * out_T + t];
+                    float vu = vb2[out_T * 80 + ch * out_T + t];
+                    x[ch * T_mel + t] += dt * ((1.0f + cfg_rate) * vc - cfg_rate * vu);
                 }
             }
+
+            if (c->verbosity >= 2 || dump_stages) {
+                float rms = 0.0f;
+                for (float v : x)
+                    rms += v * v;
+                rms = std::sqrt(rms / x.size());
+                fprintf(stderr, "s3gen: CFM step %d/%d (t=%.3f→%.3f) x_rms=%.4f [b2]\n", step + 1, n_steps, t_val,
+                        r_val, rms);
+            }
+            continue;
         }
 
-        // Time embedding — use pre-computed value (avoids 20× Metal→CPU weight reads).
-        std::vector<float> t_sin = meanflow ? mixed_embs[step] : t_embs[step];
+        // ── Single-pass path (meanflow or cfg=0) ─────────────────────────────
+        ggml_cgraph* gf = build_graph_unet1d(c, T_mel);
 
-        // Helper: run denoiser with given input, return velocity.
         auto run_denoiser = [&](const std::vector<float>& input) -> std::vector<float> {
             ggml_backend_sched_reset(c->sched);
             s3gen_maybe_pin_graph_to_cpu(c, gf, s3gen_subgraph::unet);
@@ -2172,64 +2513,9 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
                                     t_sin.size() * sizeof(float));
             ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mask"), mask_data.data(), 0,
                                     mask_data.size() * sizeof(float));
-            // PLAN #83 r9 follow-up: dump per-node allocator decisions on step 0
-            // so we can diff 1-mark vs 2-mark configs and spot the address
-            // collision that causes Metal NaN. Format: "name @ data_ptr size bytes".
-            if (step == 0) {
-                const char* dump_addr = std::getenv("CRISPASR_S3GEN_DUMP_UNET_ADDR");
-                if (dump_addr && *dump_addr) {
-                    const int n_nodes_addr = ggml_graph_n_nodes(gf);
-                    fprintf(stderr, "s3gen: [DUMP_UNET_ADDR=%s] %d nodes\n", dump_addr, n_nodes_addr);
-                    for (int i = 0; i < n_nodes_addr; ++i) {
-                        ggml_tensor* node = ggml_graph_node(gf, i);
-                        if (!node)
-                            continue;
-                        fprintf(stderr, "s3gen: [addr] %4d  %p  %8zu  %s\n", i, node->data, ggml_nbytes(node),
-                                node->name);
-                    }
-                }
-            }
             if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
                 fprintf(stderr, "s3gen: UNet1D compute failed\n");
                 return {};
-            }
-            // PLAN #83 r9 per-segment drift bisect: when CRISPASR_S3GEN_DUMP_UNET=<tag>
-            // is set, dump every "dump_*" named intermediate from step 0 to
-            // /tmp/cb-unet-dump-<tag>-<name>.bin. Run twice (weight-residency
-            // vs gpu-residency), compare per-block.
-            if (step == 0) {
-                const char* dump_tag = std::getenv("CRISPASR_S3GEN_DUMP_UNET");
-                if (dump_tag && *dump_tag) {
-                    // PLAN #83 r9 follow-up #5: run_denoiser fires twice per
-                    // CFM step (cond + uncond). Without disambiguation the
-                    // second call overwrites the first. Use a local static
-                    // counter to tag dumps "cond"/"uncond".
-                    static int dump_call_idx = 0;
-                    const char* pass_tag = (dump_call_idx % 2 == 0) ? "cond" : "uncond";
-                    dump_call_idx++;
-                    const int n_nodes = ggml_graph_n_nodes(gf);
-                    int n_dumped = 0;
-                    for (int i = 0; i < n_nodes; ++i) {
-                        ggml_tensor* node = ggml_graph_node(gf, i);
-                        if (!node || std::strncmp(node->name, "dump_", 5) != 0)
-                            continue;
-                        const size_t nb_node = ggml_nbytes(node);
-                        std::vector<char> buf(nb_node);
-                        ggml_backend_tensor_get(node, buf.data(), 0, nb_node);
-                        char path[256];
-                        std::snprintf(path, sizeof(path), "/tmp/cb-unet-dump-%s-%s-%s.bin", dump_tag, pass_tag,
-                                      node->name);
-                        FILE* fp = std::fopen(path, "wb");
-                        if (fp) {
-                            std::fwrite(buf.data(), 1, nb_node, fp);
-                            std::fclose(fp);
-                            n_dumped++;
-                        }
-                    }
-                    fprintf(stderr,
-                            "s3gen: [DUMP_UNET=%s pass=%s] dumped %d intermediates to /tmp/cb-unet-dump-%s-%s-*.bin\n",
-                            dump_tag, pass_tag, n_dumped, dump_tag, pass_tag);
-                }
             }
             ggml_tensor* out = ggml_graph_get_tensor(gf, "denoiser_out");
             if (step == 0 && c->verbosity >= 1) {
@@ -2241,32 +2527,25 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
             return v;
         };
 
-        // Run conditioned pass
         std::vector<float> v_cond = run_denoiser(unet_input);
         if (v_cond.empty())
             break;
 
-        // Run unconditioned pass for CFG (skip for meanflow — distilled, no CFG)
         std::vector<float> v_uncond;
-        if (cfg_rate > 0.0f && !meanflow) {
-            v_uncond = run_denoiser(unet_uncond);
-        }
+        if (cfg_rate > 0.0f && !meanflow)
+            v_uncond = run_denoiser(std::vector<float>(T_mel * 320, 0.0f));
 
-        // Read output dimensions from the conditioned pass
         ggml_tensor* out_t = ggml_graph_get_tensor(gf, "denoiser_out");
         int out_T = (int)out_t->ne[0];
         int out_C = (out_t->ne[1] > 1) ? (int)out_t->ne[1] : 1;
         int use_T = std::min(out_T, T_mel);
         int use_C = std::min(out_C, 80);
 
-        // Euler step with CFG blending:
-        // v = (1 + cfg_rate) * v_cond - cfg_rate * v_uncond
-        // Denoiser output is ggml (ne[0]=T, ne[1]=C) → data[ch * T + t] (channel-first)
         for (int ch = 0; ch < use_C; ch++) {
             for (int t = 0; t < use_T; t++) {
                 float vc = v_cond[ch * out_T + t];
                 float v;
-                if (cfg_rate > 0.0f && !v_uncond.empty()) {
+                if (!v_uncond.empty()) {
                     float vu = v_uncond[ch * out_T + t];
                     v = (1.0f + cfg_rate) * vc - cfg_rate * vu;
                 } else {
@@ -2278,20 +2557,18 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
 
         if (c->verbosity >= 2 || dump_stages) {
             float rms = 0.0f;
-            for (auto v : x)
+            for (float v : x)
                 rms += v * v;
             rms = std::sqrt(rms / x.size());
             fprintf(stderr, "s3gen: CFM step %d/%d (t=%.3f→%.3f) x_rms=%.4f\n", step + 1, n_steps, t_val, r_val, rms);
         }
         if (dump_stages) {
-            // Print first 5 values at (t=0, ch=0..4) for diff comparison
             fprintf(stderr, "s3gen[dump]: cfm_step_%d (t=0,ch=0..4): ", step);
             for (int ch = 0; ch < 5; ch++)
                 fprintf(stderr, "%.6f ", x[ch * T_mel + 0]);
             fprintf(stderr, "\n");
-            // Also velocity rms
             float v_rms = 0;
-            for (auto v : v_cond)
+            for (float v : v_cond)
                 v_rms += v * v;
             v_rms = std::sqrt(v_rms / v_cond.size());
             fprintf(stderr, "s3gen[dump]: velocity_rms=%.4f\n", v_rms);
