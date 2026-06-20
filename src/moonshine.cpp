@@ -73,6 +73,12 @@ struct moonshine_context {
     // same audio.
     uint64_t seed_override = 0;
     moonshine_timing timing = {};
+
+    // §176s: cached encoder graph — reused when n_samples matches.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    ggml_context* cached_enc_ctx = nullptr;
+    std::vector<uint8_t> cached_enc_meta;
+    int cached_enc_n_samples = 0;
 };
 
 using TensorMap = std::map<std::string, ggml_tensor*>;
@@ -536,47 +542,63 @@ static bool moonshine_kv_cache_init(moonshine_kv_cache& cache, int n_layers, int
 static int moonshine_run_encoder(struct moonshine_context* ctx, const float* audio, int n_samples) {
     const auto& hp = ctx->model.hparams;
 
-    const size_t n_tensors = hp.enc_n_layers * 25 + 100;
-    const size_t mem_size = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead();
-    struct ggml_init_params params = {
-        /*.mem_size   =*/mem_size,
-        /*.mem_buffer =*/nullptr,
-        /*.no_alloc   =*/true,
-    };
-    struct ggml_context* ctx0 = ggml_init(params);
-    if (!ctx0) {
-        fprintf(stderr, "%s: failed to init ggml context\n", __func__);
-        return -1;
+    // §176s: reuse cached encoder graph when n_samples matches.
+    struct ggml_cgraph* graph;
+    if (ctx->cached_enc_gf && ctx->cached_enc_n_samples == n_samples) {
+        graph = ctx->cached_enc_gf;
+    } else {
+        if (ctx->cached_enc_ctx) {
+            ggml_free(ctx->cached_enc_ctx);
+            ctx->cached_enc_ctx = nullptr;
+            ctx->cached_enc_gf = nullptr;
+        }
+        const size_t n_tensors = hp.enc_n_layers * 25 + 100;
+        const size_t mem_size = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead();
+        ctx->cached_enc_meta.assign(mem_size, 0);
+        struct ggml_init_params params = {
+            /*.mem_size   =*/mem_size,
+            /*.mem_buffer =*/ctx->cached_enc_meta.data(),
+            /*.no_alloc   =*/true,
+        };
+        ctx->cached_enc_ctx = ggml_init(params);
+        if (!ctx->cached_enc_ctx) {
+            fprintf(stderr, "%s: failed to init ggml context\n", __func__);
+            return -1;
+        }
+
+        struct ggml_tensor* input = ggml_new_tensor_3d(ctx->cached_enc_ctx, GGML_TYPE_F32, n_samples, 1, 1);
+        ggml_set_name(input, "audio_input");
+        ggml_set_input(input);
+
+        struct ggml_tensor* conv_out = build_conv_stem(ctx->cached_enc_ctx, ctx->model, input);
+
+        const int seq_len = (int)conv_out->ne[1];
+
+        struct ggml_tensor* pos = ggml_new_tensor_1d(ctx->cached_enc_ctx, GGML_TYPE_I32, seq_len);
+        ggml_set_name(pos, "enc_pos");
+        ggml_set_input(pos);
+
+        struct ggml_tensor* output = moonshine_build_encoder(ctx->cached_enc_ctx, ctx->model, conv_out, pos, seq_len);
+        ggml_set_name(output, "encoder_output");
+        ggml_set_output(output);
+
+        graph = ggml_new_graph(ctx->cached_enc_ctx);
+        ggml_build_forward_expand(graph, output);
+        ctx->cached_enc_gf = graph;
+        ctx->cached_enc_n_samples = n_samples;
     }
-
-    struct ggml_tensor* input = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_samples, 1, 1);
-    ggml_set_name(input, "audio_input");
-    ggml_set_input(input);
-
-    struct ggml_tensor* conv_out = build_conv_stem(ctx0, ctx->model, input);
-
-    const int seq_len = (int)conv_out->ne[1];
-
-    struct ggml_tensor* pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, seq_len);
-    ggml_set_name(pos, "enc_pos");
-    ggml_set_input(pos);
-
-    struct ggml_tensor* output = moonshine_build_encoder(ctx0, ctx->model, conv_out, pos, seq_len);
-    ggml_set_name(output, "encoder_output");
-    ggml_set_output(output);
-
-    struct ggml_cgraph* graph = ggml_new_graph(ctx0);
-    ggml_build_forward_expand(graph, output);
 
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, graph)) {
         fprintf(stderr, "%s: failed to alloc graph\n", __func__);
-        ggml_free(ctx0);
         return -1;
     }
 
+    struct ggml_tensor* input = ggml_graph_get_tensor(graph, "audio_input");
     ggml_backend_tensor_set(input, audio, 0, n_samples * sizeof(float));
 
+    struct ggml_tensor* pos = ggml_graph_get_tensor(graph, "enc_pos");
+    const int seq_len = (int)pos->ne[0];
     std::vector<int32_t> pos_data(seq_len);
     for (int i = 0; i < seq_len; i++) {
         pos_data[i] = i;
@@ -585,10 +607,10 @@ static int moonshine_run_encoder(struct moonshine_context* ctx, const float* aud
 
     if (ggml_backend_sched_graph_compute(ctx->sched, graph) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "%s: graph compute failed\n", __func__);
-        ggml_free(ctx0);
         return -1;
     }
 
+    struct ggml_tensor* output = ggml_graph_get_tensor(graph, "encoder_output");
     const int hidden_dim = (int)output->ne[0];
     const int out_seq = (int)output->ne[1];
     const size_t out_bytes = hidden_dim * out_seq * sizeof(float);
@@ -597,7 +619,7 @@ static int moonshine_run_encoder(struct moonshine_context* ctx, const float* aud
     ctx->enc_len = out_seq;
     ggml_backend_tensor_get(output, ctx->encoder_out.data(), 0, out_bytes);
 
-    ggml_free(ctx0);
+    // Do NOT free ctx — it's cached (§176s).
     return 0;
 }
 
@@ -1242,6 +1264,8 @@ void moonshine_free(struct moonshine_context* ctx) {
     if (!ctx) {
         return;
     }
+    if (ctx->cached_enc_ctx)
+        ggml_free(ctx->cached_enc_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     // moonshine_model's destructor frees buf_w + ctx_w. It must run BEFORE
