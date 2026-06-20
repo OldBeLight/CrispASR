@@ -73,6 +73,32 @@ tensor_get_f32 data movement per 1000-token synthesis (~48 MB per step).
 All 10 call sites in build_speech_token_embed, build_speech_token_embed_gpt2,
 prefill builders, and CFG uncond setup now use direct array indexing.
 
+## 2026-06-20 §196 MeloTTS weight pre-cache — 16% faster synthesis (§176t)
+
+Same pattern as piper-tts §195. Pre-populate `unordered_map<tensor*,
+vector<float>>` at model load so `read_tensor_f32()` returns cached F32
+data instead of re-reading from backend + dequanting F16→F32 on every
+synthesis call. 48 `read_tensor_f32` calls across text_encoder,
+flow_inverse, wavenet, SDP, HiFi-GAN. Gated by
+`CRISPASR_MELOTTS_WEIGHT_CACHE` (default ON). A/B: 20806 vs 24684 ms
+(best of 3), 1.19× end-to-end.
+
+---
+
+## 2026-06-20 §195 Piper-TTS weight pre-cache — 14% faster synthesis (§176t)
+
+Pre-populate `unordered_map<tensor*, vector<float>>` at model load so
+every `read_tensor_f32()` call returns cached F32 data instead of
+`ggml_backend_tensor_get` + F16→F32 dequant. 39 calls across text
+encoder, flow_inverse, wavenet, SDP, HiFi-GAN. Gated by
+`CRISPASR_PIPER_WEIGHT_CACHE` (default ON). Cost: ~60 MB extra RAM for
+a 30 MB F16 model. A/B: 11444–11790 vs 13269–13287 ms, 1.13–1.16×.
+
+Also fixed `#include <array>` in orpheus.cpp, outetts.cpp, chatterbox.cpp
+(upstream Lk-bucketed graph cache uses std::array without the include).
+
+---
+
 ## 2026-06-20 §187 Embed fast path — 4 more LLM-ASR backends
 
 Extended the funasr single-token embed fast path (§180) to glm_asr,
