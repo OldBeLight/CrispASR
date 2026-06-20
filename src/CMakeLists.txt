@@ -427,6 +427,12 @@ target_include_directories(crispasr-core PUBLIC . ../include)
 target_include_directories(crispasr-core PRIVATE ../ggml/src)
 target_compile_features   (crispasr-core PUBLIC cxx_std_17)
 target_link_libraries     (crispasr-core PUBLIC ggml-base ggml)
+# §176f: the STFT frame loop in core/mel.cpp is OpenMP-parallel (each frame's
+# FFT is independent → bit-identical output). Link OpenMP when available; the
+# pragma is #ifdef _OPENMP-guarded so non-OMP builds keep the serial path.
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(crispasr-core PUBLIC OpenMP::OpenMP_CXX)
+endif()
 if(NOT MSVC)
     target_compile_options(crispasr-core PRIVATE -O3)
 endif()

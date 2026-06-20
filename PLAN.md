@@ -6624,15 +6624,28 @@ post-processing pipelines that call these per-segment.
 
 #### §176f Parallel STFT in mel.cpp + BLAS mel projection
 
-**Status:** PARTIAL — BLAS mel projection DONE (§189 2026-06-20)
+**Status:** DONE — BLAS mel projection (§189 2026-06-20) + STFT OMP gated path
+(2026-06-20, default off)
 **Effort:** Small
 **Files:** `src/core/mel.cpp`, `src/core/kaldi_fbank.cpp`
 **Done (§189):** Mel projection replaced with `cblas_sgemm` for both MelsFreqs
 and FreqsMels layouts; `crispasr-core` now links Accelerate/MKL/OpenBLAS.
-**Remaining:** STFT loop OMP parallelization (deferred — requires verifying
-all FftR2C function-pointer implementations are thread-safe).
+**Done (STFT):** OMP-parallel STFT frame loop, gated (see below).
 **Impact:** Entry point for ~40 backends. BLAS gives AMX/SIMD for free on
 the mel projection matrix multiply.
+
+**STFT done (gated, default OFF):** OpenMP-parallel STFT frame loop in
+`core_mel::compute`, opt-in via **`CRISPASR_MEL_PARALLEL=1`** (needs an OMP
+build; `crispasr-core` now links `OpenMP::OpenMP_CXX` when found). Bit-identical
+to serial (each frame writes its own `power` row + thread-private scratch;
+verified: cohere transcript identical default vs parallel). Kept OFF by default
+because the `fft` callable is per-backend (`cohere_fft_r2c`, `glm_fft`,
+`voxtral_fft_wrapper`, …) and parallel correctness needs each to be re-entrant;
+flip a backend to default-on once its fft is audited. Speed is arch/load
+dependent (allocating ffts contend on malloc across threads) — retest per arch
+on a quiet machine; **`CRISPASR_MEL_TIMING=1`** prints per-call STFT ms +
+thread count for that A/B. (The mel projection half of §176f is already done by
+§189's `cblas_sgemm`; this STFT half stacks on top of it.)
 
 #### §176g CPU embedding cache for AR TTS backends
 
