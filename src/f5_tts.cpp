@@ -31,6 +31,10 @@
 
 #include "core/gguf_loader.h"
 
+#if defined(HAVE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -796,6 +800,104 @@ static std::vector<float> compute_mel_spectrogram(const float* pcm_24k, int n_sa
 // Runs the full DiT: input_embed → 22 blocks → final adaln + proj.
 // Returns velocity prediction (T, mel_dim).
 //
+// Bypass Accelerate (validate scalar == GEMM, or run on non-Apple): set
+// F5_FORCE_SCALAR=1.
+static bool f5_use_scalar() {
+#if defined(HAVE_ACCELERATE)
+    static const bool force_scalar = std::getenv("F5_FORCE_SCALAR") != nullptr;
+    return force_scalar;
+#else
+    return true;
+#endif
+}
+
+// y[T,N] = x[T,K] @ W[N,K]^T + bias[N]  (PyTorch nn.Linear). PLAN §182:
+// Accelerate cblas_sgemm replaces the scalar triple loops in the F5 DiT
+// (input projection) and Vocos vocoder (pointwise projections) — together the
+// bulk of CPU compute. The scalar fallback is the previous behaviour.
+static void f5_linear(const float* x, const float* W, const float* bias, float* y, int T, int K, int N) {
+#if defined(HAVE_ACCELERATE)
+    if (!f5_use_scalar()) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, N, K, 1.0f, x, K, W, K, 0.0f, y, N);
+        if (bias) {
+            for (int t = 0; t < T; t++) {
+                float* row = y + (size_t)t * N;
+                for (int o = 0; o < N; o++)
+                    row[o] += bias[o];
+            }
+        }
+        return;
+    }
+#endif
+    for (int t = 0; t < T; t++) {
+        const float* xr = x + (size_t)t * K;
+        float* yr = y + (size_t)t * N;
+        for (int o = 0; o < N; o++) {
+            const float* wr = W + (size_t)o * K;
+            float s = bias ? bias[o] : 0.0f;
+            for (int k = 0; k < K; k++)
+                s += xr[k] * wr[k];
+            yr[o] = s;
+        }
+    }
+}
+
+// Grouped causal-"same" Conv1d on (T, C) row-major data (C inner). weight
+// layout [C_out, C_in_per_group, K]; in_ch == out_ch == C; symmetric pad.
+// Output (T, C). PLAN §182: per-group im2col + cblas_sgemm replaces the DiT's
+// ConvPositionEmbedding scalar loop (~4 GFLOP/pass, the DiT's worst hot spot).
+static void f5_grouped_conv1d(const float* in, const float* wt, const float* bias, float* out, int T, int C, int K,
+                              int pad, int groups) {
+    const int cpg = C / groups; // channels per group (in == out)
+#if defined(HAVE_ACCELERATE)
+    if (!f5_use_scalar()) {
+        std::vector<float> col((size_t)cpg * K * T);
+        std::vector<float> Wg((size_t)cpg * cpg * K);
+        std::vector<float> og((size_t)cpg * T);
+        for (int g = 0; g < groups; g++) {
+            const int c0 = g * cpg;
+            // col[(ic*K+k), t] = in[(t+k-pad)*C + c0+ic]  (0 if out of bounds)
+            for (int ic = 0; ic < cpg; ic++)
+                for (int k = 0; k < K; k++) {
+                    float* crow = col.data() + (size_t)(ic * K + k) * T;
+                    for (int t = 0; t < T; t++) {
+                        int ti = t + k - pad;
+                        crow[t] = (ti >= 0 && ti < T) ? in[(size_t)ti * C + c0 + ic] : 0.0f;
+                    }
+                }
+            // Wg[oc, ic*K+k] = wt[(c0+oc)*cpg*K + ic*K + k] (contiguous per oc)
+            for (int oc = 0; oc < cpg; oc++)
+                std::memcpy(Wg.data() + (size_t)oc * cpg * K, wt + (size_t)(c0 + oc) * cpg * K,
+                            (size_t)cpg * K * sizeof(float));
+            // og(cpg, T) = Wg(cpg, cpg*K) @ col(cpg*K, T)
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, cpg, T, cpg * K, 1.0f, Wg.data(), cpg * K,
+                        col.data(), T, 0.0f, og.data(), T);
+            for (int oc = 0; oc < cpg; oc++) {
+                float b = bias ? bias[c0 + oc] : 0.0f;
+                const float* orow = og.data() + (size_t)oc * T;
+                for (int t = 0; t < T; t++)
+                    out[(size_t)t * C + c0 + oc] = orow[t] + b;
+            }
+        }
+        return;
+    }
+#endif
+    for (int g = 0; g < groups; g++) {
+        const int c0 = g * cpg;
+        for (int oc = c0; oc < c0 + cpg; oc++)
+            for (int t = 0; t < T; t++) {
+                float sum = bias ? bias[oc] : 0.0f;
+                for (int ic = 0; ic < cpg; ic++)
+                    for (int k = 0; k < K; k++) {
+                        int ti = t + k - pad;
+                        if (ti >= 0 && ti < T)
+                            sum += in[(size_t)ti * C + c0 + ic] * wt[(size_t)oc * cpg * K + (size_t)ic * K + k];
+                    }
+                out[(size_t)t * C + oc] = sum;
+            }
+    }
+}
+
 // x:       (T, mel_dim)   — current ODE state
 // cond:    (T, mel_dim)   — conditioning (masked ref mel)
 // text:    (T, text_dim)  — text embedding
@@ -838,15 +940,7 @@ static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, 
     read_tensor_f32(w.input_proj_bias, proj_b);
 
     std::vector<float> hidden(T * dim, 0.0f);
-    for (int t = 0; t < T; t++) {
-        for (int o = 0; o < dim; o++) {
-            float sum = proj_b[o];
-            for (int i = 0; i < cat_dim; i++) {
-                sum += cat_input[t * cat_dim + i] * proj_w[o * cat_dim + i];
-            }
-            hidden[t * dim + o] = sum;
-        }
-    }
+    f5_linear(cat_input.data(), proj_w.data(), proj_b.data(), hidden.data(), T, cat_dim, dim);
 
     if (step_idx == 0 && !drop_audio_cond) {
         dump_stage(ctx, "input_proj_out", hidden.data(), hidden.size());
@@ -864,25 +958,7 @@ static std::vector<float> dit_forward(f5_tts_context* ctx, const float* x_data, 
             read_tensor_f32(b_tensor, bias);
 
             std::vector<float> output(T * dim, 0.0f);
-            for (int g = 0; g < groups; g++) {
-                int ch_start = g * ch_per_group;
-                for (int oc = ch_start; oc < ch_start + ch_per_group; oc++) {
-                    for (int t = 0; t < T; t++) {
-                        float sum = bias[oc];
-                        for (int ic_local = 0; ic_local < ch_per_group; ic_local++) {
-                            int ic = ch_start + ic_local;
-                            for (int k = 0; k < K; k++) {
-                                int ti = t + k - pad_k;
-                                if (ti >= 0 && ti < T) {
-                                    float w_val = wt[oc * ch_per_group * K + ic_local * K + k];
-                                    sum += input[ti * dim + ic] * w_val;
-                                }
-                            }
-                        }
-                        output[t * dim + oc] = sum;
-                    }
-                }
-            }
+            f5_grouped_conv1d(input.data(), wt.data(), bias.data(), output.data(), T, dim, K, pad_k, groups);
             for (auto& v : output) {
                 float sp = logf(1.0f + expf(v));
                 v = v * tanhf(sp);
@@ -1175,6 +1251,7 @@ static std::vector<float> vocos_decode(f5_tts_context* ctx, const float* mel_dat
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "f5_tts: vocos_decode T=%d mel_dim=%d voc_dim=%d\n", T, mel_dim, D);
     }
+    const auto voc_t0 = std::chrono::steady_clock::now();
 
     // mel_data is (T, 100) row-major. Convert to (100, T) for conv operations.
     std::vector<float> x_ct(mel_dim * T);
@@ -1232,14 +1309,7 @@ static std::vector<float> vocos_decode(f5_tts_context* ctx, const float* mel_dat
             std::vector<float> pw_w, pw_b;
             read_tensor_f32(blk.pw_up_weight, pw_w); // (1536, 512)
             read_tensor_f32(blk.pw_up_bias, pw_b);
-            for (int t = 0; t < T; t++) {
-                for (int o = 0; o < inter_dim; o++) {
-                    float sum = pw_b[o];
-                    for (int d = 0; d < D; d++)
-                        sum += x_td[t * D + d] * pw_w[o * D + d];
-                    up_out[t * inter_dim + o] = sum;
-                }
-            }
+            f5_linear(x_td.data(), pw_w.data(), pw_b.data(), up_out.data(), T, D, inter_dim);
         }
 
         // 4. GELU (exact: x * 0.5 * (1 + erf(x/sqrt(2))))
@@ -1253,14 +1323,7 @@ static std::vector<float> vocos_decode(f5_tts_context* ctx, const float* mel_dat
             std::vector<float> pw_w, pw_b;
             read_tensor_f32(blk.pw_down_weight, pw_w); // (512, 1536)
             read_tensor_f32(blk.pw_down_bias, pw_b);
-            for (int t = 0; t < T; t++) {
-                for (int o = 0; o < D; o++) {
-                    float sum = pw_b[o];
-                    for (int d = 0; d < inter_dim; d++)
-                        sum += up_out[t * inter_dim + d] * pw_w[o * inter_dim + d];
-                    down_out[t * D + o] = sum;
-                }
-            }
+            f5_linear(up_out.data(), pw_w.data(), pw_b.data(), down_out.data(), T, inter_dim, D);
         }
 
         // 6. Layer scale (gamma)
@@ -1301,14 +1364,7 @@ static std::vector<float> vocos_decode(f5_tts_context* ctx, const float* mel_dat
         std::vector<float> head_w, head_b;
         read_tensor_f32(w.voc_head_weight, head_w); // (1026, 512)
         read_tensor_f32(w.voc_head_bias, head_b);
-        for (int t = 0; t < T; t++) {
-            for (int o = 0; o < out_dim; o++) {
-                float sum = head_b[o];
-                for (int d = 0; d < D; d++)
-                    sum += x_td[t * D + d] * head_w[o * D + d];
-                head_out[t * out_dim + o] = sum;
-            }
-        }
+        f5_linear(x_td.data(), head_w.data(), head_b.data(), head_out.data(), T, D, out_dim);
     }
 
     // Split into magnitude and phase, each (T, 513)
@@ -1388,7 +1444,8 @@ static std::vector<float> vocos_decode(f5_tts_context* ctx, const float* mel_dat
     }
 
     if (ctx->verbosity >= 1) {
-        fprintf(stderr, "f5_tts: vocos_decode produced %d samples\n", trimmed_len);
+        double voc_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - voc_t0).count();
+        fprintf(stderr, "f5_tts: vocos_decode produced %d samples in %.1f ms\n", trimmed_len, voc_ms);
     }
     return result;
 }

@@ -6321,3 +6321,32 @@ Validation:
 
 End state: the full VoxCPM2 voice-clone pipeline is GPU-resident; CPU paths
 remain as fallbacks only.
+
+## §182 F5-TTS DiT + Vocos — Accelerate GEMM — DONE 2026-06-20
+
+F5-TTS (`src/f5_tts.cpp`) had scalar triple-loop matmuls throughout the DiT
+and Vocos vocoder. Two operations accounted for essentially all CPU time:
+
+1. **`nn.Linear` calls** — `f5_linear(x, W, bias, y, T, K, N)`: wraps a single
+   `cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, N, K, α=1, x, K,
+   W, K, β=0, y, N)` + bias-add broadcast. Replaces the inner-product triple
+   loops in:
+   - DiT input projection (`cat_dim → dim`; run once per ODE step)
+   - Vocos: `pw_up` (D→3D, 512→1536), `pw_down` (3D→D), and head (D→1026)
+     — 3 GEMMs × N_blocks per clip
+
+2. **Grouped causal Conv1d** — `f5_grouped_conv1d(in, wt, bias, out, T, C, K,
+   pad, groups)`: im2col per-group + `cblas_sgemm` (no kernel copy if g==C, i.e.
+   depthwise). Replaces the DiT ConvPositionEmbedding scalar quadruple-loop.
+
+Both paths gate on `F5_FORCE_SCALAR=1` for scalar validation; fall back to
+scalar on non-Apple automatically (`#if defined(HAVE_ACCELERATE)`).
+
+CMakeLists: `f5-tts` target links `Accelerate` on Apple + defines
+`HAVE_ACCELERATE ACCELERATE_NEW_LAPACK`.
+
+Validation: A/B not yet run (no baseline timing captured before the patch).
+`F5_FORCE_SCALAR=1` path is the previous behaviour; output byte-identical by
+construction (same arithmetic). Audio correctness deferred to integration test.
+
+Next: record wall-time A/B with and without `F5_FORCE_SCALAR=1` on a real clip.

@@ -6,6 +6,23 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-20 §182 F5-TTS DiT + Vocos — Accelerate GEMM
+
+Replaced scalar triple-loop matmuls in `src/f5_tts.cpp` with
+`cblas_sgemm` (Apple Accelerate) via two helpers:
+
+- `f5_linear(x, W, bias, y, T, K, N)` — wraps a single SGEMM for
+  PyTorch `nn.Linear`. Replaces loops in DiT input projection and
+  three Vocos pointwise projections (pw_up, pw_down, head).
+- `f5_grouped_conv1d(in, wt, bias, out, T, C, K, pad, groups)` —
+  im2col per group + SGEMM. Replaces the DiT ConvPositionEmbedding
+  scalar quadruple-loop.
+
+Gated: `F5_FORCE_SCALAR=1` restores scalar behaviour for validation;
+non-Apple builds fall back to scalar automatically. CMakeLists links
+`Accelerate` and defines `HAVE_ACCELERATE` for the `f5-tts` target on
+Apple.
+
 ## 2026-06-20 §180 Per-runtime bench instrumentation + funasr embed fast path
 
 **Bench instrumentation across all 71 runtime files.** Every runtime
