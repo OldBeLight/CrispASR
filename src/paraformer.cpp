@@ -326,8 +326,9 @@ static std::vector<float> paraformer_compute_features(paraformer_context* ctx, c
     // CMVN: x = (x + shift) * scale (AddShift + Rescale)
     if (ctx->model.cmvn_shift && ctx->model.cmvn_scale) {
         const size_t cmvn_sz = ggml_nbytes(ctx->model.cmvn_shift);
-        fprintf(stderr, "paraformer: CMVN shift nbytes=%zu, D_lfr=%d, expect=%zu\n", cmvn_sz, D_lfr,
-                (size_t)D_lfr * sizeof(float));
+        if (ctx->verbosity >= 2)
+            fprintf(stderr, "paraformer: CMVN shift nbytes=%zu, D_lfr=%d, expect=%zu\n", cmvn_sz, D_lfr,
+                    (size_t)D_lfr * sizeof(float));
         std::vector<float> shift_v((size_t)D_lfr);
         std::vector<float> scale_v((size_t)D_lfr);
         ggml_backend_tensor_get(ctx->model.cmvn_shift, shift_v.data(), 0, D_lfr * sizeof(float));
@@ -687,11 +688,13 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
                 ggml_free(ctx0);
             return "";
         }
-        fprintf(stderr, "paraformer: encoder input OK: T_lfr=%d, D_lfr=%d, bytes=%zu\n", T_lfr, D_lfr_actual,
-                lfr_bytes);
+        if (ctx->verbosity >= 2)
+            fprintf(stderr, "paraformer: encoder input OK: T_lfr=%d, D_lfr=%d, bytes=%zu\n", T_lfr, D_lfr_actual,
+                    lfr_bytes);
         ggml_backend_tensor_set(inp, lfr.data(), 0, lfr_bytes);
     }
-    fprintf(stderr, "paraformer: running encoder graph...\n");
+    if (ctx->verbosity >= 2)
+        fprintf(stderr, "paraformer: running encoder graph...\n");
     {
         paraformer_bench_stage _b("encoder");
         if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
@@ -700,7 +703,8 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
             return "";
         }
     }
-    fprintf(stderr, "paraformer: encoder done\n");
+    if (ctx->verbosity >= 2)
+        fprintf(stderr, "paraformer: encoder done\n");
 
     // Extract encoder output
     ggml_tensor* enc_result = ggml_graph_get_tensor(gf, "encoder_output");
@@ -711,8 +715,10 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     }
     const size_t enc_bytes = ggml_nbytes(enc_result);
     const size_t enc_expect = (size_t)D * T_lfr * sizeof(float);
-    fprintf(stderr, "paraformer: enc_result ne=(%lld, %lld), type=%d, nbytes=%zu, expect=%zu\n",
-            (long long)enc_result->ne[0], (long long)enc_result->ne[1], (int)enc_result->type, enc_bytes, enc_expect);
+    if (ctx->verbosity >= 2)
+        fprintf(stderr, "paraformer: enc_result ne=(%lld, %lld), type=%d, nbytes=%zu, expect=%zu\n",
+                (long long)enc_result->ne[0], (long long)enc_result->ne[1], (int)enc_result->type, enc_bytes,
+                enc_expect);
     if (enc_bytes < enc_expect) {
         fprintf(stderr, "paraformer: encoder_output size mismatch: got %zu, expected %zu (D=%d, T=%d)\n", enc_bytes,
                 enc_expect, D, T_lfr);
@@ -764,7 +770,8 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     if (out_fire_frames)
         *out_fire_frames = std::move(fire_frames_vec);
 
-    fprintf(stderr, "paraformer: CIF predicted %d tokens from T_lfr=%d\n", N_tokens, T_lfr);
+    if (ctx->verbosity >= 1)
+        fprintf(stderr, "paraformer: CIF predicted %d tokens from T_lfr=%d\n", N_tokens, T_lfr);
     if (N_tokens <= 0)
         return "";
 
