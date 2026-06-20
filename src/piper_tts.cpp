@@ -613,6 +613,12 @@ struct piper_tts_context {
     int verbosity;
     int n_threads;
     std::string dump_dir; // if non-empty, dump intermediates for diff harness
+
+    // Pre-cached F32 weight data. Populated at init to avoid repeated
+    // ggml_backend_tensor_get + dequant on every synthesis call.
+    // Gated by CRISPASR_PIPER_WEIGHT_CACHE (default ON).
+    std::unordered_map<ggml_tensor*, std::vector<float>> weight_cache;
+    bool weight_cache_enabled = true;
 };
 
 // ── Diff harness: dump intermediate tensors to binary files ────────
@@ -696,8 +702,23 @@ struct mini_graph {
 } // namespace
 
 // ── Tensor read helper (handles F16→F32 conversion) ───────────────
+// When g_piper_ctx is set and its weight_cache contains t, the cached
+// F32 data is returned directly (no backend round-trip or dequant).
+// g_piper_ctx is set at the top of each synthesize call and cleared
+// on return — safe because piper synthesis is single-threaded.
+
+static piper_tts_context* g_piper_ctx = nullptr;
 
 static void read_tensor_f32(ggml_tensor* t, std::vector<float>& out) {
+    // Fast path: return pre-cached F32 data if available.
+    if (g_piper_ctx && g_piper_ctx->weight_cache_enabled) {
+        auto it = g_piper_ctx->weight_cache.find(t);
+        if (it != g_piper_ctx->weight_cache.end()) {
+            out = it->second;
+            return;
+        }
+    }
+
     const int64_t n = ggml_nelements(t);
     out.resize(n);
     const size_t nbytes = ggml_nbytes(t);
@@ -2231,6 +2252,39 @@ struct piper_tts_context* piper_tts_init_from_file(const char* path_model, struc
     ctx->speaker_id = params.speaker_id;
     ctx->espeak_voice = ctx->hp.espeak_voice;
 
+    // Pre-cache all weights as F32 to avoid repeated backend_tensor_get +
+    // dequant on every synthesis call. Gated by CRISPASR_PIPER_WEIGHT_CACHE
+    // (default ON). Cost: ~2× model RAM (30 MB F16 → +60 MB F32 cache).
+    {
+        const char* env = std::getenv("CRISPASR_PIPER_WEIGHT_CACHE");
+        ctx->weight_cache_enabled = (!env || *env != '0');
+    }
+    if (ctx->weight_cache_enabled && ctx->w_ctx) {
+        int n_cached = 0;
+        size_t bytes_cached = 0;
+        // Walk all tensors in the weight context and cache them as F32.
+        for (ggml_tensor* t = ggml_get_first_tensor(ctx->w_ctx); t; t = ggml_get_next_tensor(ctx->w_ctx, t)) {
+            const int64_t n = ggml_nelements(t);
+            std::vector<float> f32(n);
+            const size_t nbytes = ggml_nbytes(t);
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(t, f32.data(), 0, nbytes);
+            } else {
+                std::vector<uint8_t> raw(nbytes);
+                ggml_backend_tensor_get(t, raw.data(), 0, nbytes);
+                const auto to_float = ggml_get_type_traits(t->type)->to_float;
+                if (to_float)
+                    to_float(raw.data(), f32.data(), n);
+            }
+            bytes_cached += n * sizeof(float);
+            ctx->weight_cache[t] = std::move(f32);
+            n_cached++;
+        }
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "piper_tts: cached %d tensors (%.1f MB F32) for fast CPU path\n", n_cached,
+                    (double)bytes_cached / (1024.0 * 1024.0));
+    }
+
     if (ctx->verbosity >= 1) {
         fprintf(stderr,
                 "piper_tts: loaded %s (hidden=%u, enc=%u layers, "
@@ -2283,6 +2337,9 @@ int piper_tts_synthesize_phonemes(struct piper_tts_context* ctx, const char* ipa
                                   int* sample_rate_out) {
     if (!ctx || !ipa_phonemes || !pcm_out)
         return 0;
+
+    // Set module-level context for read_tensor_f32 cache lookup.
+    g_piper_ctx = ctx;
 
     piper_tts_bench_stage _bs_synth("synthesize");
 
@@ -2378,6 +2435,7 @@ int piper_tts_synthesize_phonemes(struct piper_tts_context* ctx, const char* ipa
     {
         piper_tts_bench_stage _bs("hifigan_decode");
         if (!hifigan_decode(ctx, z, T_latent, pcm)) {
+            g_piper_ctx = nullptr;
             return 0;
         }
     }
@@ -2396,6 +2454,7 @@ int piper_tts_synthesize_phonemes(struct piper_tts_context* ctx, const char* ipa
                 ctx->hp.sample_rate);
     }
 
+    g_piper_ctx = nullptr;
     return n_samples;
 }
 
