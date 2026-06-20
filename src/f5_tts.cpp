@@ -533,6 +533,9 @@ static std::vector<std::string> convert_to_pinyin(const std::string& text) {
     return chars;
 }
 
+// Forward declaration (defined after FFT helpers, used here for text encoder ConvNeXt blocks)
+static void f5_linear(const float* x, const float* W, const float* bias, float* y, int T, int K, int N);
+
 // ── Text Encoder (embedding + sinusoidal pos + ConvNeXtV2 blocks) ─
 
 static std::vector<float> compute_text_embed(f5_tts_context* ctx, const int32_t* tokens, int n_tokens, int seq_len) {
@@ -644,16 +647,8 @@ static std::vector<float> compute_text_embed(f5_tts_context* ctx, const int32_t*
         }
 
         // 3. Pointwise up: (T, D) × (inter_dim, D)^T → (T, inter_dim)
-        std::vector<float> up_out(T * inter_dim, 0.0f);
-        for (int t = 0; t < T; t++) {
-            for (int o = 0; o < inter_dim; o++) {
-                float sum = pw_up_b[o];
-                for (int d = 0; d < D; d++) {
-                    sum += conv_out[t * D + d] * pw_up_w[o * D + d];
-                }
-                up_out[t * inter_dim + o] = sum;
-            }
-        }
+        std::vector<float> up_out(T * inter_dim);
+        f5_linear(conv_out.data(), pw_up_w.data(), pw_up_b.data(), up_out.data(), T, D, inter_dim);
 
         // 4. GELU (exact: x * 0.5 * (1 + erf(x/sqrt(2))))
         for (auto& v : up_out) {
@@ -691,16 +686,8 @@ static std::vector<float> compute_text_embed(f5_tts_context* ctx, const int32_t*
         }
 
         // 6. Pointwise down: (T, inter_dim) × (D, inter_dim)^T → (T, D)
-        std::vector<float> down_out(T * D, 0.0f);
-        for (int t = 0; t < T; t++) {
-            for (int o = 0; o < D; o++) {
-                float sum = pw_down_b[o];
-                for (int d = 0; d < inter_dim; d++) {
-                    sum += up_out[t * inter_dim + d] * pw_down_w[o * inter_dim + d];
-                }
-                down_out[t * D + o] = sum;
-            }
-        }
+        std::vector<float> down_out(T * D);
+        f5_linear(up_out.data(), pw_down_w.data(), pw_down_b.data(), down_out.data(), T, inter_dim, D);
 
         // 7. Residual
         for (int i = 0; i < T * D; i++) {

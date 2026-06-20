@@ -9262,3 +9262,14 @@ attention loops. Applied the same three cblas_sgemm paths (QKV projections,
 per-head Q@K^T scores, per-head attn@V accumulation) with relative key/value
 biases staying scalar. `PIPER_FORCE_SCALAR=1` to bypass. All 4 piper unit
 tests pass.
+
+## 2026-06-20 §200 F5-TTS text encoder — ConvNeXt pointwise projections via f5_linear
+
+`compute_text_embed` in `f5_tts.cpp` had scalar O(T×D×inter_dim) triple loops
+for the pw_up and pw_down pointwise projections in each of the 4 ConvNeXtV2
+blocks (D=512, inter_dim=1024). The Vocos ConvNeXt blocks already used
+`f5_linear` (which calls `cblas_sgemm` with CblasTrans on W). The text encoder
+uses the same weight layout — `W[n*K + k]` row-major — so the same substitution
+applies: replaced both scalar loops with `f5_linear` calls. Added a forward
+declaration before `compute_text_embed` since `f5_linear` is defined later in
+the file. All 699 unit tests pass.

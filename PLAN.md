@@ -5501,7 +5501,7 @@ backends at long output sequences.
 - OpenVoice2 WaveNet: 16 layers × T × K=5 × C=192 → ggml_conv_1d
 - Granite Speech `cpu_linear`: naive dequant matmul → ggml or OMP
 - Nemotron LSTM/joint: same pattern as Parakeet
-- F5-TTS Vocos + text encoder: ConvNeXt matmuls → ggml
+- F5-TTS text encoder ConvNeXt pw_up/pw_down: DONE — replaced O(T×D×inter_dim) scalar loops with f5_linear (cblas_sgemm) calls (§200 2026-06-20); Vocos blocks were already using f5_linear
 **Impact:** These are the dominant compute paths in their respective
 runtimes and currently run as unvectorized nested loops.
 
