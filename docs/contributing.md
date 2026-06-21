@@ -423,7 +423,18 @@ not just M1.
   `ggml_backend_graph_compute(ctx->backend, gf)` instead of the scheduler — a
   single-backend graph never inserts the broken copy. (Pinning the input with
   `set_tensor_backend` or `op_offload=true` did **not** help; only avoiding the
-  split did.)
+  split did.) Fixed lfm2-audio (§206) and kugelaudio (§209), which share this bug.
+- **Mixing gallocr and sched when one graph has a Metal-unsupported op.** If most
+  graphs need the gallocr fix above but ONE uses an op the active backend can't run
+  (kugelaudio's VAE decoder uses `ggml_pad` — the causal-conv left-pad — which Metal
+  rejects), gallocr has no fallback and aborts (`unsupported op 'PAD'`). Keep that
+  one graph on `ggml_backend_sched` (which falls back to CPU for the unsupported op;
+  on CUDA `PAD` is supported, so it runs fully on GPU) and run the rest on gallocr.
+  This is safe as long as the sched-routed graph's *first* op uses a weight (input
+  lands on GPU) — only the leaf-input + weight-less-first-op combo triggers the
+  broken cross-backend copy; mid-graph CPU splits are fine. (A `ggml_concat`-of-a-
+  scaled-view "manual pad" to avoid `GGML_OP_PAD` fails when pad > input length —
+  you can't build zeros wider than the source view.)
 
 ## Watermarking tests
 
