@@ -10,7 +10,7 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
-## Localizing a GPU miscompute with CPU-vs-Metal diffing, and when to just default to CPU (§206)
+## Localizing a GPU miscompute with CPU-vs-Metal diffing — the ggml_backend_sched weight-less-first-op trap (§206)
 
 lfm2-audio transcribed garbage on Metal but was bit-correct on CPU. Technique to
 localize a "works on CPU, garbage on GPU" backend, entirely on an M1 (no CUDA):
@@ -44,13 +44,30 @@ sub-step (after-norm, after-operator, after-residual) so the early-return value
 *is* the output, not a snapshot. This pinned lfm2's divergence to the very first
 layer and showed it tracks **weight-reading ops** (the norm-weight broadcast
 `ggml_mul` and Q5_K `mul_mat`s) while weightless `ggml_rms_norm` matches exactly.
-What this *ruled out* (each a real experiment, not a guess): the im2col depthwise
-conv (an explicit shift-add reimplementation gave identical divergence), the
-shared scheduler (a fresh per-call sched was worse — all zeros), and weight
-placement (`load_weights` puts everything on one GPU buffer). The root cause is a
-deep ggml-Metal issue, still open. Use the published PyTorch ref
-(`cstr/crispasr-regression-fixtures` `lfm2-audio-1.5b/jfk_11s/ref.gguf`) +
-`CRISPASR_DIFF_USE_GPU=1` to continue.
+What this *ruled out* (each a real experiment): the im2col depthwise conv (an
+explicit shift-add gave identical divergence), the shared scheduler, weight
+placement, and every op in isolation (rms_norm, broadcast-mul, Q5_K mul_mat,
+even a full short_conv replica — all cos≈1.0 on Metal).
+
+**ROOT CAUSE — `ggml_backend_sched` + a weight-less first op.** `GGML_SCHED_DEBUG=2`
+showed the input `ao_in [CPU]` and `node_0 (RMS_NORM) [CPU]`, then a `MTL0#ao_in#0`
+copy feeding the next op on Metal. The backbone's leading op is a *weight-less*
+RMSNorm, so the scheduler (op_offload=false) placed it AND the leaf input on the
+CPU backend, then inserted a CPU→GPU copy of the activation — and on this ggml
+revision that cross-backend copy is miscomputed, corrupting the whole backbone.
+The encoder/adapter were fine because their first op uses a weight, keeping the
+input on the GPU. The standalone op tests falsely passed because the sched ran
+the weight-less ops on CPU for *both* the CPU and Metal runs (so they trivially
+matched) — **always confirm with `GGML_SCHED_DEBUG` which backend each op actually
+ran on; a "Metal" sched run may be computing on CPU.**
+
+**FIX:** when a whole subgraph is supported on the active backend, compute it
+*directly* on `ctx->backend` with `ggml_gallocr` + `ggml_backend_graph_compute`
+instead of `ggml_backend_sched`. A single-backend graph never inserts the broken
+cross-backend copy. (Pinning the input with `set_tensor_backend` or op_offload=true
+did NOT help — the copy persisted; only avoiding the split entirely worked.) Use
+the published PyTorch ref (`cstr/crispasr-regression-fixtures`
+`lfm2-audio-1.5b/jfk_11s/ref.gguf`) + `CRISPASR_DIFF_USE_GPU=1` to re-validate.
 
 **When you can't crack it: default to CPU.** If the GPU path is broken end-to-end
 and CPU is correct + fast enough, force the backend to CPU

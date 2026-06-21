@@ -726,13 +726,17 @@ mistakes, not bugs**, leaving **7 genuine failures** (+1 pending). Of those 7,
   `backend_cpu`; channel-major `convt1d_decomp` on a time-major input). Both
   validated on M1 Metal. CUDA re-test pending. Full write-up in HISTORY §204.
 
-**RESOLVED — lfm2-audio defaulted to CPU (HISTORY §206):**
-- ✅ **lfm2-audio** (ASR) — fixed by `a046225a`. Two GPU bugs: embed lookups
-  crashed on CUDA (device-ptr deref, like §204), and the hybrid ShortConv+GQA
-  backbone produces garbage logits on Metal/CUDA (CPU is bit-correct). Not
-  localized to one op, so the backend now defaults to CPU (verified verbatim ASR;
-  `CRISPASR_LFM2_AUDIO_GPU=1` opts into the still-broken GPU path). On CUDA it now
-  runs on CPU → no crash, correct output. Proper GPU-backbone fix still open.
+**RESOLVED — lfm2-audio GPU backbone fixed (HISTORY §206):**
+- ✅ **lfm2-audio** (ASR) — fully fixed. The crash was embed lookups on CUDA
+  (device-ptr deref, like §204). The garbage was the ROOT CAUSE found via the
+  diff harness + GGML_SCHED_DEBUG (`63d4c013`): the backbone's weight-less leading
+  RMSNorm made `ggml_backend_sched` put the input + first op on CPU and feed the
+  GPU a miscomputed cross-backend copy. Fix: compute the backbone directly on
+  ctx->backend via gallocr (single-backend, no copy) in `backbone_step` + `run_lfm`.
+  GPU transcribes JFK verbatim; GPU diff matches the PyTorch ref like CPU.
+  **GPU is default again**; `CRISPASR_LFM2_AUDIO_CPU=1` forces CPU. PyTorch ref +
+  GPU diff (`CRISPASR_DIFF_USE_GPU=1`) shipped. Follow-up: GPU-decode graph caching
+  (AR decode is currently dispatch-bound, GPU ~slower than CPU on JFK).
 
 **GENUINE bugs — fail on CUDA even with correct args (TODO):**
 - [ ] **orpheus** (TTS) — 0-byte (~17 s) with `--voice tara`. Llama-3.2 + SNAC.

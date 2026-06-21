@@ -48,11 +48,30 @@ shift-add reimplementation gave identical divergence), scheduler sharing (a
 fresh per-call sched produced all-zeros — worse), and weight placement (all
 weights on one GPU buffer). The divergence tracks **weight-reading ops** (the
 norm-weight broadcast `ggml_mul` and the Q5_K `mul_mat`s) while weightless
-`rms_norm` matches CPU exactly — pointing at a deep ggml-Metal issue, still not
-isolated. Caveat that cost time: per-intermediate `ggml_set_output` snapshots are
-**unreliable under the Metal sched** (they read cos=1.0 even when the real
-forward is garbage); only the graph's final output is trustworthy — bisect with
-layer truncation on the *output*, not snapshots.
+`rms_norm` matches CPU exactly.
+
+**ROOT CAUSE + FIX (`63d4c013`).** Cracked it with `GGML_SCHED_DEBUG=2` and a
+standalone ggml repro. The LFM backbone's leading op is a **weight-less
+RMSNorm**, so `ggml_backend_sched` (op_offload=false) assigned that op *and the
+leaf input tensor* to the **CPU** backend (`ao_in [CPU]`), then inserted a
+CPU→GPU copy (`MTL0#ao_in#0`) to feed the next, weight-using op on Metal — and
+on this ggml revision that cross-backend copy is miscomputed, so the whole
+backbone produced garbage on GPU while CPU stayed bit-correct. The
+encoder/adapter were spared because *their* first op uses a weight, keeping the
+input on the GPU. (The standalone op tests had falsely "passed" because the
+sched silently ran the weight-less ops on CPU for *both* the CPU and Metal runs,
+trivially matching.) **Fix:** compute the backbone graph directly on
+`ctx->backend` via `ggml_gallocr` + `ggml_backend_graph_compute` instead of the
+scheduler — the entire backbone is supported on the active backend (Metal &
+CUDA), so a single-backend graph never inserts the broken copy. Applied to
+`backbone_step` (ASR/TTS/S2S) and `run_lfm`. GPU now transcribes JFK verbatim and
+the GPU diff matches the PyTorch ref identically to CPU. **GPU is the default
+again**; `CRISPASR_LFM2_AUDIO_CPU=1` forces CPU (AR decode is dispatch-bound and
+can run faster on CPU; GPU-decode graph-caching is a perf follow-up). Lesson that
+cost the most time: per-intermediate `ggml_set_output` snapshots are unreliable
+on the Metal sched (read cos=1.0 while the real forward is garbage) — bisect on
+the genuine truncated *output*, and check `GGML_SCHED_DEBUG` for stray `[CPU]`
+ops + `#copy#` nodes before blaming a kernel.
 
 ## 2026-06-21 §205 Chatterbox CUDA crash — non-power-of-two FFT heap overflow + q8/Metal CFM NaN
 
