@@ -176,7 +176,7 @@ makes long utterances slower). Validate + flip to default on CUDA.
 **Validation (crispasr-diff vs F32 PyTorch ground truth).** Generated a
 parler reference (`tools/dump_reference.py --backend parler-tts`, greedy,
 seed 42) and ran `crispasr-diff parler-tts` with the bucket path off and on
-(reference at `hf.co/datasets/cstr/crispasr-diff-refs/parler-tts-ref.gguf`):
+(reference at `hf.co/cstr/parler-tts-mini-v1.1-GGUF/parler-mini-v1.1-ref.gguf`):
 - **F16: legacy 108/108 (100%) PASS, bucket 108/108 (100%) PASS** — the port
   matches PyTorch exactly and the bucket is bit-identical to both legacy and
   ground truth over the gen_codes_20 window.
