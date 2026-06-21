@@ -9489,7 +9489,10 @@ crash.)
 
 **Validation.** cstr/fastpitch-en-GGUF q8_0 on M1 Metal: GPU and CPU outputs are
 byte-identical and ASR-roundtrip verbatim ("The quick brown fox jumps over the
-lazy dog."). SpeechT5 shares the fixed code path; its M1 e2e re-test was blocked
-by a truncated local `speecht5-tts-f16.gguf` (load-time mmap-bounds failure,
-unrelated) — CUDA re-test of speecht5 still pending. Worktree:
+lazy dog."). SpeechT5 shares the fixed code path and was **also validated on M1
+Metal** (after re-downloading the f16 GGUF — the local copy was truncated): GPU
+and CPU both synthesise and ASR-roundtrip intelligibly ("the quick brown fox
+jumps over lazy dog"), where pre-fix it aborted 0-byte. SpeechT5 is
+autoregressive so GPU≠CPU bit-for-bit, but both give the same 28160-sample
+output and transcript. CUDA re-test of speecht5 still pending. Worktree:
 `/Volumes/backups/code/fastpitch-cuda-stash`.

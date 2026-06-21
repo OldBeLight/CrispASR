@@ -724,9 +724,10 @@ mistakes, not bugs**, leaving **7 genuine failures** (+1 pending):
 - [x] **speecht5** (TTS) — FIXED (shared `core_hifigan` fix, commit `69dc1789`,
   §204). Same latent HiFi-GAN ConvTranspose layout bug as fastpitch below — both
   pass `ups_w_perm` and feed time-major `mel_in=(T_mel, n_mel)`, so the code path
-  is identical to the fastpitch fix. CUDA re-test still pending (local
-  `speecht5-tts-f16.gguf` is truncated → load-time mmap-bounds failure blocked
-  the M1 e2e re-test).
+  is identical to the fastpitch fix. **Validated on M1 Metal** (re-downloaded
+  cstr/speecht5-tts-GGUF f16): GPU + CPU both synthesise, ASR roundtrip
+  intelligible ("the quick brown fox jumps over lazy dog"); pre-fix it aborted
+  0-byte. CUDA re-test pending.
 - [x] **fastpitch** (TTS) — FIXED (commit `69dc1789`, §204). Two Metal-masked
   bugs: (1) decoder+vocoder graphs were `sched_alloc`'d then computed on
   `backend_cpu` → GPU device-ptr deref (CUDA-only crash); (2) `core_hifigan`
