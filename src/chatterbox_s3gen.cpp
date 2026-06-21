@@ -294,13 +294,17 @@ struct chatterbox_s3gen_context {
     bool unet_on_gpu = false;
 
     // Set at load time on Metal when the CFM (s3.fd.*) weights are quantized.
-    // The Metal q8 CFM compounds F16-precision error through the 10-step Euler
-    // solver into NaN (the GGML_PREC_F32 mul_mat hints are not enough — non-
-    // mul_mat ops still accumulate in F16). Routing the CFM to CPU restores
-    // finite, reference-matching mel (F16 s3gen stays GPU-resident). CUDA is
-    // not affected (PLAN #83 validated GPU+PREC_F32 to cos 1.0 on P100), so
-    // this is gated to Metal builds. Opt back onto GPU with
-    // CRISPASR_S3GEN_UNET_CPU=0.
+    // Metal's q8_0 mat-vec kernel (kernel_quantize_q8_0_f32 +
+    // kernel_mul_mv_q8_0_q8_0) requantizes the F32 activations to q8_0 and does
+    // q8×q8, ignoring the GGML_PREC_F32 hint mul_mat_hp() sets — corrupting the
+    // CFM (NaN on the batch=2 fused CFG graph at the very first Euler step;
+    // finite-but-garbage on the batch=1 path). It is NOT a 10-step accumulation.
+    // CPU dequantizes q8→F32 and computes F32×F32 (correct), so routing the CFM
+    // to CPU restores intelligible mel; F16 s3gen stays GPU-resident (it takes
+    // the correct mul_mm_f16_f32_hp path). CUDA is unaffected (PLAN #83 validated
+    // GPU+PREC_F32 to cos 1.0 on P100), so this is gated to Metal builds. Opt
+    // back onto GPU with CRISPASR_S3GEN_UNET_CPU=0. (A GPU-keeping alternative
+    // would be to dequantize s3.fd.* to F16 at load on Metal.)
     bool force_unet_cpu = false;
 
 
@@ -640,9 +644,9 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
         const bool unet_cpu_env_off =
             unet_cpu_env && (unet_cpu_env[0] == '0' || unet_cpu_env[0] == 'n' || unet_cpu_env[0] == 'N');
 #ifdef GGML_USE_METAL
-        // Auto-route a quantized CFM to CPU on Metal: the q8 s3.fd.* weights make
-        // the Metal CFM compound F16-precision error into NaN over the 10 Euler
-        // steps (mul_mat F32 hints are not enough). See force_unet_cpu comment.
+        // Auto-route a quantized CFM to CPU on Metal: Metal's q8 mat-vec kernel
+        // requantizes the CFM activations to q8 (corrupting the flow-matcher —
+        // NaN/garbage), which CPU dequant→F32 avoids. See force_unet_cpu comment.
         if (!unet_cpu_env_off && c->backend != c->backend_cpu && s3gen_cfm_is_quantized(path)) {
             c->force_unet_cpu = true;
             if (verbosity >= 1) {

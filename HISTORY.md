@@ -50,22 +50,34 @@ M1 Metal** (`conv_pre rms=nan`; the `STFT range [1e30,0]` is just the
 uninitialised `stft_min` sentinel — every vocoder value is NaN). Pre-existing
 (the unfixed baseline NaNs identically), absent with F16 s3gen.
 
-Bisected with the `CRISPASR_S3GEN_*_CPU` / `UNET_*_OP` levers:
-- It's the **CFM (UNet1D) Metal compute**, not the vocoder (`UNET_CPU=1` →
-  clean) and not the q8 *data* (CPU dequant → clean, reference-matching mel).
-- It's a **compound F16-precision** failure: `mul_mat` is already CPU-pinned
-  for F32 accumulation, yet it still NaNs; per-op bisects exonerate
-  `flash_attn_ext` and `mish` individually. The q8 quantisation noise inflates
-  intermediate magnitudes enough that the F16 accumulation in the remaining
-  Metal ops compounds to NaN across the 10-step Euler solver.
+**Properly diagnosed (an earlier write-up wrongly called this "compound F16
+accumulation" — it is not).** Instrumented with `CRISPASR_S3GEN_DUMP=1`
+(per-Euler-step `x_rms`) + the compiled-Metal-pipeline log:
+- **Single-pass, not compounding.** The **first** Euler step is already NaN
+  (`CFM step 1/10 x_rms=nan`) — one UNet forward emits it, no 10-step build-up.
+- **Not a split-count effect.** F16 (clean) and q8 (NaN) both report
+  `n_splits=31` for the same b2 graph.
+- **It's the Metal q8 mul_mat, mat-vec path.** The q8 run compiles
+  `kernel_quantize_q8_0_f32` + `kernel_mul_mv_q8_0_q8_0` — Metal **requantises
+  the F32 activation to q8_0 and does q8×q8**, ignoring the `GGML_PREC_F32` that
+  `mul_mat_hp()` sets. F16 compiles only `kernel_mul_mm_f16_f32_hp` (f16×f32,
+  F32 accum). So q8-GPU is wrong while F16-GPU and q8-CPU (dequant→F32) are
+  correct — the activation requant is the q8-GPU-only defect.
+- **Batch shape decides NaN vs garbage.** The default cond+uncond **batch=2
+  fused CFG graph** NaNs; the batch=1 single-pass path
+  (`CRISPASR_S3GEN_UNET_CFG_SINGLE=1`) is *finite but unintelligible* on q8-GPU
+  (`conv_pre rms` ~2× ref, ASR → ∅). Same root cause, different blow-up.
 
 Fix: `s3gen_cfm_is_quantized()` peeks GGUF tensor types for a quantized
 `s3.fd.*`; on **Metal builds** (`#ifdef GGML_USE_METAL`) a quantized CFM on GPU
-is auto-routed to CPU (`force_unet_cpu`) — the validated-clean residency. F16
-s3gen stays GPU-resident; CUDA is untouched (PLAN #83 validated GPU+PREC_F32 to
-cos 1.0 on P100, so the crash fix alone should let the q8 sweep pass there).
-Override with `CRISPASR_S3GEN_UNET_CPU=0`. Result: q8 default-config synth
-produces finite, reference-matching audio (`conv_pre rms≈3.4`).
+is auto-routed to CPU (`force_unet_cpu`) so the q8 weights are dequantised to
+F32 and never hit the Metal q8 GEMV. F16 s3gen stays GPU-resident; CUDA is
+untouched (PLAN #83 validated GPU+PREC_F32 to cos 1.0 on P100, so the crash fix
+alone should let the q8 sweep pass there). Override with
+`CRISPASR_S3GEN_UNET_CPU=0`. Result: q8 default-config synth produces finite,
+intelligible audio (`conv_pre rms≈3.4`, ASR roundtrip recognisable). A future
+GPU-keeping alternative: dequantise `s3.fd.*` to F16 at load on Metal so it
+takes the correct `mul_mm_f16_f32_hp` path.
 
 Open: confirm on a Kaggle CUDA re-run that q8 chatterbox (the sweep default)
 produces good audio there with the FFT fix (the Metal CFM route is M1-only).

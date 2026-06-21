@@ -36,27 +36,46 @@ bit-identical. Audit rule: **any `core_mel::compute` caller passing
 `fft_radix2_wrapper` must use a power-of-two `p.n_fft`** — grep the call sites
 when adding a backend. See [[project_tts_gpu_cuda_crash_patterns]].
 
-## A Metal kernel can NaN on quantized weights where it only drifts on F16 (§205)
+## Metal's q8_0 mat-vec kernel requantizes activations to q8 and ignores the F32 prec hint (§205)
 
-Chatterbox's S3Gen CFM (the flow-matching UNet1D) produces **all-NaN mel on
-M1 Metal with q8 weights** but is clean with F16. It is **not** the q8 data
-(forcing the CFM to CPU dequantizes the same q8 weights and yields finite,
-reference-matching output) and **not** the vocoder (`CRISPASR_S3GEN_VOCODER_CPU`
-is irrelevant; `UNET_CPU=1` is what fixes it). It is a **compound F16
-accumulation** failure: q8 quantization noise inflates intermediate magnitudes,
-and the GPU's F16-accumulating non-`mul_mat` ops (norm/conv/activation) compound
-that over the 10-step Euler solver until it overflows to NaN. The existing
-`mul_mat`→CPU pin (the F32-precision lever) is *not enough*, and bisecting with
-`CRISPASR_S3GEN_UNET_PIN_CPU_OP=<op>` / `..._KEEP_GPU_OP=<op>` exonerates
-`flash_attn_ext` and `mish` individually — no single op is the culprit. The
-robust fix is residency: detect a quantized CFM (peek GGUF tensor types for
-`s3.fd.*` via `open_metadata`) and, on Metal builds only, route the whole UNet
-to CPU; CUDA keeps GPU residency (PLAN #83 validated GPU+`GGML_PREC_F32` to
-cos 1.0 on P100). Lesson: a per-op precision hint (`ggml_mul_mat_set_prec`,
-`ggml_flash_attn_ext_set_prec`) only covers the op it tags; for a deep
-GPU subgraph that compounds F16 error under quantization, whole-subgraph CPU
-residency is the reliable fix, and it's worth gating to the affected backend
-(Metal) so you don't tax the platform that's actually fine.
+Chatterbox's S3Gen CFM (flow-matching UNet1D) produces **all-NaN mel on M1
+Metal with q8 weights** but is clean with F16 — and the temptation is to call it
+"compound F16 accumulation." **It is not** (that was a wrong first guess; a NaN
+is a specific event, so instrument and find it). The real mechanism, confirmed
+by per-step dumps + the compiled Metal pipelines:
+
+- **It is single-pass, not compounding.** `CRISPASR_S3GEN_DUMP=1` prints the
+  per-Euler-step `x_rms`: the **first** step is already `nan` (`CFM step 1/10
+  x_rms=nan`). The 10-step solver doesn't accumulate to NaN — one UNet forward
+  emits it.
+- **It is not a backend-split-count effect.** F16 (clean) and q8 (NaN) both
+  report `n_splits=31` for the same b2 graph.
+- **It is the q8 Metal mul_mat, specifically its mat-vec path.** The q8 run
+  compiles `kernel_quantize_q8_0_f32` + `kernel_mul_mv_q8_0_q8_0` — i.e. Metal
+  **requantizes the F32 activation to q8_0 and does a q8×q8 GEMV**, throwing away
+  the activation precision and ignoring the `GGML_PREC_F32` that `mul_mat_hp()`
+  set. The F16 run compiles only `kernel_mul_mm_f16_f32_hp` (f16×f32, F32 accum,
+  no activation requant). So: **q8-GPU is wrong; F16-GPU and q8-CPU are correct**
+  — because only the q8-GPU path requantizes activations.
+- **The batch shape decides NaN vs garbage.** The default cond+uncond **batch=2
+  fused CFG graph** (`build_graph_unet1d_b2`) NaNs at step 1; forcing the
+  **batch=1** single-pass path (`CRISPASR_S3GEN_UNET_CFG_SINGLE=1`) on the same
+  q8-GPU weights is *finite but unintelligible* (`conv_pre rms` ~2× ref, ASR
+  transcribes to nothing). Same root cause (activation requant), different blowup.
+
+Bisecting per-op (`CRISPASR_S3GEN_UNET_PIN_CPU_OP` / `..._KEEP_GPU_OP`) is a dead
+end here precisely because the culprit is the q8 *mul_mat* path, not an
+activation op (`flash_attn_ext`/`mish` were individually exonerated). Fix:
+detect a quantized CFM (peek GGUF tensor types for `s3.fd.*` via
+`open_metadata`) and, on Metal builds, route the UNet to CPU so the q8 weights
+are dequantised to F32 and never hit the Metal q8 GEMV; CUDA is unaffected
+(PLAN #83 validated GPU+`GGML_PREC_F32` to cos 1.0 on P100). A future
+GPU-keeping alternative: dequantise the `s3.fd.*` weights to F16 at load on
+Metal so they take the correct `mul_mm_f16_f32_hp` path. Lessons: (1) never
+diagnose a NaN by adjective — print the first NaN and the compiled kernels;
+(2) `GGML_PREC_F32` does **not** stop activation requantisation in Metal's q8
+mat-vec kernel, so quantized weights on Metal can be silently wrong for
+precision-sensitive iterative solvers, not just slightly drifted.
 
 ---
 

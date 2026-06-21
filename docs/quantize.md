@@ -127,7 +127,7 @@ ASR backends.
 | kokoro (TTS)        | ✓     | ✓     | —     | —     | Q5_K and below break the German backbone — ship F16 + Q8_0 only.         |
 | qwen3-tts           | ✓     | ✓     | ✓     | ✓     |                                                                          |
 | vibevoice (TTS)     | ✓     | ✓     | ✓     | ✓     | F16 + Q4_K shipped.                                                      |
-| chatterbox (TTS)    | ✓     | ✓     | ✓     | ✓     | Vocoder/F0/embeddings auto-skipped. F16 + Q8_0 + Q4_K shipped. On **Metal** a quantized S3Gen CFM is auto-routed to CPU (q8 GPU-CFM NaNs there — compound F16 accumulation); F16 S3Gen and all CUDA keep GPU residency. Override: `CRISPASR_S3GEN_UNET_CPU=0`. |
+| chatterbox (TTS)    | ✓     | ✓     | ✓     | ✓     | Vocoder/F0/embeddings auto-skipped. F16 + Q8_0 + Q4_K shipped. On **Metal** a quantized S3Gen CFM is auto-routed to CPU (Metal's q8 mat-vec kernel requantises activations to q8 and corrupts the CFM — NaN/garbage; CPU dequant→F32 is correct); F16 S3Gen and all CUDA keep GPU residency. Override: `CRISPASR_S3GEN_UNET_CPU=0`. |
 
 > The cells marked `—` are not just "untested" — they have a known
 > quality regression. See [`PERFORMANCE.md`](../PERFORMANCE.md) for
