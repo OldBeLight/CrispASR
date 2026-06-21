@@ -130,7 +130,7 @@ struct crisp_audio_context {
 
     ggml_context* model_ctx = nullptr;
     ggml_backend_buffer_t model_buf = nullptr;
-    std::map<std::string, ggml_tensor*> tensors;
+    core_gguf::tensor_map tensors; // alias tracks the per-repo map choice (see gguf_loader.h)
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
