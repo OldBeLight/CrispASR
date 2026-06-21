@@ -645,6 +645,20 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
         delete c;
         return nullptr;
     }
+    // §212: apply the CPU thread count to the s3gen backend. Previously the
+    // count was stored but never set on the backend, so the encoder / CFM (CPU
+    // route) / HiFT vocoder all ran at ggml's default thread count regardless
+    // of -t or CRISPASR_CHATTERBOX_THREADS. Honour the env directly too, so a
+    // standalone s3gen (no parent chatterbox to pre-resolve it) is configurable.
+    {
+        int s3_threads = c->n_threads;
+        if (const char* e = std::getenv("CRISPASR_CHATTERBOX_THREADS"); e && *e)
+            s3_threads = std::max(1, atoi(e));
+        c->n_threads = s3_threads;
+        ggml_backend_cpu_set_n_threads(c->backend_cpu, s3_threads);
+        if (verbosity >= 1)
+            fprintf(stderr, "s3gen: CPU backend threads=%d\n", s3_threads);
+    }
     c->backend = use_gpu ? ggml_backend_init_best() : c->backend_cpu;
     if (!c->backend) {
         if (verbosity >= 1 && use_gpu) {

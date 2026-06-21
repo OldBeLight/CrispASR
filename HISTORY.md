@@ -6,6 +6,36 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-21 §212 Chatterbox — s3gen now honours the CPU thread env (+ optional gated cached-uncond T3 path)
+
+Two configurability items from the T3-CFG perf dig.
+
+**Fix — s3gen ignored the CPU thread count.** chatterbox resolves its thread
+count (`-t` / `CRISPASR_CHATTERBOX_THREADS`, default `min(8,hw)`; §176u) and
+calls `ggml_backend_cpu_set_n_threads` on its own backend, then passes the count
+to `chatterbox_s3gen_init_from_file` — but s3gen only *stored* it and never set
+it on its backend. So the S3Gen encoder, the CPU-route CFM, and the HiFT vocoder
+all ran at ggml's default thread count regardless of the knob. Now s3gen applies
+the count (and reads `CRISPASR_CHATTERBOX_THREADS` directly, so a standalone
+s3gen is configurable too). Verified: `CRISPASR_CHATTERBOX_THREADS=6` →
+`chatterbox: CPU backend threads=6` **and** `s3gen: CPU backend threads=6`.
+
+**Optional gated path — cached CFG uncond T3 decode (default OFF).** The cond
+pass uses the Lk-bucketed cached graph; the uncond pass skipped it (`use_kv_k`
+set) and rebuilt + re-allocated its graph every token. Added a parallel bucket
+cache bound to `kv_k_cfg`/`kv_v_cfg` with its own scheduler
+(`CRISPASR_CHATTERBOX_T3_CFG_BUCKET=1`). Token-parity is bit-identical (greedy,
+same graph topology — only the KV binding differs). But it is **not a default
+win**: graph-rebuild is negligible on this compute-bound decode (cf. §208), and
+the dual-scheduler path showed no improvement on the contended M1 (timing too
+noisy to trust — load 24–50). Kept **gated, default OFF** for quiet-machine
+evaluation + regression bisection, per "keep alternative paths gated as long as
+they stay pixel-perfect." The real T3 win remains batched CFG B=2 (weight-
+bandwidth halving; gianni −42%) — a focused follow-up. Worktree:
+`/Volumes/backups/code/cb-t3cfg-stash`.
+
+---
+
 ## 2026-06-21 §211 Chatterbox turbo meanflow — fix §207 regression that ran 6 CFM steps instead of 2
 
 §207 changed the standard CFM default 10→6, but the meanflow (turbo/distilled)

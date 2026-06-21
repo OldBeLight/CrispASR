@@ -780,6 +780,19 @@ struct chatterbox_context {
     std::array<T3Bucket, kT3NBuckets> t3_buckets{};
     ggml_backend_sched_t t3_step_sched = nullptr;
     int t3_active_bucket = -1;
+    // §212: optional parallel bucket cache for the CFG *unconditioned* pass,
+    // bound to kv_k_cfg/kv_v_cfg with its own scheduler so cond + uncond can
+    // both stay allocated and alternate without re-allocating every token. The
+    // unconditioned pass otherwise skips the bucket fast path (use_kv_k set) and
+    // rebuilds + re-allocates its graph each step. Same graph topology as the
+    // cond bucket — only the KV-cache binding differs — so it is bit-identical
+    // (token-parity verified). Opt IN with CRISPASR_CHATTERBOX_T3_CFG_BUCKET=1;
+    // default OFF because graph-rebuild is negligible on this compute-bound
+    // decode (cf. §208) and the dual-scheduler path showed no win on contended
+    // M1. Kept gated for quiet-machine evaluation + regression bisection.
+    std::array<T3Bucket, kT3NBuckets> t3_buckets_cfg{};
+    ggml_backend_sched_t t3_step_sched_cfg = nullptr;
+    int t3_active_bucket_cfg = -1;
 
     // §188: CPU-side F32 copies of embedding tables.
     // Populated once at init; eliminates tensor_get_f32 on every decode step.
@@ -814,7 +827,12 @@ struct chatterbox_context {
             chatterbox_s3gen_free(s3gen_ctx);
         if (t3_step_sched)
             ggml_backend_sched_free(t3_step_sched);
+        if (t3_step_sched_cfg)
+            ggml_backend_sched_free(t3_step_sched_cfg);
         for (auto& bk : t3_buckets)
+            if (bk.ctx)
+                ggml_free(bk.ctx);
+        for (auto& bk : t3_buckets_cfg)
             if (bk.ctx)
                 ggml_free(bk.ctx);
         if (sched)
@@ -1434,18 +1452,19 @@ static int t3_pick_bucket(chatterbox_context* c, int needed_lk) {
 
 // §186: lazily create the dedicated step scheduler (separate from c->sched so
 // bucket allocations survive sched resets during synthesis).
-static ggml_backend_sched_t t3_step_sched_lazy(chatterbox_context* c) {
-    if (c->t3_step_sched)
-        return c->t3_step_sched;
+static ggml_backend_sched_t t3_step_sched_lazy(chatterbox_context* c, bool cfg = false) {
+    ggml_backend_sched_t& s = cfg ? c->t3_step_sched_cfg : c->t3_step_sched;
+    if (s)
+        return s;
     ggml_backend_t backends[2] = {c->backend, c->backend_cpu};
     int n_be = (c->backend && c->backend != c->backend_cpu) ? 2 : 1;
-    c->t3_step_sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
-    return c->t3_step_sched;
+    s = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+    return s;
 }
 
 // §186: get or build the pre-allocated graph for bucket[idx].
-static ggml_cgraph* t3_get_or_build_bucket(chatterbox_context* c, int idx) {
-    auto& bk = c->t3_buckets[idx];
+static ggml_cgraph* t3_get_or_build_bucket(chatterbox_context* c, int idx, bool cfg = false) {
+    auto& bk = cfg ? c->t3_buckets_cfg[idx] : c->t3_buckets[idx];
     if (bk.gf)
         return bk.gf;
     bk.lk = chatterbox_context::kT3BucketLks[idx];
@@ -1453,11 +1472,13 @@ static ggml_cgraph* t3_get_or_build_bucket(chatterbox_context* c, int idx) {
     ggml_init_params ip = {bk.meta.size(), bk.meta.data(), true};
     bk.ctx = ggml_init(ip);
     if (!bk.ctx) {
-        fprintf(stderr, "chatterbox: t3_bucket[%d] arena init failed\n", idx);
+        fprintf(stderr, "chatterbox: t3_bucket%s[%d] arena init failed\n", cfg ? "_cfg" : "", idx);
         return nullptr;
     }
+    // §212: cfg bucket binds the unconditioned KV cache; otherwise default (cond).
     bk.gf = build_graph_t3_kv(c, /*n_past=*/0, /*n_tokens=*/1,
-                              /*use_kv_k=*/nullptr, /*use_kv_v=*/nullptr,
+                              /*use_kv_k=*/cfg ? c->kv_k_cfg : nullptr,
+                              /*use_kv_v=*/cfg ? c->kv_v_cfg : nullptr,
                               /*fixed_kv_len=*/bk.lk, /*arena_ctx=*/bk.ctx);
     if (!bk.gf) {
         ggml_free(bk.ctx);
@@ -1467,32 +1488,36 @@ static ggml_cgraph* t3_get_or_build_bucket(chatterbox_context* c, int idx) {
     return bk.gf;
 }
 
-// §186: fast Lk-bucketed single-step T3 decode (cond-pass only, no debug dumps).
-static float* run_t3_kv_bucket(chatterbox_context* c, const float* embeds, int n_past) {
+// §186: fast Lk-bucketed single-step T3 decode (no debug dumps). §212: `cfg`
+// selects the unconditioned-pass bucket cache (bound to kv_k_cfg/kv_v_cfg, own
+// scheduler) so the CFG uncond pass is graph-cached just like the cond pass
+// instead of rebuilding its graph every token.
+static float* run_t3_kv_bucket(chatterbox_context* c, const float* embeds, int n_past, bool cfg = false) {
     const int idx = t3_pick_bucket(c, n_past + 1);
     if (idx < 0)
         return nullptr;
 
-    ggml_cgraph* gf = t3_get_or_build_bucket(c, idx);
+    ggml_cgraph* gf = t3_get_or_build_bucket(c, idx, cfg);
     if (!gf)
         return nullptr;
 
-    const auto& bk = c->t3_buckets[idx];
+    const auto& bk = cfg ? c->t3_buckets_cfg[idx] : c->t3_buckets[idx];
     const int D = (int)c->hp.hidden_size;
     const int Lk = bk.lk;
     const int vocab = (int)c->hp.speech_vocab_size;
 
-    ggml_backend_sched_t step_sched = t3_step_sched_lazy(c);
+    ggml_backend_sched_t step_sched = t3_step_sched_lazy(c, cfg);
     if (!step_sched)
         return nullptr;
 
-    if (c->t3_active_bucket != idx) {
+    int& active = cfg ? c->t3_active_bucket_cfg : c->t3_active_bucket;
+    if (active != idx) {
         ggml_backend_sched_reset(step_sched);
         if (!ggml_backend_sched_alloc_graph(step_sched, gf)) {
-            fprintf(stderr, "chatterbox: t3_bucket[%d] alloc failed\n", idx);
+            fprintf(stderr, "chatterbox: t3_bucket%s[%d] alloc failed\n", cfg ? "_cfg" : "", idx);
             return nullptr;
         }
-        c->t3_active_bucket = idx;
+        active = idx;
     }
 
     int32_t pos = n_past;
@@ -1531,6 +1556,21 @@ static float* run_t3_kv(chatterbox_context* c, const float* embeds, int n_tokens
         if (float* r = run_t3_kv_bucket(c, embeds, n_past))
             return r;
         // Fall through if no bucket fits (n_past+1 > max bucket or > kv_max_ctx).
+    }
+    // §212: optional Lk-bucketed fast path for the T=1 CFG *unconditioned* pass
+    // (use_kv_k == kv_k_cfg), so it is graph-cached instead of rebuilt every
+    // token. Bit-identical graph (token-parity verified), just bound to the cfg
+    // KV cache. Opt IN with CRISPASR_CHATTERBOX_T3_CFG_BUCKET=1 (default OFF —
+    // no proven win on contended M1; kept for quiet-machine evaluation).
+    if (n_tokens == 1 && use_kv_k == c->kv_k_cfg && c->kv_k_cfg && !t3_debug_active()) {
+        static const bool s_cfg_bucket = []() {
+            const char* s = std::getenv("CRISPASR_CHATTERBOX_T3_CFG_BUCKET");
+            return s && (s[0] == '1' || s[0] == 'y' || s[0] == 'Y');
+        }();
+        if (s_cfg_bucket) {
+            if (float* r = run_t3_kv_bucket(c, embeds, n_past, /*cfg=*/true))
+                return r;
+        }
     }
 
     if (n_past + n_tokens > c->kv_max_ctx) {
