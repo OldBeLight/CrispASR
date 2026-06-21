@@ -65,10 +65,12 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
 
     print(f"orpheus_talker ref: loading {model_dir}", file=sys.stderr)
     tok = AutoTokenizer.from_pretrained(str(model_dir))
-    # Prefer GPU+F32 (clean ground truth, fits VRAM on a 16 GB GPU); on a
-    # CPU-only / low-RAM box fall back to bf16 (~6 GB). Override via
-    # ORPHEUS_REF_DTYPE (float32|bfloat16|float16).
-    cuda = torch.cuda.is_available()
+    # Prefer GPU+F32 (clean ground truth) ONLY when the GPU is actually usable
+    # by this PyTorch — a Kaggle P100 is sm_60, which modern PyTorch wheels do
+    # NOT support (sm_70+), so `cuda.is_available()` is True but every kernel
+    # would fail. Gate on compute capability >= 7.0 (T4). Else CPU+bf16 (~6 GB,
+    # fits a 13-16 GB box). Override via ORPHEUS_REF_DTYPE.
+    cuda = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7
     default_dtype = "float32" if cuda else "bfloat16"
     dtype = getattr(torch, os.environ.get("ORPHEUS_REF_DTYPE", default_dtype))
     dev = "cuda" if cuda else "cpu"
@@ -82,7 +84,7 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
 
     captures: Dict[str, Any] = {}
     if "prompt_ids" in stages:
-        captures["prompt_ids"] = prompt_ids[0].numpy().astype(np.float32)
+        captures["prompt_ids"] = prompt_ids[0].cpu().numpy().astype(np.float32)
 
     gen_codes = []
     with torch.no_grad():
@@ -90,7 +92,7 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         logits = out.logits[:, -1, :]
         past = out.past_key_values
         if "step0_logits" in stages:
-            captures["step0_logits"] = logits[0].float().numpy()
+            captures["step0_logits"] = logits[0].float().cpu().numpy()
         for step in range(n_steps):
             nxt = int(torch.argmax(logits[0]).item())  # greedy
             if nxt == AUDIO_END:
