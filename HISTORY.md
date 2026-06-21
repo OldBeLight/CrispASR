@@ -26,9 +26,21 @@ when `tokenizer.size() > text_vocab_size` (BPE could emit an id past the embeddi
 No re-download needed — the files already on every user's disk now load again.
 Verified: `chatterbox-turbo-t3-q4_k.gguf` loads, synthesizes (63 tokens, clean
 EOS), ASR-roundtrips near-verbatim ("Hello world this is the … model"). Base
-chatterbox (704==704) is unaffected. (A cleaner data fix — re-converting the turbo
-GGUFs with the paired 50276-token tokenizer — is optional and unnecessary for
-correctness; it would need the source turbo tokenizer + HF re-upload.)
+chatterbox (704==704) is unaffected.
+
+**Data fix too (shipped to HF).** The 19 missing ids are the turbo emotion/style
+control tokens (`[laugh] [whispering] [angry] [sigh] [gasp] …`) from the source
+`added_tokens.json` (ResembleAI/chatterbox-turbo), which the converter's GPT-2
+path dropped (it read `vocab.json` = 50257 only). Fixed the converter to merge
+`added_tokens.json`, and added `models/patch-chatterbox-turbo-tokens.py` to repair
+the already-published GGUFs in place (rewrite `tokenizer.ggml.tokens` 50257→50276;
+copy all other KV + tensors byte-for-byte, no re-quantize). Re-uploaded all three
+(`-t3-{q4_k,q8_0,f16}.gguf`) to `cstr/chatterbox-turbo-GGUF` — now internally
+consistent (50276==50276, no load warning), each verified to load + synthesize +
+ASR-roundtrip verbatim. Xet deduped the unchanged weights (only the tokenizer
+delta uploaded). NB: the tokens are now *present* but the runtime doesn't emit the
+`[emotion]` tags yet (`tokenize_text_bpe` BPEs them literally) — that's a separate
+feature, PLAN §217.
 
 ---
 
