@@ -22,6 +22,7 @@
 #include "core/conv.h"
 #include "core/gguf_loader.h"
 
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -322,6 +323,23 @@ struct chatterbox_s3gen_context {
     ggml_backend_sched_t sched = nullptr;
     std::vector<uint8_t> compute_meta;
 
+    // §208 — alternative single-all-GPU raw-gallocr CFM path
+    // (CRISPASR_S3GEN_UNET_GALLOCR=1). The legacy `sched` path rebuilds +
+    // re-allocates the b2 UNet graph every Euler step (~54% of synthesis) and
+    // cannot cache (sched mutates the graph on alloc — SIGSEGV on reuse). A raw
+    // ggml_gallocr on a single GPU backend does NOT mutate the graph on alloc,
+    // so the b2 graph + allocation are built once per T_mel and reused across all
+    // Euler steps (set 3 inputs → ggml_backend_graph_compute → read output).
+    // Independent of `sched`/`compute_meta` so the encoder/vocoder are untouched.
+    // §208 verdict: correct (parity 0.999) but a perf DUD — the host build+alloc
+    // it eliminates is only ~0.3% of the compute-bound per-step. Default OFF.
+    bool unet_gallocr_active = false;
+    ggml_gallocr_t unet_galloc = nullptr;
+    ggml_context* unet_cached_ctx = nullptr; // owns the cached b2 graph (kept alive)
+    ggml_cgraph* unet_cached_gf = nullptr;
+    int unet_cached_T = 0;
+    std::vector<uint8_t> unet_cache_meta; // persistent meta buffer for the cached graph
+
     // Pre-permuted ConvTranspose1d weights for decomposed mul_mat + col2im_1d.
     static constexpr int kMaxUps = 4;
     ggml_tensor* ups_w_perm[kMaxUps] = {};
@@ -362,6 +380,10 @@ struct chatterbox_s3gen_context {
     int s3tok_campplus_unused = 0;
 
     ~chatterbox_s3gen_context() {
+        if (unet_galloc)
+            ggml_gallocr_free(unet_galloc);
+        if (unet_cached_ctx)
+            ggml_free(unet_cached_ctx);
         if (sched)
             ggml_backend_sched_free(sched);
         if (buf_perm)
@@ -809,6 +831,26 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
         const bool use_parallel = (c->backend != c->backend_cpu);
         c->sched = ggml_backend_sched_new(backends, nullptr, n_be, 32768, use_parallel, false);
         c->compute_meta.resize(ggml_tensor_overhead() * 32768 + ggml_graph_overhead_custom(32768, false));
+    }
+
+    // §208 — opt into the single-all-GPU raw-gallocr cached CFM path. Requires a
+    // real GPU backend and the UNet kept on GPU (the CPU/hybrid routes keep the
+    // legacy sched path). The F16-dequant CFM weights (dequant_cfm_f16) are
+    // already GPU-resident via c->tensors, so the gallocr path picks them up
+    // unchanged. Falls back to legacy automatically when unmet.
+    {
+        const char* g = std::getenv("CRISPASR_S3GEN_UNET_GALLOCR");
+        const bool want_gallocr = g && (g[0] == '1' || g[0] == 'y' || g[0] == 'Y');
+        c->unet_gallocr_active = want_gallocr && (c->backend != c->backend_cpu) && c->unet_on_gpu;
+        if (want_gallocr && !c->unet_gallocr_active && verbosity >= 1) {
+            fprintf(stderr,
+                    "s3gen: CRISPASR_S3GEN_UNET_GALLOCR requested but unmet "
+                    "(GPU=%d, unet_on_gpu=%d) — using legacy sched path\n",
+                    (int)(c->backend != c->backend_cpu), (int)c->unet_on_gpu);
+        } else if (c->unet_gallocr_active && verbosity >= 1) {
+            fprintf(stderr, "s3gen: §208 UNet CFM raw-gallocr cached path ENABLED "
+                            "(single-GPU, graph reused across Euler steps)\n");
+        }
     }
 
     // S3Tokenizer V2 — bind from `s3.tok.*` (optional; the field stays
@@ -2137,8 +2179,17 @@ static ggml_tensor* basic_transformer_block_b2(ggml_context* ctx, ggml_tensor* x
 // x_in: (T, 320, 2) where batch=0=conditioned, batch=1=unconditioned
 // t_emb: (1024,) — same time step for both
 // Returns: (T, 80, 2) velocity predictions — read back as [cond | uncond]
-static ggml_cgraph* build_graph_unet1d_b2(chatterbox_s3gen_context* c, int T_mel) {
-    ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), true};
+// When `meta_keep` is non-null the graph is built into that persistent meta
+// buffer (not the shared c->compute_meta) and ctx0 is returned via *ctx_keep
+// instead of being freed, so the graph object survives for reuse across CFM
+// steps under the raw-gallocr path (§208). Default (both null) = the legacy
+// behaviour: build into c->compute_meta, free ctx0, return the graph (the meta
+// buffer is caller-owned so the graph data survives the ggml_free).
+static ggml_cgraph* build_graph_unet1d_b2(chatterbox_s3gen_context* c, int T_mel,
+                                          std::vector<uint8_t>* meta_keep = nullptr,
+                                          ggml_context** ctx_keep = nullptr) {
+    std::vector<uint8_t>& meta = meta_keep ? *meta_keep : c->compute_meta;
+    ggml_init_params ip = {meta.size(), meta.data(), true};
     ggml_context* ctx0 = ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 32768, false);
 
@@ -2236,8 +2287,16 @@ static ggml_cgraph* build_graph_unet1d_b2(chatterbox_s3gen_context* c, int T_mel
     if (mask)
         x = ggml_mul(ctx0, x, mask); // (T, 1) broadcasts over (T, 80, 2) ✓
     ggml_set_name(x, "denoiser_out_b2");
+    // Mark the terminal node as a graph output so the gallocr keeps its buffer
+    // live for the per-step tensor_get read (no-op for the legacy sched path —
+    // it reads the same tensor by name and the flag does not change numerics).
+    ggml_set_output(x);
     ggml_build_forward_expand(gf, x);
-    ggml_free(ctx0);
+    if (ctx_keep) {
+        *ctx_keep = ctx0; // caller owns ctx0 (cached gallocr path) — do not free
+    } else {
+        ggml_free(ctx0);
+    }
     return gf;
 }
 
@@ -2578,31 +2637,90 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
             // Faster: just zero the uncond non-x region explicitly.
             std::fill(b2_input.begin() + T_mel * 320 + 80 * T_mel, b2_input.begin() + T_mel * 320 * 2, 0.0f);
 
-            // Rebuild graph each step (same reason as b1: gallocr state is not reusable).
-            ggml_cgraph* gf_b2 = build_graph_unet1d_b2(c, T_mel);
-            ggml_backend_sched_reset(c->sched);
-            s3gen_maybe_pin_graph_to_cpu(c, gf_b2, s3gen_subgraph::unet);
-            if (!ggml_backend_sched_alloc_graph(c->sched, gf_b2)) {
-                fprintf(stderr, "s3gen: failed to alloc UNet1D b2 graph\n");
-                break;
-            }
-            static int b2_diag_seen = 0;
-            if (!b2_diag_seen && c->verbosity >= 1) {
-                fprintf(stderr, "s3gen: [unet-b2 step 0] n_nodes=%d n_splits=%d\n", ggml_graph_n_nodes(gf_b2),
-                        ggml_backend_sched_get_n_splits(c->sched));
-                b2_diag_seen = 1;
-            }
+            ggml_cgraph* gf_b2 = nullptr;
+            if (c->unet_gallocr_active) {
+                // ── §208: single-all-GPU raw-gallocr cached path ──────────────
+                // Build + allocate the b2 graph once per T_mel and reuse it across
+                // all Euler steps. Unlike ggml_backend_sched_alloc_graph (which
+                // mutates the graph by inserting split-copy nodes and leaves stale
+                // backend_buffer pointers — SIGSEGV on reuse, the §207 finding),
+                // ggml_gallocr_alloc_graph does NOT mutate the graph, so the same
+                // object can be re-fed and re-computed every step. The CFM weights
+                // are GPU-resident (F16-dequant on Metal) and reached via c->tensors.
+                if (!c->unet_cached_gf || c->unet_cached_T != T_mel) {
+                    if (c->unet_cached_ctx) {
+                        ggml_free(c->unet_cached_ctx);
+                        c->unet_cached_ctx = nullptr;
+                        c->unet_cached_gf = nullptr;
+                    }
+                    if (c->unet_galloc) {
+                        ggml_gallocr_free(c->unet_galloc);
+                        c->unet_galloc = nullptr;
+                    }
+                    c->unet_cache_meta.resize(c->compute_meta.size());
+                    ggml_context* keep = nullptr;
+                    c->unet_cached_gf = build_graph_unet1d_b2(c, T_mel, &c->unet_cache_meta, &keep);
+                    c->unet_cached_ctx = keep;
+                    c->unet_cached_T = T_mel;
+                    c->unet_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(c->backend));
+                    if (!c->unet_galloc || !ggml_gallocr_alloc_graph(c->unet_galloc, c->unet_cached_gf)) {
+                        fprintf(stderr, "s3gen: UNet1D b2 gallocr alloc failed\n");
+                        break;
+                    }
+                    if (c->verbosity >= 1)
+                        fprintf(stderr, "s3gen: [unet-b2 gallocr] built+allocated graph T_mel=%d n_nodes=%d\n", T_mel,
+                                ggml_graph_n_nodes(c->unet_cached_gf));
+                }
+                gf_b2 = c->unet_cached_gf;
 
-            ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "unet_input_b2"), b2_input.data(), 0,
-                                    b2_input.size() * sizeof(float));
-            ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "time_emb"), t_sin.data(), 0,
-                                    t_sin.size() * sizeof(float));
-            ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "mask"), mask_data.data(), 0,
-                                    mask_data.size() * sizeof(float));
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "unet_input_b2"), b2_input.data(), 0,
+                                        b2_input.size() * sizeof(float));
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "time_emb"), t_sin.data(), 0,
+                                        t_sin.size() * sizeof(float));
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "mask"), mask_data.data(), 0,
+                                        mask_data.size() * sizeof(float));
 
-            if (ggml_backend_sched_graph_compute(c->sched, gf_b2) != GGML_STATUS_SUCCESS) {
-                fprintf(stderr, "s3gen: UNet1D b2 compute failed\n");
-                break;
+                if (ggml_backend_graph_compute(c->backend, gf_b2) != GGML_STATUS_SUCCESS) {
+                    fprintf(stderr, "s3gen: UNet1D b2 gallocr compute failed\n");
+                    break;
+                }
+            } else {
+                // ── Legacy ggml_backend_sched path (default) ──────────────────
+                // Rebuild graph each step (sched mutates it on alloc; not reusable).
+                const bool bench_alloc = std::getenv("CHATTERBOX_BENCH") != nullptr;
+                int64_t t_alloc0 = bench_alloc ? ggml_time_us() : 0;
+                gf_b2 = build_graph_unet1d_b2(c, T_mel);
+                ggml_backend_sched_reset(c->sched);
+                s3gen_maybe_pin_graph_to_cpu(c, gf_b2, s3gen_subgraph::unet);
+                if (!ggml_backend_sched_alloc_graph(c->sched, gf_b2)) {
+                    fprintf(stderr, "s3gen: failed to alloc UNet1D b2 graph\n");
+                    break;
+                }
+                if (bench_alloc) {
+                    // §208: host-side build+sched-alloc cost — the work the gallocr
+                    // cached path eliminates per step. Bounds the achievable speedup
+                    // independent of GPU compute contention.
+                    fprintf(stderr, "s3gen: [unet-b2 host build+alloc] step %d = %.2f ms\n", step,
+                            (ggml_time_us() - t_alloc0) / 1000.0);
+                }
+                static int b2_diag_seen = 0;
+                if (!b2_diag_seen && c->verbosity >= 1) {
+                    fprintf(stderr, "s3gen: [unet-b2 step 0] n_nodes=%d n_splits=%d\n", ggml_graph_n_nodes(gf_b2),
+                            ggml_backend_sched_get_n_splits(c->sched));
+                    b2_diag_seen = 1;
+                }
+
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "unet_input_b2"), b2_input.data(), 0,
+                                        b2_input.size() * sizeof(float));
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "time_emb"), t_sin.data(), 0,
+                                        t_sin.size() * sizeof(float));
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "mask"), mask_data.data(), 0,
+                                        mask_data.size() * sizeof(float));
+
+                if (ggml_backend_sched_graph_compute(c->sched, gf_b2) != GGML_STATUS_SUCCESS) {
+                    fprintf(stderr, "s3gen: UNet1D b2 compute failed\n");
+                    break;
+                }
             }
 
             // Output: (T, 80, 2) — batch 0 = cond, batch 1 = uncond.

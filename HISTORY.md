@@ -6,6 +6,46 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-06-21 §208 Chatterbox S3Gen CFM — single-GPU raw-gallocr cached path (correct, but a perf DUD)
+
+Built the §207 follow-up lever: an alternative, env-gated CFM compute path
+(`CRISPASR_S3GEN_UNET_GALLOCR=1`) that runs the whole batch-2 CFG UNet1D on a
+**single GPU backend** allocated with **raw `ggml_gallocr`** (no
+`ggml_backend_sched`) and **caches the graph + allocation across all Euler
+steps**. Unlike `ggml_backend_sched_alloc_graph` (which mutates the graph with
+split-copy nodes and is unreusable — the §207 SIGSEGV), `ggml_gallocr_alloc_graph`
+does not mutate the graph, so the b2 graph is built+allocated once per `T_mel`
+and reused: per step just `tensor_set ×3 → ggml_backend_graph_compute → read`.
+`build_graph_unet1d_b2` gained two optional params (persistent meta buffer +
+kept `ctx0`); the path uses its own `unet_galloc`/`unet_cache_meta`, independent
+of `c->sched`, so encoder/vocoder are untouched. Legacy sched path bit-unchanged
+when the env is off (only `ggml_set_output` added to the terminal node — a flag,
+no numerics).
+
+**Correctness: full pass.** Single all-GPU backend ran with zero CPU fallback
+(every b2 op is Metal-supported; the sched's 31 "splits" were not GPU↔CPU
+copies). Bug B (CFG uncond divergence) did **not** resurface — there's no
+cross-backend copy boundary. vs legacy, fixed seed: per-step `x_rms` matches
+step-for-step (max Δ 1e-4), log-mag spectral corr **0.999105** (≥0.999 gate),
+ASR round-trip **identical** text.
+
+**Speedup: none — the premise was wrong.** Direct instrumentation of the host
+work the cached path eliminates (graph build + `sched_reset` +
+`sched_alloc_graph`) = **~4–7 ms/step** out of **~1887 ms/step** total = **~0.3%**.
+The CFM per-step is **compute-bound** (3148-node, batch-2 DiT GEMMs at T_mel=484),
+not overhead-bound as the §207 handover hypothesized. The contaminated A/B agreed
+(gallocr 1835 vs legacy 1811 ms/step — indistinguishable; M1 at load 24–50 from
+parallel sessions made clean wall-clock A/B impossible anyway, the
+[[project_chatterbox_t3_decode_perf]] noise trap). gianni's RTF 0.16 comes from
+M3 Ultra GPU throughput, not from skipping a 4 ms host alloc.
+
+**Shipped** the path env-gated, **default OFF** (no speedup → don't flip). Kept
+as the clean single-backend reference + regression-bisection gate, and because
+the result class (graph-cache helps only overhead-bound graphs) is the finding.
+Worktree: `/Volumes/backups/code/chatterbox-gallocr-stash`.
+
+---
+
 ## 2026-06-21 §175 item 2 — GPT-2 BPE decoder DRY (6 copies → core_bpe)
 
 Removed 6 copy-pasted `byte_decoder()` + `decode_token()` / `gpt2_byte_decode()`

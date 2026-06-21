@@ -1,5 +1,18 @@
 # Handover — Chatterbox S3Gen CFM: alternative single-all-GPU `ggml_gallocr` path with graph cache
 
+> **OUTCOME (2026-06-21, §208): BUILT + VALIDATED CORRECT, but a perf DUD —
+> default stays OFF.** Implemented exactly as specced
+> (`CRISPASR_S3GEN_UNET_GALLOCR=1`, single GPU backend, raw `ggml_gallocr`, graph
+> reused across Euler steps). Correctness is full: per-step `x_rms` matches legacy
+> step-for-step (Δ≤1e-4), log-mag spectral corr **0.999105**, identical ASR, Bug B
+> does **not** recur. **But there is no speedup:** the host work the cached path
+> eliminates (graph build + `sched_reset` + `sched_alloc_graph`) is only **~4–7
+> ms/step out of ~1887 ms/step (~0.3%)** — the CFM per-step is **compute-bound**
+> (Metal GEMM of the 3148-node batch-2 DiT at T_mel=484), **not** overhead-bound as
+> the premise below assumed. Shipped env-gated, default OFF; kept as a clean
+> single-backend reference + regression-bisection gate. See HISTORY/LEARNINGS §208.
+> The rest of this doc is the original (now-falsified-premise) plan, kept for context.
+
 **Goal.** Add an *alternative*, env-gated compute path for the Chatterbox S3Gen
 CFM (the flow-matching UNet1D denoiser) that runs the whole UNet on **one GPU
 backend** allocated with **raw `ggml_gallocr`** (no `ggml_backend_sched`), and

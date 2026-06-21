@@ -10626,6 +10626,24 @@ embedding cache on 8 GB machines. The n==1 direct-dequant fast path
 (§176o) is the right approach for large vocabs — one row at a time,
 no full table copy.
 
+### Graph/alloc caching only helps overhead-bound graphs — measure host build+alloc first (§208)
+
+Before porting a graph to a cached raw-`ggml_gallocr` single-backend path to kill
+per-step rebuild+alloc overhead, measure that overhead directly. For the chatterbox
+S3Gen CFM (3148-node batch-2 DiT, T_mel=484, F16-dequant on Metal): host-side
+`build_graph + sched_reset + sched_alloc_graph` = **~4–7 ms/step** out of **~1887
+ms/step** = **0.3%**. The per-step cost is raw Metal GEMM (compute-bound), so
+caching the graph + allocation — though architecturally cleaner (single backend,
+zero splits, graph reused, parity 0.999) — bought nothing. The §207 handover's
+"per-step is almost all overhead" assumption was never measured; a one-line
+`ggml_time_us()` around the build+alloc would have pre-empted the whole port.
+Heuristic: a graph-reuse/bucket cache pays off only when host-side
+build+alloc+(GPU↔CPU split copies) is a *meaningful* fraction of per-step wall
+time; for a big GPU-resident GEMM graph it is single-digit ms and the lever is a
+DUD (cf. the bucket-floor DUD in [[project_chatterbox_t3_decode_perf]]). The
+single-backend gallocr path is also a Bug-B-free reference: no sched, no
+cross-backend copy boundary, so CFG uncond cannot diverge.
+
 ### RNNoise/resampler caching isn't worth breaking thread safety
 
 The miniaudio resamplers and RNNoise DenoiseState are per-call by
