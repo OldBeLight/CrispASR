@@ -2577,10 +2577,20 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
             // GGML_PREC_F32 mul_mat hints (mul_mat_hp()) + parallel=true sched.
             // Opt back into T3-GPU on Metal with CRISPASR_CHATTERBOX_T3_GPU=1.
             // S3Gen CPU opt-out: CRISPASR_CHATTERBOX_S3GEN_CPU=1.
-#ifdef GGML_USE_METAL
+#if defined(GGML_USE_METAL)
             const bool t3_gpu_default = false;
             const char* t3_default_reason =
                 "Metal kernel-launch overhead × AR steps (override: CRISPASR_CHATTERBOX_T3_GPU=1)";
+#elif defined(GGML_USE_VULKAN) && !defined(GGML_USE_CUDA)
+            // Vulkan-only build: the §186 Lk-bucketed T3 step graph is allocated
+            // once and reused across AR steps; on Vulkan that reuse segfaults in
+            // ggml_vk_tensor_subbuffer (null buffer) at the rms_norm of step ~2
+            // (issue #170). S3Gen GPU on Vulkan is fine, so keep T3 on CPU and
+            // s3gen on GPU. Opt into the (crashing) T3-GPU path with
+            // CRISPASR_CHATTERBOX_T3_GPU=1.
+            const bool t3_gpu_default = false;
+            const char* t3_default_reason =
+                "Vulkan T3 step-graph segfault (issue #170; override: CRISPASR_CHATTERBOX_T3_GPU=1)";
 #else
             const bool t3_gpu_default = true;
             const char* t3_default_reason = "non-Metal GPU";
