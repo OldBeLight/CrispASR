@@ -339,7 +339,7 @@ if (CRISPASR_AMR)
         # sources directly with add_library since there's no upstream CMakeLists.
         include(FetchContent)
         FetchContent_Declare(crispasr_opencore_amr
-            GIT_REPOSITORY https://github.com/niclas-timm/opencore-amr.git
+            GIT_REPOSITORY https://github.com/feuvan/opencore-amr-iOS.git
             GIT_TAG        v0.1.6
             GIT_SHALLOW    TRUE)
         FetchContent_GetProperties(crispasr_opencore_amr)
