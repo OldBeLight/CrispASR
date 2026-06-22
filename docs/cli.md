@@ -859,27 +859,34 @@ can drive `-m auto`-style resolution without re-implementing it.
 
 ## Audio formats
 
-Every audio path goes through `read_audio_data()` inherited from
-upstream whisper.cpp. Two single-header decoders are embedded:
+CrispASR decodes most common formats natively — no ffmpeg required — and
+auto-resamples to 16 kHz mono. The decoders are permissive-licensed and either
+embedded or linked:
 
-- **[miniaudio](https://miniaud.io/)** — WAV (any bit depth: 16/24/32
-  PCM, IEEE float, A-law, μ-law, ADPCM), FLAC, MP3
-- **[stb_vorbis](https://github.com/nothings/stb)** — OGG Vorbis
+- **[miniaudio](https://miniaud.io/)** (MIT-0) — WAV (any bit depth: 16/24/32
+  PCM, IEEE float, A-law, μ-law, ADPCM), FLAC, MP3, and the WAV family **AIFF /
+  W64 / RF64** (via its bundled `dr_wav`)
+- **[stb_vorbis](https://github.com/nothings/stb)** (public domain) — OGG Vorbis
+- **libopus + opusfile** (BSD-3) — **`.opus`** (Ogg/Opus). Built by default
+  (`CRISPASR_OPUS`, on when system `opusfile` is found; `CRISPASR_OPUS_FETCH=ON`
+  builds it statically for platforms without system libs)
+- **AudioToolbox** (Apple system framework) — **`.aac` / `.m4a` / `.alac` /
+  `.caf`** on macOS/iOS, no extra dependency
 
-Out of the box, CrispASR accepts **WAV / FLAC / MP3 / OGG Vorbis** at
-any bit depth and any sample rate (auto-resampled to 16 kHz), mono or
-stereo (auto-mixed to mono).
+| Format | Linux/other | Apple (macOS/iOS) | `CRISPASR_FFMPEG=ON` |
+|---|:---:|:---:|:---:|
+| WAV / FLAC / MP3 / OGG Vorbis / AIFF / W64 / RF64 | ✔ | ✔ | ✔ |
+| `.opus` | ✔ | ✔ | ✔ |
+| `.aac` / `.m4a` / `.alac` / `.caf` | ✗¹ | ✔ (AudioToolbox) | ✔ |
+| `.webm` / `.wma` / `.amr` / raw PCM | ✗ | ✗ | ✔ / pre-convert |
 
-| Format | Default build | `CRISPASR_FFMPEG=ON` |
-|---|:---:|:---:|
-| WAV / FLAC / MP3 / OGG | ✔ | ✔ |
-| `.opus` | ✗ | ✔ |
-| `.m4a` / `.mp4` / `.webm` | ✗ | ⚠ upstream crash, pre-convert |
-| `.aiff` / `.wma` / raw PCM | ✗ | pre-convert |
+¹ No permissive cross-platform AAC decoder exists. On Apple it's handled natively
+(AudioToolbox); on Windows/Android the OS decoders (Media Foundation /
+MediaCodec) are planned; on Linux use `CRISPASR_FFMPEG=ON` or pre-convert.
 
-For anything in the bottom half, the reliable path is
-`ffmpeg -i in.X -ar 16000 -ac 1 -c:a pcm_s16le out.wav` then pass the
-WAV. To enable `CRISPASR_FFMPEG=ON`, see [install.md](install.md).
+For anything not covered natively, build with `CRISPASR_FFMPEG=ON` (an optional,
+dynamically-linked fallback — see [install.md](install.md)) or pre-convert:
+`ffmpeg -i in.X -ar 16000 -ac 1 -c:a pcm_s16le out.wav`.
 
 ## Memory footprint
 

@@ -165,7 +165,26 @@ crispasr --gpu-backend vulkan -dev 1 -m model.gguf -f audio.wav
 crispasr --gpu-backend cpu -m model.gguf -f audio.wav        # benchmarking
 ```
 
-## ffmpeg ingestion (Opus, M4A, WebM, …)
+## Opus support (default, no ffmpeg)
+
+`.opus` (Ogg/Opus) decodes natively via libopus + opusfile — **no ffmpeg
+needed**. It's on by default (`CRISPASR_OPUS`) when the system `opusfile` is
+found via pkg-config (e.g. `apt install libopusfile-dev`, `brew install
+opusfile`). On platforms without system libs (Windows / iOS / Android / WASM),
+build them statically:
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCRISPASR_OPUS_FETCH=ON
+```
+
+AAC / M4A / ALAC / CAF decode natively on **Apple** (macOS/iOS) via the system
+AudioToolbox framework — also no ffmpeg. See [cli.md](cli.md#audio-formats) for
+the full format matrix.
+
+## ffmpeg ingestion (AAC on Linux, WebM, WMA, …) — optional fallback
+
+For formats with no permissive native decoder (AAC/M4A on Linux, WebM, WMA,
+AMR, …), build with the optional ffmpeg fallback:
 
 ```bash
 # Install ffmpeg dev libs first:
@@ -177,11 +196,10 @@ cmake --build build-ffmpeg -j$(nproc) --target crispasr-lib
 
 > **Upstream bug warning.** `.m4a` / `.mp4` / `.webm` containers
 > currently crash CrispASR's ffmpeg integration. For those formats,
-> pre-convert to WAV:
+> pre-convert to WAV (or, on Apple, `.m4a`/AAC work natively without ffmpeg):
 > ```bash
-> ffmpeg -i input.opus -ar 16000 -ac 1 -c:a pcm_s16le -y /tmp/audio.wav
+> ffmpeg -i input.m4a -ar 16000 -ac 1 -c:a pcm_s16le -y /tmp/audio.wav
 > ```
-> Bare-codec `.opus` files work fine with `CRISPASR_FFMPEG=ON`.
 
 ## Older glibc systems
 

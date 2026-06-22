@@ -1,14 +1,17 @@
 // Minimal audio file decoder for the language wrappers.
 //
 // libwhisper callers (Dart, Python, Rust wrappers) need cross-platform
-// decoding of WAV / MP3 / FLAC / WAVE-containerised OGG so they can hand
+// decoding of common audio formats so they can hand
 // `crispasr_session_transcribe` a clean 16-kHz mono float32 buffer
-// regardless of the original input format.
+// regardless of the original input format — without an ffmpeg dependency.
 //
-// miniaudio (MIT-0) handles WAV, MP3 and FLAC out of the box and does
-// resampling + channel down-mix internally via its `ma_decoder` stream.
-// Ogg Vorbis is handled by stb_vorbis — include it header-only before
-// miniaudio so MA_HAS_VORBIS is auto-defined.
+// miniaudio (MIT-0) handles WAV/MP3/FLAC (+ AIFF/W64/RF64 via its dr_wav) out
+// of the box and does resampling + channel down-mix internally via its
+// `ma_decoder` stream. Ogg Vorbis is handled by stb_vorbis (include it
+// header-only before miniaudio so MA_HAS_VORBIS is auto-defined). Opus is added
+// as a miniaudio custom backend (libopus/opusfile, CRISPASR_HAVE_OPUS; see
+// below), and AAC/M4A/ALAC/CAF fall back to AudioToolbox on Apple. All
+// permissive-licensed; ffmpeg stays an optional dynamic fallback only.
 
 // stb_vorbis lives in examples/ — use relative path from src/
 #define STB_VORBIS_HEADER_ONLY
@@ -191,9 +194,11 @@ int crispasr_at_decode(const char* path, int want_channels, float** out_interlea
 } // namespace
 #endif // __APPLE__
 
-/// Decode an audio file into float32 mono PCM at 16 kHz. Supports WAV,
-/// MP3, and FLAC via miniaudio. The returned buffer is malloc-owned and
-/// must be released with `crispasr_audio_free`.
+/// Decode an audio file into float32 mono PCM at 16 kHz. Supports WAV / MP3 /
+/// FLAC / AIFF / W64 / RF64 (miniaudio), OGG Vorbis (stb_vorbis), .opus
+/// (libopus/opusfile, when CRISPASR_HAVE_OPUS), and AAC / M4A / ALAC / CAF on
+/// Apple (AudioToolbox fallback). The returned buffer is malloc-owned and must
+/// be released with `crispasr_audio_free`.
 ///
 /// Returns 0 on success and writes:
 ///   *out_pcm         → float * of `*out_samples` elements (mono)
