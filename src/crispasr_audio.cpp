@@ -1382,16 +1382,102 @@ int crispasr_webm_decode(const char* path, int want_channels, float** out_buf, i
 } // namespace
 #endif // CRISPASR_HAVE_OPUS
 
-// ── M4A/AAC decode via fdk-aac (Fraunhofer, permissive) ─────────────────────
+// ── M4A/AAC decode via fdk-aac (runtime dlopen, MIT-clean) ──────────────────
 // Minimal ISOBMFF (MP4/M4A) parser extracts AudioSpecificConfig + raw AAC
-// frames, feeds them to fdk-aac for decode. Covers .m4a, .mp4 (audio track),
-// .aac (ADTS). On Apple, AudioToolbox already handles these; on Windows,
-// Media Foundation; on Android, MediaCodec. This path covers Linux and any
-// platform where fdk-aac is available. CMake-gated on CRISPASR_HAVE_FDK_AAC.
-#if defined(CRISPASR_HAVE_FDK_AAC)
-#include <fdk-aac/aacdecoder_lib.h>
+// frames. If libfdk-aac.so is installed on the system, it is loaded at
+// runtime via dlopen and used to decode the AAC frames. The project binary
+// itself never links against fdk-aac — the license responsibility lies with
+// the user who installs the library. On Apple, AudioToolbox is preferred;
+// on Windows, Media Foundation; on Android, NDK MediaCodec.
+//
+// Not compiled on Apple (AudioToolbox covers it) or when targeting WASM.
+#if !defined(__APPLE__) && !defined(__EMSCRIPTEN__)
 
 namespace {
+
+// ── fdk-aac dlopen wrapper (no compile-time dependency) ──────────────────────
+// Mirror just the types and function signatures we need from aacdecoder_lib.h.
+// Loaded at runtime via dlopen("libfdk-aac.so.2") — if the library isn't
+// installed, crispasr_m4a_decode returns -2 and the caller falls through to
+// the next fallback or gives up.
+#if !defined(_WIN32) // dlopen is POSIX; Windows uses LoadLibrary below
+#include <dlfcn.h>
+#endif
+
+typedef void* FDK_HANDLE; // opaque HANDLE_AACDECODER
+typedef int FDK_ERR;      // AAC_DECODER_ERROR
+typedef short FDK_PCM;    // INT_PCM = SHORT
+typedef unsigned char FDK_UCHAR;
+typedef unsigned int FDK_UINT;
+typedef int FDK_INT;
+
+// CStreamInfo — we only access the first 3 int fields.
+struct FDK_StreamInfo {
+    FDK_INT sampleRate;
+    FDK_INT frameSize;
+    FDK_INT numChannels;
+    // ... more fields follow that we don't use
+};
+
+// Transport type constants
+static constexpr int FDK_TT_MP4_RAW = 0;
+static constexpr int FDK_TT_MP4_ADTS = 2;
+// Error codes
+static constexpr FDK_ERR FDK_AAC_DEC_OK = 0x0000;
+static constexpr FDK_ERR FDK_AAC_DEC_NOT_ENOUGH_BITS = 0x1002;
+
+// Function pointer types
+using fn_aacDecoder_Open = FDK_HANDLE (*)(int transport_type, FDK_UINT nr_of_layers);
+using fn_aacDecoder_ConfigRaw = FDK_ERR (*)(FDK_HANDLE, FDK_UCHAR** conf, FDK_UINT* length);
+using fn_aacDecoder_Fill = FDK_ERR (*)(FDK_HANDLE, FDK_UCHAR** pBuffer, FDK_UINT* bufferSize, FDK_UINT* bytesValid);
+using fn_aacDecoder_DecodeFrame = FDK_ERR (*)(FDK_HANDLE, FDK_PCM* pTimeData, int timeDataSize, FDK_UINT flags);
+using fn_aacDecoder_GetStreamInfo = FDK_StreamInfo* (*)(FDK_HANDLE);
+using fn_aacDecoder_Close = void (*)(FDK_HANDLE);
+
+struct FdkAacLib {
+    void* handle = nullptr;
+    fn_aacDecoder_Open Open = nullptr;
+    fn_aacDecoder_ConfigRaw ConfigRaw = nullptr;
+    fn_aacDecoder_Fill Fill = nullptr;
+    fn_aacDecoder_DecodeFrame DecodeFrame = nullptr;
+    fn_aacDecoder_GetStreamInfo GetStreamInfo = nullptr;
+    fn_aacDecoder_Close Close = nullptr;
+    bool tried = false;
+    bool ok = false;
+
+    bool load() {
+        if (tried)
+            return ok;
+        tried = true;
+#if defined(_WIN32)
+        handle = (void*)LoadLibraryA("libfdk-aac-2.dll");
+        if (!handle)
+            handle = (void*)LoadLibraryA("fdk-aac.dll");
+#define DLSYM(h, name) (void*)GetProcAddress((HMODULE)(h), (name))
+#else
+        handle = dlopen("libfdk-aac.so.2", RTLD_NOW | RTLD_LOCAL);
+        if (!handle)
+            handle = dlopen("libfdk-aac.so", RTLD_NOW | RTLD_LOCAL);
+#define DLSYM(h, name) dlsym((h), (name))
+#endif
+        if (!handle)
+            return false;
+        Open = (fn_aacDecoder_Open)DLSYM(handle, "aacDecoder_Open");
+        ConfigRaw = (fn_aacDecoder_ConfigRaw)DLSYM(handle, "aacDecoder_ConfigRaw");
+        Fill = (fn_aacDecoder_Fill)DLSYM(handle, "aacDecoder_Fill");
+        DecodeFrame = (fn_aacDecoder_DecodeFrame)DLSYM(handle, "aacDecoder_DecodeFrame");
+        GetStreamInfo = (fn_aacDecoder_GetStreamInfo)DLSYM(handle, "aacDecoder_GetStreamInfo");
+        Close = (fn_aacDecoder_Close)DLSYM(handle, "aacDecoder_Close");
+#undef DLSYM
+        ok = Open && ConfigRaw && Fill && DecodeFrame && GetStreamInfo && Close;
+        return ok;
+    }
+};
+
+static FdkAacLib& fdk_aac() {
+    static FdkAacLib lib;
+    return lib;
+}
 
 // Read 32-bit big-endian from buffer
 static inline uint32_t mp4_be32(const uint8_t* p) {
@@ -1804,7 +1890,12 @@ int crispasr_m4a_decode(const char* path, int want_channels, float** out_buf, in
     if (!is_adts && !is_mp4)
         return -2;
 
-    HANDLE_AACDECODER dec = aacDecoder_Open(is_adts ? TT_MP4_ADTS : TT_MP4_RAW, 1);
+    // Try to load fdk-aac at runtime
+    FdkAacLib& fdk = fdk_aac();
+    if (!fdk.load())
+        return -2; // libfdk-aac not installed — caller falls through
+
+    FDK_HANDLE dec = fdk.Open(is_adts ? FDK_TT_MP4_ADTS : FDK_TT_MP4_RAW, 1);
     if (!dec)
         return -2;
 
@@ -1816,14 +1907,14 @@ int crispasr_m4a_decode(const char* path, int want_channels, float** out_buf, in
 
     if (is_mp4) {
         if (!mp4_parse_audio(file_data.data(), file_data.size(), mp4info)) {
-            aacDecoder_Close(dec);
+            fdk.Close(dec);
             return -2;
         }
         // Configure decoder with ASC
-        UCHAR* asc_buf = mp4info.asc.data();
-        UINT asc_size = (UINT)mp4info.asc.size();
-        if (aacDecoder_ConfigRaw(dec, &asc_buf, &asc_size) != AAC_DEC_OK) {
-            aacDecoder_Close(dec);
+        FDK_UCHAR* asc_buf = mp4info.asc.data();
+        FDK_UINT asc_size = (FDK_UINT)mp4info.asc.size();
+        if (fdk.ConfigRaw(dec, &asc_buf, &asc_size) != FDK_AAC_DEC_OK) {
+            fdk.Close(dec);
             return -2;
         }
         sample_offsets = mp4_sample_offsets(mp4info);
@@ -1833,33 +1924,32 @@ int crispasr_m4a_decode(const char* path, int want_channels, float** out_buf, in
 
     // Decode
     std::vector<int16_t> pcm_all;
-    INT_PCM decode_buf[8 * 2048]; // max frame size
+    FDK_PCM decode_buf[8 * 2048]; // max frame size
 
     if (is_adts) {
         // Feed entire ADTS stream in chunks
-        UCHAR* input = file_data.data();
-        UINT bytes_remaining = (UINT)file_data.size();
-        UINT bytes_valid = bytes_remaining;
+        FDK_UCHAR* input = file_data.data();
+        FDK_UINT bytes_remaining = (FDK_UINT)file_data.size();
+        FDK_UINT bytes_valid = bytes_remaining;
 
         while (bytes_valid > 0) {
-            UCHAR* in_ptr = input + (bytes_remaining - bytes_valid);
-            UINT in_size = bytes_valid;
-            AAC_DECODER_ERROR err = aacDecoder_Fill(dec, &in_ptr, &in_size, &bytes_valid);
-            if (err != AAC_DEC_OK)
+            FDK_UCHAR* in_ptr = input + (bytes_remaining - bytes_valid);
+            FDK_UINT in_size = bytes_valid;
+            FDK_ERR err = fdk.Fill(dec, &in_ptr, &in_size, &bytes_valid);
+            if (err != FDK_AAC_DEC_OK)
                 break;
 
             while (true) {
-                err = aacDecoder_DecodeFrame(dec, decode_buf, sizeof(decode_buf) / sizeof(decode_buf[0]), 0);
-                if (err == AAC_DEC_NOT_ENOUGH_BITS)
+                err = fdk.DecodeFrame(dec, decode_buf, sizeof(decode_buf) / sizeof(decode_buf[0]), 0);
+                if (err == FDK_AAC_DEC_NOT_ENOUGH_BITS)
                     break;
-                if (err != AAC_DEC_OK)
+                if (err != FDK_AAC_DEC_OK)
                     break;
 
-                CStreamInfo* si = aacDecoder_GetStreamInfo(dec);
+                FDK_StreamInfo* si = fdk.GetStreamInfo(dec);
                 if (si && si->numChannels > 0 && si->frameSize > 0) {
                     dec_sample_rate = (uint32_t)si->sampleRate;
                     dec_channels = si->numChannels;
-                    // Downmix to mono inline if multi-channel
                     for (int i = 0; i < si->frameSize; ++i) {
                         int32_t sum = 0;
                         for (int c = 0; c < si->numChannels; ++c)
@@ -1877,18 +1967,18 @@ int crispasr_m4a_decode(const char* path, int want_channels, float** out_buf, in
             if (off + sz > file_data.size())
                 continue;
 
-            UCHAR* in_ptr = file_data.data() + off;
-            UINT in_size = sz;
-            UINT bytes_valid = sz;
-            AAC_DECODER_ERROR err = aacDecoder_Fill(dec, &in_ptr, &in_size, &bytes_valid);
-            if (err != AAC_DEC_OK)
+            FDK_UCHAR* in_ptr = file_data.data() + off;
+            FDK_UINT in_size = sz;
+            FDK_UINT bytes_valid = sz;
+            FDK_ERR err = fdk.Fill(dec, &in_ptr, &in_size, &bytes_valid);
+            if (err != FDK_AAC_DEC_OK)
                 continue;
 
-            err = aacDecoder_DecodeFrame(dec, decode_buf, sizeof(decode_buf) / sizeof(decode_buf[0]), 0);
-            if (err != AAC_DEC_OK)
+            err = fdk.DecodeFrame(dec, decode_buf, sizeof(decode_buf) / sizeof(decode_buf[0]), 0);
+            if (err != FDK_AAC_DEC_OK)
                 continue;
 
-            CStreamInfo* si = aacDecoder_GetStreamInfo(dec);
+            FDK_StreamInfo* si = fdk.GetStreamInfo(dec);
             if (si && si->numChannels > 0 && si->frameSize > 0) {
                 dec_sample_rate = (uint32_t)si->sampleRate;
                 dec_channels = si->numChannels;
@@ -1901,7 +1991,7 @@ int crispasr_m4a_decode(const char* path, int want_channels, float** out_buf, in
             }
         }
     }
-    aacDecoder_Close(dec);
+    fdk.Close(dec);
 
     if (pcm_all.empty() || dec_sample_rate == 0)
         return -2;
@@ -1964,10 +2054,10 @@ int crispasr_m4a_decode(const char* path, int want_channels, float** out_buf, in
     return 0;
 }
 } // namespace
-#endif // CRISPASR_HAVE_FDK_AAC
+#endif // !__APPLE__ && !__EMSCRIPTEN__
 
 // ── Windows Media Foundation AAC decoder ─────────────────────────────────────
-#if defined(_WIN32) && !defined(__APPLE__) && !defined(CRISPASR_HAVE_FDK_AAC)
+#if defined(_WIN32) && !defined(__APPLE__)
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -2055,7 +2145,7 @@ int crispasr_mf_decode(const char* path, int want_channels, float** out_buf, int
 // to decode AAC/M4A/MP4 audio without ffmpeg. The OS provides hardware-
 // accelerated AAC decode for free. Gated on __ANDROID__ and the absence of
 // fdk-aac (if fdk-aac is linked, prefer it for consistency across platforms).
-#if defined(__ANDROID__) && !defined(CRISPASR_HAVE_FDK_AAC)
+#if defined(__ANDROID__)
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaExtractor.h>
 #include <media/NdkMediaFormat.h>
@@ -2229,7 +2319,7 @@ int crispasr_ndk_decode(const char* path, int want_channels, float** out_buf, in
 /// (libopus/opusfile, when CRISPASR_HAVE_OPUS), Sun AU / .snd (inline, µ-law /
 /// A-law / PCM), AMR-NB/WB (opencore-amr, when CRISPASR_HAVE_AMR),
 /// WebM/Matroska Opus|Vorbis (EBML demux, when CRISPASR_HAVE_OPUS),
-/// M4A/AAC/ADTS (fdk-aac, when CRISPASR_HAVE_FDK_AAC; Media Foundation on
+/// M4A/AAC/ADTS (fdk-aac via dlopen if installed; Media Foundation on
 /// Windows; NDK MediaCodec on Android), and AAC / M4A / ALAC / CAF on Apple
 /// (AudioToolbox fallback). The returned buffer is malloc-owned and must be
 /// released with
@@ -2311,8 +2401,8 @@ CA_EXPORT int crispasr_audio_load(const char* path, float** out_pcm, int* out_sa
             }
         }
 #endif
-#if defined(CRISPASR_HAVE_FDK_AAC)
-        // M4A / AAC / ADTS fallback (fdk-aac, Fraunhofer permissive)
+#if !defined(__APPLE__) && !defined(__EMSCRIPTEN__)
+        // M4A / AAC / ADTS fallback (fdk-aac via dlopen, if installed)
         {
             float* aac_buf = nullptr;
             int aac_fr = 0, aac_ch = 0;
@@ -2325,7 +2415,7 @@ CA_EXPORT int crispasr_audio_load(const char* path, float** out_pcm, int* out_sa
             }
         }
 #endif
-#if defined(_WIN32) && !defined(__APPLE__) && !defined(CRISPASR_HAVE_FDK_AAC)
+#if defined(_WIN32) && !defined(__APPLE__)
         // Windows Media Foundation fallback for AAC/M4A
         {
             float* mf_buf = nullptr;
@@ -2339,7 +2429,7 @@ CA_EXPORT int crispasr_audio_load(const char* path, float** out_pcm, int* out_sa
             }
         }
 #endif
-#if defined(__ANDROID__) && !defined(CRISPASR_HAVE_FDK_AAC)
+#if defined(__ANDROID__)
         // Android NDK MediaCodec fallback for AAC/M4A
         {
             float* ndk_buf = nullptr;
@@ -2510,11 +2600,11 @@ CA_EXPORT int crispasr_audio_load_stereo(const char* path, float** out_left, flo
         if (split_fallback(crispasr_webm_decode) == 0)
             return 0;
 #endif
-#if defined(CRISPASR_HAVE_FDK_AAC)
+#if !defined(__APPLE__) && !defined(__EMSCRIPTEN__)
         if (split_fallback(crispasr_m4a_decode) == 0)
             return 0;
 #endif
-#if defined(__ANDROID__) && !defined(CRISPASR_HAVE_FDK_AAC)
+#if defined(__ANDROID__)
         if (split_fallback(crispasr_ndk_decode) == 0)
             return 0;
 #endif

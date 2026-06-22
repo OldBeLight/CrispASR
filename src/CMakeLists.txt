@@ -384,23 +384,19 @@ if (CRISPASR_AMR)
     endif()
 endif()
 
-# ── Optional AAC/M4A decode via fdk-aac (Fraunhofer, permissive) ─────────────
-# Covers AAC/M4A/ADTS on platforms without a native AAC decoder (Linux).
-# fdk-aac is not OSI-approved but is permissive (BSD-like + patent clause),
-# not GPL, not NC. On Apple, AudioToolbox is preferred; on Windows, Media
-# Foundation. Disable with -DCRISPASR_FDK_AAC=OFF.
-option(CRISPASR_FDK_AAC "Decode AAC/M4A via fdk-aac" ON)
-
-if (CRISPASR_FDK_AAC AND NOT APPLE)
+# ── AAC/M4A decode via fdk-aac (runtime dlopen, MIT-clean) ───────────────────
+# The project binary never links against fdk-aac. At runtime, libfdk-aac.so is
+# loaded via dlopen if installed — the user's choice and license responsibility.
+# On Apple, AudioToolbox is preferred; on Windows, Media Foundation; on
+# Android, NDK MediaCodec. This check is informational only.
+if (NOT APPLE)
     find_package(PkgConfig QUIET)
     if (PkgConfig_FOUND)
-        pkg_check_modules(FDK_AAC QUIET IMPORTED_TARGET fdk-aac)
-        if (FDK_AAC_FOUND)
-            target_link_libraries(crispasr-lib PRIVATE PkgConfig::FDK_AAC)
-            target_compile_definitions(crispasr-lib PRIVATE CRISPASR_HAVE_FDK_AAC=1)
-            message(STATUS "CrispASR: AAC/M4A via system fdk-aac ${FDK_AAC_VERSION} (pkg-config)")
+        pkg_check_modules(_FDK_AAC_CHECK QUIET fdk-aac)
+        if (_FDK_AAC_CHECK_FOUND)
+            message(STATUS "CrispASR: AAC/M4A — libfdk-aac ${_FDK_AAC_CHECK_VERSION} found (will dlopen at runtime)")
         else()
-            message(STATUS "CrispASR: AAC/M4A disabled — fdk-aac not found (apt install libfdk-aac-dev)")
+            message(STATUS "CrispASR: AAC/M4A — libfdk-aac not found (install libfdk-aac-dev for M4A/AAC decode)")
         endif()
     endif()
 endif()
@@ -423,7 +419,7 @@ if (CRISPASR_EXTRA_FLAGS)
 endif()
 
 find_package(Threads REQUIRED)
-target_link_libraries(crispasr-lib PUBLIC ggml Threads::Threads audioseal crispasr-core snac)
+target_link_libraries(crispasr-lib PUBLIC ggml Threads::Threads audioseal crispasr-core snac ${CMAKE_DL_LIBS})
 
 # `crispasr_cache.cpp` calls WinHTTP for HF auto-download on Windows. MSVC
 # auto-links winhttp.lib via `#pragma comment(lib, "winhttp.lib")` inside
