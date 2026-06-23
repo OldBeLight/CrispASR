@@ -304,7 +304,7 @@ combine_static_libraries() {
     local archs=""
     local min_version_flag=""
     local install_name=""
-    local frameworks="-framework Foundation -framework Metal -framework Accelerate"
+    local frameworks="-framework Foundation -framework Metal -framework Accelerate -framework AudioToolbox -framework CoreFoundation -framework CoreAudio"
 
     case "$platform" in
         "ios")
