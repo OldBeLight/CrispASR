@@ -52,6 +52,7 @@ def generate_dot(dot_path):
         "-DCRISPASR_BUILD_EXAMPLES=OFF",
         "-DCRISPASR_BUILD_SERVER=OFF",
         "-DGGML_CUDA=OFF",
+        "-DCRISPASR_OPUS_FETCH=ON",
     ]
     subprocess.run(cmd, check=True, capture_output=True)
 

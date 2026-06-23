@@ -31,7 +31,8 @@ jobs:
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
             -DCRISPASR_BUILD_SERVER=OFF \
-            -DGGML_CUDA=OFF
+            -DGGML_CUDA=OFF \
+            -DCRISPASR_OPUS_FETCH=ON
           python tools/sync_go_cgo_ldflags.py --check --dot /tmp/crispasr.dot
 
   ubuntu-22:
