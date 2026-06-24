@@ -81,6 +81,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <memory>
 #include <cstdio>
@@ -851,6 +852,24 @@ static bool qwen3_tts_codec_use_gpu_by_default(const qwen3_tts_context* c) {
     // fixed in f8fc8b8e, and the op itself was replaced by mul_mat+col2im_1d
     // in 5f600f25 — no backend has a transposed-conv problem any more.
     return true;
+}
+
+static bool qwen3_tts_codec_backend_is_cuda(const qwen3_tts_context* c) {
+    if (!c || !c->backend || c->backend == c->backend_cpu) {
+        return false;
+    }
+    std::string name = ggml_backend_name(c->backend);
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return (char)std::tolower(ch); });
+    return name.find("cuda") != std::string::npos;
+}
+
+static bool qwen3_tts_codec_decode_uses_cuda(const qwen3_tts_context* c) {
+    const bool force_cpu = std::getenv("QWEN3_TTS_CODEC_CPU") != nullptr;
+    if (force_cpu || !qwen3_tts_codec_backend_is_cuda(c)) {
+        return false;
+    }
+    return std::getenv("QWEN3_TTS_CODEC_FORCE_METAL") != nullptr || std::getenv("QWEN3_TTS_CODEC_GPU") != nullptr ||
+           qwen3_tts_codec_use_gpu_by_default(c);
 }
 
 // ---------------------------------------------------------------------------
@@ -3638,7 +3657,7 @@ static ggml_tensor* codec_dec_block(ggml_context* ctx, ggml_tensor* x, const g3t
 //   attn_mask: F16 [T, T] sliding-window causal mask (nullptr iff T==1).
 // Returns the graph output tensor name "pcm" of shape [T_out] F32.
 // ---------------------------------------------------------------------------
-static ggml_cgraph* build_graph_codec_decode(qwen3_tts_context* c, int T) {
+static ggml_cgraph* build_graph_codec_decode(qwen3_tts_context* c, int T, bool keep_stage_outputs = false) {
     const auto& codec = c->codec;
     const auto& hp = codec.hp;
     const int n_q = (int)hp.n_q;
@@ -3677,12 +3696,16 @@ static ggml_cgraph* build_graph_codec_decode(qwen3_tts_context* c, int T) {
 
     ggml_tensor* h = ggml_add(ctx0, emb_first, emb_rest); // [512, T]
     ggml_set_name(h, "codec_rvq_out");
-    ggml_set_output(h); // prevent gallocr from reusing this buffer
+    if (keep_stage_outputs) {
+        ggml_set_output(h);
+    }
 
     // ── Step 2: pre_conv ────────────────────────────────────────────────────
     h = codec_causal_conv1d(ctx0, h, codec.pre_conv_w, codec.pre_conv_b, 1, 1); // [1024, T]
     ggml_set_name(h, "codec_pre_conv_out");
-    ggml_set_output(h);
+    if (keep_stage_outputs) {
+        ggml_set_output(h);
+    }
 
     // ── Step 3: transformer ─────────────────────────────────────────────────
     // input_proj: [1024, T] → [512, T]
@@ -3737,7 +3760,9 @@ static ggml_cgraph* build_graph_codec_decode(qwen3_tts_context* c, int T) {
     h = ggml_mul(ctx0, h, codec.xfmr_norm_w);
     h = ggml_add(ctx0, ggml_mul_mat(ctx0, codec.xfmr_out_proj_w, h), codec.xfmr_out_proj_b);
     ggml_set_name(h, "codec_xfmr_out");
-    ggml_set_output(h);
+    if (keep_stage_outputs) {
+        ggml_set_output(h);
+    }
 
     // ── Step 4: ConvNeXt upsample (2 stages, each 2×) ──────────────────────
     for (int s = 0; s < 2; s++) {
@@ -3746,18 +3771,24 @@ static ggml_cgraph* build_graph_codec_decode(qwen3_tts_context* c, int T) {
         char uname[32];
         snprintf(uname, sizeof(uname), "codec_up%d_out", s);
         ggml_set_name(h, uname);
-        ggml_set_output(h);
+        if (keep_stage_outputs) {
+            ggml_set_output(h);
+        }
     }
 
     // ── Step 5: Decoder blocks ──────────────────────────────────────────────
     h = codec_causal_conv1d(ctx0, h, codec.in_conv_w, codec.in_conv_b, 1, 1); // [1536, 4T]
     ggml_set_name(h, "codec_in_conv_out");
-    ggml_set_output(h);
+    if (keep_stage_outputs) {
+        ggml_set_output(h);
+    }
     for (int b = 0; b < 4; b++) {
         h = codec_dec_block(ctx0, h, codec.blocks[b], hp.upsample_rates[b]);
         if (b == 0) {
             ggml_set_name(h, "codec_blk0_out");
-            ggml_set_output(h);
+            if (keep_stage_outputs) {
+                ggml_set_output(h);
+            }
         }
     }
 
@@ -4175,15 +4206,31 @@ static float* codec_decode_codes(qwen3_tts_context* c, const int32_t* codes, int
         }
     }
 
-    // Chunk parameters (ENV-tunable). Defaults: chunk 150 frames, ctx 128 (> sliding_window 72).
-    int chunk = 150;
-    int ctx = 128;
+    // Chunk parameters (ENV-tunable). CUDA uses smaller windows by default:
+    // the decomposed transposed-conv path materializes large column tensors,
+    // and Win64 10 GiB cards can OOM even when the high-level decode is
+    // nominally chunked (GH #187).
+    const bool cuda_codec = qwen3_tts_codec_decode_uses_cuda(c);
+    const int cuda_chunk_cap = 64;
+    int chunk = cuda_codec ? cuda_chunk_cap : 150;
+    int ctx = cuda_codec ? std::max(window, 96) : 128;
     if (const char* e = std::getenv("QWEN3_TTS_CODEC_CHUNK"))
         chunk = atoi(e);
     if (const char* e = std::getenv("QWEN3_TTS_CODEC_CTX"))
         ctx = atoi(e);
     if (ctx < window)
         ctx = window;    // left-context must cover the sliding window
+    if (cuda_codec && !std::getenv("QWEN3_TTS_CODEC_ALLOW_FULL")) {
+        if (chunk <= 0) {
+            chunk = cuda_chunk_cap;
+        } else if (chunk > cuda_chunk_cap) {
+            chunk = cuda_chunk_cap;
+        }
+        const int cuda_ctx_cap = std::max(window, 96);
+        if (ctx > cuda_ctx_cap) {
+            ctx = cuda_ctx_cap;
+        }
+    }
     const int UP = 1920; // PCM samples per codec frame (24 kHz / 12.5 fps)
 
     // Single-pass fallback: short sequence or chunking disabled.
@@ -4192,6 +4239,10 @@ static float* codec_decode_codes(qwen3_tts_context* c, const int32_t* codes, int
     }
 
     // Chunked: decode [window_start, chunk_end) per chunk, discard the left-context PCM.
+    if (c->params.verbosity >= 1) {
+        fprintf(stderr, "qwen3_tts: codec: chunked decode T=%d chunk=%d ctx=%d%s\n", T_codec, chunk, ctx,
+                cuda_codec ? " (CUDA cap)" : "");
+    }
     std::vector<float> pcm_all;
     pcm_all.reserve((size_t)T_codec * UP);
     for (int chunk_start = 0; chunk_start < T_codec; chunk_start += chunk) {
@@ -4262,7 +4313,7 @@ static float* codec_extract_stage(qwen3_tts_context* c, const int32_t* codes, in
         pos[i] = i;
     }
 
-    ggml_cgraph* gf = build_graph_codec_decode(c, T_codec);
+    ggml_cgraph* gf = build_graph_codec_decode(c, T_codec, /*keep_stage_outputs=*/true);
     ggml_backend_sched_t sched = codec_pick_sched(c);
     ggml_backend_sched_reset(sched);
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
