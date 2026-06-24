@@ -498,9 +498,15 @@ cmake -B build-macos -G Xcode \
     -S .
 cmake --build build-macos --config Release -- -quiet
 
+# visionOS/tvOS: build with -DCRISPASR_OPUS=OFF. Opus 1.5.2's FetchContent
+# build doesn't compile cleanly on these SDKs (the u_int/_XOPEN_SOURCE compat
+# gaps noted below), which broke the ios-xcode-build CI at the xcframework
+# step. These platforms use AudioToolbox for decode anyway, so opus isn't
+# needed. iOS keeps opus (links via the _deps glob, 1ed1e62b); macOS unaffected.
 echo "Building for visionOS..."
 cmake -B build-visionos -G Xcode \
     "${COMMON_CMAKE_ARGS[@]}" \
+    -DCRISPASR_OPUS=OFF \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=${VISIONOS_MIN_OS_VERSION} \
     -DCMAKE_OSX_ARCHITECTURES="arm64" \
     -DCMAKE_SYSTEM_NAME=visionOS \
@@ -514,6 +520,7 @@ cmake --build build-visionos --config Release -- -quiet
 echo "Building for visionOS simulator..."
 cmake -B build-visionos-sim -G Xcode \
     "${COMMON_CMAKE_ARGS[@]}" \
+    -DCRISPASR_OPUS=OFF \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=${VISIONOS_MIN_OS_VERSION} \
     -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
     -DCMAKE_SYSTEM_NAME=visionOS \
@@ -528,6 +535,7 @@ cmake --build build-visionos-sim --config Release -- -quiet
 echo "Building for tvOS simulator..."
 cmake -B build-tvos-sim -G Xcode \
     "${COMMON_CMAKE_ARGS[@]}" \
+    -DCRISPASR_OPUS=OFF \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=${TVOS_MIN_OS_VERSION} \
     -DCMAKE_SYSTEM_NAME=tvOS \
     -DCMAKE_OSX_SYSROOT=appletvsimulator \
@@ -542,6 +550,7 @@ cmake --build build-tvos-sim --config Release -- -quiet
 echo "Building for tvOS devices..."
 cmake -B build-tvos-device -G Xcode \
     "${COMMON_CMAKE_ARGS[@]}" \
+    -DCRISPASR_OPUS=OFF \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=${TVOS_MIN_OS_VERSION} \
     -DCMAKE_SYSTEM_NAME=tvOS \
     -DCMAKE_OSX_SYSROOT=appletvos \
