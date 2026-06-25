@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -185,6 +186,7 @@ struct tada_context {
     std::vector<int32_t> prompt_masks;       // (n_prompt,) all 1s
     std::vector<int32_t> prompt_time_before; // (n_prompt,) time gaps
     std::vector<int32_t> prompt_time_after;  // (n_prompt,) time gaps
+    std::string prompt_text;
     int n_prompt = 0;
 
     uint64_t rng_state = 0;
@@ -1088,6 +1090,7 @@ int tada_load_prompt(struct tada_context* ctx, const char* path) {
     gguf_context* meta = core_gguf::open_metadata(path);
     if (!meta)
         return -1;
+    ctx->prompt_text = core_gguf::kv_str(meta, "crispasr.ref.tada_tts_prompt_text", "");
     core_gguf::free_metadata(meta);
 
     core_gguf::WeightLoad wl;
@@ -1123,7 +1126,7 @@ int tada_load_prompt(struct tada_context* ctx, const char* path) {
         ctx->prompt_time_after.resize(np + 1, 0);
         for (int i = 0; i < np; i++) {
             int p_cur = (int)pos[i];
-            int p_prev = (i > 0) ? (int)pos[i - 1] : 0;
+            int p_prev = (i > 0) ? (int)pos[i - 1] : 1;
             int gap = std::min(std::max(p_cur - p_prev, 0), max_t);
             ctx->prompt_time_before[i + 1] = gap; // shifted by 1 (index 0 is padding)
         }
@@ -1159,6 +1162,192 @@ void tada_set_temperature(struct tada_context* ctx, float temp) {
         ctx->params.temperature = temp;
 }
 
+static std::string tada_normalize_text(std::string text) {
+    auto replace_all = [](std::string& s, const std::string& from, const std::string& to) {
+        if (from.empty())
+            return;
+        size_t pos = 0;
+        while ((pos = s.find(from, pos)) != std::string::npos) {
+            s.replace(pos, from.size(), to);
+            pos += to.size();
+        }
+    };
+
+    replace_all(text, "; ", ". ");
+    replace_all(text, "\"", "");
+    replace_all(text, ":", ",");
+    replace_all(text, "(", "");
+    replace_all(text, ")", "");
+    replace_all(text, "--", "-");
+    replace_all(text, "-", ", ");
+    replace_all(text, ",,", ",");
+    replace_all(text, " '", " ");
+    replace_all(text, "' ", " ");
+    replace_all(text, "  ", " ");
+
+    std::string no_space_before_punct;
+    no_space_before_punct.reserve(text.size());
+    for (size_t i = 0; i < text.size(); i++) {
+        if (std::isspace((unsigned char)text[i]) && i + 1 < text.size() &&
+            (text[i + 1] == '.' || text[i + 1] == ',' || text[i + 1] == '?' || text[i + 1] == '!')) {
+            continue;
+        }
+        no_space_before_punct.push_back(text[i]);
+    }
+    text.swap(no_space_before_punct);
+
+    for (char& ch : text)
+        ch = (char)std::tolower((unsigned char)ch);
+
+    bool cap_next = true;
+    for (size_t i = 0; i < text.size(); i++) {
+        unsigned char ch = (unsigned char)text[i];
+        if (cap_next && std::isalnum(ch)) {
+            text[i] = (char)std::toupper(ch);
+            cap_next = false;
+        }
+        if ((text[i] == '.' || text[i] == '!' || text[i] == '?') && i + 1 < text.size() &&
+            std::isspace((unsigned char)text[i + 1])) {
+            cap_next = true;
+        }
+    }
+    return text;
+}
+
+static void tada_build_input_ids_for_text(tada_context* ctx, const char* text, std::vector<int32_t>& full_ids,
+                                          std::vector<int32_t>* text_ids_out = nullptr) {
+    std::vector<int32_t> text_ids = tokenize(ctx, tada_normalize_text(std::string(text ? text : "")));
+    auto lookup = [&](const char* name, int32_t fallback) -> int32_t {
+        auto it = ctx->vocab.token_to_id.find(name);
+        return (it != ctx->vocab.token_to_id.end()) ? it->second : fallback;
+    };
+    int32_t bos = lookup("<|begin_of_text|>", 128000);
+    int32_t eot = lookup("<|eot_id|>", 128009);
+    int32_t start_header = lookup("<|start_header_id|>", 128006);
+    int32_t end_header = lookup("<|end_header_id|>", 128007);
+
+    std::vector<int32_t> system_text_ids = tokenize(ctx, std::string("system"));
+    std::vector<int32_t> assistant_text_ids = tokenize(ctx, std::string("assistant"));
+    std::vector<int32_t> prefix_ids;
+    prefix_ids.push_back(start_header);
+    prefix_ids.insert(prefix_ids.end(), system_text_ids.begin(), system_text_ids.end());
+    prefix_ids.push_back(end_header);
+    prefix_ids.push_back(eot);
+    prefix_ids.push_back(start_header);
+    prefix_ids.insert(prefix_ids.end(), assistant_text_ids.begin(), assistant_text_ids.end());
+    prefix_ids.push_back(end_header);
+
+    full_ids.clear();
+    full_ids.push_back(bos);
+    full_ids.insert(full_ids.end(), prefix_ids.begin(), prefix_ids.end());
+    full_ids.insert(full_ids.end(), text_ids.begin(), text_ids.end());
+    for (uint32_t i = 0; i < ctx->hp.shift_acoustic; i++)
+        full_ids.push_back(eot);
+    if (text_ids_out)
+        *text_ids_out = std::move(text_ids);
+}
+
+float* tada_extract_stage(struct tada_context* ctx, const char* text, const char* stage, int* out_n) {
+    if (out_n)
+        *out_n = 0;
+    if (!ctx || !stage || !*stage)
+        return nullptr;
+
+    std::vector<int32_t> full_ids;
+    std::vector<int32_t> text_ids;
+    tada_build_input_ids_for_text(ctx, text, full_ids, &text_ids);
+    if (strcmp(stage, "text_tokens") == 0) {
+        float* out = (float*)malloc(text_ids.size() * sizeof(float));
+        if (!out)
+            return nullptr;
+        for (size_t i = 0; i < text_ids.size(); i++)
+            out[i] = (float)text_ids[i];
+        if (out_n)
+            *out_n = (int)text_ids.size();
+        return out;
+    }
+    if (full_ids.empty())
+        return nullptr;
+
+    const int ad = (int)ctx->hp.acoustic_dim;
+    const int lat = (int)ctx->hp.fm_latent;
+    const int hid = (int)ctx->hp.fm_hidden;
+    std::vector<float> zeros(ad, 0.0f);
+
+    ggml_backend_buffer_clear(ctx->kv_buf, 0);
+    if (ctx->kv_neg_buf)
+        ggml_backend_buffer_clear(ctx->kv_neg_buf, 0);
+    ctx->rng_state = ctx->params.seed ? ctx->params.seed : 42;
+
+    float* emb = build_step_embedding(ctx, full_ids[0], zeros.data(), 0, 0, 0);
+    if (!emb)
+        return nullptr;
+    if (strcmp(stage, "llm_embed") == 0) {
+        if (out_n)
+            *out_n = (int)ctx->hp.d_model;
+        return emb;
+    }
+
+    talker_result tr = run_talker_kv(ctx, emb, 1, 0, false);
+    free(emb);
+    if (!tr.hidden)
+        return nullptr;
+    if (strcmp(stage, "llm_hidden_0") == 0) {
+        if (out_n)
+            *out_n = hid;
+        return tr.hidden;
+    }
+
+    std::vector<float> speech(lat);
+    for (int j = 0; j < lat; j++)
+        speech[j] = rng_normal(&ctx->rng_state) * ctx->params.noise_temp;
+    if (strcmp(stage, "fm_noise_0") == 0) {
+        float* out = (float*)malloc((size_t)lat * sizeof(float));
+        if (!out) {
+            free(tr.hidden);
+            return nullptr;
+        }
+        memcpy(out, speech.data(), (size_t)lat * sizeof(float));
+        if (out_n)
+            *out_n = lat;
+        free(tr.hidden);
+        return out;
+    }
+
+    std::vector<float> vel(lat);
+    if (strcmp(stage, "fm_step_0_0") == 0 || strcmp(stage, "fm_step_0_5") == 0) {
+        float t = strcmp(stage, "fm_step_0_5") == 0 ? 0.5f : 0.0f;
+        run_fm_step(ctx, speech.data(), t, tr.hidden, vel.data());
+        float* out = (float*)malloc((size_t)lat * sizeof(float));
+        if (!out) {
+            free(tr.hidden);
+            return nullptr;
+        }
+        memcpy(out, vel.data(), (size_t)lat * sizeof(float));
+        if (out_n)
+            *out_n = lat;
+        free(tr.hidden);
+        return out;
+    }
+    if (strcmp(stage, "fm_output_0") == 0) {
+        fm_euler_solve(ctx, speech.data(), tr.hidden, ctx->params.num_fm_steps > 0 ? ctx->params.num_fm_steps : 10,
+                       ctx->params.acoustic_cfg, nullptr, false);
+        float* out = (float*)malloc((size_t)lat * sizeof(float));
+        if (!out) {
+            free(tr.hidden);
+            return nullptr;
+        }
+        memcpy(out, speech.data(), (size_t)lat * sizeof(float));
+        if (out_n)
+            *out_n = lat;
+        free(tr.hidden);
+        return out;
+    }
+
+    free(tr.hidden);
+    return nullptr;
+}
+
 float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_samples) {
     if (!ctx || !text || !out_n_samples)
         return nullptr;
@@ -1179,7 +1368,8 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     tada_bench_stage _bs_synth("synthesize");
 
     // ── Tokenize ──
-    std::vector<int32_t> text_ids = tokenize(ctx, std::string(text));
+    std::string norm_text = tada_normalize_text(std::string(text));
+    std::vector<int32_t> text_ids = tokenize(ctx, norm_text);
     if (text_ids.empty()) {
         fprintf(stderr, "tada: empty tokenization\n");
         return nullptr;
@@ -1219,7 +1409,9 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     std::vector<int32_t> prompt_text_ids;
     const char* prompt_text_env = getenv("TADA_PROMPT_TEXT");
     if (prompt_text_env && ctx->n_prompt > 0) {
-        prompt_text_ids = tokenize(ctx, std::string(prompt_text_env));
+        prompt_text_ids = tokenize(ctx, tada_normalize_text(std::string(prompt_text_env)));
+    } else if (!ctx->prompt_text.empty() && ctx->n_prompt > 0) {
+        prompt_text_ids = tokenize(ctx, tada_normalize_text(ctx->prompt_text));
     }
 
     // Full sequence: BOS + prefix + prompt_text + synth_text + EOT*shift
@@ -1255,6 +1447,14 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     if (ctx->kv_neg_buf)
         ggml_backend_buffer_clear(ctx->kv_neg_buf, 0);
 
+    // Mirror tada.modules.tada.generate(): prompt acoustic features are
+    // left-padded by the chat prefix and then the final transition frames are
+    // removed before _generate() sees them.
+    const int transition_steps = shift;
+    const int prompt_padded_len = prefix_len + ctx->n_prompt;
+    const int prompt_used_len = std::max(0, prompt_padded_len - transition_steps);
+    const int prefill_len = prompt_used_len > 0 ? std::min(num_prompt, transition_steps + prompt_used_len - 1) : 0;
+
     // ── AR + FM generation loop ──
     std::vector<std::vector<float>> acoustic_features;
     std::vector<int> time_before_list;
@@ -1266,10 +1466,37 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     int32_t cur_t_after = 0;
     int n_past = 0;
 
-    // Extend full_ids as we generate
-    std::vector<int32_t> all_ids = full_ids;
+    int32_t pad_id = 128004; // Llama <|finetune_right_pad_id|>
+    auto pad_it = ctx->vocab.token_to_id.find("<|finetune_right_pad_id|>");
+    if (pad_it != ctx->vocab.token_to_id.end())
+        pad_id = pad_it->second;
 
-    for (int step = 0; step < num_prompt + max_tokens; step++) {
+    // Python generate(use_text_in_prompt=False) masks text content in the
+    // prompt-acoustic region on the positive path too. Keep chat structure and
+    // header names, but hide prompt transcript content behind the pad token.
+    std::vector<int32_t> model_ids = full_ids;
+    bool in_header = false;
+    for (int i = 0; i < prompt_used_len && i < (int)model_ids.size(); ++i) {
+        const int32_t tok = model_ids[i];
+        bool keep = false;
+        if (tok == start_header) {
+            in_header = true;
+            keep = true;
+        } else if (tok == end_header) {
+            in_header = false;
+            keep = true;
+        } else if (in_header || tok == eot || tok == bos) {
+            keep = true;
+        }
+        if (!keep)
+            model_ids[i] = pad_id;
+    }
+
+    // Extend model_ids as we generate
+    std::vector<int32_t> all_ids = model_ids;
+
+    (void)max_tokens;
+    for (int step = 0; step < num_prompt; step++) {
         if (step >= (int)all_ids.size())
             break;
 
@@ -1295,14 +1522,11 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
         // Build neg embedding: same acoustic/time, but token replaced with pad
         float* neg_hidden = nullptr;
         if (cfg_scale != 1.0f && ctx->kv_neg_k) {
-            int32_t pad_id = 128004; // Llama <|finetune_right_pad_id|>
-            auto pad_it = ctx->vocab.token_to_id.find("<|finetune_right_pad_id|>");
-            if (pad_it != ctx->vocab.token_to_id.end())
-                pad_id = pad_it->second;
-
-            // Keep structural tokens, replace content with pad
-            bool is_structural = (cur_token == eot);
-            int32_t neg_token = is_structural ? cur_token : pad_id;
+            // Python batches positive and negative prefill with identical
+            // masked embeddings. After prefill, negative_step_output keeps
+            // chat structural tokens and replaces content with pad.
+            bool is_structural = (cur_token == start_header || cur_token == end_header || cur_token == eot);
+            int32_t neg_token = (step < prefill_len || is_structural) ? cur_token : pad_id;
 
             float* neg_emb =
                 build_step_embedding(ctx, neg_token, cur_acoustic.data(), cur_mask, cur_t_before, cur_t_after);
@@ -1312,7 +1536,7 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
                 neg_hidden = neg_tr.hidden; // caller frees
             }
 
-            if (step < 3 || (step >= shift && step < shift + 3)) {
+            if (ctx->params.verbosity >= 2 && (step < 3 || (step >= shift && step < shift + 3))) {
                 float neg_rms = 0, pos_rms = 0;
                 for (int j = 0; j < (int)hp.fm_hidden; j++) {
                     neg_rms += neg_hidden[j] * neg_hidden[j];
@@ -1370,7 +1594,7 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
             cond_rms += tr.hidden[j] * tr.hidden[j];
         cond_rms = std::sqrt(cond_rms / hp.fm_hidden);
 
-        if (ctx->params.verbosity >= 2 || (step >= shift && step < shift + 3)) {
+        if (ctx->params.verbosity >= 2 || (ctx->params.verbosity >= 1 && step >= shift && step < shift + 3)) {
             fprintf(stderr, "  step %d: noise_rms=%.4f speech_rms=%.4f cond_rms=%.4f\n", step, noise_rms, speech_rms,
                     cond_rms);
         }
@@ -1389,14 +1613,8 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
         // Next token prediction (greedy for now)
         if (step >= num_prompt - 1 && tr.logits) {
             int next = argmax_logits(tr.logits, (int)hp.vocab_size);
-            if (next == eot) {
-                if (ctx->params.verbosity >= 1) {
-                    fprintf(stderr, "tada: EOS at step %d\n", step);
-                }
-                free(tr.hidden);
-                free(tr.logits);
-                break;
-            }
+            if (next == eot && ctx->params.verbosity >= 1)
+                fprintf(stderr, "tada: EOS at step %d\n", step);
             all_ids.push_back(next);
         }
         free(tr.logits);
@@ -1404,24 +1622,23 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
         // Update state for next step
         if (step >= shift) {
             int feat_idx = step - shift;
-            // Python pads prompt features with prefix_len zeros to align prompt audio
-            // with prompt TEXT tokens. prefix_len tokens have zero acoustic features.
-            // Prompt audio occupies indices [prefix_len, prefix_len + n_prompt) in the
-            // virtual padded array.
+            // In Python, only prompt_acoustic_features after prefix padding and
+            // transition trimming are replayed. Once feat_idx reaches
+            // prompt_used_len, the FM prediction becomes the next acoustic state.
             int prompt_feat_idx = feat_idx - prefix_len; // index into actual prompt data
-            bool in_prefix = (feat_idx < prefix_len);
-            bool in_prompt =
-                (!in_prefix && ctx->n_prompt > 0 && prompt_feat_idx >= 0 && prompt_feat_idx < ctx->n_prompt);
+            bool in_prefix = (feat_idx < prefix_len && feat_idx < prompt_used_len);
+            bool in_prompt = (!in_prefix && feat_idx < prompt_used_len && ctx->n_prompt > 0 && prompt_feat_idx >= 0 &&
+                              prompt_feat_idx < ctx->n_prompt);
 
             if (in_prefix) {
-                // Prefix positions: zero acoustic (matches Python's left-padding)
+                // Prefix positions: zero acoustic + zero time (matches Python's left-padding zeros)
                 std::vector<float> feat(ad, 0.0f);
                 acoustic_features.push_back(feat);
-                time_before_list.push_back(pred_t_before);
+                time_before_list.push_back(0);
                 cur_acoustic = feat;
                 cur_mask = 0;
-                cur_t_before = pred_t_before;
-                cur_t_after = pred_t_after;
+                cur_t_before = 0;
+                cur_t_after = 0;
             } else if (in_prompt) {
                 // Use pre-computed prompt features
                 std::vector<float> feat(ctx->prompt_values.begin() + prompt_feat_idx * ad,
@@ -1483,16 +1700,13 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     float ac_std = hp.acoustic_std;
     float ac_mean = hp.acoustic_mean;
 
-    // Skip all prompt-phase acoustic frames (steps shift..num_prompt-1).
-    // The C++ loop collects acoustic features starting at step=shift — these include
-    // FM outputs computed during prompt prefilling (prefix zeros, audio prompt, synth
-    // text, EOT shift tokens).  Only the frames generated AFTER the full prompt is
-    // consumed (step >= num_prompt) are meaningful.  The Python model prefills the
-    // prompt in one shot and never computes acoustic features during that phase, so
-    // Python's generated-features array == C++'s generated-features array.
-    //
-    // Correct skip: num_prompt - shift  (= number of steps in prompt phase after shift)
-    int skip_frames = num_prompt - (int)shift;
+    // Match Python:
+    //   encoded = acoustic_features[..., num_prompt_tokens + num_transition_steps - 1:, :]
+    // where num_prompt_tokens is prompt_acoustic_features after prefix padding
+    // and transition trimming. With no voice prompt this keeps the acoustic
+    // frames generated after the short prefix transition instead of decoding a
+    // mostly-zero prefix.
+    int skip_frames = prompt_used_len + transition_steps - 1;
     if (skip_frames < 0)
         skip_frames = 0;
     if (skip_frames >= (int)acoustic_features.size())
@@ -1506,8 +1720,9 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     std::vector<float> expanded;
     std::vector<int32_t> token_masks;
     std::vector<int> all_times;
-    // time_before for the decode portion starts at skip_frames
-    all_times.push_back(0);
+    // time_before for the decode portion starts at skip_frames. Python passes
+    // this first duration into _decode_wav(), lets it affect codec attention,
+    // then trims the corresponding leading silence from the decoded PCM.
     for (int i = skip_frames; i < (int)time_before_list.size(); i++) {
         all_times.push_back(time_before_list[i]);
     }
@@ -1591,6 +1806,19 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
         int n_samples = 0;
         float* pcm = tada_codec_decode(ctx->codec_ctx, expanded.data(), n_expanded, token_masks.data(), &n_samples);
         if (pcm && n_samples > 0) {
+            int trim = 0;
+            if (!all_times.empty())
+                trim = (int)((int64_t)24000 * (int64_t)all_times[0] / 50);
+            if (trim > 0 && trim < n_samples) {
+                int kept = n_samples - trim;
+                float* out = (float*)malloc((size_t)kept * sizeof(float));
+                if (out) {
+                    memcpy(out, pcm + trim, (size_t)kept * sizeof(float));
+                    tada_codec_pcm_free(pcm);
+                    *out_n_samples = kept;
+                    return out;
+                }
+            }
             *out_n_samples = n_samples;
             return pcm;
         }

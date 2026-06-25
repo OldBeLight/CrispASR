@@ -5465,6 +5465,13 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
         return rc;
     }
 #endif
+#ifdef CA_HAVE_TADA
+    if (s->tada_ctx) {
+        if (ends_with_wav(path))
+            return -2;
+        return tada_load_prompt(s->tada_ctx, path);
+    }
+#endif
 #ifdef CA_HAVE_KOKORO
     if (s->kokoro_ctx) {
         // Kokoro voicepacks are GGUF only; .wav reference audio is not

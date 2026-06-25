@@ -62,6 +62,12 @@ void tada_set_temperature(struct tada_context* ctx, float temp);
 // number of float samples. Returns NULL on failure.
 float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_samples);
 
+// Debug/diff helper for generation stages. Returns a heap-allocated float32
+// array for the requested stage; caller frees with free(). Supported stages:
+// "text_tokens", "llm_embed", "llm_hidden_0", "fm_noise_0",
+// "fm_step_0_0", "fm_step_0_5", "fm_output_0".
+float* tada_extract_stage(struct tada_context* ctx, const char* text, const char* stage, int* out_n);
+
 void tada_pcm_free(float* pcm);
 void tada_free(struct tada_context* ctx);
 

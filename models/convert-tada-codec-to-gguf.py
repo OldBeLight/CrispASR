@@ -174,9 +174,12 @@ def main():
 
     # ── Pre-materialize weight-normed convolutions ──
     # PyTorch weight_norm stores parametrizations.weight.original0 (g, magnitude)
-    # and parametrizations.weight.original1 (v, direction). The actual weight is
-    # w = g * v / ||v||. We compute this at conversion time and store a single
-    # .weight tensor in the GGUF.
+    # and parametrizations.weight.original1 (v, direction). The TADA modules call
+    # torch.nn.utils.parametrizations.weight_norm(module) without overriding dim,
+    # so dim=0 for both Conv1d weights (out, in, k) and ConvTranspose1d weights
+    # (in, out, k). The actual weight is w = g * v / ||v|| over every dimension
+    # except dim 0. We compute this at conversion time and store a single .weight
+    # tensor in the GGUF.
     wn_pairs = {}  # prefix → {"g": tensor, "v": tensor}
     for hf_name in sorted(name_to_idx.keys()):
         if ".parametrizations.weight.original0" in hf_name:
@@ -191,14 +194,11 @@ def main():
         if "g" in pair and "v" in pair:
             g = handles[name_to_idx[pair["g"]]].get_tensor(pair["g"]).to(torch.float32)
             v = handles[name_to_idx[pair["v"]]].get_tensor(pair["v"]).to(torch.float32)
-            # g shape: (1, 1, C_out) or (C_out, 1, 1) — flatten to (C_out,)
-            g_flat = g.reshape(-1)
-            # v shape: (K, C_in_or_out, C_out_or_in) — norm over all dims except last
-            v_flat = v.reshape(-1, v.shape[-1])  # (K*C_mid, C_out)
-            v_norm = torch.linalg.norm(v_flat, dim=0, keepdim=True)  # (1, C_out)
-            w = v * (g_flat / (v_norm.squeeze(0) + 1e-12)).reshape(1, 1, -1)
-            materialized[prefix] = w.numpy()
-            print(f"  WN materialized: {prefix}  g={list(g.shape)}  v={list(v.shape)} → w={list(w.shape)}")
+            norm_dims = tuple(range(1, v.ndim))
+            v_norm = torch.linalg.vector_norm(v, dim=norm_dims, keepdim=True)
+            wt = v * (g / (v_norm + 1e-12))
+            materialized[prefix] = wt.numpy()
+            print(f"  WN materialized: {prefix}  g={list(g.shape)}  v={list(v.shape)} → w={list(wt.shape)}")
 
     # ── Map tensors ──
     n_mapped = 0

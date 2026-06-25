@@ -70,6 +70,8 @@
 #include "lfm2_audio.h"
 #include "mini_omni2.h"
 #include "nemotron.h"
+#include "tada_codec.h"
+#include "tada_tts.h"
 #if __has_include("kugelaudio.h")
 #include "kugelaudio.h"
 #define CA_HAVE_KUGELAUDIO 1
@@ -765,6 +767,27 @@ static void print_row(const char* name, const crispasr_diff::Report& r, float co
            shape_str.c_str(), r.cos_min, r.cos_mean, r.max_abs, r.rms, *extra ? "  " : "", extra);
 }
 
+static void print_row_exact(const char* name, const crispasr_diff::Report& r, float cos_threshold,
+                            float max_abs_threshold, const char* extra = "") {
+    const bool pass = r.found && r.n_nonfinite == 0 && r.cos_min >= cos_threshold && r.max_abs <= max_abs_threshold;
+    const char* tag = r.found ? (pass ? "[PASS]" : "[FAIL]") : "[SKIP]";
+    std::string shape_str = "[";
+    for (size_t i = 0; i < r.shape.size(); i++) {
+        shape_str += std::to_string(r.shape[i]);
+        if (i + 1 < r.shape.size())
+            shape_str += ",";
+    }
+    shape_str += "]";
+    if (!r.found) {
+        printf("%s %-22s %s  (reference not in archive)%s%s\n", tag, name, shape_str.c_str(), *extra ? "  " : "",
+               extra);
+        return;
+    }
+    printf("%s %-22s shape=%-16s cos_min=%.6f  cos_mean=%.6f  max_abs=%.2e  rms=%.2e  criterion=max_abs<=%.1e%s%s\n",
+           tag, name, shape_str.c_str(), r.cos_min, r.cos_mean, r.max_abs, r.rms, max_abs_threshold, *extra ? "  " : "",
+           extra);
+}
+
 // Like compare_with_row_width but handles mismatched row strides between the
 // C++ data (stride_cpp) and the reference data (stride_ref).  Only the first
 // min(stride_cpp, stride_ref) columns of each row are compared — the extra
@@ -882,21 +905,30 @@ static crispasr_diff::Report compare_with_row_width(const crispasr_diff::Ref& re
     return r;
 }
 
+static std::string dirname_of(const std::string& path) {
+    const size_t pos = path.find_last_of("/\\");
+    if (pos == std::string::npos)
+        return ".";
+    if (pos == 0)
+        return path.substr(0, 1);
+    return path.substr(0, pos);
+}
 
 int main(int argc, char** argv) {
     if (argc < 5) {
-        fprintf(stderr,
-                "usage: %s <backend> <model.gguf> <reference.gguf> <audio.wav>\n"
-                "\n"
-                "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, "
-                "granite-4.1, "
-                "granite-nle, parakeet, chatterbox, voxcpm2-tts, "
-                "canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, moonshine-streaming, "
-                "parler-tts, moss-audio\n"
-                "  model.gguf    crispasr-compatible model weights\n"
-                "  reference.gguf  archive produced by tools/dump_reference.py\n"
-                "  audio.wav     16 kHz mono WAV\n",
-                argv[0]);
+        fprintf(
+            stderr,
+            "usage: %s <backend> <model.gguf> <reference.gguf> <audio.wav>\n"
+            "\n"
+            "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, tada-tts, kokoro, granite, "
+            "granite-4.1, "
+            "granite-nle, parakeet, chatterbox, voxcpm2-tts, "
+            "canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, moonshine-streaming, "
+            "parler-tts, moss-audio\n"
+            "  model.gguf    crispasr-compatible model weights\n"
+            "  reference.gguf  archive produced by tools/dump_reference.py\n"
+            "  audio.wav     16 kHz mono WAV\n",
+            argv[0]);
         return 1;
     }
     const std::string backend_name = argv[1];
@@ -2266,6 +2298,179 @@ int main(int argc, char** argv) {
             free(our_data);
         }
         qwen3_tts_free(ctx);
+
+    } else if (backend_name == "tada-tts" || backend_name == "tada") {
+        const char* env_codec = std::getenv("TADA_CODEC_GGUF");
+        std::string codec_path = env_codec && *env_codec ? env_codec : dirname_of(model_path) + "/tada-codec-f16.gguf";
+        if (!file_exists(codec_path)) {
+            fprintf(stderr, "tada-tts: codec not found at '%s'; set TADA_CODEC_GGUF=<path/to/tada-codec-f16.gguf>\n",
+                    codec_path.c_str());
+            return 4;
+        }
+
+        auto input_pair = ref.get_f32("codec_input");
+        if (!input_pair.first || input_pair.second == 0 || input_pair.second % 512 != 0) {
+            fprintf(stderr, "tada-tts: reference needs codec_input with a multiple of 512 floats\n");
+            return 4;
+        }
+        const int n_frames = (int)(input_pair.second / 512);
+        std::vector<int32_t> token_masks(n_frames, 0);
+        for (int t = 0; t < n_frames; t++) {
+            double ss = 0.0;
+            for (int k = 0; k < 512; k++) {
+                const float v = input_pair.first[(size_t)t * 512 + (size_t)k];
+                ss += (double)v * v;
+            }
+            token_masks[t] = ss > 0.0 ? 1 : 0;
+        }
+
+        const char* env_text = std::getenv("TADA_DIFF_TEXT");
+        std::string synth_text = env_text && *env_text ? env_text : ref.meta("tada_tts_syn_text");
+        if (synth_text.empty())
+            synth_text = "Hello world.";
+        std::string dump_path = dirname_of(ref_path) + "/.tada-diff-codec-input.bin";
+        setenv("TADA_DUMP_FEATURES", dump_path.c_str(), 1);
+
+        tada_context_params tp = tada_context_default_params();
+        tp.n_threads = 4;
+        tp.verbosity = 0;
+        tp.seed = 42;
+        tada_context* tctx = tada_init_from_file(model_path.c_str(), tp);
+        if (!tctx) {
+            fprintf(stderr, "failed to load TADA model '%s'\n", model_path.c_str());
+            return 4;
+        }
+        if (tada_set_codec_path(tctx, codec_path.c_str()) != 0) {
+            fprintf(stderr, "failed to load TADA codec '%s'\n", codec_path.c_str());
+            tada_free(tctx);
+            return 4;
+        }
+        std::string prompt_path;
+        if (const char* prompt = std::getenv("TADA_PROMPT_CACHE"); prompt && *prompt)
+            prompt_path = prompt;
+        else if (ref.has("prompt_token_values"))
+            prompt_path = ref_path;
+        if (!prompt_path.empty()) {
+            if (tada_load_prompt(tctx, prompt_path.c_str()) != 0) {
+                fprintf(stderr, "tada-tts: warning: failed to load prompt cache '%s'\n", prompt_path.c_str());
+            }
+        }
+
+        static const char* gen_stages[] = {
+            "text_tokens", "llm_embed", "llm_hidden_0", "fm_noise_0", "fm_step_0_0", "fm_step_0_5", "fm_output_0",
+        };
+        for (const char* stage : gen_stages) {
+            if (!ref.has(stage)) {
+                printf("[SKIP] %-22s (not in reference archive)\n", stage);
+                n_skip++;
+                continue;
+            }
+            int n_stage = 0;
+            float* our_data = tada_extract_stage(tctx, synth_text.c_str(), stage, &n_stage);
+            if (!our_data || n_stage <= 0) {
+                printf("[ERR ] %-22s  extract returned null\n", stage);
+                n_fail++;
+                if (our_data)
+                    free(our_data);
+                continue;
+            }
+            auto rep = ref.compare(stage, our_data, (size_t)n_stage, crispasr_diff::Ref::COS_LAST_DIM);
+            print_row_exact(stage, rep, COS_THRESHOLD, 1e-3f);
+            if (!rep.found)
+                n_skip++;
+            else if (rep.n_nonfinite == 0 && rep.cos_min >= COS_THRESHOLD && rep.max_abs <= 1e-3f)
+                n_pass++;
+            else
+                n_fail++;
+            free(our_data);
+        }
+
+        int n_pcm = 0;
+        float* gen_pcm = tada_synthesize(tctx, synth_text.c_str(), &n_pcm);
+        if (gen_pcm && n_pcm > 0) {
+            auto rep = ref.compare("codec_pcm", gen_pcm, (size_t)n_pcm, crispasr_diff::Ref::COS_LAST_DIM);
+            print_row_exact("codec_pcm(generated)", rep, COS_THRESHOLD, 1e-3f);
+            if (!rep.found)
+                n_skip++;
+            else if (rep.n_nonfinite == 0 && rep.cos_min >= COS_THRESHOLD && rep.max_abs <= 1e-3f)
+                n_pass++;
+            else
+                n_fail++;
+            tada_pcm_free(gen_pcm);
+        } else {
+            printf("[ERR ] %-22s  tada_synthesize returned null\n", "codec_pcm(generated)");
+            n_fail++;
+        }
+        tada_free(tctx);
+
+        std::vector<float> gen_codec_input;
+        int gen_frames = 0, gen_dim = 0;
+        if (FILE* f = fopen(dump_path.c_str(), "rb")) {
+            uint32_t hdr[2] = {0, 0};
+            if (fread(hdr, sizeof(hdr), 1, f) == 1) {
+                gen_frames = (int)hdr[0];
+                gen_dim = (int)hdr[1];
+                if (gen_frames > 0 && gen_dim > 0) {
+                    gen_codec_input.resize((size_t)gen_frames * gen_dim);
+                    size_t got = fread(gen_codec_input.data(), sizeof(float), gen_codec_input.size(), f);
+                    if (got != gen_codec_input.size())
+                        gen_codec_input.clear();
+                }
+            }
+            fclose(f);
+            remove(dump_path.c_str());
+        }
+        if (!gen_codec_input.empty() && gen_dim == 512) {
+            auto rep = ref.compare("codec_input", gen_codec_input.data(), gen_codec_input.size(),
+                                   crispasr_diff::Ref::COS_LAST_DIM);
+            print_row_exact("codec_input(generated)", rep, COS_THRESHOLD, 1e-3f);
+            if (!rep.found)
+                n_skip++;
+            else if (rep.n_nonfinite == 0 && rep.cos_min >= COS_THRESHOLD && rep.max_abs <= 1e-3f)
+                n_pass++;
+            else
+                n_fail++;
+            printf("tada-tts: generated text=%s codec_input frames=%d\n", synth_text.c_str(), gen_frames);
+        } else {
+            printf("[ERR ] %-22s  no generated codec_input dump for text '%s'\n", "codec_input(generated)",
+                   synth_text.c_str());
+            n_fail++;
+        }
+
+        tada_codec_context* ctx = tada_codec_init_from_file(codec_path.c_str(), 4);
+        if (!ctx) {
+            fprintf(stderr, "failed to load TADA codec '%s'\n", codec_path.c_str());
+            return 4;
+        }
+
+        struct TadaStage {
+            const char* ref_name;
+            const char* graph_name;
+            crispasr_diff::Ref::CompareMode mode;
+        };
+        static const TadaStage stages[] = {
+            {"codec_proj", "dump_proj", crispasr_diff::Ref::COS_LAST_DIM},
+            {"codec_attn_out", "dump_attn", crispasr_diff::Ref::COS_LAST_DIM},
+            {"codec_pcm", "pcm", crispasr_diff::Ref::COS_LAST_DIM},
+        };
+
+        printf("tada-tts: codec_input frames=%d token_masks=%d/%d codec=%s\n", n_frames,
+               (int)std::count(token_masks.begin(), token_masks.end(), 1), n_frames, codec_path.c_str());
+        for (const auto& s : stages) {
+            int n_stage = 0;
+            float* our_data =
+                tada_codec_extract_stage(ctx, input_pair.first, n_frames, token_masks.data(), s.graph_name, &n_stage);
+            if (!our_data) {
+                printf("[ERR ] %-22s  extract returned null\n", s.ref_name);
+                n_fail++;
+                continue;
+            }
+            auto rep = ref.compare(s.ref_name, our_data, (size_t)n_stage, s.mode);
+            print_row(s.ref_name, rep, COS_THRESHOLD);
+            record(rep);
+            free(our_data);
+        }
+        tada_codec_free(ctx);
 
     } else if (backend_name == "lid-glotlid" || backend_name == "lid-fasttext176") {
         // Text-input LID (GlotLID + Facebook LID-176 share this backend).

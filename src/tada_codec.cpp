@@ -310,7 +310,6 @@ static ggml_tensor* snake1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* alph
     if (!alpha || !inv_alpha)
         return x;
     const int C = (int)x->ne[0];
-    const int T = (int)x->ne[1];
 
     ggml_tensor* a = ggml_cast(ctx, ggml_cont(ctx, ggml_reshape_2d(ctx, alpha, C, 1)), GGML_TYPE_F32);
     ggml_tensor* ia = ggml_cast(ctx, ggml_cont(ctx, ggml_reshape_2d(ctx, inv_alpha, C, 1)), GGML_TYPE_F32);
@@ -777,41 +776,45 @@ float* tada_codec_decode(struct tada_codec_context* ctx, const float* features, 
         return nullptr;
     }
 
-    // Dump intermediate tensors for diff comparison
-    auto dump = [&](const char* name) {
-        ggml_tensor* t = ggml_graph_get_tensor(gf, name);
-        if (!t)
-            return;
-        int n = (int)ggml_nelements(t);
-        std::vector<float> buf(n);
-        ggml_backend_tensor_get(t, buf.data(), 0, (size_t)n * sizeof(float));
-        float rms = 0;
-        for (int i = 0; i < n; i++)
-            rms += buf[i] * buf[i];
-        rms = std::sqrt(rms / n);
-        float mn = *std::min_element(buf.begin(), buf.end());
-        float mx = *std::max_element(buf.begin(), buf.end());
-        fprintf(stderr, "  DUMP %s: n=%d range=[%.4f, %.4f] rms=%.4f\n", name, n, mn, mx, rms);
-    };
-    dump("dump_proj");
-    dump("dump_attn");
-    dump("dump_layer0");
-    dump("dump_dac_in");
-    dump("dump_b0_snake");
-    dump("dump_b0_convt");
-    dump("dump_blk0");
-    dump("dump_blk1");
-    dump("dump_blk2");
-    dump("dump_blk3");
-    dump("dump_dac_out");
+    const bool dump_stats = [] {
+        const char* e = std::getenv("TADA_CODEC_DUMP");
+        return e && *e && *e != '0';
+    }();
+    if (dump_stats) {
+        auto dump = [&](const char* name) {
+            ggml_tensor* t = ggml_graph_get_tensor(gf, name);
+            if (!t)
+                return;
+            int n = (int)ggml_nelements(t);
+            std::vector<float> buf(n);
+            ggml_backend_tensor_get(t, buf.data(), 0, (size_t)n * sizeof(float));
+            float rms = 0;
+            for (int i = 0; i < n; i++)
+                rms += buf[i] * buf[i];
+            rms = std::sqrt(rms / n);
+            float mn = *std::min_element(buf.begin(), buf.end());
+            float mx = *std::max_element(buf.begin(), buf.end());
+            fprintf(stderr, "  DUMP %s: n=%d range=[%.4f, %.4f] rms=%.4f\n", name, n, mn, mx, rms);
+        };
+        dump("dump_proj");
+        dump("dump_attn");
+        dump("dump_layer0");
+        dump("dump_dac_in");
+        dump("dump_b0_snake");
+        dump("dump_b0_convt");
+        dump("dump_blk0");
+        dump("dump_blk1");
+        dump("dump_blk2");
+        dump("dump_blk3");
+        dump("dump_dac_out");
+    }
 
     ggml_tensor* pcm_t = ggml_graph_get_tensor(gf, "pcm");
     int n_samples = (int)ggml_nelements(pcm_t);
     float* pcm = (float*)malloc((size_t)n_samples * sizeof(float));
     ggml_backend_tensor_get(pcm_t, pcm, 0, (size_t)n_samples * sizeof(float));
 
-    // Dump PCM stats
-    {
+    if (dump_stats) {
         float rms = 0, mn = pcm[0], mx = pcm[0];
         for (int i = 0; i < n_samples; i++) {
             rms += pcm[i] * pcm[i];
@@ -827,6 +830,83 @@ float* tada_codec_decode(struct tada_codec_context* ctx, const float* features, 
     ggml_backend_sched_free(sched);
     *out_n_samples = n_samples;
     return pcm;
+}
+
+float* tada_codec_extract_stage(struct tada_codec_context* ctx, const float* features, int n_frames,
+                                const int32_t* token_masks, const char* stage, int* out_n) {
+    if (out_n)
+        *out_n = 0;
+    if (!ctx || !features || !stage || !*stage || n_frames <= 0)
+        return nullptr;
+
+    const int ed = ctx->embed_dim;
+    ggml_cgraph* gf = build_decode_graph(ctx, n_frames);
+
+    ggml_backend_t backends[] = {ctx->backend};
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, 32768, false, false);
+    ggml_backend_sched_reset(sched);
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        fprintf(stderr, "tada-codec: failed to alloc graph for stage '%s'\n", stage);
+        ggml_backend_sched_free(sched);
+        return nullptr;
+    }
+
+    ggml_tensor* inp = ggml_graph_get_tensor(gf, "features");
+    ggml_backend_tensor_set(inp, features, 0, (size_t)ed * n_frames * sizeof(float));
+
+    ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "codec_pos");
+    if (pos_t) {
+        std::vector<int32_t> positions(n_frames);
+        for (int i = 0; i < n_frames; i++)
+            positions[i] = i;
+        ggml_backend_tensor_set(pos_t, positions.data(), 0, (size_t)n_frames * sizeof(int32_t));
+    }
+
+    ggml_tensor* mask_t = ggml_graph_get_tensor(gf, "attn_mask");
+    if (mask_t) {
+        std::vector<int32_t> block_ids(n_frames);
+        int block = 0;
+        for (int i = 0; i < n_frames; i++) {
+            if (token_masks && token_masks[i])
+                block++;
+            block_ids[i] = block - ((token_masks && token_masks[i]) ? 1 : 0);
+        }
+
+        std::vector<ggml_fp16_t> mask_data((size_t)n_frames * n_frames);
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+        for (int i = 0; i < n_frames; i++) {
+            for (int j = 0; j < n_frames; j++) {
+                bool same = (block_ids[j] == block_ids[i]);
+                bool prev = (block_ids[j] == block_ids[i] - 1);
+                mask_data[(size_t)i * n_frames + j] = (same || prev) ? zero : neg_inf;
+            }
+        }
+        ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+    }
+
+    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "tada-codec: graph compute failed for stage '%s'\n", stage);
+        ggml_backend_sched_free(sched);
+        return nullptr;
+    }
+
+    ggml_tensor* t = ggml_graph_get_tensor(gf, stage);
+    if (!t) {
+        ggml_backend_sched_free(sched);
+        return nullptr;
+    }
+    const int n = (int)ggml_nelements(t);
+    float* out = (float*)malloc((size_t)n * sizeof(float));
+    if (!out) {
+        ggml_backend_sched_free(sched);
+        return nullptr;
+    }
+    ggml_backend_tensor_get(t, out, 0, (size_t)n * sizeof(float));
+    if (out_n)
+        *out_n = n;
+    ggml_backend_sched_free(sched);
+    return out;
 }
 
 float* tada_codec_decode_dac(struct tada_codec_context* ctx, const float* hidden, int n_frames, int* out_n_samples) {
