@@ -4499,8 +4499,10 @@ static ggml_tensor* build_cenc_seanet(ggml_context* ctx, const g3t_cenc_seanet& 
 // Input: [T_enc, 512] from SEANet → converts to [512, T] internally.
 // Output: [T_enc, 512] (back-converted).
 // Mimi's encoder transformer uses CAUSAL attention with sliding window=250.
+// pos_in: optional i32 [T] tensor of ABSOLUTE positions (for chunked encoding).
+//         When null, positions 0..T-1 are derived from ggml_arange (full-sequence path).
 static ggml_tensor* build_cenc_transformer(ggml_context* ctx, const std::vector<g3t_cenc_xfmr_layer>& layers,
-                                           ggml_tensor* x) {
+                                           ggml_tensor* x, ggml_tensor* pos_in = nullptr) {
     // Transpose from SEANet [T, d] → [d, T] for ggml_norm (normalizes over ne[0]=d)
     x = ggml_cont(ctx, ggml_transpose(ctx, x)); // [d=512, T]
 
@@ -4510,7 +4512,7 @@ static ggml_tensor* build_cenc_transformer(ggml_context* ctx, const std::vector<
     const int T = (int)x->ne[1];
     const int d = (int)x->ne[0]; // 512
 
-    ggml_tensor* pos = ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float)T, 1.0f), GGML_TYPE_I32);
+    ggml_tensor* pos = pos_in ? pos_in : ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float)T, 1.0f), GGML_TYPE_I32);
 
     // Causal sliding-window mask [T, T] F16 — set as input, filled at compute.
     ggml_tensor* causal_mask = nullptr;
@@ -4573,6 +4575,212 @@ static ggml_tensor* build_cenc_transformer(ggml_context* ctx, const std::vector<
     }
     // Back to [T, d] for the downsample conv
     return ggml_cont(ctx, ggml_transpose(ctx, x));
+}
+
+// Forward declarations for helpers defined further below.
+static std::vector<ggml_fp16_t> build_cenc_mask(int T_enc);
+static bool cenc_rvq_encode(qwen3_tts_context* c, const float* emb, int T, std::vector<int32_t>& out_codes);
+
+// ---------------------------------------------------------------------------
+// Chunked encoder sub-graphs (for long reference audio, T_enc > CENC_XFMR_THRESHOLD)
+// ---------------------------------------------------------------------------
+
+// Frames per output chunk; left-context kept for each chunk (= sliding_window).
+static const int CENC_XFMR_CHUNK = 500;
+static const int CENC_XFMR_CTX = 250;
+// Encoder uses the original full-graph path for T_enc ≤ this; chunked above.
+// 1500 frames ≈ 60 s reference audio; attention scratch at this size is ~144 MB
+// (1500² × 8 heads × 4 B), safe for any backend.  Long audio (11 min = 16500
+// frames) would need 8.7 GB of scratch and OOMs on CUDA.
+static const int CENC_XFMR_THRESHOLD = 1500;
+
+// SEANet only (no transformer, no downsample): PCM [n_samples] → [T_enc, 512].
+static ggml_cgraph* build_cenc_seanet_only_graph(qwen3_tts_context* c, int n_samples) {
+    size_t mem = c->cenc_compute_meta.size();
+    ggml_init_params ip = {mem, c->cenc_compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
+
+    ggml_tensor* pcm = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_samples);
+    ggml_set_name(pcm, "pcm_input");
+    ggml_set_input(pcm);
+
+    ggml_tensor* x = ggml_reshape_2d(ctx0, pcm, n_samples, 1); // [T, 1]
+    x = build_cenc_seanet(ctx0, c->cenc.seanet, x);            // → [T_enc, 512]
+    x = ggml_cont(ctx0, x);
+    ggml_set_name(x, "cenc_seanet_out");
+    ggml_set_output(x);
+    ggml_build_forward_expand(gf, x);
+    ggml_free(ctx0);
+    return gf;
+}
+
+// Transformer chunk: inputs cenc_chunk_in [chunk_T, 512] + cenc_chunk_pos [chunk_T] i32
+// (absolute frame positions) → output cenc_chunk_out [chunk_T, 512].
+static ggml_cgraph* build_cenc_xfmr_chunk_graph(qwen3_tts_context* c, int chunk_T) {
+    size_t mem = c->cenc_compute_meta.size();
+    ggml_init_params ip = {mem, c->cenc_compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
+
+    ggml_tensor* x_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, chunk_T, 512);
+    ggml_set_name(x_in, "cenc_chunk_in");
+    ggml_set_input(x_in);
+
+    ggml_tensor* pos_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, chunk_T);
+    ggml_set_name(pos_in, "cenc_chunk_pos");
+    ggml_set_input(pos_in);
+
+    // build_cenc_transformer will use pos_in for RoPE and create "cenc_mask" input.
+    ggml_tensor* out = build_cenc_transformer(ctx0, c->cenc.xfmr_layers, x_in, pos_in);
+    out = ggml_cont(ctx0, out); // [chunk_T, 512]
+    ggml_set_name(out, "cenc_chunk_out");
+    ggml_set_output(out);
+    ggml_build_forward_expand(gf, out);
+    ggml_free(ctx0);
+    return gf;
+}
+
+// Downsample only: input cenc_ds_in [T_enc, 512] → enc_emb [512, T_frames].
+static ggml_cgraph* build_cenc_downsample_graph(qwen3_tts_context* c, int T_enc) {
+    size_t mem = c->cenc_compute_meta.size();
+    ggml_init_params ip = {mem, c->cenc_compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
+
+    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T_enc, 512);
+    ggml_set_name(x, "cenc_ds_in");
+    ggml_set_input(x);
+
+    const auto& ce = c->cenc;
+    g3t_cenc_conv ds_conv = {ce.downsample.w, ce.downsample.b};
+    ggml_tensor* tmp = cenc_conv1d_ext(ctx0, x, ds_conv, 2, /*replicate*/ true); // [T_frames, 512]
+    tmp = ggml_cont(ctx0, ggml_transpose(ctx0, tmp));                            // [512, T_frames]
+    ggml_set_name(tmp, "enc_emb");
+    ggml_set_output(tmp);
+    ggml_build_forward_expand(gf, tmp);
+    ggml_free(ctx0);
+    return gf;
+}
+
+// Chunked encoder for T_enc > CENC_XFMR_THRESHOLD.
+// Splits the O(T²) transformer attention into chunks of CENC_XFMR_CHUNK frames,
+// each with CENC_XFMR_CTX frames of left-context (= sliding window).
+// SEANet runs once over full PCM (O(n)); transformer runs per chunk (O(chunk²));
+// downsample runs once over the concatenated output (O(n)).
+static bool run_cenc_chunked(qwen3_tts_context* c, const float* audio, int n_samples, std::vector<int32_t>& codes,
+                             int& T_frames) {
+    const int T_enc = n_samples / 960;
+    fprintf(stderr, "qwen3_tts: cenc: chunked encoder T_enc=%d (%.1fs ref audio, chunk=%d ctx=%d)\n", T_enc,
+            (float)n_samples / 24000.0f, CENC_XFMR_CHUNK, CENC_XFMR_CTX);
+
+    // ── Phase 1: SEANet over full PCM ──
+    // seanet_buf layout: ne=[T_enc, 512] → flat index [ch * T_enc + t]
+    std::vector<float> seanet_buf((size_t)512 * T_enc);
+    {
+        ggml_cgraph* gf = build_cenc_seanet_only_graph(c, n_samples);
+        ggml_backend_sched_reset(c->sched);
+        if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
+            fprintf(stderr, "qwen3_tts: cenc: seanet alloc failed\n");
+            return false;
+        }
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pcm_input"), audio, 0, (size_t)n_samples * sizeof(float));
+        if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "qwen3_tts: cenc: seanet compute failed\n");
+            return false;
+        }
+        ggml_tensor* se_t = ggml_graph_get_tensor(gf, "cenc_seanet_out");
+        ggml_backend_tensor_get(se_t, seanet_buf.data(), 0, seanet_buf.size() * sizeof(float));
+    }
+
+    // ── Phase 2: Transformer in chunks ──
+    // xfmr_out layout: ne=[T_enc, 512] → flat index [ch * T_enc + t]
+    std::vector<float> xfmr_out((size_t)512 * T_enc);
+    {
+        int result_start = 0;
+        while (result_start < T_enc) {
+            const int ctx_T = std::min(result_start, CENC_XFMR_CTX);
+            const int ctx_start = result_start - ctx_T;
+            const int new_T = std::min(CENC_XFMR_CHUNK, T_enc - result_start);
+            const int chunk_T = ctx_T + new_T;
+
+            ggml_cgraph* gf = build_cenc_xfmr_chunk_graph(c, chunk_T);
+            ggml_backend_sched_reset(c->sched);
+            if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
+                fprintf(stderr, "qwen3_tts: cenc: xfmr chunk alloc failed (chunk_T=%d)\n", chunk_T);
+                return false;
+            }
+
+            // Copy frames [ctx_start, ctx_start+chunk_T) from seanet_buf → chunk_in.
+            // Both buffers use ne=[T, 512] layout: data[ch * T + t].
+            {
+                std::vector<float> chunk_in((size_t)512 * chunk_T);
+                for (int ch = 0; ch < 512; ch++) {
+                    memcpy(&chunk_in[(size_t)ch * chunk_T], &seanet_buf[(size_t)ch * T_enc + ctx_start],
+                           (size_t)chunk_T * sizeof(float));
+                }
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "cenc_chunk_in"), chunk_in.data(), 0,
+                                        chunk_in.size() * sizeof(float));
+            }
+
+            // Absolute positions for RoPE: ctx_start, ctx_start+1, …, ctx_start+chunk_T-1.
+            {
+                std::vector<int32_t> pos_vals(chunk_T);
+                for (int t = 0; t < chunk_T; t++) {
+                    pos_vals[t] = ctx_start + t;
+                }
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "cenc_chunk_pos"), pos_vals.data(), 0,
+                                        pos_vals.size() * sizeof(int32_t));
+            }
+
+            // Causal mask for the chunk.
+            ggml_tensor* mask_t = ggml_graph_get_tensor(gf, "cenc_mask");
+            if (mask_t && chunk_T > 1) {
+                auto mask = build_cenc_mask(chunk_T);
+                ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+            }
+
+            if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "qwen3_tts: cenc: xfmr chunk compute failed (chunk_T=%d start=%d)\n", chunk_T,
+                        result_start);
+                return false;
+            }
+
+            // Read back chunk output and copy the new_T frames (skip ctx_T left-context).
+            {
+                std::vector<float> chunk_out((size_t)512 * chunk_T);
+                ggml_tensor* out_t = ggml_graph_get_tensor(gf, "cenc_chunk_out");
+                ggml_backend_tensor_get(out_t, chunk_out.data(), 0, chunk_out.size() * sizeof(float));
+                for (int ch = 0; ch < 512; ch++) {
+                    memcpy(&xfmr_out[(size_t)ch * T_enc + result_start], &chunk_out[(size_t)ch * chunk_T + ctx_T],
+                           (size_t)new_T * sizeof(float));
+                }
+            }
+
+            result_start += new_T;
+        }
+    }
+
+    // ── Phase 3: Downsample + RVQ ──
+    {
+        ggml_cgraph* gf = build_cenc_downsample_graph(c, T_enc);
+        ggml_backend_sched_reset(c->sched);
+        if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
+            fprintf(stderr, "qwen3_tts: cenc: downsample alloc failed\n");
+            return false;
+        }
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "cenc_ds_in"), xfmr_out.data(), 0,
+                                xfmr_out.size() * sizeof(float));
+        if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "qwen3_tts: cenc: downsample compute failed\n");
+            return false;
+        }
+        ggml_tensor* emb_t = ggml_graph_get_tensor(gf, "enc_emb");
+        T_frames = (int)emb_t->ne[1];
+        std::vector<float> emb((size_t)512 * T_frames);
+        ggml_backend_tensor_get(emb_t, emb.data(), 0, emb.size() * sizeof(float));
+        return cenc_rvq_encode(c, emb.data(), T_frames, codes);
+    }
 }
 
 // Build the SEANet→transformer→downsample graph and return downsampled embeddings.
@@ -4742,6 +4950,13 @@ static std::vector<ggml_fp16_t> build_cenc_mask(int T_enc) {
 // Run codec encoder: 24kHz PCM → codes [T_frames × 16] row-major.
 static bool run_cenc(qwen3_tts_context* c, const float* audio, int n_samples, std::vector<int32_t>& codes,
                      int& T_frames) {
+    // For long reference audio, the O(T²) transformer attention OOMs.
+    // Use the chunked path (SEANet + chunked transformer + downsample) above threshold.
+    const int T_enc = n_samples / 960;
+    if (T_enc > CENC_XFMR_THRESHOLD) {
+        return run_cenc_chunked(c, audio, n_samples, codes, T_frames);
+    }
+
     // Build and execute the SEANet+transformer+downsample graph
     ggml_cgraph* gf = build_cenc_graph(c, n_samples);
     ggml_backend_sched_reset(c->sched);
@@ -6243,8 +6458,8 @@ static bool qwen3_tts_generate_codes_ar(qwen3_tts_context* ctx, const char* text
     const auto& hp = ctx->hp;
     const int d = (int)hp.d_model;
     const int n_groups = (int)hp.n_code_groups; // 16
-    int max_frames = ctx->params.max_codec_steps > 0 ? ctx->params.max_codec_steps
-                                                     : (ctx->kv_max_ctx > 0 ? ctx->kv_max_ctx : 1500);
+    int max_frames =
+        ctx->params.max_codec_steps > 0 ? ctx->params.max_codec_steps : (ctx->kv_max_ctx > 0 ? ctx->kv_max_ctx : 1500);
     if (const char* mf = getenv("QWEN3_TTS_MAX_FRAMES")) {
         const int v = std::atoi(mf);
         if (v > 0)
