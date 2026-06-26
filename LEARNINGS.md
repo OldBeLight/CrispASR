@@ -10884,3 +10884,48 @@ variables (`tb`, `ta`, `cur_t_before`, `cur_t_after`) switch one step earlier.
 they must be tracked independently.  A single off-by-one in a time embedding
 several frames before the decoded zone can still corrupt all decoded frames via
 KV-state drift.
+
+### TADA TTS: `tada-ref.gguf` is both a prompt cache and a poor full diff oracle
+
+`tada-ref.gguf` contains the prompt tensors the runtime needs
+(`prompt_token_values`, `prompt_token_positions`, plus prompt transcript
+metadata).  That makes it a valid **voice prompt cache** for
+`tada_load_prompt()`.  It does **not** make every published `tada-ref.gguf`
+a trustworthy full end-to-end generated-output reference.  Stale refs can
+still contain prompt tensors that are useful for synthesis while their
+`codec_input`, `codec_pcm`, `time_before`, or generated acoustic tensors no
+longer match current Python/reference generation.
+
+**Bug pattern:** treating a passing codec-only diff against a stale ref as proof
+that generated timing is correct.  In issue #192, stale refs hid the real
+tempo problem because they did not force the harness to compare the generated
+`time_before` sequence and full acoustic matrix from the same Python run.
+
+**Fix:** keep runtime prompt loading scoped to prompt tensors, but make the
+TADA diff harness compare generated `acoustic_features` and generated
+`time_before` whenever those tensors exist in the reference archive.  For exact
+timing work, regenerate a fresh full ref from the original Python model/weights;
+do not infer timing correctness from prompt-only GGUFs.
+
+### TADA TTS: multilingual lives in prompt encoding, not generation
+
+The Python blueprint does multilingual TADA by selecting a language-specific
+aligner when building the prompt:
+
+- `Encoder.from_pretrained(codec_repo, subfolder="encoder", language="fr")`
+  loads `aligner-fr`
+- `Encoder(audio, text=[transcript], sample_rate=...)` forced-aligns the
+  reference audio to the supplied transcript
+- `model.generate(prompt=prompt, text=...)` then consumes only
+  `prompt.token_values`, `prompt.token_positions`, and `prompt.text`; it has no
+  separate generation-time language flag
+
+**Runtime implication:** `-l fr` cannot magically make a default English prompt
+French.  It can only select a pre-encoded sibling prompt such as
+`tada-ref-fr.gguf`.  Custom multilingual voices must first be converted with
+`models/convert-tada-ref-to-gguf.py --language fr --transcript ...`, which
+matches the blueprint's `aligner-fr` path.
+
+**Practical rule:** for TADA, fix language issues in the prompt-conversion
+pipeline, not in `tada_synthesize()`.  The C++ runtime should load the right
+prompt GGUF and then follow Python generation exactly.
