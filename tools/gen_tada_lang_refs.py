@@ -30,6 +30,39 @@ try:
 except ImportError:
     sys.exit("gguf not found: pip install gguf")
 
+# Redirect gated meta-llama/Llama-3.2-1B → unsloth mirror (same weights, public).
+# hume-tada's Encoder internally loads the Llama-3.2-1B tokenizer/config; patch
+# hf_hub_download at all call sites before importing tada/transformers so those
+# requests go to the ungated unsloth mirror instead.
+_LLAMA_REDIR = {"meta-llama/Llama-3.2-1B": "unsloth/Llama-3.2-1B"}
+
+try:
+    import huggingface_hub
+    import huggingface_hub.file_download as _hfd
+
+    _orig_dl = _hfd.hf_hub_download
+
+    def _hf_hub_download_redir(repo_id: str, *args, **kw):
+        if repo_id in _LLAMA_REDIR:
+            target = _LLAMA_REDIR[repo_id]
+            print(f"  [llama-bypass] {repo_id} → {target}", flush=True)
+            repo_id = target
+        return _orig_dl(repo_id, *args, **kw)
+
+    # Patch both the module attr and the file_download submodule attr so any
+    # import path (huggingface_hub.hf_hub_download or the internal one) is covered.
+    _hfd.hf_hub_download = _hf_hub_download_redir
+    huggingface_hub.hf_hub_download = _hf_hub_download_redir
+
+    # Pre-import transformers and patch its module-level binding too, so
+    # transformers.utils.hub.cached_file() uses the redirected function.
+    import transformers.utils.hub as _tuh
+    if hasattr(_tuh, "hf_hub_download"):
+        _tuh.hf_hub_download = _hf_hub_download_redir
+    print("  [llama-bypass] redirect installed (meta-llama → unsloth)", flush=True)
+except Exception as _patch_err:
+    print(f"  WARNING: llama bypass setup failed: {_patch_err}", flush=True)
+
 try:
     from tada.modules.encoder import Encoder
 except ImportError as _e:
