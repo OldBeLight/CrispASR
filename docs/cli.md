@@ -100,7 +100,7 @@ crispasr --list-backends
 | `-m auto` | Download the registry default for `--backend` on first use; subsequent runs are instant |
 | `--model-quant Q` | Preferred quant for registry resolution; overrides the default. E.g. `--model-quant q8_0` to get Q8_0 instead of the default Q4_K. Also changes any companion model (voice pack, codec). |
 | `--auto-download` | Explicitly allow auto-download of missing registry models. Implied by `-m auto` and `--hf-repo`. |
-| `--cache-dir DIR` | Override the auto-download cache directory (default: `~/.cache/crispasr/`) |
+| `--cache-dir DIR` | Override the auto-download cache directory. Precedence: this flag, `$CRISPASR_CACHE_DIR`, `$CRISPASR_MODELS_DIR`, then `~/.cache/crispasr/`. |
 | `-hfr REPO`, `--hf-repo OWNER/REPO[:FILE]` | Fetch model from an arbitrary HuggingFace repo. E.g. `--hf-repo cstr/parakeet-tdt-0.6b-v3-GGUF:parakeet-tdt-0.6b-v3-q4_k.gguf`. Implies `--auto-download`. |
 | `-hff FNAME`, `--hf-file FNAME` | Filename within `--hf-repo` (alternative to the `OWNER/REPO:FILE` shorthand) |
 | `--dry-run-resolve` | Print the resolved model path + companion paths and exit — does not load or synthesize |

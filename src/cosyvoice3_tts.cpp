@@ -962,13 +962,26 @@ extern "C" struct cosyvoice3_tts_context* cosyvoice3_tts_init_from_file(const ch
         return nullptr;
     }
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    // Phase 2 default: CPU-only. The cosyvoice3 LM is small (~0.5B,
-    // 24 layers) so CPU is acceptable for the diff-validation phase.
-    // GPU path lands in a later phase once the prefill + step shapes
-    // are validated.
-    ctx->backend = ctx->backend_cpu;
-    if (params.use_gpu && params.verbosity >= 1) {
-        fprintf(stderr, "cosyvoice3_tts: --gpu requested but pinned to CPU for Phase 2 (LLM validation)\n");
+    // The original diff-validation implementation pinned every CosyVoice3
+    // stage to CPU even when the caller requested GPU execution.  Besides the
+    // AR LLM, the flow estimator runs 22 transformer blocks twice for every
+    // Euler step, so that stale pin makes normal synthesis appear hung on
+    // CUDA machines.  All stages use the shared backend scheduler below and
+    // can therefore follow their GPU-resident weights, with CPU retained as
+    // the fallback for unsupported operations.
+    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    if (!ctx->backend) {
+        if (params.use_gpu && params.verbosity >= 1) {
+            fprintf(stderr, "cosyvoice3_tts: GPU backend unavailable, falling back to CPU\n");
+        }
+        ctx->backend = ctx->backend_cpu;
+    }
+    if (ggml_backend_is_cpu(ctx->backend)) {
+        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    }
+    if (params.verbosity >= 1) {
+        fprintf(stderr, "cosyvoice3_tts: using %s backend: %s\n", ggml_backend_is_cpu(ctx->backend) ? "CPU" : "GPU",
+                ggml_backend_name(ctx->backend));
     }
 
     // ---- Weight pass ----
@@ -1266,8 +1279,13 @@ extern "C" float* cosyvoice3_tts_step_speech(struct cosyvoice3_tts_context* ctx,
         embed = embed_alloc;
     }
 
-    // Step 2: run the LM forward with that embedding. Use the cached
-    // T=1 graph when possible to amortise the build cost across steps.
+    // Step 2: run the LM forward with that embedding. Cache the T=1 graph
+    // topology, but always reset + allocate the scheduler before execution.
+    // Skipping scheduler allocation for a cached graph leaves stale compute
+    // buffer bindings on GPU backends; the second AR step then crashes while
+    // encoding the first normalization op (issue #194). This mirrors the
+    // VibeVoice bucket-cache fix: graph construction stays amortized while
+    // the inexpensive scheduler split/allocation pass is refreshed.
     const int fixed_kv = ctx->kv_max_ctx;
     const bool can_skip = (ctx->step_t1_gf != nullptr && ctx->step_t1_fixed_kv_len == fixed_kv);
 
@@ -1280,14 +1298,15 @@ extern "C" float* cosyvoice3_tts_step_speech(struct cosyvoice3_tts_context* ctx,
             free(embed_alloc);
             return nullptr;
         }
-        ggml_backend_sched_reset(ctx->sched);
-        if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
-            fprintf(stderr, "cosyvoice3_tts: step alloc_graph failed\n");
-            free(embed_alloc);
-            return nullptr;
-        }
         ctx->step_t1_gf = gf;
         ctx->step_t1_fixed_kv_len = fixed_kv;
+    }
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "cosyvoice3_tts: step alloc_graph failed\n");
+        free(embed_alloc);
+        return nullptr;
     }
 
     auto set_t = [&](const char* nm, const void* data, size_t bytes) {

@@ -3,6 +3,7 @@
 
 #include "crispasr_cache.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -337,15 +338,12 @@ static bool fetch_libcurl(const std::string& url, const std::string& dest, bool 
 
 // ─── public API ──────────────────────────────────────────────────────────────
 
-std::string dir(const std::string& cache_dir_override) {
+namespace {
+
+std::string platform_default_dir() {
 #ifdef __EMSCRIPTEN__
-    // WASM: use Emscripten MEMFS. Models are written by JS via FS.writeFile.
-    return cache_dir_override.empty() ? "/models" : cache_dir_override;
+    return "/models";
 #endif
-    if (!cache_dir_override.empty()) {
-        mkdir(cache_dir_override.c_str(), 0755); // create leaf dir if absent
-        return cache_dir_override;
-    }
 
     const char* home = std::getenv("HOME");
 #ifdef _WIN32
@@ -363,6 +361,35 @@ std::string dir(const std::string& cache_dir_override) {
     d += "/crispasr";
     mkdir(d.c_str(), 0755);
     return d;
+}
+
+void append_unique(std::vector<std::string>& dirs, const std::string& candidate) {
+    if (candidate.empty())
+        return;
+    if (std::find(dirs.begin(), dirs.end(), candidate) == dirs.end())
+        dirs.push_back(candidate);
+}
+
+} // namespace
+
+std::string dir(const std::string& cache_dir_override) {
+#ifdef __EMSCRIPTEN__
+    // WASM: use Emscripten MEMFS. Models are written by JS via FS.writeFile.
+    return cache_dir_override.empty() ? platform_default_dir() : cache_dir_override;
+#endif
+    std::string selected = cache_dir_override;
+    if (selected.empty()) {
+        if (const char* env = std::getenv("CRISPASR_CACHE_DIR"); env && *env)
+            selected = env;
+    }
+    if (selected.empty()) {
+        if (const char* env = std::getenv("CRISPASR_MODELS_DIR"); env && *env)
+            selected = env;
+    }
+    if (selected.empty())
+        selected = platform_default_dir();
+    mkdir(selected.c_str(), 0755); // create leaf dir if absent
+    return selected;
 }
 
 bool file_present(const std::string& path) {
@@ -469,13 +496,14 @@ bool fetch(const std::string& url, const std::string& dest, bool quiet) {
 // The list is platform-agnostic; non-existent dirs are skipped silently.
 static std::vector<std::string> well_known_search_dirs(const std::string& cache_dir_override) {
     std::vector<std::string> dirs;
-    dirs.push_back(dir(cache_dir_override));
+    append_unique(dirs, dir(cache_dir_override));
 
     if (const char* env = std::getenv("CRISPASR_MODELS_DIR"); env && *env) {
-        dirs.emplace_back(env);
+        append_unique(dirs, env);
     }
-    dirs.emplace_back("/mnt/storage/gguf-models");
-    dirs.emplace_back("/Volumes/backups/ai/crispasr-models");
+    append_unique(dirs, "/mnt/storage/gguf-models");
+    append_unique(dirs, "/Volumes/backups/ai/crispasr-models");
+    append_unique(dirs, platform_default_dir());
 
     const char* home = std::getenv("HOME");
 #ifdef _WIN32
@@ -483,8 +511,8 @@ static std::vector<std::string> well_known_search_dirs(const std::string& cache_
         home = std::getenv("USERPROFILE");
 #endif
     if (home && *home) {
-        dirs.emplace_back(std::string(home) + "/.cache/crispasr-models");
-        dirs.emplace_back(std::string(home) + "/.cache/huggingface/hub");
+        append_unique(dirs, std::string(home) + "/.cache/crispasr-models");
+        append_unique(dirs, std::string(home) + "/.cache/huggingface/hub");
     }
     return dirs;
 }

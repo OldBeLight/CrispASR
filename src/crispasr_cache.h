@@ -20,7 +20,8 @@ namespace crispasr_cache {
 // Return the cache directory (creating it if missing).
 //   • If cache_dir_override is non-empty, use it directly (creating the leaf
 //     directory if it does not exist; parents must already exist).
-//   • Otherwise use the platform default:
+//   • Otherwise honor CRISPASR_CACHE_DIR, then CRISPASR_MODELS_DIR.
+//   • If neither environment variable is set, use the platform default:
 //       - POSIX : $HOME/.cache/crispasr
 //       - Windows: %USERPROFILE%/.cache/crispasr
 //                  (%HOME% / %LOCALAPPDATA% as fallbacks if USERPROFILE unset)
