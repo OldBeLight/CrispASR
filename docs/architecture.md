@@ -200,11 +200,14 @@ regression test against `samples/jfk.wav`:
   omniasr-LLM, gemma4-e2b, mimo-asr, vibevoice): audio features
   injected into LLM embedding space, KV-cached autoregressive
   decoding.
-- **Transducer** (parakeet): LSTM predictor + joint network,
-  frame-synchronous TDT decoding. Supports greedy (default),
-  label-looping beam search (`-bs N`), and MAES (Modified Adaptive
-  Expansion Search — `CRISPASR_PARAKEET_MAES=1 -bs N`), with per-beam
-  LSTM state snapshots and per-beam hotword trie tracking.
+- **Transducer** (parakeet, reazonspeech): LSTM predictor + joint
+  network, frame-synchronous TDT/RNNT decoding. Supports greedy
+  (default), label-looping beam search (`-bs N`), and MAES (Modified
+  Adaptive Expansion Search — `CRISPASR_PARAKEET_MAES=1 -bs N`), with
+  per-beam LSTM state snapshots and per-beam hotword trie tracking.
+  Models with `n_tdt_durations=0` auto-select the pure RNNT decode
+  path; local attention (`att_context_size`) is supported for long-form
+  models like ReazonSpeech.
 - **Codec + LM** (kyutai-stt): neural audio codec (RVQ) →
   token-based LM.
 - **TTS — codec / vocoder pipeline**:
@@ -924,3 +927,34 @@ supporting ASR, TTS, and speech-to-speech.
 
 Models: single GGUF (F16 ~1.6 GB) converted from `lit_model.pth` + `small.pt`.
 For TTS/S2S, also needs SNAC codec GGUF (`--codec-model snac-24khz.gguf`).
+
+### reazonspeech
+
+ReazonSpeech NeMo v2 (reazon-research, Apache-2.0): 619M-param Japanese
+FastConformer-RNNT ASR model trained on the ReazonSpeech v2.0 corpus.
+
+```
+Audio → 80 log-mel (n_fft=512, Hann, per-feature z-norm)
+      → dw_striding 8× subsampling (5× Conv2d + Linear)
+      → 24 FastConformer blocks (rel_pos_local_attn, window=[128,128], 1 global token)
+      → RNNT joint network (enc→640, pred→640, ReLU, →3001)
+      → 2-layer LSTM predictor (embed(3001,640) + LSTM(640,640)×2)
+      → RNNT greedy decode (n_tdt_durations=0)
+```
+
+Key architectural points:
+- Reuses the `parakeet` runtime entirely — same GGUF arch tag, same C runtime
+- **Local attention** (`self_attention_model: rel_pos_local_attn`): each position
+  attends only to [q-128, q+128] plus 1 global token at position 0. Implemented
+  via an additive (T,T) mask in `core_conformer::build_block()`. For audio shorter
+  than ~20s (T_enc < 257), the window covers the full sequence = full attention.
+- **Pure RNNT** (no TDT duration head): `n_tdt_durations=0` triggers the dedicated
+  `parakeet_rnnt_decode()` / `parakeet_rnnt_beam_decode()` paths.
+- **Quantization**: RNNT joint network is structurally sensitive to quantization
+  noise (blank/non-blank argmax can flip). `crispasr-quantize` keeps
+  `joint.*` and `decoder.embed.*` at source precision for RNNT models by default
+  (override with `CRISPASR_PARAKEET_QUANT_ALL=1`). Q8_0 (704 MB) is the recommended
+  deployment quant; Q4_K (455 MB) works with the RNNT protection rule.
+- 3000-token SentencePiece unigram vocabulary, Japanese only.
+
+Models at `cstr/reazonspeech-nemo-v2-GGUF`: F16 (1240 MB), Q8_0 (704 MB), Q4_K (455 MB).

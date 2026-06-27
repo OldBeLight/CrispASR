@@ -333,6 +333,30 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
         }
     }
 
+    // Parakeet RNNT: the transducer joint network (joint.{enc,pred,out}.weight)
+    // and decoder embedding are structurally sensitive to quantization noise.
+    // The joint network's blank/non-blank decision is a ~3001-way argmax where
+    // the blank token competes with every real token — quantization noise can
+    // flip frames from blank to non-blank, causing the RNNT greedy decoder to
+    // enter a non-terminating emission loop. TDT models are less affected
+    // because the duration head provides an independent advance mechanism.
+    // Default: keep joint.* and decoder.embed.* at source precision for RNNT
+    // models (n_tdt_durations==0). Override with CRISPASR_PARAKEET_QUANT_ALL=1.
+    const bool is_parakeet = (arch == "parakeet");
+    bool parakeet_is_rnnt = false;
+    if (is_parakeet) {
+        int key = gguf_find_key(ctx_in, "parakeet.n_tdt_durations");
+        if (key >= 0)
+            parakeet_is_rnnt = (gguf_get_val_u32(ctx_in, key) == 0);
+    }
+    const char* env_parakeet_all = std::getenv("CRISPASR_PARAKEET_QUANT_ALL");
+    const bool parakeet_quant_all = is_parakeet && env_parakeet_all && *env_parakeet_all && *env_parakeet_all != '0';
+    if (is_parakeet && parakeet_is_rnnt && !parakeet_quant_all) {
+        printf("%s: parakeet RNNT — keeping joint.* and decoder.embed.* at source precision "
+               "(override with CRISPASR_PARAKEET_QUANT_ALL=1)\n",
+               __func__);
+    }
+
     // First pass: determine which tensors will be quantized and compute
     // their target types. We need this BEFORE adding tensors to ctx_out
     // so that gguf_add_tensor computes correct offsets for the quantized
@@ -395,6 +419,8 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             !(is_mini_omni2 &&
               (sname.find("audio.") == 0 || sname.find("adapter.") == 0 || sname.find("llm.token_embd") == 0)) &&
             !(is_orpheus && sname.find("talker.token_embd") == 0) &&
+            !(is_parakeet && parakeet_is_rnnt && !parakeet_quant_all &&
+              (sname.find("joint.") == 0 || sname.find("decoder.embed") == 0)) &&
             !(is_tada && !tada_quant_all && (sname.find("talker.token_embd") == 0 || sname.find("tada.") == 0)) &&
             ([&]() {
                 if (!is_tada || tada_quant_all || (tada_keep_head == 0 && tada_keep_tail == 0))

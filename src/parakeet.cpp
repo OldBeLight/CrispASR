@@ -142,6 +142,11 @@ struct parakeet_hparams {
     uint32_t n_tdt_durations = 5;
     uint32_t frame_dur_cs = 8; // 80 ms per encoder frame
     std::vector<int32_t> tdt_durations = {0, 1, 2, 3, 4};
+
+    // Local attention (rel_pos_local_attn). -1 = full (global) attention.
+    int32_t att_context_left = -1;
+    int32_t att_context_right = -1;
+    uint32_t global_tokens = 0; // positions that all tokens can attend to
 };
 
 // ===========================================================================
@@ -314,6 +319,11 @@ static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, co
         hp.blank_id = core_gguf::kv_u32(gctx, "parakeet.blank_id", hp.blank_id);
         hp.n_tdt_durations = core_gguf::kv_u32(gctx, "parakeet.n_tdt_durations", hp.n_tdt_durations);
         hp.frame_dur_cs = core_gguf::kv_u32(gctx, "parakeet.frame_dur_cs", hp.frame_dur_cs);
+
+        // Local attention context (rel_pos_local_attn models).
+        hp.att_context_left = core_gguf::kv_i32(gctx, "parakeet.att_context_left", hp.att_context_left);
+        hp.att_context_right = core_gguf::kv_i32(gctx, "parakeet.att_context_right", hp.att_context_right);
+        hp.global_tokens = core_gguf::kv_u32(gctx, "parakeet.global_tokens", hp.global_tokens);
 
         // CTC head metadata (hybrid TDT+CTC models).
         model.has_ctc = core_gguf::kv_bool(gctx, "parakeet.has_ctc", false);
@@ -739,12 +749,23 @@ static ggml_cgraph* parakeet_build_graph_encoder(parakeet_context* ctx, int T_me
     ggml_set_name(pos_enc, "pos_enc");
     ggml_set_input(pos_enc);
 
+    // ----- Local attention mask (rel_pos_local_attn models) -----
+    ggml_tensor* local_mask = nullptr;
+    const bool use_local_attn =
+        hp.att_context_left >= 0 && hp.att_context_right >= 0 && T > hp.att_context_left + hp.att_context_right + 1;
+    if (use_local_attn) {
+        local_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T, T);
+        ggml_set_name(local_mask, "local_attn_mask");
+        ggml_set_input(local_mask);
+    }
+
     // ----- 24× FastConformer block -----
     core_conformer::BlockParams bp = {
-        (int)hp.d_model, (int)hp.n_heads, (int)hp.head_dim, (int)hp.conv_kernel, kLayerNormEps,
+        (int)hp.d_model, (int)hp.n_heads,     (int)hp.head_dim,     (int)hp.conv_kernel,
+        kLayerNormEps,   hp.att_context_left, hp.att_context_right, (int)hp.global_tokens,
     };
     for (uint32_t il = 0; il < hp.n_layers; il++) {
-        cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp);
+        cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp, local_mask);
     }
 
     ggml_set_name(cur, "enc_out");
@@ -802,6 +823,15 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
     T_enc = (T_enc + 1) / 2; // pos_enc has 2T-1 columns; recover T
     auto pe = core_conformer::make_pos_enc((int)ctx->model.hparams.d_model, T_enc);
     ggml_backend_tensor_set(pos_in, pe.data(), 0, pe.size() * sizeof(float));
+
+    // Local attention mask (when present in the graph).
+    ggml_tensor* local_mask_in = ggml_graph_get_tensor(gf, "local_attn_mask");
+    if (local_mask_in) {
+        const auto& hp = ctx->model.hparams;
+        auto lm = core_conformer::make_local_attn_mask(T_enc, hp.att_context_left, hp.att_context_right,
+                                                       (int)hp.global_tokens);
+        ggml_backend_tensor_set(local_mask_in, lm.data(), 0, lm.size() * sizeof(float));
+    }
 
     // Compute
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
@@ -2538,11 +2568,21 @@ static ggml_cgraph* parakeet_build_graph_encoder_dump(parakeet_context* ctx, int
     ggml_set_name(pos_enc, "pos_enc");
     ggml_set_input(pos_enc);
 
+    ggml_tensor* local_mask_dump = nullptr;
+    const bool use_local_attn_dump =
+        hp.att_context_left >= 0 && hp.att_context_right >= 0 && T > hp.att_context_left + hp.att_context_right + 1;
+    if (use_local_attn_dump) {
+        local_mask_dump = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T, T);
+        ggml_set_name(local_mask_dump, "local_attn_mask");
+        ggml_set_input(local_mask_dump);
+    }
+
     core_conformer::BlockParams bp = {
-        (int)hp.d_model, (int)hp.n_heads, (int)hp.head_dim, (int)hp.conv_kernel, kLayerNormEps,
+        (int)hp.d_model, (int)hp.n_heads,     (int)hp.head_dim,     (int)hp.conv_kernel,
+        kLayerNormEps,   hp.att_context_left, hp.att_context_right, (int)hp.global_tokens,
     };
     for (uint32_t il = 0; il < hp.n_layers; il++) {
-        cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp);
+        cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp, local_mask_dump);
         char nm[64];
         snprintf(nm, sizeof(nm), "dump_layer_%u", il);
         ggml_tensor* tag = ggml_cont(ctx0, cur);
@@ -2592,6 +2632,14 @@ extern "C" int parakeet_run_encoder_dump(struct parakeet_context* ctx, const flo
     T_enc = (T_enc + 1) / 2;
     auto pe = core_conformer::make_pos_enc((int)ctx->model.hparams.d_model, T_enc);
     ggml_backend_tensor_set(pos_in, pe.data(), 0, pe.size() * sizeof(float));
+
+    ggml_tensor* local_mask_in2 = ggml_graph_get_tensor(gf, "local_attn_mask");
+    if (local_mask_in2) {
+        const auto& hp = ctx->model.hparams;
+        auto lm = core_conformer::make_local_attn_mask(T_enc, hp.att_context_left, hp.att_context_right,
+                                                       (int)hp.global_tokens);
+        ggml_backend_tensor_set(local_mask_in2, lm.data(), 0, lm.size() * sizeof(float));
+    }
 
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "parakeet: dump: encoder graph compute failed\n");

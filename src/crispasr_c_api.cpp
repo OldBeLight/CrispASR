@@ -1780,7 +1780,7 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #ifdef CA_HAVE_PARAKEET
-    if (s->backend == "parakeet") {
+    if (s->backend == "parakeet" || s->backend == "reazonspeech") {
         parakeet_context_params pp = parakeet_context_default_params();
         pp.n_threads = s->n_threads;
         pp.verbosity = g_open_verbosity_tls;
@@ -2826,7 +2826,7 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
         return -1;
     std::string list = "whisper";
 #ifdef CA_HAVE_PARAKEET
-    list += ",parakeet";
+    list += ",parakeet,reazonspeech";
 #endif
 #ifdef CA_HAVE_NEMOTRON
     list += ",nemotron";

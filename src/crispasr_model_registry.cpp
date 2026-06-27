@@ -359,6 +359,13 @@ constexpr Entry k_registry[] = {
     {"parakeet-rnnt-1.1b", "parakeet-rnnt-1.1b-q4_k.gguf",
      "https://huggingface.co/cstr/parakeet-rnnt-1.1b-GGUF/resolve/main/parakeet-rnnt-1.1b-q4_k.gguf",
      "~770 MB", nullptr, nullptr},
+    // reazonspeech-nemo-v2 — Japanese FastConformer-RNNT (619M params).
+    // 80-mel input, rel_pos_local_attn (window=128+128, 1 global token),
+    // 3000-token SentencePiece vocab. Pure RNNT (n_tdt_durations=0).
+    // Trained on the ReazonSpeech v2.0 corpus (multi-hour capability).
+    {"reazonspeech", "reazonspeech-nemo-v2-q8_0.gguf",
+     "https://huggingface.co/cstr/reazonspeech-nemo-v2-GGUF/resolve/main/reazonspeech-nemo-v2-q8_0.gguf",
+     "~704 MB", nullptr, nullptr},
     // Qwen3-TTS: the talker LM and the codec live in two separate HF
     // repos. Default download is Q8_0 talker (the LEARNINGS-recommended
     // deployment quant — Q4_K drifts noticeably in strict diffs) paired

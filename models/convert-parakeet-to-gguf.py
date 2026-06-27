@@ -158,6 +158,23 @@ def unpack_nemo(nemo_path: Path, out_dir: Path) -> dict:
     return paths
 
 
+def load_nemo_disk(nemo_path: Path, extract_dir: Path) -> dict:
+    """Extract .nemo to disk and load weights via mmap — low memory for large models.
+
+    Returns dict with keys: 'weights' (state_dict), 'config_str', 'spm_bytes'.
+    """
+    paths = unpack_nemo(nemo_path, extract_dir)
+    sd = torch.load(paths["weights"], map_location="cpu", weights_only=True, mmap=True)
+    if isinstance(sd, dict) and "state_dict" in sd:
+        sd = sd["state_dict"]
+    result = {"weights": sd}
+    result["config_str"] = paths["config"].read_text() if "config" in paths else ""
+    result["spm_bytes"] = paths["spm"].read_bytes()
+    if "vocab" in paths:
+        result["vocab_bytes"] = paths["vocab"].read_bytes()
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Tensor name remapping
 # ---------------------------------------------------------------------------
@@ -291,13 +308,18 @@ _QUANT_TYPE_MAP: dict[str, gguf.GGMLQuantizationType] = {
 }
 
 
-def convert(nemo_path: Path, out_path: Path, quant: str | None = None) -> None:
+def convert(nemo_path: Path, out_path: Path, quant: str | None = None,
+            extract_dir: Path | None = None) -> None:
     quant_type = _QUANT_TYPE_MAP.get(quant.lower()) if quant else None
     if quant and quant_type is None:
         sys.exit(f"Unknown --quant type '{quant}'. Choices: {list(_QUANT_TYPE_MAP)}")
 
-    print(f"Loading: {nemo_path}  (in-memory, no disk extraction)")
-    nemo_data = load_nemo_inmem(nemo_path)
+    if extract_dir is not None:
+        print(f"Loading: {nemo_path}  (disk extract to {extract_dir}, mmap)")
+        nemo_data = load_nemo_disk(nemo_path, extract_dir)
+    else:
+        print(f"Loading: {nemo_path}  (in-memory, no disk extraction)")
+        nemo_data = load_nemo_inmem(nemo_path)
     sd = nemo_data["weights"]
 
     import yaml
@@ -430,6 +452,20 @@ def convert(nemo_path: Path, out_path: Path, quant: str | None = None) -> None:
     # frame_dur_cs is in centiseconds: 0.01 s stride × 8× subsampling = 8 cs (80 ms)
     writer.add_uint32("parakeet.frame_dur_cs", int(round(wst * subsampling_factor * 100)))
 
+    # Local attention context (rel_pos_local_attn models like reazonspeech-nemo-v2).
+    # att_context_size: [left, right] in encoder frames (after 8× subsampling).
+    # When absent or [−1, −1], the runtime uses full (global) attention.
+    att_model = enc_cfg.get("self_attention_model", "rel_pos")
+    att_ctx = enc_cfg.get("att_context_size", None)
+    if att_model == "rel_pos_local_attn" and att_ctx:
+        att_left = att_ctx[0] if isinstance(att_ctx, list) else att_ctx
+        att_right = att_ctx[1] if isinstance(att_ctx, list) and len(att_ctx) > 1 else att_left
+        writer.add_int32("parakeet.att_context_left", att_left)
+        writer.add_int32("parakeet.att_context_right", att_right)
+        n_global_tokens = enc_cfg.get("global_tokens", 0)
+        writer.add_uint32("parakeet.global_tokens", n_global_tokens)
+        print(f"  local attention: left={att_left} right={att_right} global_tokens={n_global_tokens}")
+
     # Check if CTC head is present (hybrid TDT+CTC models).
     has_ctc = "ctc_decoder.decoder_layers.0.weight" in sd
     writer.add_bool("parakeet.has_ctc", has_ctc)
@@ -546,9 +582,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--nemo", required=True, type=Path, help="path to .nemo file")
     p.add_argument("--output", required=True, type=Path, help="output GGUF path")
     p.add_argument("--quant", default=None, help="quantize linear weights (e.g. q4_k, q8_0); default: F16")
+    p.add_argument("--extract-dir", default=None, type=Path,
+                   help="extract .nemo to this dir and load via mmap (low memory for large models)")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    convert(args.nemo, args.output, quant=args.quant)
+    convert(args.nemo, args.output, quant=args.quant, extract_dir=args.extract_dir)

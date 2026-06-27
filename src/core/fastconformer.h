@@ -75,6 +75,39 @@ static inline std::vector<float> make_pos_enc(int d_model, int T) {
 }
 
 // ---------------------------------------------------------------------------
+// Local attention mask builder for rel_pos_local_attn models.
+// Returns a flat row-major (T, T) float array where mask[q*T+k] = 0.0 for
+// visible positions and -inf for masked positions. Positions within
+// [q - left, q + right] are visible. The first `global_tokens` positions
+// are always visible to all queries (and can see all positions).
+// ---------------------------------------------------------------------------
+static inline std::vector<float> make_local_attn_mask(int T, int left, int right, int global_tokens) {
+    const float NEG_INF = -1e9f; // large enough for softmax to zero out
+    std::vector<float> mask((size_t)T * T, NEG_INF);
+    for (int q = 0; q < T; q++) {
+        // Global token queries can attend to everything.
+        if (q < global_tokens) {
+            for (int k = 0; k < T; k++)
+                mask[(size_t)q * T + k] = 0.0f;
+            continue;
+        }
+        // Regular positions attend to their local window + global tokens.
+        int k_lo = q - left;
+        if (k_lo < 0)
+            k_lo = 0;
+        int k_hi = q + right;
+        if (k_hi >= T)
+            k_hi = T - 1;
+        for (int k = k_lo; k <= k_hi; k++)
+            mask[(size_t)q * T + k] = 0.0f;
+        // Global token keys are always visible.
+        for (int k = 0; k < global_tokens && k < T; k++)
+            mask[(size_t)q * T + k] = 0.0f;
+    }
+    return mask;
+}
+
+// ---------------------------------------------------------------------------
 // Pre-encode (dw_striding 8× subsampling) weights.
 //
 //   Conv2d(1→C,  k=3, s=2, p=1) → ReLU
@@ -207,12 +240,21 @@ struct BlockParams {
     int head_dim; // d / n_heads
     int K;        // conv_kernel (usually 9)
     float ln_eps; // LayerNorm epsilon
+
+    // Local attention window (rel_pos_local_attn). Negative = full attention.
+    int att_context_left = -1;  // max positions to the left each query sees
+    int att_context_right = -1; // max positions to the right
+    int global_tokens = 0;      // first N positions are global (visible to all)
 };
 
 // Build one Conformer block. `cur` must be (d, T). `pos_enc` is the shared
-// sinusoidal rel-pos table (d, 2T-1). Returns the post-block (d, T) output.
+// sinusoidal rel-pos table (d, 2T-1). `local_attn_mask` is an optional (T, T)
+// F32 tensor with 0.0 for visible positions and -inf for masked positions
+// (used by rel_pos_local_attn models). Pass nullptr for full attention.
+// Returns the post-block (d, T) output.
 static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, ggml_tensor* pos_enc, int T,
-                                       const BlockWeights& e, const BlockParams& p) {
+                                       const BlockWeights& e, const BlockParams& p,
+                                       ggml_tensor* local_attn_mask = nullptr) {
     const int d = p.d;
     const int n_heads = p.n_heads;
     const int head_dim = p.head_dim;
@@ -266,6 +308,14 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, ggm
     // BD is a strided view from rel_shift — make contiguous before scale/cast.
     ggml_tensor* BD_c = ggml_cont(ctx0, BD);
     ggml_tensor* BD_scaled = ggml_scale(ctx0, BD_c, scale);
+
+    // Local attention window mask: add -inf for positions outside the window.
+    // The mask tensor is created externally and passed via `local_attn_mask`.
+    if (local_attn_mask) {
+        // Broadcast (T, T) mask across all heads in BD_scaled (T, T, n_heads).
+        BD_scaled = ggml_add(ctx0, BD_scaled, local_attn_mask);
+    }
+
     // flash_attn_ext mask must be F16
     ggml_tensor* BD_mask = ggml_cast(ctx0, BD_scaled, GGML_TYPE_F16);
 

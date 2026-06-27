@@ -82,7 +82,7 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
     if (name == "nemotron" || name == "nemotron-streaming" || name == "nemotron-3.5" || name == "nemotron-asr" ||
         name == "nemotron-speech-streaming")
         return crispasr_make_nemotron_backend();
-    if (name == "parakeet")
+    if (name == "parakeet" || name == "reazonspeech")
         return crispasr_make_parakeet_backend();
     if (name == "canary")
         return crispasr_make_canary_backend();
@@ -209,6 +209,7 @@ std::vector<std::string> crispasr_list_backends() {
         "whisper",
         "nemotron",
         "parakeet",
+        "reazonspeech",
         "canary",
         "lfm2-audio",
         "mini-omni2",
@@ -480,6 +481,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
     if (contains_ci("parakeet") && contains_ci("ctc") && !contains_ci("tdt"))
         return "fastconformer-ctc";
     if (contains_ci("parakeet"))
+        return "parakeet";
+    if (contains_ci("reazonspeech"))
         return "parakeet";
     // Check "fastconformer-ctc" / "stt_en_fc_ctc" style filenames before
     // the broader "canary" match so users who drop a NeMo standalone
