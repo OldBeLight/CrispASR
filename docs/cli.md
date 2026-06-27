@@ -1134,6 +1134,21 @@ reuse, etc.) see [`tts.md`](tts.md):
   `VIBEVOICE_VAE_BACKEND` bisect the TTS GPU graph (LM attention vs.
   the conv/col2im VAE) to localise a bad kernel.
 
+CosyVoice3 performance notes:
+
+- Keep GPU execution enabled. The 10-step DiT flow is substantially slower
+  on CPU; `--gpu-backend metal` selects Metal explicitly on macOS.
+- `-n/--max-new-tokens` is also the AR KV-cache sizing bound. A realistic
+  cap reduces per-token work, but a value that is too low truncates speech.
+- `COSYVOICE3_FLOW_STEPS=5` approximately halves flow work. The default `10`
+  preserves upstream quality.
+- An external model directory affects cold startup, not steady-state
+  synthesis. For repeated requests, use server mode so the ~1.2 GB model set
+  remains resident.
+- On an Apple M1 test using the Q4_K LLM and Q8_0 flow, request-sized KV
+  caching reduced a 17-token LM decode from about 6.8 s to 1.4 s while
+  producing a byte-identical WAV. Hardware and prompt length change results.
+
 ### Comparison with llama.cpp
 
 For users coming from `llama.cpp`, here's how the equivalent knobs

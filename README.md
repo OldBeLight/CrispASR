@@ -635,6 +635,13 @@ crispasr --mic -m model.gguf
 # TTS via auto-downloaded VibeVoice (~636 MB on first run)
 crispasr --backend vibevoice-tts -m auto --tts "Hello world" --tts-output hello.wav
 
+# CosyVoice3 on GPU; companions auto-download beside the LLM
+crispasr --backend cosyvoice3-tts -m auto --tts "Hello world" --tts-output cosy.wav
+
+# CosyVoice3 fast mode: 5 flow steps instead of the quality-default 10
+COSYVOICE3_FLOW_STEPS=5 crispasr --backend cosyvoice3-tts -m auto \
+  --tts "Hello world" --tts-output cosy-fast.wav
+
 # Persistent HTTP server, OpenAI-compatible
 crispasr --server -m model.gguf --port 8080
 curl -F "file=@audio.wav" http://localhost:8080/v1/audio/transcriptions

@@ -10929,3 +10929,30 @@ matches the blueprint's `aligner-fr` path.
 **Practical rule:** for TADA, fix language issues in the prompt-conversion
 pipeline, not in `tada_synthesize()`.  The C++ runtime should load the right
 prompt GGUF and then follow Python generation exactly.
+
+### CosyVoice3: fixed-shape graph reuse must not imply a maximum-size KV graph
+
+CosyVoice3 caches its single-token AR graph because rebuilding 24 Qwen2 layers
+per speech token is expensive. The graph shape includes the KV-cache length,
+so the original implementation used a fixed 4096-token cache to make every
+step reusable. On Metal this made a short request attend over thousands of
+unused slots at every step: a 17-token decode took about 6.8 s on an M1.
+
+Size KV storage and the cached graph from `prefill_tokens + max_new_tokens`
+before prefill. Direct prefill/step API calls still need a modest fallback,
+but they must preserve an already-sized cache instead of expanding it back to
+4096. With a 625-slot default CLI budget, the same decode took about 1.4 s and
+the final WAV was byte-identical.
+
+Two adjacent rules matter:
+
+- Plumb the CLI `-n/--max-new-tokens` value into the backend context; otherwise
+  the advertised cap neither limits generation nor controls KV sizing.
+- A cached ggml topology still needs scheduler reset/allocation before each
+  GPU execution. Reusing stale scheduler bindings caused the earlier Metal
+  second-token crash; right-sizing the topology does not change that rule.
+
+The remaining default-quality bottleneck is the 10-step DiT-CFM flow. Reducing
+`COSYVOICE3_FLOW_STEPS` trades quality for nearly linear speed. Do not silently
+change its default, and do not treat cold reads from an external SSD as
+inference time; use a resident server when measuring repeated synthesis.
