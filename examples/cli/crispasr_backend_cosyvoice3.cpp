@@ -233,9 +233,8 @@ private:
         if (cloning_models_loaded_)
             return true;
         if (campplus_path_.empty() || s3tok_path_.empty()) {
-            fprintf(stderr,
-                    "crispasr[cosyvoice3-tts]: WAV cloning requires cosyvoice3-campplus-f16.gguf and "
-                    "cosyvoice3-s3tok-f16.gguf beside the LLM (or COSYVOICE3_CAMPPLUS_PATH).\n");
+            fprintf(stderr, "crispasr[cosyvoice3-tts]: WAV cloning requires cosyvoice3-campplus-f16.gguf and "
+                            "cosyvoice3-s3tok-f16.gguf beside the LLM (or COSYVOICE3_CAMPPLUS_PATH).\n");
             return false;
         }
         if (cosyvoice3_tts_init_campplus_from_file(ctx_, campplus_path_.c_str()) != 0) {

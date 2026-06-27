@@ -22,8 +22,10 @@
 #include <cstdlib>
 #include <cmath>
 #include <algorithm>
+#include <mutex>
 #include <string>
 #include <sstream>
+#include <utility>
 #include <vector>
 
 #include "crispasr.h"
@@ -1600,6 +1602,10 @@ struct crispasr_session {
     cosyvoice3_tts_context* cosyvoice3_ctx = nullptr;
     std::string cosyvoice3_voice;    // bank voice name OR *.wav clone path (set_voice)
     std::string cosyvoice3_ref_text; // ref transcription for *.wav cloning
+    std::string cosyvoice3_camp_path;
+    std::string cosyvoice3_s3tok_path;
+    bool cosyvoice3_cloning_models_loaded = false;
+    std::mutex cosyvoice3_cloning_mutex;
 #endif
 #ifdef CA_HAVE_INDEXTTS
     indextts_context* indextts_ctx = nullptr;
@@ -2519,10 +2525,8 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
             delete s;
             return nullptr;
         }
-        if (!cv3_camp.empty())
-            cosyvoice3_tts_init_campplus_from_file(s->cosyvoice3_ctx, cv3_camp.c_str());
-        if (!cv3_s3tok.empty())
-            cosyvoice3_tts_init_s3tok_from_file(s->cosyvoice3_ctx, cv3_s3tok.c_str());
+        s->cosyvoice3_camp_path = std::move(cv3_camp);
+        s->cosyvoice3_s3tok_path = std::move(cv3_s3tok);
         return s;
     }
 #endif
@@ -5801,6 +5805,26 @@ CA_EXPORT int crispasr_session_is_voice_design(crispasr_session* s) {
 
 // Raw synthesis — no watermark. Used internally; the public API wraps this
 // and applies the watermark automatically.
+#ifdef CA_HAVE_COSYVOICE3
+static bool crispasr_session_ensure_cosyvoice3_cloning_models(crispasr_session* s) {
+    std::lock_guard<std::mutex> lock(s->cosyvoice3_cloning_mutex);
+    if (s->cosyvoice3_cloning_models_loaded)
+        return true;
+    if (s->cosyvoice3_camp_path.empty() || s->cosyvoice3_s3tok_path.empty()) {
+        s->last_synth_error =
+            "cosyvoice3 WAV cloning requires cosyvoice3-campplus-f16.gguf and cosyvoice3-s3tok-f16.gguf";
+        return false;
+    }
+    if (cosyvoice3_tts_init_campplus_from_file(s->cosyvoice3_ctx, s->cosyvoice3_camp_path.c_str()) != 0 ||
+        cosyvoice3_tts_init_s3tok_from_file(s->cosyvoice3_ctx, s->cosyvoice3_s3tok_path.c_str()) != 0) {
+        s->last_synth_error = "failed to load CosyVoice3 WAV-cloning companions";
+        return false;
+    }
+    s->cosyvoice3_cloning_models_loaded = true;
+    return true;
+}
+#endif
+
 static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const char* text, int* out_n_samples) {
     if (out_n_samples)
         *out_n_samples = 0;
@@ -5815,6 +5839,8 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
         const std::string& v = s->cosyvoice3_voice;
         const bool is_wav =
             v.size() >= 4 && (v.compare(v.size() - 4, 4, ".wav") == 0 || v.compare(v.size() - 4, 4, ".WAV") == 0);
+        if (is_wav && !crispasr_session_ensure_cosyvoice3_cloning_models(s))
+            return nullptr;
         int n = 0;
         float* pcm = is_wav ? cosyvoice3_tts_synth_from_wav(s->cosyvoice3_ctx, text, v.c_str(),
                                                             s->cosyvoice3_ref_text.c_str(), &n)

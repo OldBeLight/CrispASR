@@ -283,12 +283,24 @@ impl Session {
 
     /// List of backend names the loaded CrispASR library was compiled with.
     pub fn available_backends() -> Vec<String> {
-        let mut buf = [0i8; 256];
-        let n = unsafe {
+        let mut buf = vec![0i8; 256];
+        let mut n = unsafe {
             crispasr_sys::crispasr_session_available_backends(buf.as_mut_ptr(), buf.len() as i32)
         };
         if n <= 0 {
             return Vec::new();
+        }
+        if n as usize >= buf.len() {
+            buf.resize(n as usize + 1, 0);
+            n = unsafe {
+                crispasr_sys::crispasr_session_available_backends(
+                    buf.as_mut_ptr(),
+                    buf.len() as i32,
+                )
+            };
+            if n <= 0 {
+                return Vec::new();
+            }
         }
         let cstr = unsafe { CStr::from_ptr(buf.as_ptr()) };
         cstr.to_string_lossy()

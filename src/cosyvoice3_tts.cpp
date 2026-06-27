@@ -2949,10 +2949,10 @@ ggml_tensor* cv3_dit_block_apply_batched(ggml_context* ctx0, ggml_tensor* x, ggm
     ggml_tensor* V = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_v_w, h_a), b.attn_v_b);
     Q = ggml_reshape_4d(ctx0, Q, d, 1, T, B);
     K = ggml_reshape_4d(ctx0, K, d, 1, T, B);
-    Q = ggml_rope_ext(ctx0, Q, positions, nullptr, hd, GGML_ROPE_TYPE_NORMAL, 0, rope_theta, 1.0f, 0.0f, 1.0f,
-                      0.0f, 0.0f);
-    K = ggml_rope_ext(ctx0, K, positions, nullptr, hd, GGML_ROPE_TYPE_NORMAL, 0, rope_theta, 1.0f, 0.0f, 1.0f,
-                      0.0f, 0.0f);
+    Q = ggml_rope_ext(ctx0, Q, positions, nullptr, hd, GGML_ROPE_TYPE_NORMAL, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f,
+                      0.0f);
+    K = ggml_rope_ext(ctx0, K, positions, nullptr, hd, GGML_ROPE_TYPE_NORMAL, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f,
+                      0.0f);
     Q = ggml_reshape_4d(ctx0, Q, hd, n_h, T, B);
     K = ggml_reshape_4d(ctx0, K, hd, n_h, T, B);
     V = ggml_reshape_4d(ctx0, V, hd, n_h, T, B);
@@ -3333,9 +3333,9 @@ ggml_cgraph* cv3_build_estimator_cfg_graph(cosyvoice3_tts_context* ctx, int T_me
     return gf;
 }
 
-float* cv3_run_estimator_cfg(cosyvoice3_tts_context* ctx, const float* x, int T_mel, const float* mu,
-                             const float* spks, const float* cond, const float* mu_zero, const float* spks_zero,
-                             const float* cond_zero, const float* sin_emb_t) {
+float* cv3_run_estimator_cfg(cosyvoice3_tts_context* ctx, const float* x, int T_mel, const float* mu, const float* spks,
+                             const float* cond, const float* mu_zero, const float* spks_zero, const float* cond_zero,
+                             const float* sin_emb_t) {
     const int mel = (int)ctx->flow.hp.mel_dim;
     const int spk_out = (int)ctx->flow.hp.spk_dim_out;
     ggml_cgraph* gf = cv3_build_estimator_cfg_graph(ctx, T_mel);

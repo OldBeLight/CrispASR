@@ -10983,7 +10983,14 @@ allocation shape for debugging.
 
 Finally, baked voices never use speech_tokenizer_v3 or CAMPPlus. Eagerly
 loading them added about 475 MiB and substantial external-SSD startup time.
-The CLI backend now discovers their paths at initialization but loads both
-under a mutex only when a `.wav` cloning request arrives. This must be lazy,
-not permanently disabled: a resident server can receive baked-voice requests
-first and a WAV-cloning request later.
+The CLI backend and session C ABI now discover their paths at initialization
+but load both under a mutex only when a `.wav` cloning request arrives. This
+must be lazy, not permanently disabled: a resident server or binding session
+can receive baked-voice requests first and a WAV-cloning request later.
+
+The contributing checklist's `Session.available_backends()` assertion also
+exposed a separate binding trap: the compiled backend CSV now exceeds 256
+bytes. Python and Rust used fixed 256-byte buffers and silently lost every
+backend after `kyutai-stt`, including CosyVoice3. The C ABI returns the full
+required length even when the supplied buffer truncates, so bindings must
+retry with `required + 1` bytes instead of assuming the backend list is small.

@@ -1204,7 +1204,10 @@ class Session:
         lib.crispasr_session_available_backends.argtypes = [ctypes.c_char_p, ctypes.c_int]
         lib.crispasr_session_available_backends.restype = ctypes.c_int
         buf = ctypes.create_string_buffer(256)
-        lib.crispasr_session_available_backends(buf, 256)
+        needed = lib.crispasr_session_available_backends(buf, len(buf))
+        if needed >= len(buf):
+            buf = ctypes.create_string_buffer(needed + 1)
+            lib.crispasr_session_available_backends(buf, len(buf))
         csv = buf.value.decode("utf-8")
         return [s.strip() for s in csv.split(",") if s.strip()]
 
