@@ -430,6 +430,10 @@ static ggml_cgraph* build_encoder_graph(tada_encoder_context* c, int n_audio_sam
 
     // ── WavEncoder ──
     // First conv: Conv1d(1→64, k=7, p=3)
+    if (tada_enc_debug())
+        fprintf(stderr, "[tada-enc] audio ne=[%lld,%lld] first_conv.w ne=[%lld,%lld,%lld]\n", (long long)audio->ne[0],
+                (long long)audio->ne[1], (long long)c->first_conv.w->ne[0], (long long)c->first_conv.w->ne[1],
+                (long long)c->first_conv.w->ne[2]);
     ggml_tensor* cur = wn_conv1d(ctx0, audio, c->first_conv, 1);
 
     // 4 encoder blocks
@@ -440,10 +444,11 @@ static ggml_cgraph* build_encoder_graph(tada_encoder_context* c, int n_audio_sam
     cur = snake1d(ctx0, cur, c->final_snake_alpha, c->inv_final_snake_alpha);
     cur = wn_conv1d(ctx0, cur, c->final_conv, 1);
 
-    // Transpose to (T, hidden_dim) for attention
-    cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur)); // (n_frames, hidden_dim)
+    // cur is channel-first (hidden_dim, n_frames) = ne[0]=d, ne[1]=T
 
-    // Dump: wav_encoder output
+    // Dump: wav_encoder output — cur is (d, T) = ne[0]=d, ne[1]=T.
+    // ggml_backend_tensor_get reads ne[0]-contiguous, giving (T, d) row-major
+    // which matches the Python reference layout.
     ggml_tensor* dump_wav = ggml_cont(ctx0, cur);
     ggml_set_name(dump_wav, "encoder_wav_out");
     ggml_set_output(dump_wav);
@@ -456,13 +461,14 @@ static ggml_cgraph* build_encoder_graph(tada_encoder_context* c, int n_audio_sam
     ggml_set_input(masks);
 
     // pos_emb: Embedding(2, hidden_dim) — index by token_masks
+    // ggml_get_rows returns (hidden_dim, n_frames) = ne[0]=d, ne[1]=T
+    // which matches cur's layout
     if (c->pos_emb_w) {
         ggml_tensor* pos = ggml_get_rows(ctx0, c->pos_emb_w, masks);
         cur = ggml_add(ctx0, cur, pos);
     }
 
-    // Transpose back to (hidden_dim, n_frames) for attention ops
-    cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur)); // (d, T)
+    // cur stays as (hidden_dim, n_frames) = (d, T) for attention
 
     // ── LocalAttentionEncoder (pre-norm) ──
     ggml_tensor* attn_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_frames, n_frames);
@@ -555,20 +561,20 @@ static ggml_cgraph* build_encoder_graph(tada_encoder_context* c, int n_audio_sam
     if (c->final_norm_b)
         cur = ggml_add(ctx0, cur, c->final_norm_b);
 
-    // Dump: attention output
+    // Dump: attention output — cur is (d, T), read back as (T, d) row-major
     ggml_tensor* dump_attn = ggml_cont(ctx0, cur);
     ggml_set_name(dump_attn, "encoder_attn_out");
     ggml_set_output(dump_attn);
     ggml_build_forward_expand(gf, dump_attn);
 
-    // ── hidden_linear ──
+    // ── hidden_linear: (d, T) → (embed_dim, T) ──
     if (c->hidden_w) {
         cur = ggml_mul_mat(ctx0, c->hidden_w, cur);
         if (c->hidden_b)
             cur = ggml_add(ctx0, cur, c->hidden_b);
     }
 
-    // Dump: hidden output
+    // Dump: hidden output — cur is (embed_dim, T), read back as (T, embed_dim) row-major
     ggml_tensor* dump_hidden = ggml_cont(ctx0, cur);
     ggml_set_name(dump_hidden, "encoder_hidden");
     ggml_set_output(dump_hidden);
@@ -816,19 +822,14 @@ int tada_encoder_encode_with_positions(tada_encoder_context* ctx, const float* a
         return -3;
     }
 
-    // Read hidden output: (embed_dim, n_frames) in ggml layout
+    // Read hidden output: the dump tensor is already (T, embed_dim) after
+    // the ggml_transpose + ggml_cont in the graph. ggml stores this as
+    // ne[0]=embed_dim (fast axis), ne[1]=T, so backend_tensor_get gives
+    // row-major (T, embed_dim) directly.
     ggml_tensor* hidden_out = ggml_graph_get_tensor(gf, "encoder_hidden");
     int ed = ctx->embed_dim;
-    std::vector<float> hidden_data((size_t)ed * n_frames);
-    ggml_backend_tensor_get(hidden_out, hidden_data.data(), 0, hidden_data.size() * sizeof(float));
-
-    // Post-processing (CPU)
-    // hidden_data is (embed_dim, n_frames) column-major from ggml
-    // Transpose to (n_frames, embed_dim) row-major
     std::vector<float> features((size_t)n_frames * ed);
-    for (int t = 0; t < n_frames; t++)
-        for (int d = 0; d < ed; d++)
-            features[t * ed + d] = hidden_data[d * n_frames + t];
+    ggml_backend_tensor_get(hidden_out, features.data(), 0, features.size() * sizeof(float));
 
     // Zero out non-token frames
     for (int t = 0; t < n_frames; t++) {
