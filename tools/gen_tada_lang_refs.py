@@ -33,7 +33,7 @@ except ImportError:
 try:
     from tada.modules.encoder import Encoder
 except ImportError as _e:
-    sys.exit(f"tada import failed ({_e}): pip install torchaudio git+https://github.com/HumeAI/tada.git")
+    sys.exit(f"tada import failed ({_e}): pip install hume-tada")
 
 try:
     from datasets import load_dataset
@@ -113,8 +113,9 @@ def fetch_fleurs_clip(fleurs_config: str, index: int = 0):
 
 def encode_and_save(audio: np.ndarray, transcript: str, lang: str,
                     out_path: str, device: str = "cpu"):
+    hf_token = os.environ.get("HF_TOKEN")
     print(f"  loading aligner for lang='{lang}' from {CODEC_REPO} …")
-    encoder = Encoder.from_pretrained(CODEC_REPO, language=lang).to(device)
+    encoder = Encoder.from_pretrained(CODEC_REPO, language=lang, token=hf_token).to(device)
     encoder.eval()
 
     waveform = torch.from_numpy(audio).unsqueeze(0).to(device)  # (1, T)

@@ -1,5 +1,5 @@
 # %% [markdown]
-# # TADA language voice reference GGUFs
+# # TADA language voice reference GGUFs  (v8 — explicit token pass, meta-llama gate accepted)
 #
 # Generates tada-ref-{ar,ch,de,es,fr,it,ja,pl,pt}.gguf from FLEURS CC-BY-4.0
 # clips using the HumeAI/tada-codec language-specific aligners.
