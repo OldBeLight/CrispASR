@@ -30,38 +30,69 @@ try:
 except ImportError:
     sys.exit("gguf not found: pip install gguf")
 
-# Redirect gated meta-llama/Llama-3.2-1B → unsloth mirror (same weights, public).
-# hume-tada's Encoder internally loads the Llama-3.2-1B tokenizer/config; patch
-# hf_hub_download at all call sites before importing tada/transformers so those
-# requests go to the ungated unsloth mirror instead.
-_LLAMA_REDIR = {"meta-llama/Llama-3.2-1B": "unsloth/Llama-3.2-1B"}
+# hume-tada's Aligner.__init__ calls AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+# which is gated. We work around this by:
+#  1. downloading the tokenizer from the public unsloth/Llama-3.2-1B mirror
+#  2. fixing additional_special_tokens in tokenizer_config.json (unsloth stores
+#     them as dicts; older transformers requires str/AddedToken — causes
+#     "One of the tokens is not a string or an AddedToken" assertion failure)
+#  3. patching Aligner.__init__ to use the local fixed dir instead
+
+def _prepare_llama_tokenizer(hf_token: str | None = None, local_dir: str = "/kaggle/working/llama-tokenizer") -> str:
+    import json
+    from pathlib import Path
+    from huggingface_hub import snapshot_download
+
+    p = Path(local_dir)
+    if (p / "tokenizer_config.json").exists():
+        print(f"  [llama-tok] using cached tokenizer at {p}", flush=True)
+        return str(p)
+
+    print("  [llama-tok] downloading tokenizer from unsloth/Llama-3.2-1B …", flush=True)
+    snapshot_download(
+        "unsloth/Llama-3.2-1B",
+        local_dir=str(p),
+        allow_patterns=["tokenizer*", "*.model", "special_tokens_map.json"],
+        token=hf_token,
+    )
+
+    # Fix additional_special_tokens: convert dicts → plain content strings so that
+    # older transformers' isinstance(t, (str, AddedToken)) assertion passes.
+    cfg_path = p / "tokenizer_config.json"
+    if cfg_path.exists():
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        ast = cfg.get("additional_special_tokens", [])
+        if ast and isinstance(ast[0], dict):
+            cfg["additional_special_tokens"] = [
+                t.get("content", str(t)) if isinstance(t, dict) else t for t in ast
+            ]
+            cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"  [llama-tok] fixed {len(ast)} additional_special_tokens (dict→str)", flush=True)
+
+    return str(p)
+
 
 try:
     import huggingface_hub
-    import huggingface_hub.file_download as _hfd
+    from tada.modules.aligner import Aligner as _TadaAligner
 
-    _orig_dl = _hfd.hf_hub_download
+    _LLAMA_TOK_DIR: str | None = None
+    _orig_aligner_init = _TadaAligner.__init__
 
-    def _hf_hub_download_redir(repo_id: str, *args, **kw):
-        if repo_id in _LLAMA_REDIR:
-            target = _LLAMA_REDIR[repo_id]
-            print(f"  [llama-bypass] {repo_id} → {target}", flush=True)
-            repo_id = target
-        return _orig_dl(repo_id, *args, **kw)
+    def _patched_aligner_init(self, config, *args, **kw):
+        global _LLAMA_TOK_DIR
+        if getattr(config, "tokenizer_name", "").startswith("meta-llama/"):
+            if _LLAMA_TOK_DIR is None:
+                _LLAMA_TOK_DIR = _prepare_llama_tokenizer(
+                    hf_token=os.environ.get("HF_TOKEN")
+                )
+            config.tokenizer_name = _LLAMA_TOK_DIR
+        _orig_aligner_init(self, config, *args, **kw)
 
-    # Patch both the module attr and the file_download submodule attr so any
-    # import path (huggingface_hub.hf_hub_download or the internal one) is covered.
-    _hfd.hf_hub_download = _hf_hub_download_redir
-    huggingface_hub.hf_hub_download = _hf_hub_download_redir
-
-    # Pre-import transformers and patch its module-level binding too, so
-    # transformers.utils.hub.cached_file() uses the redirected function.
-    import transformers.utils.hub as _tuh
-    if hasattr(_tuh, "hf_hub_download"):
-        _tuh.hf_hub_download = _hf_hub_download_redir
-    print("  [llama-bypass] redirect installed (meta-llama → unsloth)", flush=True)
+    _TadaAligner.__init__ = _patched_aligner_init
+    print("  [llama-tok] Aligner.__init__ patched", flush=True)
 except Exception as _patch_err:
-    print(f"  WARNING: llama bypass setup failed: {_patch_err}", flush=True)
+    print(f"  WARNING: llama tokenizer patch failed: {_patch_err}", flush=True)
 
 try:
     from tada.modules.encoder import Encoder

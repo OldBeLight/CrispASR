@@ -1,5 +1,5 @@
 # %% [markdown]
-# # TADA language voice reference GGUFs  (v10 — full traceback + remove token= from Encoder API)
+# # TADA language voice reference GGUFs  (v11 — fix additional_special_tokens dict→str)
 #
 # Generates tada-ref-{ar,ch,de,es,fr,it,ja,pl,pt}.gguf from FLEURS CC-BY-4.0
 # clips using the HumeAI/tada-codec language-specific aligners.
