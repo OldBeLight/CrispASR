@@ -65,17 +65,23 @@ language codes: `ar`, `ch`, `de`, `es`, `fr`, `it`, `ja`, `pl`, `pt`.
 ### Use case (b) — custom voice cloning
 
 To speak in a specific person's voice, bake a ref GGUF from ~10 s of their
-speech. This requires `hume-tada` (Python, offline step only):
+speech. Two options — pure C++ (no Python) or the Python converter:
+
+#### Option 1: C++ `--make-ref` (no Python needed)
+
+Place `tada-encoder-f16.gguf` and `tada-aligner-en.gguf` (from
+[cstr/tada-encoder-GGUF](https://huggingface.co/cstr/tada-encoder-GGUF))
+next to your TADA model GGUF, then:
 
 ```bash
 # Step 1 — bake the ref GGUF (one-time per speaker):
-pip install hume-tada
-python models/convert-tada-ref-to-gguf.py \
-    --audio speaker_10s.wav \
-    --language fr \
-    --output tada-ref-custom.gguf
+crispasr --backend tada-3b-ml -m auto \
+    --make-ref \
+    --voice speaker_10s.wav \
+    --ref-text "Exact words spoken in the audio." \
+    --make-ref-output tada-ref-custom.gguf
 
-# Step 2 — synthesise with that voice (C++ only, no Python):
+# Step 2 — synthesise with that voice:
 crispasr --backend tada-3b-ml -m auto \
     --voice tada-ref-custom.gguf \
     --tts "Bonjour, comment allez-vous ?" \
@@ -83,14 +89,29 @@ crispasr --backend tada-3b-ml -m auto \
     --i-have-rights
 ```
 
-`--language` selects the language-specific TADA aligner used during encoding;
-it must match the language of the text you will synthesise. A 5–15 s clip of
-clean speech (no music/noise) produces the best fingerprint.
+The `--make-ref` pipeline runs entirely in C++: wav2vec2 aligner → BPE
+tokenization → DP alignment → WavEncoder → LocalAttentionEncoder → GGUF
+output. Auto-discovers the encoder + aligner GGUFs next to the model file;
+override with `--make-ref-encoder` / `--make-ref-aligner` if needed.
 
-### Encoder / aligner GGUFs (for `--make-ref` and diff harness)
+#### Option 2: Python converter
 
-The encoder pipeline (WAV+transcript → voice reference) has been ported to
-C++/ggml. Pre-converted GGUFs are on HuggingFace at
+```bash
+pip install hume-tada
+python models/convert-tada-ref-to-gguf.py \
+    --audio speaker_10s.wav \
+    --language fr \
+    --output tada-ref-custom.gguf
+```
+
+A 5–15 s clip of clean speech (no music/noise) produces the best fingerprint.
+`--language` (Python) selects the language-specific TADA aligner; it must match
+the language of the text you will synthesise.
+
+### Encoder / aligner GGUFs
+
+The encoder pipeline (WAV+transcript → voice reference) is ported to C++/ggml.
+Pre-converted GGUFs are on HuggingFace at
 [cstr/tada-encoder-GGUF](https://huggingface.co/cstr/tada-encoder-GGUF):
 
 | File | Size | Description |
@@ -99,9 +120,7 @@ C++/ggml. Pre-converted GGUFs are on HuggingFace at
 | `tada-aligner-en.gguf` | 1.1 GB | English aligner (wav2vec2-large + 128K-class Llama CTC head) |
 
 The encoder GGUF is loaded by `src/tada_encoder.{h,cpp}`. The aligner GGUF
-is loaded by the existing `wav2vec2_load()` runtime (same architecture). The
-C++ `--make-ref` flag is wired but requires C++ BPE tokenization to be
-fully end-to-end (currently the Python converter is the production path).
+is loaded by the existing `wav2vec2_load()` runtime (same architecture).
 
 To convert language-specific aligners:
 ```bash

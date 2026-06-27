@@ -115,6 +115,10 @@ crispasr --list-backends
 | `--ref-text "TEXT"` | Reference transcription for the ref audio (qwen3-tts, f5-tts). Auto-transcribed from `--voice <wav>` if omitted |
 | `--ref-asr BACKEND` | ASR backend to auto-transcribe the ref audio (default: `whisper`) |
 | `--instruct "TEXT"` | Natural-language voice/style description. For qwen3-tts: VoiceDesign mode (voice description) or CustomVoice mode (style control) |
+| `--make-ref` | Create a TADA voice reference GGUF from `--voice <audio.wav>` + `--ref-text "transcript"`. Pure C++, no Python. Auto-discovers `tada-encoder-f16.gguf` + `tada-aligner-en.gguf` next to the model. Output path via `--make-ref-output` (default: `tada-ref-custom.gguf`) |
+| `--make-ref-output PATH` | Output path for `--make-ref` (default: `tada-ref-custom.gguf`) |
+| `--make-ref-encoder PATH` | Explicit path to the TADA encoder GGUF (auto-discovered if omitted) |
+| `--make-ref-aligner PATH` | Explicit path to the TADA aligner GGUF (auto-discovered if omitted) |
 | `--codec-model FNAME` | Explicit path to the codec/companion GGUF (e.g. Qwen3-TTS codec encoder). Defaults to sibling / cache / registry auto-discovery |
 | `--codec-quant Q` | Preferred quant for registry companion resolution (codec model) |
 | `--tts-steps N` | DPM-Solver++ diffusion steps (VibeVoice only; default 20, valid range 10–20) |
