@@ -59,9 +59,20 @@ else:
 
 # %% [code]  install deps
 _step("pip-install.begin")
+# Install base deps first so we can read the torch version before
+# installing torchaudio (must match torch exactly to avoid ABI errors).
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", "-q",
     "gguf", "datasets", "soundfile", "scipy",
+])
+import importlib.util as _ilu
+_torch_ver = None
+if _ilu.find_spec("torch"):
+    import torch as _t; _torch_ver = _t.__version__.split("+")[0]
+_torchaudio_pin = f"torchaudio=={_torch_ver}" if _torch_ver else "torchaudio"
+subprocess.check_call([
+    sys.executable, "-m", "pip", "install", "-q",
+    _torchaudio_pin,
     "git+https://github.com/HumeAI/tada.git",
 ])
 _step("pip-install.done")
