@@ -177,6 +177,9 @@ struct tada_context {
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
+    bool backend_is_vulkan = false;          // backend is a Vulkan device (#192)
+    bool vulkan_native = false;              // CRISPASR_TADA_VULKAN_NATIVE: compute graphs direct (no sched)
+    ggml_gallocr_t ar_step_galloc = nullptr; // direct-compute allocator for talker/embed graphs
     ggml_context* ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
@@ -228,6 +231,7 @@ struct tada_context {
     std::vector<uint8_t> fm_step_meta;
     ggml_cgraph* fm_step_gf = nullptr;
     ggml_backend_sched_t fm_step_sched = nullptr;
+    ggml_gallocr_t fm_step_galloc = nullptr;
 
     // B=2 batched CFG FM graph cache (CRISPASR_TADA_FM_B2).
     // Batches pos+neg condition in one forward; halves FM graph compute calls.
@@ -235,6 +239,7 @@ struct tada_context {
     std::vector<uint8_t> fm_b2_meta;
     ggml_cgraph* fm_b2_gf = nullptr;
     ggml_backend_sched_t fm_b2_sched = nullptr;
+    ggml_gallocr_t fm_b2_galloc = nullptr;
     bool fm_b2_active = false;
     ggml_context* fm_b2_ctx_f16 = nullptr;
     ggml_backend_buffer_t fm_b2_buf_f16 = nullptr;
@@ -249,6 +254,7 @@ struct tada_context {
     std::vector<uint8_t> fm_batch_meta;
     ggml_cgraph* fm_batch_gf = nullptr;
     ggml_backend_sched_t fm_batch_sched = nullptr;
+    ggml_gallocr_t fm_batch_galloc = nullptr;
     int fm_batch_B = 0;
 };
 
@@ -886,20 +892,38 @@ static bool run_fm_step_batch(tada_context* c, const float* noisy_b, float times
         ggml_backend_t backends[2] = {c->backend, c->backend_cpu};
         int n_be = (c->backend && c->backend != c->backend_cpu) ? 2 : 1;
         c->fm_batch_sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+        if (c->fm_batch_galloc) {
+            ggml_gallocr_free(c->fm_batch_galloc);
+            c->fm_batch_galloc = nullptr;
+        }
         c->fm_batch_B = B;
     }
     ggml_cgraph* gf = c->fm_batch_gf;
-    ggml_backend_sched_t sched = c->fm_batch_sched;
-    ggml_backend_sched_reset(sched);
-    if (!ggml_backend_sched_alloc_graph(sched, gf))
-        return false;
 
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "noisy_b"), noisy_b, 0, (size_t)lat * B * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_emb_sin"), t_emb, 0, 256 * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "cond_b"), cond_b, 0, (size_t)hid * B * sizeof(float));
+    // Vulkan native path: direct compute on the backend (no sched split) — see run_fm_step (#192).
+    if (c->vulkan_native) {
+        if (!c->fm_batch_galloc)
+            c->fm_batch_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(c->backend));
+        if (!ggml_gallocr_alloc_graph(c->fm_batch_galloc, gf))
+            return false;
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "noisy_b"), noisy_b, 0, (size_t)lat * B * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_emb_sin"), t_emb, 0, 256 * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "cond_b"), cond_b, 0, (size_t)hid * B * sizeof(float));
+        if (ggml_backend_graph_compute(c->backend, gf) != GGML_STATUS_SUCCESS)
+            return false;
+    } else {
+        ggml_backend_sched_t sched = c->fm_batch_sched;
+        ggml_backend_sched_reset(sched);
+        if (!ggml_backend_sched_alloc_graph(sched, gf))
+            return false;
 
-    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS)
-        return false;
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "noisy_b"), noisy_b, 0, (size_t)lat * B * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_emb_sin"), t_emb, 0, 256 * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "cond_b"), cond_b, 0, (size_t)hid * B * sizeof(float));
+
+        if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS)
+            return false;
+    }
 
     ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "velocity_b"), vel_b_out, 0, (size_t)lat * B * sizeof(float));
     return true;
@@ -1066,12 +1090,22 @@ static void tada_scale_noise_like_python(float* data, int n, float noise_temp) {
 static float* embed_tokens(tada_context* c, const int32_t* ids, int n) {
     const int d = (int)c->hp.d_model;
     ggml_cgraph* gf = build_graph_embed(c, n);
-    ggml_backend_sched_reset(c->sched);
-    if (!ggml_backend_sched_alloc_graph(c->sched, gf))
-        return nullptr;
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "input_ids"), ids, 0, (size_t)n * sizeof(int32_t));
-    if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS)
-        return nullptr;
+    if (c->vulkan_native) {
+        if (!c->ar_step_galloc)
+            c->ar_step_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(c->backend));
+        if (!ggml_gallocr_alloc_graph(c->ar_step_galloc, gf))
+            return nullptr;
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "input_ids"), ids, 0, (size_t)n * sizeof(int32_t));
+        if (ggml_backend_graph_compute(c->backend, gf) != GGML_STATUS_SUCCESS)
+            return nullptr;
+    } else {
+        ggml_backend_sched_reset(c->sched);
+        if (!ggml_backend_sched_alloc_graph(c->sched, gf))
+            return nullptr;
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "input_ids"), ids, 0, (size_t)n * sizeof(int32_t));
+        if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS)
+            return nullptr;
+    }
     ggml_tensor* out = ggml_graph_get_tensor(gf, "embeds");
     float* r = (float*)malloc((size_t)d * n * sizeof(float));
     ggml_backend_tensor_get(out, r, 0, (size_t)d * n * sizeof(float));
@@ -1085,9 +1119,16 @@ static float* build_step_embedding(tada_context* c, int32_t token_id, const floa
     const int ad = (int)c->hp.acoustic_dim;
 
     ggml_cgraph* gf = build_graph_step_embed(c);
-    ggml_backend_sched_reset(c->sched);
-    if (!ggml_backend_sched_alloc_graph(c->sched, gf))
-        return nullptr;
+    if (c->vulkan_native) {
+        if (!c->ar_step_galloc)
+            c->ar_step_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(c->backend));
+        if (!ggml_gallocr_alloc_graph(c->ar_step_galloc, gf))
+            return nullptr;
+    } else {
+        ggml_backend_sched_reset(c->sched);
+        if (!ggml_backend_sched_alloc_graph(c->sched, gf))
+            return nullptr;
+    }
 
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "token_id"), &token_id, 0, sizeof(int32_t));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "acoustic"), acoustic, 0, (size_t)ad * sizeof(float));
@@ -1095,8 +1136,12 @@ static float* build_step_embedding(tada_context* c, int32_t token_id, const floa
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_before"), &t_before, 0, sizeof(int32_t));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_after"), &t_after, 0, sizeof(int32_t));
 
-    if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS)
+    if (c->vulkan_native) {
+        if (ggml_backend_graph_compute(c->backend, gf) != GGML_STATUS_SUCCESS)
+            return nullptr;
+    } else if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
         return nullptr;
+    }
     ggml_tensor* out = ggml_graph_get_tensor(gf, "step_embed");
     float* r = (float*)malloc((size_t)d * sizeof(float));
     ggml_backend_tensor_get(out, r, 0, (size_t)d * sizeof(float));
@@ -1149,10 +1194,21 @@ static talker_result run_talker_kv_bucket(tada_context* c, const float* embeds, 
     ggml_cgraph* gf = tada_get_or_build_bucket(c, idx);
     if (!gf)
         return res;
-    ggml_backend_sched_t ss = tada_step_sched_lazy(c);
-    ggml_backend_sched_reset(ss);
-    if (!ggml_backend_sched_alloc_graph(ss, gf))
-        return res;
+    // Vulkan native path: direct compute on the backend (no {backend,CPU} sched).
+    // This needs a driver with a REPEAT pipeline for the GQA head expansion (RADV
+    // has it; MoltenVK aborts), hence the CRISPASR_TADA_VULKAN_NATIVE gate (#192).
+    ggml_backend_sched_t ss = nullptr;
+    if (c->vulkan_native) {
+        if (!c->ar_step_galloc)
+            c->ar_step_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(c->backend));
+        if (!ggml_gallocr_alloc_graph(c->ar_step_galloc, gf))
+            return res;
+    } else {
+        ss = tada_step_sched_lazy(c);
+        ggml_backend_sched_reset(ss);
+        if (!ggml_backend_sched_alloc_graph(ss, gf))
+            return res;
+    }
     const int d = (int)c->hp.d_model;
     const int vocab = (int)c->hp.vocab_size;
     const int Lk = c->ar_buckets[idx].lk;
@@ -1165,8 +1221,12 @@ static talker_result run_talker_kv_bucket(tada_context* c, const float* embeds, 
         mask[k] = (k <= n_past) ? z : ni;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
                             mask.size() * sizeof(ggml_fp16_t));
-    if (ggml_backend_sched_graph_compute(ss, gf) != GGML_STATUS_SUCCESS)
+    if (c->vulkan_native) {
+        if (ggml_backend_graph_compute(c->backend, gf) != GGML_STATUS_SUCCESS)
+            return res;
+    } else if (ggml_backend_sched_graph_compute(ss, gf) != GGML_STATUS_SUCCESS) {
         return res;
+    }
     res.hidden = (float*)malloc((size_t)d * sizeof(float));
     ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "hidden_state"), res.hidden, 0, (size_t)d * sizeof(float));
     if (need_logits) {
@@ -1210,9 +1270,18 @@ static talker_result run_talker_kv(tada_context* c, const float* embeds, int n_t
     }
 
     ggml_cgraph* gf = build_graph_talker_kv(c, n_past, n_tokens, need_logits, use_kv_k, use_kv_v);
-    ggml_backend_sched_reset(c->sched);
-    if (!ggml_backend_sched_alloc_graph(c->sched, gf))
-        return res;
+
+    // Vulkan native path: direct compute on the backend (no sched split) — #192.
+    if (c->vulkan_native) {
+        if (!c->ar_step_galloc)
+            c->ar_step_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(c->backend));
+        if (!ggml_gallocr_alloc_graph(c->ar_step_galloc, gf))
+            return res;
+    } else {
+        ggml_backend_sched_reset(c->sched);
+        if (!ggml_backend_sched_alloc_graph(c->sched, gf))
+            return res;
+    }
 
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inputs_embeds"), embeds, 0,
                             (size_t)d * n_tokens * sizeof(float));
@@ -1222,8 +1291,12 @@ static talker_result run_talker_kv(tada_context* c, const float* embeds, int n_t
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
                                 mask.size() * sizeof(ggml_fp16_t));
     }
-    if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS)
+    if (c->vulkan_native) {
+        if (ggml_backend_graph_compute(c->backend, gf) != GGML_STATUS_SUCCESS)
+            return res;
+    } else if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
         return res;
+    }
 
     ggml_tensor* h = ggml_graph_get_tensor(gf, "hidden_state");
     res.hidden = (float*)malloc((size_t)d * sizeof(float));
@@ -1281,20 +1354,39 @@ static void run_fm_step(tada_context* c, const float* noisy_z, float timestep, c
         fprintf(stderr, "tada: failed to build fm_step graph\n");
         return;
     }
-    ggml_backend_sched_t sched = tada_fm_step_sched_lazy(c);
-    ggml_backend_sched_reset(sched);
-    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-        fprintf(stderr, "tada: failed to alloc fm_step graph\n");
-        return;
-    }
+    // On the Vulkan native path, compute directly on the backend via a cached
+    // gallocr, bypassing the {backend,CPU} scheduler whose cross-backend split
+    // corrupts the FM head on Vulkan (#192).
+    if (c->vulkan_native) {
+        if (!c->fm_step_galloc)
+            c->fm_step_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(c->backend));
+        if (!ggml_gallocr_alloc_graph(c->fm_step_galloc, gf)) {
+            fprintf(stderr, "tada: failed to alloc fm_step graph (direct)\n");
+            return;
+        }
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "noisy_z"), noisy_z, 0, (size_t)lat * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_emb_sin"), t_emb, 0, 256 * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "fm_cond"), cond_input, 0, (size_t)hid * sizeof(float));
+        if (ggml_backend_graph_compute(c->backend, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "tada: fm_step compute failed (direct)\n");
+            return;
+        }
+    } else {
+        ggml_backend_sched_t sched = tada_fm_step_sched_lazy(c);
+        ggml_backend_sched_reset(sched);
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            fprintf(stderr, "tada: failed to alloc fm_step graph\n");
+            return;
+        }
 
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "noisy_z"), noisy_z, 0, (size_t)lat * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_emb_sin"), t_emb, 0, 256 * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "fm_cond"), cond_input, 0, (size_t)hid * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "noisy_z"), noisy_z, 0, (size_t)lat * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_emb_sin"), t_emb, 0, 256 * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "fm_cond"), cond_input, 0, (size_t)hid * sizeof(float));
 
-    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "tada: fm_step compute failed\n");
-        return;
+        if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "tada: fm_step compute failed\n");
+            return;
+        }
     }
 
     ggml_tensor* vel = ggml_graph_get_tensor(gf, "velocity");
@@ -1448,14 +1540,6 @@ static bool run_fm_step_b2(tada_context* c, const float* noisy_z, float timestep
     if (!gf)
         return false;
 
-    ggml_backend_sched_t sched = tada_fm_b2_sched_lazy(c);
-    ggml_backend_sched_reset(sched);
-    if (!ggml_backend_sched_alloc_graph(sched, gf))
-        return false;
-
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "noisy_z"), noisy_z, 0, (size_t)lat * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_emb_sin"), t_emb, 0, 256 * sizeof(float));
-
     // Pack pos+neg as column-interleaved (hid, 2) in column-major order:
     // col 0 = cond_pos, col 1 = cond_neg
     std::vector<float> cond_b2((size_t)hid * 2);
@@ -1463,10 +1547,33 @@ static bool run_fm_step_b2(tada_context* c, const float* noisy_z, float timestep
         cond_b2[j] = cond_pos[j];       // col 0
         cond_b2[hid + j] = cond_neg[j]; // col 1
     }
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "fm_cond_b2"), cond_b2.data(), 0, cond_b2.size() * sizeof(float));
 
-    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS)
-        return false;
+    // Vulkan native path: direct compute on the backend (no sched split) — see run_fm_step (#192).
+    if (c->vulkan_native) {
+        if (!c->fm_b2_galloc)
+            c->fm_b2_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(c->backend));
+        if (!ggml_gallocr_alloc_graph(c->fm_b2_galloc, gf))
+            return false;
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "noisy_z"), noisy_z, 0, (size_t)lat * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_emb_sin"), t_emb, 0, 256 * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "fm_cond_b2"), cond_b2.data(), 0,
+                                cond_b2.size() * sizeof(float));
+        if (ggml_backend_graph_compute(c->backend, gf) != GGML_STATUS_SUCCESS)
+            return false;
+    } else {
+        ggml_backend_sched_t sched = tada_fm_b2_sched_lazy(c);
+        ggml_backend_sched_reset(sched);
+        if (!ggml_backend_sched_alloc_graph(sched, gf))
+            return false;
+
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "noisy_z"), noisy_z, 0, (size_t)lat * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_emb_sin"), t_emb, 0, 256 * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "fm_cond_b2"), cond_b2.data(), 0,
+                                cond_b2.size() * sizeof(float));
+
+        if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS)
+            return false;
+    }
 
     ggml_tensor* vel = ggml_graph_get_tensor(gf, "velocity_b2");
     std::vector<float> vel_b2((size_t)lat * 2);
@@ -1873,30 +1980,50 @@ struct tada_context* tada_init_from_file(const char* path_model, struct tada_con
     if (!c->backend)
         c->backend = c->backend_cpu;
 
-    // TADA's GPU compute graphs (the flow-matching FM head + the codec) are not
-    // yet numerically correct on Vulkan: the FM solver produces NaN / exploded
-    // values, which poison the autoregressive acoustic feedback so the talker
-    // never emits EOS. Generation then runs to the token cap and the resulting
-    // garbage per-token durations expand to tens of thousands of frames — one
-    // such runaway tried to allocate 113 GB and segfaulted (issue #192). This
-    // reproduces on both RADV (POLARIS10) and MoltenVK, so it is a graph bug,
-    // not a driver bug. Until the graphs are fixed, fall back to CPU on Vulkan so
-    // the user gets correct audio instead of silence / NaN / a huge allocation.
-    // Metal and CUDA are validated and unaffected. Override (for debugging the
-    // Vulkan path) with CRISPASR_TADA_ALLOW_VULKAN=1.
+    // On Vulkan, TADA's default scheduler path miscomputes: ggml_backend_sched
+    // splits the FM-head and talker graphs across GPU/CPU (because GGML_OP_REPEAT
+    // — GQA head expansion + batched FM — has no Vulkan pipeline on some drivers)
+    // and corrupts the cross-backend activation copies. The FM solver then
+    // produces NaN / exploded values, which poison the autoregressive acoustic
+    // feedback so the talker never emits EOS; generation runs to the token cap and
+    // the garbage durations expand to tens of thousands of frames (one runaway
+    // tried to allocate 113 GB and segfaulted). Issue #192; reproduces on both
+    // RADV (POLARIS10) and MoltenVK.
+    //
+    // Two opt-in escapes from the default CPU fallback:
+    //   CRISPASR_TADA_VULKAN_NATIVE=1 — keep Vulkan and compute every TADA graph
+    //     directly on the backend (no scheduler, no cross-backend split). This is
+    //     the real native-Vulkan fix; the FM head is validated correct this way
+    //     (speech_rms 426 -> 1.14 on MoltenVK), but the talker path needs a driver
+    //     with a REPEAT pipeline (RADV has it; MoltenVK aborts), so it is gated for
+    //     validation on real hardware.
+    //   CRISPASR_TADA_ALLOW_VULKAN=1 — keep Vulkan on the (broken) scheduler path,
+    //     for debugging only.
+    // Metal and CUDA are validated and unaffected by either flag.
     if (c->backend != c->backend_cpu) {
         const char* bname = ggml_backend_name(c->backend);
         const bool is_vulkan = bname && strstr(bname, "Vulkan");
+        const char* native = std::getenv("CRISPASR_TADA_VULKAN_NATIVE");
         const char* allow = std::getenv("CRISPASR_TADA_ALLOW_VULKAN");
-        if (is_vulkan && !(allow && allow[0] == '1')) {
+        const bool want_native = native && native[0] == '1';
+        const bool want_allow = allow && allow[0] == '1';
+        if (is_vulkan && want_native) {
+            c->backend_is_vulkan = true;
+            c->vulkan_native = true;
+            if (params.verbosity >= 1)
+                fprintf(stderr, "tada: Vulkan native path ENABLED (CRISPASR_TADA_VULKAN_NATIVE=1) — "
+                                "computing all graphs directly on the backend (#192).\n");
+        } else if (is_vulkan && !want_allow) {
             fprintf(stderr,
-                    "tada: WARNING: GPU backend '%s' is not yet supported for TADA — its flow-matching "
-                    "and codec graphs miscompute on Vulkan and produce no usable audio (issue #192). "
-                    "Falling back to CPU. Use Metal or CUDA for GPU acceleration, or set "
-                    "CRISPASR_TADA_ALLOW_VULKAN=1 to force the (broken) Vulkan path.\n",
+                    "tada: WARNING: GPU backend '%s' is not yet supported for TADA — its scheduler path "
+                    "miscomputes on Vulkan and produces no usable audio (issue #192). Falling back to CPU. "
+                    "Use Metal/CUDA for GPU acceleration, set CRISPASR_TADA_VULKAN_NATIVE=1 to try the "
+                    "native direct-compute path, or CRISPASR_TADA_ALLOW_VULKAN=1 to force the broken path.\n",
                     bname);
             ggml_backend_free(c->backend);
             c->backend = c->backend_cpu;
+        } else if (is_vulkan) {
+            c->backend_is_vulkan = true; // ALLOW_VULKAN: broken sched path, debugging only
         }
     }
     if (params.verbosity >= 1) {
@@ -3110,6 +3237,8 @@ void tada_free(struct tada_context* ctx) {
         return;
     if (ctx->fm_b2_sched)
         ggml_backend_sched_free(ctx->fm_b2_sched);
+    if (ctx->fm_b2_galloc)
+        ggml_gallocr_free(ctx->fm_b2_galloc);
     if (ctx->fm_b2_ctx)
         ggml_free(ctx->fm_b2_ctx);
     if (ctx->fm_b2_buf_f16)
@@ -3118,14 +3247,20 @@ void tada_free(struct tada_context* ctx) {
         ggml_free(ctx->fm_b2_ctx_f16);
     if (ctx->fm_batch_sched)
         ggml_backend_sched_free(ctx->fm_batch_sched);
+    if (ctx->fm_batch_galloc)
+        ggml_gallocr_free(ctx->fm_batch_galloc);
     if (ctx->fm_batch_ctx)
         ggml_free(ctx->fm_batch_ctx);
     if (ctx->fm_step_sched)
         ggml_backend_sched_free(ctx->fm_step_sched);
+    if (ctx->fm_step_galloc)
+        ggml_gallocr_free(ctx->fm_step_galloc);
     if (ctx->fm_step_ctx)
         ggml_free(ctx->fm_step_ctx);
     if (ctx->ar_step_sched)
         ggml_backend_sched_free(ctx->ar_step_sched);
+    if (ctx->ar_step_galloc)
+        ggml_gallocr_free(ctx->ar_step_galloc);
     for (auto& bk : ctx->ar_buckets)
         if (bk.ctx)
             ggml_free(bk.ctx);
