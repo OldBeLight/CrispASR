@@ -250,16 +250,60 @@ public:
         if (!prompt_path.empty()) {
             if (tada_load_prompt(ctx_, prompt_path.c_str()) != 0) {
                 fprintf(stderr, "crispasr[tada]: failed to load prompt from '%s'\n", prompt_path.c_str());
-            } else if (!p.no_prints && (p.tts_voice.empty() || p.tts_voice == "default" || p.tts_voice == "auto")) {
-                fprintf(stderr, "crispasr[tada]: using default voice prompt '%s'\n", prompt_path.c_str());
+            } else {
+                // Remember which voice is loaded so per-request switching (#201)
+                // can skip a reload when the request asks for the same one. An
+                // explicit --voice is keyed by its request string; a default /
+                // discovered prompt is keyed empty ("keep current").
+                const bool explicit_voice = !p.tts_voice.empty() && p.tts_voice != "default" && p.tts_voice != "auto";
+                last_voice_key_ = explicit_voice ? p.tts_voice : "";
+                if (!p.no_prints && !explicit_voice)
+                    fprintf(stderr, "crispasr[tada]: using default voice prompt '%s'\n", prompt_path.c_str());
             }
         }
+        return true;
+    }
+
+    // Switch the voice reference for this request (#201). Mirrors chatterbox's
+    // per-call voice key: reload the prompt only when the request names a
+    // different voice than the one currently loaded, so a long-running server
+    // can swap voices without a restart. Returns false (and keeps the current
+    // voice) when the requested ref can't be resolved.
+    bool apply_request_voice(const whisper_params& p) {
+        const std::string& v = p.tts_voice;
+        if (v.empty() || v == "default" || v == "auto" || v == last_voice_key_)
+            return true; // keep whatever is loaded
+        const bool is_wav = v.size() >= 4 && (v.substr(v.size() - 4) == ".wav" || v.substr(v.size() - 4) == ".WAV");
+        if (is_wav) {
+            fprintf(stderr,
+                    "crispasr[tada]: voice '%s' is a .wav — direct .wav voice cloning is not yet "
+                    "supported at query time. Convert it to a tada-ref.gguf first "
+                    "(models/convert-tada-ref-to-gguf.py or the CLI --make-ref pipeline) and pass that.\n",
+                    v.c_str());
+            return false;
+        }
+        std::string ref =
+            crispasr_resolve_model_cli(v, p.backend, p.no_prints, p.cache_dir, p.auto_download, p.model_quant);
+        if (ref.empty()) {
+            fprintf(stderr, "crispasr[tada]: voice '%s' not found; keeping current voice.\n", v.c_str());
+            return false;
+        }
+        if (tada_load_prompt(ctx_, ref.c_str()) != 0) {
+            fprintf(stderr, "crispasr[tada]: failed to load voice '%s'; keeping current voice.\n", ref.c_str());
+            return false;
+        }
+        last_voice_key_ = v;
+        if (!p.no_prints)
+            fprintf(stderr, "crispasr[tada]: switched voice → '%s'\n", ref.c_str());
         return true;
     }
 
     std::vector<float> synthesize(const std::string& text, const whisper_params& params) override {
         if (!ctx_)
             return {};
+        // Switch the voice reference per request if a different one is named (#201)
+        // — a long-running server can change voice without a restart.
+        apply_request_voice(params);
         // Apply the talker sampler per request so a long-running server can tune
         // temperature / top-p / top-k / repetition-penalty at query time without a
         // restart (#197). The context is shared across requests, so every knob is
@@ -312,6 +356,10 @@ private:
     int def_num_fm_steps_ = 10;
     float def_acoustic_cfg_ = 1.6f;
     float def_noise_temp_ = 0.9f;
+    // Currently-loaded voice reference, so a server can switch voices per request
+    // without a restart (#201). Reload only when the request names a different
+    // voice. Empty/"default"/"auto" mean "keep whatever is loaded".
+    std::string last_voice_key_;
 };
 
 } // namespace

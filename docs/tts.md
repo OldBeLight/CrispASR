@@ -62,6 +62,27 @@ prosody) extracted offline from a 10 s FLEURS CC-BY-4.0 French clip. Once
 cached it is reused for every subsequent French synthesis call. Available
 language codes: `ar`, `ch`, `de`, `es`, `fr`, `it`, `ja`, `pl`, `pt`.
 
+#### Switching voice at query time (server, #201)
+
+On the HTTP server the voice is **per request** — point `voice` at a different
+`tada-ref-*.gguf` and the backend reloads it on the next call, no container
+restart needed. Omitting `voice` (or `"default"`/`"auto"`) keeps the
+currently-loaded reference, so requests that don't care pay nothing.
+
+```bash
+# request 1: French built-in voice
+curl -s :8080/v1/audio/speech -d '{"input":"Bonjour.","voice":"tada-ref-fr.gguf"}' -o fr.wav
+# request 2: German voice — switched live, same running server
+curl -s :8080/v1/audio/speech -d '{"input":"Guten Tag.","voice":"tada-ref-de.gguf"}' -o de.wav
+```
+
+The name resolves like any other model path (absolute path, or a cache/registry
+name that auto-downloads). Embedders going through the session C ABI get the
+same capability via `crispasr_session_set_voice(s, "tada-ref-de.gguf", NULL)`.
+Generating a brand-new reference from raw audio+transcript at query time is not
+yet wired into the server (it needs the encoder+aligner GGUFs loaded) — bake the
+ref offline with the `--make-ref` pipeline below, then switch to it live.
+
 ### Use case (b) — custom voice cloning
 
 To speak in a specific person's voice, bake a ref GGUF from ~10 s of their
