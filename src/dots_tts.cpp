@@ -1013,7 +1013,7 @@ static void dots_penc_forward(dots_tts_context* ctx, const float* latent_patch, 
     // TODO: implement strided conv downsample properly
     int T = n_frames; // After downsample, may be T/2
 
-    size_t n_tensors = pe.n_layers * 20 + 64;
+    size_t n_tensors = pe.n_layers * 80 + 512; // kv_self_attn ~40-60 nodes/layer
     size_t ctx_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead();
     ggml_init_params ip = {ctx_size, nullptr, true};
     ggml_context* ctx0 = ggml_init(ip);
