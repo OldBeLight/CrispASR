@@ -247,21 +247,21 @@ struct dots_projections {
 };
 
 // ── BigVGAN vocoder ──
+// Architecture: pre_proj → MI-LSTM → post_proj(→latent) → conv_pre →
+//   6× (SnakeBeta → ConvTranspose1d → 3× AMPBlock averaged) →
+//   SnakeBeta → conv_post → tanh → mono 48 kHz PCM.
+// AMPBlock (resblock): 3× (SnakeBeta → dilated conv1 → SnakeBeta → conv2) + residual.
+// Anti-alias filters in Activation1d are skipped for now (quality refinement).
 
 struct dots_voc_resblock {
-    // 3 kernel sizes × 3 dilations = 9 conv layers (kernel 3/7/11, dilation 1/3/5)
-    std::vector<ggml_tensor*> conv_w;
-    std::vector<ggml_tensor*> conv_b;
-    std::vector<ggml_tensor*> alpha; // SnakeBeta alpha (per-conv)
-    std::vector<ggml_tensor*> beta;  // SnakeBeta beta (per-conv)
-};
-
-struct dots_voc_stage {
-    ggml_tensor* upsample_w = nullptr; // ConvTranspose1d
-    ggml_tensor* upsample_b = nullptr;
-    ggml_tensor* alpha = nullptr; // pre-upsample SnakeBeta
-    ggml_tensor* beta = nullptr;
-    std::vector<dots_voc_resblock> resblocks;
+    // AMPBlock1: 3 dilated conv pairs (convs1[0..2] + convs2[0..2])
+    // Each pair has a SnakeBeta activation before it (activations[0..5])
+    ggml_tensor* act_alpha[6] = {};
+    ggml_tensor* act_beta[6] = {};
+    ggml_tensor* convs1_w[3] = {};
+    ggml_tensor* convs1_b[3] = {};
+    ggml_tensor* convs2_w[3] = {};
+    ggml_tensor* convs2_b[3] = {};
 };
 
 struct dots_vocoder {
@@ -269,29 +269,37 @@ struct dots_vocoder {
     uint32_t latent_dim = 128;
     uint32_t initial_ch = 1536;
     uint32_t mi_num_layers = 4;
-    std::vector<uint32_t> upsample_rates;
-    std::vector<uint32_t> upsample_ksizes;
-    std::vector<uint32_t> resblock_ksizes;
-    std::vector<std::vector<uint32_t>> resblock_dilations;
+    uint32_t n_stages = 6;
+    std::vector<uint32_t> upsample_rates;  // [10, 6, 4, 2, 2, 2]
+    std::vector<uint32_t> upsample_ksizes; // [20, 12, 8, 4, 4, 4]
 
-    // Pre-conv
-    ggml_tensor* pre_conv_w = nullptr;
-    ggml_tensor* pre_conv_b = nullptr;
+    // MI layer (decoder side): Linear(128→512) → LSTM(512, 4 layers) → Linear(512→128)
+    ggml_tensor* mi_in_w = nullptr; // dec_mi_layer.0
+    ggml_tensor* mi_in_b = nullptr;
+    ggml_tensor* mi_out_w = nullptr; // dec_mi_layer.2
+    ggml_tensor* mi_out_b = nullptr;
+    // LSTM (4 layers, hidden=512)
+    ggml_tensor* lstm_w_ih[4] = {};
+    ggml_tensor* lstm_w_hh[4] = {};
+    ggml_tensor* lstm_b_ih[4] = {};
+    ggml_tensor* lstm_b_hh[4] = {};
 
-    // MI-LSTM
-    std::vector<ggml_tensor*> lstm_w_ih;
-    std::vector<ggml_tensor*> lstm_w_hh;
-    std::vector<ggml_tensor*> lstm_b_ih;
-    std::vector<ggml_tensor*> lstm_b_hh;
+    // conv_pre: Conv1d(128, 1536, k=5)
+    ggml_tensor* conv_pre_w = nullptr;
+    ggml_tensor* conv_pre_b = nullptr;
 
-    // Upsample stages
-    std::vector<dots_voc_stage> stages;
+    // 6 upsample stages: ConvTranspose1d
+    ggml_tensor* ups_w[6] = {};
+    ggml_tensor* ups_b[6] = {};
+
+    // 18 resblocks (3 per stage × 6 stages, kernel sizes cycle 3/7/11)
+    dots_voc_resblock resblocks[18] = {};
 
     // Post activation + conv
     ggml_tensor* post_alpha = nullptr;
     ggml_tensor* post_beta = nullptr;
     ggml_tensor* post_conv_w = nullptr;
-    ggml_tensor* post_conv_b = nullptr;
+    // No post_conv_b (use_bias_at_final=false in config)
 
     // Weight/compute contexts
     ggml_context* ctx_w = nullptr;
@@ -1128,39 +1136,190 @@ static void dots_flow_match(dots_tts_context* ctx, const float* llm_hidden, int 
 // BigVGAN vocoder decode (latents → 48 kHz PCM)
 // ===========================================================================
 
+// ── Conv1d helper (channel-first: (C, T) in, (C_out, T_out) out) ────────────
+// Weight layout: (K, C_in, C_out) in ggml. Causal left-pad for dots.tts.
+static ggml_tensor* dots_conv1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, int dilation = 1) {
+    int K = (int)w->ne[0];
+    int pad = (K - 1) * dilation; // causal: full left-pad
+    // Transpose to (T, C) for ggml_conv_1d
+    ggml_tensor* xT = ggml_cont(ctx, ggml_transpose(ctx, x)); // (T, C_in)
+    ggml_tensor* y = ggml_conv_1d(ctx, w, xT, /*stride*/ 1, pad, dilation);
+    int Cout = (int)w->ne[2];
+    int Tout = (int)y->ne[0];
+    y = ggml_reshape_2d(ctx, y, Tout, Cout);
+    // Causal: trim right to keep output T == input T
+    int T_in = (int)x->ne[1];
+    if (Tout > T_in) {
+        y = ggml_view_2d(ctx, y, T_in, Cout, y->nb[1], 0);
+        y = ggml_cont(ctx, y);
+    }
+    y = ggml_cont(ctx, ggml_transpose(ctx, y)); // (Cout, T_out)
+    if (b)
+        y = ggml_add(ctx, y, b);
+    return y;
+}
+
+// ── ConvTranspose1d (upsample) ──────────────────────────────────────────────
+// Weight: (K, C_out, C_in). Stride = upsample rate. Symmetric padding.
+static ggml_tensor* dots_convt1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, int stride) {
+    int K = (int)w->ne[0];
+    int Cout = (int)w->ne[1];
+    int pad = (K - stride) / 2; // symmetric padding
+
+    ggml_tensor* xT = ggml_cont(ctx, ggml_transpose(ctx, x));          // (T, Cin)
+    ggml_tensor* y = ggml_conv_transpose_1d(ctx, w, xT, stride, 0, 1); // (T_raw, Cout, 1, 1)
+    int T_raw = (int)y->ne[0];
+    y = ggml_reshape_2d(ctx, y, T_raw, Cout);
+    // Trim symmetric padding
+    int T_out = T_raw - 2 * pad;
+    if (pad > 0 && T_out > 0) {
+        y = ggml_view_2d(ctx, y, T_out, Cout, (size_t)T_raw * sizeof(float), (size_t)pad * sizeof(float));
+        y = ggml_cont(ctx, y);
+    }
+    y = ggml_cont(ctx, ggml_transpose(ctx, y)); // (Cout, T_out)
+    if (b)
+        y = ggml_add(ctx, y, b);
+    return y;
+}
+
+// ── AMPBlock1 forward (one resblock) ────────────────────────────────────────
+// Structure: 3× (SnakeBeta → dilated_conv1 → SnakeBeta → conv2) + residual
+static ggml_tensor* dots_resblock_fwd(ggml_context* ctx, ggml_tensor* x, const dots_voc_resblock& rb,
+                                      const int dilations[3]) {
+    ggml_tensor* residual = x;
+    for (int d = 0; d < 3; d++) {
+        // SnakeBeta before conv1
+        x = core_act::snake_beta(ctx, x, rb.act_alpha[d * 2], rb.act_beta[d * 2]);
+        // Dilated conv1
+        x = dots_conv1d(ctx, x, rb.convs1_w[d], rb.convs1_b[d], dilations[d]);
+        // SnakeBeta before conv2
+        x = core_act::snake_beta(ctx, x, rb.act_alpha[d * 2 + 1], rb.act_beta[d * 2 + 1]);
+        // Conv2 (dilation=1)
+        x = dots_conv1d(ctx, x, rb.convs2_w[d], rb.convs2_b[d], 1);
+    }
+    return ggml_add(ctx, x, residual);
+}
+
+// ── BigVGAN vocoder decode ──────────────────────────────────────────────────
 static float* dots_vocoder_decode(dots_tts_context* ctx, const float* latents, int n_frames, int* out_n_samples) {
-    (void)latents; // TODO: implement BigVGAN decode graph
     if (!ctx->has_vocoder) {
         std::fprintf(stderr, "dots_tts: vocoder not loaded\n");
         *out_n_samples = 0;
         return nullptr;
     }
 
-    // BigVGAN decode: latents (n_frames, latent_dim) → PCM (n_samples,)
-    // Total upsample factor: 10 × 6 × 4 × 2 × 2 × 2 = 960
-    // So n_samples = n_frames × 960
-
+    dots_bench_stage bench("vocoder_graph");
     auto& voc = ctx->voc;
+
     int total_upsample = 1;
     for (auto r : voc.upsample_rates)
         total_upsample *= (int)r;
     int n_samples = n_frames * total_upsample;
-
-    // TODO: Implement BigVGAN decode graph
-    // For now, output silence to allow end-to-end testing
-    float* pcm = (float*)std::malloc(n_samples * sizeof(float));
-    if (!pcm) {
-        *out_n_samples = 0;
-        return nullptr;
-    }
-    std::memset(pcm, 0, n_samples * sizeof(float));
-    *out_n_samples = n_samples;
+    int latent_dim = (int)voc.latent_dim;
 
     if (dots_debug_enabled()) {
         std::fprintf(stderr, "dots_tts: vocoder decode %d frames → %d samples (%.1f s at %d Hz)\n", n_frames, n_samples,
                      (float)n_samples / (float)voc.sample_rate, (int)voc.sample_rate);
     }
 
+    // Build ggml graph
+    // The graph is large: 6 upsample stages × (conv_transpose + 3 resblocks × 8 ops each)
+    size_t n_tensors = 8192;
+    size_t ctx_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead();
+    ggml_init_params ip = {ctx_size, nullptr, true};
+    ggml_context* ctx0 = ggml_init(ip);
+    if (!ctx0) {
+        std::fprintf(stderr, "dots_tts: vocoder graph context alloc failed\n");
+        *out_n_samples = 0;
+        return nullptr;
+    }
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, n_tensors, false);
+
+    // Input: latents (latent_dim, n_frames) — channel-first
+    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, latent_dim, n_frames);
+    ggml_set_name(x, "voc_input");
+    ggml_set_input(x);
+
+    // Step 1: MI layer (skip for now — it processes latents but the graph
+    // is CPU-side LSTM which needs special handling. TODO: implement via
+    // core_lstm or CPU-side loop.)
+    // For now, pass latents directly to conv_pre.
+
+    // Step 2: conv_pre — Conv1d(128, 1536, k=5)
+    x = dots_conv1d(ctx0, x, voc.conv_pre_w, voc.conv_pre_b);
+
+    // Step 3: 6 upsample stages
+    const int dilations[3] = {1, 3, 5};
+    int n_stages = (int)voc.n_stages;
+
+    for (int si = 0; si < n_stages; si++) {
+        // SnakeBeta activation before upsample
+        // Note: the activation is inside the resblocks, not before upsample.
+        // BigVGAN does: upsample → resblocks (SnakeBeta inside each).
+        // Actually looking at the upstream code, the upsample has LeakyReLU
+        // BEFORE it (BigVGAN v1) or SnakeBeta (BigVGAN v2). In dots.tts,
+        // the activation is inside Activation1d which wraps each resblock conv.
+        // The upsample has NO activation before it.
+
+        // ConvTranspose1d upsample
+        int stride = (int)voc.upsample_rates[si];
+        x = dots_convt1d(ctx0, x, voc.ups_w[si], voc.ups_b[si], stride);
+
+        // 3 resblocks per stage, outputs averaged
+        int rb_base = si * 3;
+        ggml_tensor* xs = nullptr;
+        for (int j = 0; j < 3; j++) {
+            ggml_tensor* rj = dots_resblock_fwd(ctx0, x, voc.resblocks[rb_base + j], dilations);
+            xs = xs ? ggml_add(ctx0, xs, rj) : rj;
+        }
+        x = ggml_scale(ctx0, xs, 1.0f / 3.0f);
+    }
+
+    // Step 4: Post activation (SnakeBeta) + conv_post
+    x = core_act::snake_beta(ctx0, x, voc.post_alpha, voc.post_beta);
+    // conv_post: Conv1d(24, 1, k=7), no bias
+    x = dots_conv1d(ctx0, x, voc.post_conv_w, nullptr);
+    // Tanh
+    x = ggml_tanh(ctx0, x);
+
+    // Output: (1, n_samples) — mono
+    ggml_set_name(x, "voc_output");
+    ggml_set_output(x);
+    ggml_build_forward_expand(gf, x);
+
+    // Allocate and compute
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        std::fprintf(stderr, "dots_tts: vocoder graph alloc failed\n");
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        *out_n_samples = 0;
+        return nullptr;
+    }
+
+    // Set input — latents in channel-first layout (latent_dim, n_frames)
+    // Input data is (n_frames, latent_dim) row-major → transpose needed
+    // Actually our latents are stored as flat (n_frames * latent_dim), which in
+    // ggml 2D (latent_dim, n_frames) is already the correct memory layout.
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "voc_input"), latents, 0, latent_dim * n_frames * sizeof(float));
+
+    ggml_backend_graph_compute(ctx->backend, gf);
+
+    // Read output
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "voc_output");
+    int out_len = (int)ggml_nelements(out);
+    float* pcm = (float*)std::malloc(out_len * sizeof(float));
+    if (!pcm) {
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        *out_n_samples = 0;
+        return nullptr;
+    }
+    ggml_backend_tensor_get(out, pcm, 0, out_len * sizeof(float));
+    *out_n_samples = out_len;
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx0);
     return pcm;
 }
 
@@ -1283,7 +1442,7 @@ int dots_tts_set_vocoder_path(struct dots_tts_context* ctx, const char* path) {
     };
     read_i32_arr("dots.voc.upsample_rates", voc.upsample_rates);
     read_i32_arr("dots.voc.upsample_kernel_sizes", voc.upsample_ksizes);
-    read_i32_arr("dots.voc.resblock_kernel_sizes", voc.resblock_ksizes);
+    // resblock kernel sizes are baked into the weight shapes (3, 7, 11)
 
     gguf_free(meta);
 
@@ -1294,13 +1453,94 @@ int dots_tts_set_vocoder_path(struct dots_tts_context* ctx, const char* path) {
     }
     voc.ctx_w = wl.ctx;
     voc.buf_w = wl.buf;
+    voc.n_stages = (uint32_t)voc.upsample_rates.size();
+
+    // ── Map tensors to vocoder struct ──
+    auto VT = [&](const char* name) -> ggml_tensor* { return ggml_get_tensor(voc.ctx_w, name); };
+
+    // MI layer (decoder side)
+    voc.mi_in_w = VT("dots.voc.dec_mi_layer.0.weight");
+    voc.mi_in_b = VT("dots.voc.dec_mi_layer.0.bias");
+    voc.mi_out_w = VT("dots.voc.dec_mi_layer.2.weight");
+    voc.mi_out_b = VT("dots.voc.dec_mi_layer.2.bias");
+    for (int i = 0; i < 4; i++) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "dots.voc.dec_mi_layer.1.lstm.weight_ih_l%d", i);
+        voc.lstm_w_ih[i] = VT(buf);
+        std::snprintf(buf, sizeof(buf), "dots.voc.dec_mi_layer.1.lstm.weight_hh_l%d", i);
+        voc.lstm_w_hh[i] = VT(buf);
+        std::snprintf(buf, sizeof(buf), "dots.voc.dec_mi_layer.1.lstm.bias_ih_l%d", i);
+        voc.lstm_b_ih[i] = VT(buf);
+        std::snprintf(buf, sizeof(buf), "dots.voc.dec_mi_layer.1.lstm.bias_hh_l%d", i);
+        voc.lstm_b_hh[i] = VT(buf);
+    }
+
+    // conv_pre
+    voc.conv_pre_w = VT("dots.voc.decoder.conv_pre.weight");
+    voc.conv_pre_b = VT("dots.voc.decoder.conv_pre.bias");
+
+    // Upsample stages
+    for (uint32_t i = 0; i < voc.n_stages && i < 6; i++) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "dots.voc.decoder.ups.%u.0.weight", i);
+        voc.ups_w[i] = VT(buf);
+        std::snprintf(buf, sizeof(buf), "dots.voc.decoder.ups.%u.0.bias", i);
+        voc.ups_b[i] = VT(buf);
+    }
+
+    // Resblocks (3 per stage, 18 total)
+    for (int rb = 0; rb < 18; rb++) {
+        auto& R = voc.resblocks[rb];
+        char buf[128];
+        // 6 activations (SnakeBeta alpha/beta pairs)
+        for (int a = 0; a < 6; a++) {
+            std::snprintf(buf, sizeof(buf), "dots.voc.decoder.resblocks.%d.activations.%d.act.alpha", rb, a);
+            R.act_alpha[a] = VT(buf);
+            std::snprintf(buf, sizeof(buf), "dots.voc.decoder.resblocks.%d.activations.%d.act.beta", rb, a);
+            R.act_beta[a] = VT(buf);
+        }
+        // 3 conv pairs
+        for (int c = 0; c < 3; c++) {
+            std::snprintf(buf, sizeof(buf), "dots.voc.decoder.resblocks.%d.convs1.%d.weight", rb, c);
+            R.convs1_w[c] = VT(buf);
+            std::snprintf(buf, sizeof(buf), "dots.voc.decoder.resblocks.%d.convs1.%d.bias", rb, c);
+            R.convs1_b[c] = VT(buf);
+            std::snprintf(buf, sizeof(buf), "dots.voc.decoder.resblocks.%d.convs2.%d.weight", rb, c);
+            R.convs2_w[c] = VT(buf);
+            std::snprintf(buf, sizeof(buf), "dots.voc.decoder.resblocks.%d.convs2.%d.bias", rb, c);
+            R.convs2_b[c] = VT(buf);
+        }
+    }
+
+    // Post activation + conv
+    voc.post_alpha = VT("dots.voc.decoder.activation_post.act.alpha");
+    voc.post_beta = VT("dots.voc.decoder.activation_post.act.beta");
+    voc.post_conv_w = VT("dots.voc.decoder.conv_post.weight");
 
     ctx->has_vocoder = true;
 
     if (ctx->params.verbosity >= 1) {
         size_t buf_size = ggml_backend_buffer_get_size(voc.buf_w);
-        std::fprintf(stderr, "dots_tts: vocoder loaded (%.1f MiB, %u Hz)\n", (double)buf_size / (1024 * 1024),
-                     voc.sample_rate);
+        std::fprintf(stderr, "dots_tts: vocoder loaded (%.1f MiB, %u Hz, %u stages)\n",
+                     (double)buf_size / (1024 * 1024), voc.sample_rate, voc.n_stages);
+        // Verify critical tensors
+        int missing = 0;
+        if (!voc.conv_pre_w) {
+            missing++;
+            std::fprintf(stderr, "  MISSING: conv_pre_w\n");
+        }
+        if (!voc.post_conv_w) {
+            missing++;
+            std::fprintf(stderr, "  MISSING: post_conv_w\n");
+        }
+        for (uint32_t i = 0; i < voc.n_stages; i++) {
+            if (!voc.ups_w[i]) {
+                missing++;
+                std::fprintf(stderr, "  MISSING: ups_w[%u]\n", i);
+            }
+        }
+        if (missing > 0)
+            std::fprintf(stderr, "dots_tts: WARNING: %d vocoder tensors missing\n", missing);
     }
     return 0;
 }
