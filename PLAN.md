@@ -78,6 +78,48 @@ test-all-backends.py passes 18/18 transcribe + 51/54 feature tests (3 stream ski
 
 ---
 
+## #201 follow-up — generate a TADA voice ref from audio+transcript at query time (OPEN)
+
+The switch-voice half of #201 shipped (commit `a5cd7510`): the server reloads a
+prebaked `tada-ref-*.gguf` per request, no restart. The remaining half from the
+reporter is **on-the-fly ref generation** — accept raw audio (+ transcript) at
+inference time and bake the reference server-side, instead of requiring an
+offline `--make-ref` pass first.
+
+Today a `.wav` passed to `voice` is rejected (CLI adapter + session ABI both
+`return -2`/warn) because the make-ref pipeline isn't loaded in the server.
+
+**Approach:** the make-ref pipeline already exists in C++ (`src/tada_encoder.{h,cpp}`
++ wav2vec2 aligner runtime; CLI `--make-ref` drives it via wav2vec2 aligner → BPE
+tokenization → DP alignment → WavEncoder → LocalAttentionEncoder → ref GGUF in
+memory). To expose it at query time:
+1. Load the encoder + aligner GGUFs in the TADA backend `init()` when configured
+   (new flags, e.g. `--make-ref-encoder` / `--make-ref-aligner`, already parsed
+   for the CLI path — reuse them). Keep them optional: only pay the ~1.3 GB
+   (178 MB encoder + 1.1 GB aligner) when ref-baking is enabled.
+2. In `synthesize()` / the server handler, when `voice` is a `.wav`, run the
+   in-memory make-ref to produce prompt_values/positions and feed them straight
+   into the context (skip the GGUF round-trip), or bake a temp ref GGUF and
+   `tada_load_prompt` it. Requires a transcript — take it from a `ref_text`
+   request field (the consent gate + `consent_attestation` already exist for
+   `.wav` voices on `/v1/audio/speech`).
+3. Cache the baked ref keyed by (audio hash, transcript) so repeat requests with
+   the same clip don't re-run the aligner.
+
+**Files:** `examples/cli/crispasr_backend_tada.cpp` (init load + synthesize bake),
+`examples/cli/crispasr_server.cpp` (`ref_text` field + `.wav` voice path),
+`src/tada_tts.{h,cpp}` (a `tada_make_ref_from_pcm` entry that returns prompt
+state without a GGUF), `src/tada_encoder.*` (reuse). Aligner is language-specific
+(`tada-aligner-<lang>.gguf`) — must match the audio language.
+
+**Effort:** Medium-large. The pipeline is ported and CLI-proven; the work is
+wiring it into the server lifecycle + per-request path + caching, plus the
+~1.3 GB memory cost gate. Lower priority than the switch-voice half (shipped),
+which already covers the common "I baked refs, let me pick one live" workflow.
+Tracked on #201 (left open for this).
+
+---
+
 ## Priority ordering
 
 | Priority | Item | Effort | Status |
