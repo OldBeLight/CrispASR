@@ -333,6 +333,27 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
         }
     }
 
+    // dots.tts: Qwen2.5-1.5B LLM + 18L DiT flow-matching + 24L PatchEncoder.
+    // The DiT conditioning pathway (AdaLN, timestep MLP, input/final projections)
+    // must stay at source precision — quantization noise compounds through
+    // 16 Euler ODE steps × 18 layers × 2 (CFG) = 576 forward passes.
+    // Safe to quantize: LLM attn/ffn projections, DiT attn/ffn projections,
+    // PatchEncoder attn/ffn projections. Keep at source precision:
+    //   - dit.time_emb.* — timestep conditioning (compounds through ODE steps)
+    //   - dit.in_proj.* — DiT input projection
+    //   - dit.final_*.* — DiT output projection + AdaLN
+    //   - dit.blk.*.adaln.* — per-block AdaLN modulation
+    //   - hidden_proj.* — LLM→DiT condition projection
+    //   - latent_proj.* — latent→DiT input
+    //   - coordinate_proj.* — noise coordinate projection
+    //   - xvec_proj.* — speaker embedding projection
+    //   - eos_proj.* — EOS detection head
+    //   - llm.tok_emb.* — token embedding (sampling-critical)
+    //   - latent_stats.* — denormalization constants
+    //   - penc.in_proj/out_proj/ds_conv — PatchEncoder I/O
+    // Vocoder and speaker encoder are in separate GGUFs — quantize normally.
+    const bool is_dots_tts = (arch.find("dots-tts") != std::string::npos || arch.find("dots_tts") != std::string::npos);
+
     // Parakeet RNNT: the transducer joint network (joint.{enc,pred,out}.weight)
     // and decoder embedding are structurally sensitive to quantization noise.
     // The joint network's blank/non-blank decision is a ~3001-way argmax where
@@ -400,6 +421,14 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                sname == "cosyvoice3.flow.input_embd.w" || sname == "cosyvoice3.flow.spk_affine.w" ||
                sname == "cosyvoice3.s3tok.fsq.proj.w")) &&
             !is_f5tts &&
+            !(is_dots_tts &&
+              (sname.find("dots.dit.time_emb.") == 0 || sname.find("dots.dit.in_proj.") == 0 ||
+               sname.find("dots.dit.final_") == 0 || sname.find(".adaln.") != std::string::npos ||
+               sname.find("dots.hidden_proj.") == 0 || sname.find("dots.latent_proj.") == 0 ||
+               sname.find("dots.coordinate_proj.") == 0 || sname.find("dots.xvec_proj.") == 0 ||
+               sname.find("dots.eos_proj.") == 0 || sname.find("dots.llm.tok_emb.") == 0 ||
+               sname.find("dots.latent_stats.") == 0 || sname.find("dots.penc.in_proj.") == 0 ||
+               sname.find("dots.penc.out_proj.") == 0 || sname.find("dots.penc.ds_conv.") == 0)) &&
             !(is_qwen3_tts && (sname.find("speaker.") == 0 || sname.find("code_pred.token_embd") == 0 ||
                                sname.find("code_pred.output") == 0 || sname.find("code_pred.small_to_mtp") == 0 ||
                                sname.find("talker.token_embd") == 0 || sname.find("talker.text_proj") == 0 ||
