@@ -131,12 +131,12 @@ try:
         log(f"Loading {lib_path}")
         lib = ctypes.CDLL(lib_path)
 
-        # Use session API
-        lib.crispasr_session_open.restype = ctypes.c_void_p
-        lib.crispasr_session_open.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        # Use session API (correct names from crispasr_session.h)
+        lib.crispasr_session_open_explicit.restype = ctypes.c_void_p
+        lib.crispasr_session_open_explicit.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
         lib.crispasr_session_synthesize.restype = ctypes.POINTER(ctypes.c_float)
         lib.crispasr_session_synthesize.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
-        lib.crispasr_session_free.argtypes = [ctypes.c_void_p]
+        lib.crispasr_session_close.argtypes = [ctypes.c_void_p]
         lib.crispasr_pcm_free.argtypes = [ctypes.POINTER(ctypes.c_float)]
 
         os.environ["DOTS_TTS_BENCH"] = "1"
@@ -144,7 +144,7 @@ try:
 
         log(f"Opening session: {core_model}")
         t0 = time.time()
-        sess = lib.crispasr_session_open(core_model.encode(), b"dots-tts")
+        sess = lib.crispasr_session_open_explicit(core_model.encode(), b"dots-tts", 4)
         if not sess:
             log("ERROR: session open failed")
         else:
@@ -184,7 +184,7 @@ try:
             else:
                 log(f"Synthesis returned null/empty ({elapsed:.1f}s)")
 
-            lib.crispasr_session_free(sess)
+            lib.crispasr_session_close(sess)
     except Exception as e:
         log(f"Synthesis test failed: {e}")
         import traceback

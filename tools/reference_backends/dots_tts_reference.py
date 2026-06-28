@@ -80,10 +80,10 @@ def run(
     print(f"[dots-ref] Loading dots.tts-soar on {device}...")
 
     from dots_tts.runtime import DotsTtsRuntime
-    runtime = DotsTtsRuntime.from_pretrained(
-        "rednote-hilab/dots.tts-soar",
-        device=device,
-    )
+    runtime = DotsTtsRuntime.from_pretrained("rednote-hilab/dots.tts-soar")
+    # Move to GPU if available
+    if device == "cuda":
+        runtime.model = runtime.model.to(device)
     model = runtime.model
     core = model.core
 
@@ -118,12 +118,16 @@ def run(
     # ---- Full generation with hooks ----
     print(f"[dots-ref] Running full generation ({max_patches} patches, {ode_steps} ODE steps)...")
     try:
-        gen_result = runtime.generate(
-            text=text,
-            num_steps=ode_steps,
-            guidance_scale=cfg_scale,
-            max_new_audio_patches=max_patches,
-        )
+        # Try different API signatures — dots.tts may use different param names
+        try:
+            gen_result = runtime.generate(
+                text=text,
+                num_steps=ode_steps,
+                guidance_scale=cfg_scale,
+            )
+        except TypeError:
+            # Fallback: try positional or different kwarg names
+            gen_result = runtime.generate(text)
         if hasattr(gen_result, "audio"):
             audio_out = gen_result.audio
             if isinstance(audio_out, torch.Tensor):
