@@ -1285,7 +1285,8 @@ static float* dots_vocoder_decode(dots_tts_context* ctx, const float* latents, i
     // Build ggml graph
     // The graph is large: 6 upsample stages × (conv_transpose + 3 resblocks × 8 ops each)
     // 6 stages × 3 resblocks × (6 snake_beta + 6 conv + 6 add) + MI-LSTM + conv_pre/post
-    size_t n_tensors = 65536;
+    // MI-LSTM alone creates ~40K nodes (1024 frames × 4 layers × ~10 ops/step)
+    size_t n_tensors = 131072;
     size_t ctx_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead();
     ggml_init_params ip = {ctx_size, nullptr, true};
     ggml_context* ctx0 = ggml_init(ip);
