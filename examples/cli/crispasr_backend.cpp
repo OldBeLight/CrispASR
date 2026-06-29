@@ -41,6 +41,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_streaming_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_gemma4_e2b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_omniasr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_mimo_asr_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_ark_asr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moss_audio_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_funasr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_paraformer_backend();
@@ -180,6 +181,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_omniasr_backend();
     if (name == "mimo-asr" || name == "mimo_asr" || name == "mimoasr")
         return crispasr_make_mimo_asr_backend();
+    if (name == "ark-asr" || name == "ark_asr" || name == "arkasr" || name == "ark")
+        return crispasr_make_ark_asr_backend();
     if (name == "moss-audio" || name == "moss_audio" || name == "mossaudio")
         return crispasr_make_moss_audio_backend();
     if (name == "funasr" || name == "fun-asr" || name == "fun-asr-nano" || name == "fun-asr-mlt-nano")
@@ -274,6 +277,7 @@ std::vector<std::string> crispasr_list_backends() {
         "omniasr-llm",
         "omniasr-llm-1b",
         "mimo-asr",
+        "ark-asr",
         "moss-audio",
         "funasr",
         "fun-asr-mlt-nano",
@@ -503,6 +507,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "wav2vec2";
     if (contains_ci("vibevoice"))
         return "vibevoice";
+    if (contains_ci("ark-asr") || contains_ci("arkasr") || contains_ci("ark_asr"))
+        return "ark-asr";
     if (contains_ci("kugelaudio"))
         return "kugelaudio";
     if (contains_ci("fireredpunc"))
@@ -695,6 +701,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "fireredpunc";
             else if (a == "mimo_asr" || a == "mimo-asr")
                 result = "mimo-asr";
+            else if (a == "arkasr" || a == "ark-asr" || a == "ark_asr")
+                result = "ark-asr";
             else if (a == "moss_audio" || a == "moss-audio")
                 result = "moss-audio";
             else if (a == "funasr" || a == "fun_asr" || a == "fun-asr")

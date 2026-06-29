@@ -6134,3 +6134,94 @@ key files under `sglang_omni/models/higgs_tts/`):
 
 **Testing:** 9.3 GB model requires Kaggle GPU kernel (won't fit 8 GB VPS).
 
+
+## §ARK — ARK-ASR-3B support (WORKING — verbatim ASR; branch feat/arkasr-3b)
+
+**STATUS 2026-06-29**: end-to-end VALIDATED. jfk.wav → verbatim English;
+De-Abwasch 79 s → verbatim German. CLI: `crispasr -m ark-asr-3b-q8_0.gguf
+--backend ark-asr -f audio.wav`. Backend defaults to **CPU** (GPU/Metal sched
+path emits no tokens — gated behind `CRISPASR_ARKASR_GPU=1`). Open follow-ups:
+(a) inject `-l` language instruction into the user turn (promptless ASR drifts
+language per 30 s chunk); (b) step-graph cache for decode perf (per-step graph
+rebuild is slow on long audio); (c) GPU/sched fix; (d) session ABI
+(crispasr_c_api.cpp) + tests + publish GGUF repo. Diff harness is built (running
+it is optional — the verbatim roundtrip is the stronger gate).
+
+Port of [AutoArk-AI/ARK-ASR-3B](https://huggingface.co/AutoArk-AI/ARK-ASR-3B):
+a 19-language ASR model = **Whisper-large-v3 encoder with partial RoPE** +
+**MLP adapter (merge-4)** + **Qwen2.5-3B decoder** with audio-token injection.
+On-policy distilled (THUNLP/OPD). BF16 safetensors, 8.14 GB, trust_remote_code.
+
+### Architecture (from config.json + modeling_*.py, mirrored in `.arkasr-ref/`)
+
+**Audio encoder** (`WhisperSpecialEncoder`, modeling_audio.py):
+- Standard Whisper conv stem: `conv1` k=3 s=1 p=1, `conv2` k=3 s=2 p=1, both GELU.
+  Input 128 mel bins → d_model 1280. 3000 mel frames → 1500 encoder frames.
+- 32 pre-norm encoder layers: `self_attn_layer_norm` → attn → +res →
+  `final_layer_norm` → fc1(5120) → gelu → fc2 → +res. 20 heads, head_dim 64.
+  q/v/out_proj have bias; **k_proj has NO bias** (Whisper convention).
+- **Partial interleaved RoPE** applied to Q and K (`WhisperRoPESdpaAttention`):
+  `RotaryEmbedding(dim = head_dim//2 = 32)`, base=10000, rope_ratio=1. Rotates
+  **only the first 32 of 64 head dims** (dims 32..63 pass through unchanged),
+  adjacent-pair (interleaved) rotation = ggml `GGML_ROPE_TYPE_NORMAL` n_dims=32.
+  See [[feedback-x-transformers-partial-rope]]. Non-causal, no attention mask.
+- **No final encoder layer_norm** — `whisper.layer_norm = nn.Identity()`.
+
+**Adapter** (`AudioMLPAdapter`):
+- `layer_norm` = LayerNorm(1280) over encoder output (this replaces the dropped
+  encoder LN).
+- merge_factor=4: reshape (B,1500,1280) → (B,375,5120) (concat 4 consecutive
+  frames). If T%4≠0 truncate to multiple of 4.
+- `adapting` = Linear(5120→4096) → GELU → Linear(4096→2048).
+- Output: 375 audio embeddings (2048-dim) for a full 30 s clip.
+
+**Decoder**: stock Qwen2.5-3B — hidden 2048, 36 layers, GQA 16 heads / 2 KV
+(head_dim 128), intermediate 11008 SwiGLU(silu), RMSNorm eps 1e-6, rope_theta
+1e6, vocab 151936, **tied embeddings** (lm_head = embed_tokens). Reuse the
+existing Qwen2 graph (cosyvoice3-LM / qwen3_asr / mimo_asr).
+
+**Audio injection**: `audio_token_id` 151663 placeholders in the embedded
+prompt are overwritten by the first N adapter frames, where
+`N = ((mel_frames+1)//2)//4` computed from the *real* (unpadded) audio length.
+Encoder runs on the 30 s-padded mel; the first N merged frames map to real audio
+(right-padding), the rest are dropped.
+
+### Prompt / decode recipe (from processing_arkasr.py)
+Token stream (add_special_tokens=False, no newlines):
+`<|user|>`(151665) `<|begin_of_audio|>`(151666) `<|audio|>`×N(151663)
+`<|end_of_audio|>`(151667) `<|assistant|>`(151668)
+Greedy decode (HF default greedy; max 256 new tokens), stop at EOS
+`<|im_end|>`(151645). bad_words: block all special tokens except EOS. Tokenizer
+is Qwen2 GPT-2 byte-level BPE, vocab 151936 + added specials (added_tokens.json).
+Mel: WhisperFeatureExtractor — feature_size 128, n_fft 400, hop 160,
+sampling_rate 16000, chunk_length 30 (n_samples 480000, nb_max_frames 3000),
+dither 0.0. >30 s audio → chunk into 30 s windows.
+
+### Implementation checklist (per docs/contributing.md)
+1. [ ] `models/convert-arkasr-to-gguf.py` — lazy safetensors → GGUF F16, embed
+       Qwen2 BPE vocab+merges + special tokens, hparams under `arkasr.*` +
+       `arkasr.whisper.*`, `general.architecture="arkasr"`. (agent-scaffolded)
+2. [ ] `src/ark_asr.{h,cpp}` — C runtime: GGUF load, mel, whisper+RoPE encoder
+       graph, adapter, Qwen2 decoder w/ KV-cache greedy decode, BPE detok. (ME)
+3. [ ] `examples/cli/crispasr_backend_ark_asr.cpp` — CLI adapter.
+4. [ ] Register: `crispasr_backend.cpp` factory + `detect_backend_from_gguf`
+       (filename "ark"/"arkasr" + arch "arkasr"); `crispasr_model_registry.cpp`.
+5. [ ] `src/CMakeLists.txt` + `examples/cli/CMakeLists.txt` library + link.
+6. [ ] `src/crispasr_c_api.cpp` — 9 edit points (session ABI mirrors CLI,
+       see [[project-session-abi-reimplements-cli]]).
+7. [ ] `examples/crispasr-quantize/main.cpp` — keep norms/bias F32; F16+Q8_0+Q4_K.
+8. [ ] Diff harness: `tools/reference_backends/arkasr.py` + register in
+       `tools/dump_reference.py` + `crispasr_diff_main.cpp` branch. (agent-scaffold)
+9. [ ] `tests/` live test + `tests/env-live-tests.sh`.
+10.[ ] README / docs / bindings docstrings.
+
+### Validation methodology
+crispasr-diff stage cosines vs PyTorch reference at: mel, encoder (per-layer +
+final), adapter, decoder embed-with-audio-injected, per-layer hidden, logits.
+Then ASR-roundtrip an English + a German FLEURS clip (verbatim text gate).
+
+### BLOCKER — disk/compute for validation
+Both local volumes are ~full (`/Volumes/backups` 7.5 GB free, `/Users` 9.9 GB).
+The 8.14 GB safetensors + ~6 GB F16 GGUF do not fit. Scaffolding + graph code is
+done on the M1; **download + conversion + diff validation must run on the VPS**
+(`/mnt/storage`, `/mnt/akademie_storage`) or after freeing local space.

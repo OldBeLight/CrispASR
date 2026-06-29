@@ -353,6 +353,10 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     //   - penc.in_proj/out_proj/ds_conv — PatchEncoder I/O
     // Vocoder and speaker encoder are in separate GGUFs — quantize normally.
     const bool is_dots_tts = (arch.find("dots-tts") != std::string::npos || arch.find("dots_tts") != std::string::npos);
+    // ARK-ASR-3B: keep the tied embedding/lm_head (dec.embed.weight) and the
+    // whole Whisper encoder + adapter (mel-sensitive, small vs the 36L decoder)
+    // at F16; quantize only the decoder attn/ffn projections.
+    const bool is_arkasr = (arch.find("arkasr") != std::string::npos);
 
     // Parakeet RNNT: the transducer joint network (joint.{enc,pred,out}.weight)
     // and decoder embedding are structurally sensitive to quantization noise.
@@ -448,6 +452,7 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             !(is_mini_omni2 &&
               (sname.find("audio.") == 0 || sname.find("adapter.") == 0 || sname.find("llm.token_embd") == 0)) &&
             !(is_orpheus && sname.find("talker.token_embd") == 0) &&
+            !(is_arkasr && (sname.find("dec.embed.") == 0 || sname.find("enc.") == 0 || sname.find("adapter.") == 0)) &&
             !(is_parakeet && parakeet_is_rnnt && !parakeet_quant_all &&
               (sname.find("joint.") == 0 || sname.find("decoder.embed") == 0)) &&
             !(is_tada && !tada_quant_all && (sname.find("talker.token_embd") == 0 || sname.find("tada.") == 0)) &&

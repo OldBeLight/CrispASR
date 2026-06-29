@@ -49,6 +49,10 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF/resolve/main/parakeet-tdt-0.6b-v3-q4_k.gguf", "~467 MB", nullptr, nullptr},
     {"canary", "canary-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/canary-1b-v2-GGUF/resolve/main/canary-1b-v2-q4_k.gguf", "~600 MB", nullptr, nullptr},
+    // AutoArk-AI/ARK-ASR-3B: Whisper-RoPE encoder + Qwen2.5-3B decoder (19-lang).
+    // NOTE: GGUF repo to be published (PLAN §ARK) — placeholder URL.
+    {"ark-asr", "ark-asr-3b-q4_k.gguf",
+     "https://huggingface.co/cstr/ark-asr-3b-GGUF/resolve/main/ark-asr-3b-q4_k.gguf", "~2.2 GB", nullptr, nullptr},
     // LiquidAI LFM2.5-Audio-1.5B: FastConformer + LFM2 hybrid
     // conv+attention backbone. ASR (+ TTS/speech-to-speech planned).
     // English base model — Q5_K recommended (Q4_K too aggressive for EN).

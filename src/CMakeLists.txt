@@ -1202,6 +1202,18 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# ark_asr — AutoArk-AI/ARK-ASR-3B (Whisper-RoPE encoder + Qwen2.5-3B decoder)
+# ---------------------------------------------------------------------------
+add_library(ark_asr STATIC ark_asr.h ark_asr.cpp)
+set_target_properties(ark_asr PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(ark_asr PUBLIC .)
+target_compile_features   (ark_asr PUBLIC cxx_std_17)
+target_link_libraries     (ark_asr PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(ark_asr PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # moss_audio — OpenMOSS-Team/MOSS-Audio-4B-Instruct (Whisper encoder + DeepStack + Qwen3 LLM)
 # ---------------------------------------------------------------------------
 add_library(moss_audio STATIC moss_audio.h moss_audio.cpp)
@@ -2092,6 +2104,9 @@ if (TARGET gemma4_e2b)
 endif()
 if (TARGET mimo_tokenizer)
     target_link_libraries(crispasr-lib PUBLIC mimo_tokenizer)
+endif()
+if (TARGET ark_asr)
+    target_link_libraries(crispasr-lib PUBLIC ark_asr)
 endif()
 if (TARGET mimo_asr)
     target_link_libraries(crispasr-lib PUBLIC mimo_asr)

@@ -58,6 +58,7 @@ add_executable(${TARGET}
     crispasr_backend_gemma4_e2b.cpp
     crispasr_backend_omniasr.cpp
     crispasr_backend_mimo_asr.cpp
+    crispasr_backend_ark_asr.cpp
     crispasr_backend_moss_audio.cpp
     crispasr_backend_funasr.cpp
     crispasr_backend_paraformer.cpp
@@ -195,6 +196,7 @@ target_link_libraries(crispasr-diff PRIVATE
     gemma4_e2b
     mimo_tokenizer
     mimo_asr
+    ark_asr
     moss_audio
     voxcpm2_tts
     funasr

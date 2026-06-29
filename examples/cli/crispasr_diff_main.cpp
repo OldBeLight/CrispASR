@@ -47,6 +47,7 @@
 #include "cohere.h"
 #include "gemma4_e2b.h"
 #include "mimo_asr.h"
+#include "ark_asr.h"
 #include "mimo_tokenizer.h"
 #include "core/snac.h"
 #include "chatterbox.h"
@@ -2953,6 +2954,61 @@ int main(int argc, char** argv) {
             print_row("dbg_extracted_sum", rep, COS_THRESHOLD);
         }
         mimo_asr_free(ctx);
+
+    } else if (backend_name == "ark-asr" || backend_name == "arkasr") {
+        // ARK-ASR-3B: compute mel + encoder/adapter + prefill logits from the
+        // raw audio and diff against the Python reference (PLAN §ARK). Three
+        // boundaries localise any bug: mel (frontend), audio_embeds (conv stem
+        // + partial RoPE + adapter), first_logits (Qwen2 decoder + injection).
+        auto cp = ark_asr_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        cp.use_gpu = std::getenv("ARKASR_GPU") != nullptr;
+        ark_asr_context* ctx = ark_asr_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load ark-asr model '%s'\n", model_path.c_str());
+            return 4;
+        }
+        {
+            int nm = 0, T = 0;
+            float* mel = ark_asr_compute_mel(ctx, samples.data(), (int)samples.size(), &nm, &T);
+            if (mel) {
+                auto rep = ref.compare("mel_spectrogram", mel, (size_t)nm * T);
+                print_row("mel_spectrogram", rep, COS_THRESHOLD);
+                record(rep);
+                free(mel);
+            } else {
+                printf("[ERR ] mel_spectrogram        extract returned null\n");
+                n_fail++;
+            }
+        }
+        {
+            int h = 0, N = 0;
+            float* emb = ark_asr_run_encoder(ctx, samples.data(), (int)samples.size(), &h, &N);
+            if (emb) {
+                auto rep = ref.compare("audio_embeds", emb, (size_t)h * N);
+                print_row("audio_embeds", rep, COS_THRESHOLD);
+                record(rep);
+                free(emb);
+            } else {
+                printf("[ERR ] audio_embeds           extract returned null\n");
+                n_fail++;
+            }
+        }
+        {
+            int v = 0;
+            float* lg = ark_asr_prefill_logits(ctx, samples.data(), (int)samples.size(), &v);
+            if (lg) {
+                auto rep = ref.compare("first_logits", lg, (size_t)v);
+                print_row("first_logits", rep, COS_THRESHOLD);
+                record(rep);
+                free(lg);
+            } else {
+                printf("[ERR ] first_logits           extract returned null\n");
+                n_fail++;
+            }
+        }
+        ark_asr_free(ctx);
 
     } else if (backend_name == "granite" || backend_name == "granite-4.1") {
         auto cp = granite_speech_context_default_params();

@@ -147,6 +147,9 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # model_dir = the MiMo-V2.5-ASR HF snapshot. The audio-tokenizer path
     # is read from MIMO_TOKENIZER_DIR (or auto-derived from a sibling dir).
     "mimo-asr":   "reference_backends.mimo_asr",
+    # ARK-ASR-3B: Whisper-RoPE encoder + MLP adapter + Qwen2.5-3B decoder.
+    "arkasr":     "reference_backends.arkasr",
+    "ark-asr":    "reference_backends.arkasr",
     # Kokoro / StyleTTS2 (iSTFTNet). Text-driven; the audio arg is a
     # placeholder. Phonemes + voice come from KOKORO_PHONEMES / KOKORO_VOICE
     # env vars (see reference_backends/kokoro.py for the full list).
