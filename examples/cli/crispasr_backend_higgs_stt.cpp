@@ -25,7 +25,18 @@ public:
 
     const char* name() const override { return "higgs-stt"; }
 
-    uint32_t capabilities() const override { return CAP_AUTO_DOWNLOAD | CAP_FLASH_ATTN; }
+    uint32_t capabilities() const override {
+        // CAP_UNBOUNDED_INPUT | CAP_INTERNAL_CHUNKING: higgs-audio handles long
+        // audio internally the same way the upstream blueprint does — split the
+        // waveform into chunk_size_seconds (4 s) chunks, encode each through the
+        // Whisper tower + projector, concatenate the audio embeds, and run ONE
+        // LLM AR decode over the whole sequence (higgs_stt_transcribe). The
+        // crispasr_run.cpp auto-chunk gate must NOT fire: a CLI-level window
+        // split would give each window a fresh LLM context (cold-starting the
+        // decoder at every boundary) and produce overlap-duplicated text —
+        // diverging from the blueprint's single-pass whole-clip decode.
+        return CAP_AUTO_DOWNLOAD | CAP_FLASH_ATTN | CAP_UNBOUNDED_INPUT | CAP_INTERNAL_CHUNKING;
+    }
 
     bool init(const whisper_params& p) override {
         auto cp = higgs_stt_context_default_params();
