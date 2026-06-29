@@ -2596,6 +2596,17 @@ void dots_tts_set_seed(struct dots_tts_context* ctx, uint64_t seed) {
     }
 }
 
+// Diff-harness backend selector. The stages default to CPU (deterministic,
+// reference-matching). Set CRISPASR_DOTS_DIFF_GPU=1 to run the GPU-resident
+// stages (penc/llm/dit/flowmatch/vocoder) on init_best() instead, to confirm
+// each stage matches the reference on the GPU backend — not just end-to-end.
+// (CAM++ x-vector and the isolated Activation1d are CPU-by-design, so their
+// diffs ignore this gate.)
+static bool dots_diff_use_gpu() {
+    const char* e = std::getenv("CRISPASR_DOTS_DIFF_GPU");
+    return e && *e && *e != '0';
+}
+
 // ── Diff-harness: validate PatchEncoder decode_patch (patch 0) ──────────────
 // Loads a (penc-only is fine) core GGUF + a reference GGUF carrying
 // penc_in_patch0 / penc_out_patch0 (tools/dots_penc_reference.py), runs the
@@ -2603,7 +2614,7 @@ void dots_tts_set_seed(struct dots_tts_context* ctx, uint64_t seed) {
 extern "C" int dots_tts_penc_diff(const char* model_gguf, const char* ref_gguf, int verbosity) {
     dots_tts_context_params p = dots_tts_context_default_params();
     p.verbosity = verbosity;
-    p.use_gpu = false;
+    p.use_gpu = dots_diff_use_gpu();
     dots_tts_context* ctx = dots_tts_init_from_file(model_gguf, p);
     if (!ctx) {
         std::fprintf(stderr, "dots_penc_diff: failed to load model %s\n", model_gguf);
@@ -2675,6 +2686,7 @@ extern "C" int dots_tts_penc_diff(const char* model_gguf, const char* ref_gguf, 
             rc = 1;
     }
 
+    core_gguf::free_weights(rw);
     dots_tts_free(ctx);
     return rc;
 }
@@ -2688,7 +2700,7 @@ extern "C" int dots_tts_penc_diff(const char* model_gguf, const char* ref_gguf, 
 extern "C" int dots_tts_llm_diff(const char* model_gguf, const char* ref_gguf, int verbosity) {
     dots_tts_context_params p = dots_tts_context_default_params();
     p.verbosity = verbosity;
-    p.use_gpu = false;
+    p.use_gpu = dots_diff_use_gpu();
     dots_tts_context* ctx = dots_tts_init_from_file(model_gguf, p);
     if (!ctx) {
         std::fprintf(stderr, "dots_llm_diff: failed to load model %s\n", model_gguf);
@@ -2764,6 +2776,7 @@ extern "C" int dots_tts_llm_diff(const char* model_gguf, const char* ref_gguf, i
     ggml_backend_tensor_get(t_hs, ref_hs.data(), 0, D * sizeof(float));
     bool ok_step = report("step[embed]", hs.data(), ref_hs.data(), D);
 
+    core_gguf::free_weights(rw);
     dots_tts_free(ctx);
     return (ok_pre && ok_prelast && ok_step) ? 0 : 1;
 }
@@ -2776,7 +2789,7 @@ extern "C" int dots_tts_llm_diff(const char* model_gguf, const char* ref_gguf, i
 extern "C" int dots_tts_flowmatch_diff(const char* model_gguf, const char* ref_gguf, int verbosity) {
     dots_tts_context_params p = dots_tts_context_default_params();
     p.verbosity = verbosity;
-    p.use_gpu = false;
+    p.use_gpu = dots_diff_use_gpu();
     dots_tts_context* ctx = dots_tts_init_from_file(model_gguf, p);
     if (!ctx) {
         std::fprintf(stderr, "dots_flowmatch_diff: failed to load model %s\n", model_gguf);
@@ -2852,6 +2865,7 @@ extern "C" int dots_tts_flowmatch_diff(const char* model_gguf, const char* ref_g
         std::printf("\n");
     }
 
+    core_gguf::free_weights(rw);
     dots_tts_free(ctx);
     return cos > 0.999 ? 0 : 1;
 }
@@ -2862,7 +2876,7 @@ extern "C" int dots_tts_flowmatch_diff(const char* model_gguf, const char* ref_g
 extern "C" int dots_tts_dit_diff(const char* model_gguf, const char* ref_gguf, int verbosity) {
     dots_tts_context_params p = dots_tts_context_default_params();
     p.verbosity = verbosity;
-    p.use_gpu = false;
+    p.use_gpu = dots_diff_use_gpu();
     dots_tts_context* ctx = dots_tts_init_from_file(model_gguf, p);
     if (!ctx) {
         std::fprintf(stderr, "dots_dit_diff: failed to load model %s\n", model_gguf);
@@ -2925,6 +2939,7 @@ extern "C" int dots_tts_dit_diff(const char* model_gguf, const char* ref_gguf, i
         std::printf("\n");
     }
 
+    core_gguf::free_weights(rw);
     dots_tts_free(ctx);
     return cos > 0.999 ? 0 : 1;
 }
@@ -2937,7 +2952,9 @@ extern "C" int dots_tts_dit_diff(const char* model_gguf, const char* ref_gguf, i
 extern "C" int dots_tts_vocoder_diff(const char* voc_gguf, const char* ref_gguf, int verbosity) {
     auto* ctx = new dots_tts_context();
     ctx->backend_cpu = ggml_backend_cpu_init();
-    ctx->backend = ctx->backend_cpu;
+    ctx->backend = dots_diff_use_gpu() ? ggml_backend_init_best() : ctx->backend_cpu;
+    if (!ctx->backend)
+        ctx->backend = ctx->backend_cpu;
     ctx->params = dots_tts_context_default_params();
     ctx->params.verbosity = verbosity;
     if (dots_tts_set_vocoder_path(ctx, voc_gguf) != 0) {
@@ -3111,6 +3128,7 @@ extern "C" int dots_tts_vocoder_diff(const char* voc_gguf, const char* ref_gguf,
         }
     }
 
+    core_gguf::free_weights(rw);
     dots_tts_free(ctx);
     return rc;
 }
