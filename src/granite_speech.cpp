@@ -305,6 +305,10 @@ struct granite_speech_context {
     // vocab logits + a host argmax scan (the megapar in-graph-argmax trick).
     // Built lazily by granite_greedy_decode_step; nullptr until first used.
     ggml_cgraph* cached_argmax_gf = nullptr;
+    // True when cached_argmax_gf folds the embed lookup inline (non-quantized
+    // token embedding). When true the step sets "input_ids"; else it sets
+    // "inputs_embeds" (pre-computed by the separate embed graph).
+    bool dec_fused_embed = false;
 
     // §176s: cached encoder graph — reused when (T, with_rpe) matches.
     ggml_cgraph* cached_enc_gf = nullptr;
@@ -2512,20 +2516,37 @@ static ggml_cgraph* granite_build_argmax_decode(granite_speech_context* ctx, int
         ctx0 = ctx->cached_dec_ctx;
     }
 
+    // Fused-embed mode: when the token embedding is a non-quantized type (F16/
+    // F32), ggml_get_rows is capture-safe, so we fold the embed lookup into
+    // this graph — one graph/token instead of two (separate embed graph +
+    // decode graph). For k-quant embeddings (Q4_K etc.) get_rows_cuda_kquant
+    // host-syncs and can't be captured, so those keep embed as a separate
+    // (uncaptured) graph and pass a pre-computed F32 embeds input.
+    const auto& m = ctx->model;
+    const bool fused_embed = m.llm.token_embd_w && !ggml_is_quantized(m.llm.token_embd_w->type);
+
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
     // Re-resolve the logits input the base builder would produce, then append
     // argmax. We rebuild the forward here (cheap: graph build is host-side) to
     // keep the argmax graph self-contained in its own cgraph (ggml's CUDA
     // graph capture keys on cgraph->nodes[0], so the argmax variant needs its
     // own cgraph to capture independently from the logits variant).
-    const auto& m = ctx->model;
     const auto& hp = m.hparams;
     const int d = (int)hp.llm_d_model;
     const int n_layers = (int)hp.llm_n_layers;
 
-    ggml_tensor* embeds = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, 1);
-    ggml_set_name(embeds, "inputs_embeds");
-    ggml_set_input(embeds);
+    ggml_tensor* embeds;
+    if (fused_embed) {
+        // input_ids (1 token) -> get_rows(token_embd_w) inline.
+        ggml_tensor* ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_name(ids, "input_ids");
+        ggml_set_input(ids);
+        embeds = ggml_get_rows(ctx0, m.llm.token_embd_w, ids);
+    } else {
+        embeds = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, 1);
+        ggml_set_name(embeds, "inputs_embeds");
+        ggml_set_input(embeds);
+    }
     ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
     ggml_set_name(positions, "positions");
     ggml_set_input(positions);
@@ -2559,6 +2580,7 @@ static ggml_cgraph* granite_build_argmax_decode(granite_speech_context* ctx, int
     cur = ggml_scale(ctx0, cur, 1.0f / hp.logits_scaling);
     ggml_set_name(cur, "logits");
 
+    ctx->dec_fused_embed = fused_embed;
     ggml_tensor* am = ggml_argmax(ctx0, cur);
     ggml_set_name(am, "argmax");
     ggml_build_forward_expand(gf, am);
@@ -2567,15 +2589,13 @@ static ggml_cgraph* granite_build_argmax_decode(granite_speech_context* ctx, int
     return gf;
 }
 
-// One argmax-fused greedy decode step. embeds the token via the separate embed
-// graph (capture-safe for F16; for Q4_K the kquant get_rows is in the embed
-// graph, not this one, so the decode graph still captures), runs the 40-layer
-// forward + argmax, and returns the chosen token id. *out_logit (optional)
-// receives that token's logit value (read back from the kept "logits" tensor at
-// the argmax offset) so callers wanting a probability can compute it.
-// Returns -1 on failure.
-static int granite_greedy_decode_step(granite_speech_context* ctx, const float* input_embed, int n_past,
-                                      int bucket_len, float* out_logit) {
+// One argmax-fused greedy decode step. For non-quantized token embeddings the
+// embed lookup is folded into this graph (one graph/token); for k-quant
+// embeddings the caller pre-computes the embed via the separate embed graph and
+// passes it. Runs the 40-layer forward + argmax, returns the chosen token id.
+// *out_logit (optional) receives that token's logit value. Returns -1 on failure.
+static int granite_greedy_decode_step(granite_speech_context* ctx, int32_t token_id, const float* input_embed,
+                                      int n_past, int bucket_len, float* out_logit) {
     ggml_cgraph* gf = granite_build_argmax_decode(ctx, bucket_len);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
@@ -2585,7 +2605,12 @@ static int granite_greedy_decode_step(granite_speech_context* ctx, const float* 
     const int d = (int)hp.llm_d_model;
     int32_t pos = n_past;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), &pos, 0, sizeof(int32_t));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inputs_embeds"), input_embed, 0, (size_t)d * sizeof(float));
+    if (ctx->dec_fused_embed) {
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "input_ids"), &token_id, 0, sizeof(int32_t));
+    } else {
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inputs_embeds"), input_embed, 0,
+                                (size_t)d * sizeof(float));
+    }
 
     ctx->dec_mask_buf.assign((size_t)bucket_len * sizeof(ggml_fp16_t), 0);
     ggml_fp16_t* pmask = (ggml_fp16_t*)ctx->dec_mask_buf.data();
@@ -2619,6 +2644,10 @@ extern "C" int32_t* granite_speech_greedy_decode(struct granite_speech_context* 
         return nullptr;
     }
     const int bucket = ctx->dec_bucket_len;
+    // Build the (cached) graph up front so dec_fused_embed is resolved before
+    // the loop: when the embed is folded in, each step passes just the token id
+    // and no separate embed graph runs.
+    granite_build_argmax_decode(ctx, bucket);
 
     std::vector<int32_t> tokens;
     tokens.reserve((size_t)max_new_tokens);
@@ -2627,10 +2656,13 @@ extern "C" int32_t* granite_speech_greedy_decode(struct granite_speech_context* 
     int n_past = initial_n_past;
     while ((int)tokens.size() < max_new_tokens && tokens.back() != eos_id) {
         int32_t last = tokens.back();
-        float* emb = granite_speech_embed_tokens(ctx, &last, 1);
-        if (!emb)
-            break;
-        int nx = granite_greedy_decode_step(ctx, emb, n_past, bucket, /*out_logit*/ nullptr);
+        float* emb = nullptr;
+        if (!ctx->dec_fused_embed) {
+            emb = granite_speech_embed_tokens(ctx, &last, 1);
+            if (!emb)
+                break;
+        }
+        int nx = granite_greedy_decode_step(ctx, last, emb, n_past, bucket, /*out_logit*/ nullptr);
         std::free(emb);
         if (nx < 0)
             break;
