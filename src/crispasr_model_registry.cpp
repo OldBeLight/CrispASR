@@ -936,8 +936,18 @@ constexpr ExtraCompanion k_tada_3b_extras[] = {
     {nullptr, nullptr},
 };
 
+// dots.tts: the CAM++ speaker encoder (15 MB) rides along so that `--voice`
+// voice cloning works after `-m auto --auto-download` — discover_speaker()
+// finds it as a sibling of the core model. Negligible vs the 4.6 GB core.
+constexpr ExtraCompanion k_dots_tts_extras[] = {
+    {"dots-tts-soar-spk-f16.gguf",
+     "https://huggingface.co/cstr/dots-tts-soar-GGUF/resolve/main/dots-tts-soar-spk-f16.gguf"},
+    {nullptr, nullptr},
+};
+
 constexpr ExtraList k_extras[] = {
     {"kokoro", k_kokoro_extras},
+    {"dots-tts", k_dots_tts_extras},
     {"vibevoice-tts", k_vibevoice_tts_extras},
     {"cosyvoice3-tts", k_cosyvoice3_tts_extras},
     {"qwen3-tts", k_qwen3_tts_base_extras},
