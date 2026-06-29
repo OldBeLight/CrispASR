@@ -284,34 +284,15 @@ static StageResult voxtral_encoder(voxtral_context* ctx, const float* samples, i
 
 // ---- higgs-stt ----
 
-static StageResult higgs_mel(higgs_stt_context* ctx, const float* samples, int n_samples) {
-    StageResult r;
-    int n_mels = 0, T_mel = 0;
-    float* mel = higgs_stt_compute_mel(ctx, samples, n_samples, &n_mels, &T_mel);
-    if (!mel) {
-        r.note = "higgs_stt_compute_mel returned null";
-        return r;
-    }
-    r.shape = {n_mels, T_mel};
-    r.data.assign(mel, mel + (size_t)n_mels * T_mel);
-    free(mel);
-    r.ok = true;
-    return r;
-}
-
 static StageResult higgs_encoder(higgs_stt_context* ctx, const float* samples, int n_samples) {
     StageResult r;
-    int n_mels = 0, T_mel = 0;
-    float* mel = higgs_stt_compute_mel(ctx, samples, n_samples, &n_mels, &T_mel);
-    if (!mel) {
-        r.note = "mel failed";
-        return r;
-    }
+    // Chunked encode (4 s chunks, per-chunk Whisper tower + projector,
+    // concatenated) — matches higgs_stt_transcribe and the reference's
+    // model._apply_audio_tower_whisper. A single padded 30 s window is wrong.
     int N_enc = 0, pdim = 0;
-    float* enc = higgs_stt_run_encoder(ctx, mel, n_mels, T_mel, &N_enc, &pdim);
-    free(mel);
+    float* enc = higgs_stt_encode_audio(ctx, samples, n_samples, &N_enc, &pdim);
     if (!enc) {
-        r.note = "higgs_stt_run_encoder returned null";
+        r.note = "higgs_stt_encode_audio returned null";
         return r;
     }
     r.shape = {N_enc, pdim};
@@ -1179,24 +1160,16 @@ int main(int argc, char** argv) {
             return 4;
         }
 
-        auto mel_r = higgs_mel(ctx, samples.data(), (int)samples.size());
-        if (mel_r.ok) {
-            auto rep = ref.compare("mel_spectrogram", mel_r.data.data(), mel_r.data.size());
-            print_row("mel_spectrogram", rep, COS_THRESHOLD);
-            record(rep);
-        } else {
-            printf("[ERR ] mel_spectrogram         %s\n", mel_r.note.c_str());
-            n_fail++;
-        }
-
-        // run_encoder returns the projector output (encoder_out, 2048-dim).
+        // Chunked Whisper tower + projector, concatenated over 4 s chunks —
+        // the boundary the runtime reproduces (subsumes mel correctness). The
+        // single-window mel/encoder stages were the wrong model and are gone.
         auto enc_r = higgs_encoder(ctx, samples.data(), (int)samples.size());
         if (enc_r.ok) {
-            auto rep = ref.compare("encoder_out", enc_r.data.data(), enc_r.data.size());
-            print_row("encoder_out", rep, COS_THRESHOLD);
+            auto rep = ref.compare("audio_embeds", enc_r.data.data(), enc_r.data.size());
+            print_row("audio_embeds", rep, COS_THRESHOLD);
             record(rep);
         } else {
-            printf("[ERR ] encoder_out             %s\n", enc_r.note.c_str());
+            printf("[ERR ] audio_embeds            %s\n", enc_r.note.c_str());
             n_fail++;
         }
 

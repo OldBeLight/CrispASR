@@ -360,6 +360,15 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     // at F16; quantize only the decoder attn/ffn projections.
     const bool is_arkasr = (arch.find("arkasr") != std::string::npos);
 
+    // higgs-audio-v3-stt: Whisper encoder + Qwen3-1.7B decoder with TIED
+    // input/output embeddings (token_embd.weight == output.weight). Both the
+    // embedding lookup and the lm_head share these rows, so quantization noise
+    // there directly perturbs every logit — keep them at source precision (the
+    // attention/FFN blocks quantize normally). The learned audio.embed_positions
+    // has no "weight" suffix so it is already skipped by the is_weight test, and
+    // the conv stacks are 3-D (skipped by ok_dims).
+    const bool is_higgs = (arch == "higgs-stt");
+
     // Parakeet RNNT: the transducer joint network (joint.{enc,pred,out}.weight)
     // and decoder embedding are structurally sensitive to quantization noise.
     // The joint network's blank/non-blank decision is a ~3001-way argmax where
@@ -454,6 +463,7 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
               (sname.find("audio.") == 0 || sname.find("adapter.") == 0 || sname.find("llm.token_embd") == 0)) &&
             !(is_orpheus && sname.find("talker.token_embd") == 0) &&
             !(is_arkasr && (sname.find("dec.embed.") == 0 || sname.find("enc.") == 0 || sname.find("adapter.") == 0)) &&
+            !(is_higgs && (sname == "token_embd.weight" || sname == "output.weight")) &&
             !(is_parakeet && parakeet_is_rnnt && !parakeet_quant_all &&
               (sname.find("joint.") == 0 || sname.find("decoder.embed") == 0)) &&
             !(is_tada && !tada_quant_all && (sname.find("talker.token_embd") == 0 || sname.find("tada.") == 0)) &&

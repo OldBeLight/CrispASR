@@ -612,16 +612,14 @@ extern "C" float* higgs_stt_compute_mel(higgs_stt_context* ctx, const float* sam
     std::vector<float> filt((size_t)n_freqs * n_mels);
     ggml_backend_tensor_get(ctx->model.audio.mel_filters, filt.data(), 0, filt.size() * sizeof(float));
 
-    // WhisperFeatureExtractor pads/truncates the raw audio to a fixed 30 s
-    // window BEFORE computing the mel, so the output is always (n_mels, 3000)
-    // and the GlobalClipMax normalization takes its max over the full padded
-    // mel. Reproduce that here (the padded region becomes the silence-mel
-    // floor — NOT zeros in normalized-mel space).
-    const int kWin = 30 * (int)hp.sample_rate; // 480000
-    std::vector<float> padded(kWin, 0.0f);
-    std::memcpy(padded.data(), samples, (size_t)std::min(n_samples, kWin) * sizeof(float));
-    samples = padded.data();
-    n_samples = kWin;
+    // higgs-audio chunks the waveform into chunk_size_seconds (=4 s) pieces and
+    // runs the WhisperFeatureExtractor PER CHUNK, so the mel length and the
+    // GlobalClipMax normalization max are per-chunk (NOT a single padded 30 s
+    // window). Compute the mel on exactly the samples handed in — the caller
+    // (higgs_stt_transcribe) splits the audio into chunks and calls this once
+    // per chunk. The per-chunk max is dominated by the speech frames, so a
+    // chunk computed at its true length matches the reference's zero-padded
+    // chunk for the valid frames.
 
     // Qwen/Whisper HF feature extractor: log10 + max-clip guard, double-accum
     // matmul, drop last STFT frame, fb in (n_freqs, n_mels) layout.
@@ -729,15 +727,17 @@ static ggml_cgraph* higgs_stt_build_graph_conv(higgs_stt_context* ctx) {
 //      -> ReLU -> Linear(2048->2048)             ["encoder_out"] (2048, 375)
 // ===========================================================================
 
-static ggml_cgraph* higgs_stt_build_graph_encoder(higgs_stt_context* ctx, ggml_context* arena_ctx = nullptr) {
+static ggml_cgraph* higgs_stt_build_graph_encoder(higgs_stt_context* ctx, int T_mel,
+                                                  ggml_context* arena_ctx = nullptr) {
     const auto& m = ctx->model;
     const auto& hp = m.hparams;
     const int d = (int)hp.audio_d_model;         // 1280
     const int n_heads = (int)hp.audio_n_heads;   // 20
     const int head_dim = (int)hp.audio_head_dim; // 64
     const int n_mels = (int)hp.n_mels;           // 128
-    const int T_mel = 3000;
-    const int T_enc = T_mel / 2;                 // 1500
+    // conv2 stride 2 (k3,p1): out length = (T_mel - 1) / 2 + 1. The chunk mel
+    // length is variable (4 s chunks = 400 frames, last chunk shorter).
+    const int T_enc = (T_mel - 1) / 2 + 1;
     const float attn_scale = 1.0f / std::sqrt((float)head_dim);
 
     ggml_context* ctx0;
@@ -763,8 +763,10 @@ static ggml_cgraph* higgs_stt_build_graph_encoder(higgs_stt_context* ctx, ggml_c
     cur = ggml_reshape_2d(ctx0, cur, T_enc, d);
     cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur)); // (d, T_enc)
 
-    // learned absolute positional embedding (d, 1500)
-    cur = ggml_add(ctx0, cur, m.audio.embed_positions);
+    // learned absolute positional embedding, sliced to this chunk's length:
+    // embed_positions.weight[:T_enc] (the encoder uses chunk-local positions).
+    ggml_tensor* embp = ggml_view_2d(ctx0, m.audio.embed_positions, d, T_enc, m.audio.embed_positions->nb[1], 0);
+    cur = ggml_add(ctx0, cur, embp);
 
     for (uint32_t il = 0; il < hp.audio_n_layers; il++) {
         const auto& b = m.audio.blocks[il];
@@ -1341,7 +1343,6 @@ extern "C" higgs_stt_context* higgs_stt_init_from_file(const char* path, higgs_s
     {
         const char* fuse_env = getenv("CRISPASR_HIGGS_STT_FUSED_QKV");
         const bool fuse_enabled = (fuse_env == nullptr) || (atoi(fuse_env) != 0);
-        auto& hp = ctx->model.hparams;
         auto& blocks = ctx->model.llm.blocks;
         bool can_fuse =
             fuse_enabled && !blocks.empty() && blocks[0].attn_q_w && blocks[0].attn_k_w && blocks[0].attn_v_w;
@@ -1454,7 +1455,7 @@ static std::vector<std::string> higgs_collapse(const std::vector<std::string>& w
     std::vector<std::string> out;
     const int L = (int)w.size();
     int i = 0;
-    auto tail_eq = [&](size_t base) {
+    auto tail_eq = [&]() {
         for (int k = 0; k < n; k++)
             if (w[i + k] != out[out.size() - n + k])
                 return false;
@@ -1462,7 +1463,7 @@ static std::vector<std::string> higgs_collapse(const std::vector<std::string>& w
     };
     while (i < L) {
         bool matched = false;
-        if ((int)out.size() >= n && i + n <= L && tail_eq(0)) {
+        if ((int)out.size() >= n && i + n <= L && tail_eq()) {
             int reps = 1;
             while ((int)out.size() >= n * (reps + 1)) {
                 bool eq = true;
@@ -1513,42 +1514,64 @@ static std::string higgs_fix_ngram_loops(const std::string& text, int max_n = 16
     return out;
 }
 
+// Encode audio the way higgs-audio does: split into chunk_size_seconds (4 s)
+// chunks, run the Whisper tower + projector on EACH chunk independently (chunk-
+// local positions + within-chunk attention), then concatenate the per-chunk
+// audio embeddings (frame-major: [frame*pdim + d]). Encoding the whole clip as
+// one padded 30 s window corrupts the result — every valid frame attends
+// globally to the ~1900 silence-pad frames — and derails the decoder. Each
+// chunk is encoded at its true length (no padding/mask): the per-chunk
+// GlobalClipMax norm is dominated by speech frames, so this matches the
+// reference's zero-padded chunk for the valid frames, and the valid token count
+// falls out exactly. Returns a malloc'd buffer the caller frees.
+extern "C" float* higgs_stt_encode_audio(higgs_stt_context* ctx, const float* samples, int n_samples, int* out_N,
+                                         int* out_pdim) {
+    const auto& hp = ctx->model.hparams;
+    const int chunk_samples = 4 * (int)hp.sample_rate; // chunk_size_seconds=4.0 -> 64000
+    const int hop = (int)hp.hop_length;                // 160
+    int pdim = 0;
+    std::vector<float> audio_embeds; // frame-major: [frame*pdim + d]
+    for (int off = 0; off < n_samples; off += chunk_samples) {
+        const int clen = std::min(chunk_samples, n_samples - off);
+        if (clen < 16 * hop) // skip a negligible (<160 ms) trailing remainder
+            continue;
+        int cm = 0, ct = 0;
+        float* mel = higgs_stt_compute_mel(ctx, samples + off, clen, &cm, &ct);
+        if (!mel)
+            continue;
+        int N_c = 0, pd = 0;
+        float* emb = higgs_stt_run_encoder(ctx, mel, cm, ct, &N_c, &pd);
+        free(mel);
+        if (!emb || N_c <= 0) {
+            free(emb);
+            continue;
+        }
+        pdim = pd;
+        audio_embeds.insert(audio_embeds.end(), emb, emb + (size_t)N_c * pd);
+        free(emb);
+    }
+    const int N = pdim > 0 ? (int)(audio_embeds.size() / pdim) : 0;
+    if (out_N)
+        *out_N = N;
+    if (out_pdim)
+        *out_pdim = pdim;
+    if (N <= 0)
+        return nullptr;
+    float* audio = (float*)malloc(audio_embeds.size() * sizeof(float));
+    std::memcpy(audio, audio_embeds.data(), audio_embeds.size() * sizeof(float));
+    return audio;
+}
+
 extern "C" char* higgs_stt_transcribe(higgs_stt_context* ctx, const float* samples, int n_samples) {
     if (!ctx || !samples || n_samples <= 0)
         return strdup("");
     const auto& hp = ctx->model.hparams;
 
-    // ---- pad/truncate raw audio to a single 30 s Whisper window ----
-    // (Long-audio VAD chunking is a follow-up; MVP transcribes <=30 s.)
-    const int kWin = 30 * (int)hp.sample_rate; // 480000
-    std::vector<float> pcm(kWin, 0.0f);
-    std::memcpy(pcm.data(), samples, (size_t)std::min(n_samples, kWin) * sizeof(float));
-
-    // ---- mel + audio encoder/projector ----
-    int n_mels = 0, T_mel = 0;
-    float* mel = higgs_stt_compute_mel(ctx, pcm.data(), kWin, &n_mels, &T_mel);
-    if (!mel)
-        return strdup("");
+    // ---- chunked mel + audio encoder/projector ----
     int N_enc = 0, pdim = 0;
-    float* audio = higgs_stt_run_encoder(ctx, mel, n_mels, T_mel, &N_enc, &pdim);
-    free(mel);
+    float* audio = higgs_stt_encode_audio(ctx, samples, n_samples, &N_enc, &pdim);
     if (!audio || N_enc <= 0)
         return strdup("");
-
-    // Only the VALID (non-silence-padded) audio frames become <|AUDIO|> tokens,
-    // matching the upstream collator. run_encoder operates on the fixed 30 s
-    // window (375 frames); for a shorter clip the trailing frames are silence
-    // padding and must NOT be fed to the LLM (they derail the decoder). Apply
-    // the encoder's length formula to the valid mel length:
-    //   conv2(s2): (L-1)/2+1 ; avgpool(s2): (L-2)/2+1 ; projector(s2): (L-1)/2+1
-    {
-        const int hop = (int)hp.hop_length;
-        int lv = std::min(n_samples / hop, T_mel); // valid mel frames
-        lv = (lv - 1) / 2 + 1;                      // post conv2
-        lv = (lv - 2) / 2 + 1;                      // post avg-pool
-        lv = (lv - 1) / 2 + 1;                      // post projector
-        N_enc = std::max(1, std::min(lv, N_enc));
-    }
 
     // ---- build the ChatML prompt token ids ----
     //   <|im_start|>user\n{instruction}<|audio_bos|>{N x <|AUDIO|>}<|audio_eos|>
@@ -1632,6 +1655,9 @@ extern "C" char* higgs_stt_transcribe(higgs_stt_context* ctx, const float* sampl
 
     // ---- detokenize + post-process ----
     std::string text = core_bpe::detokenize(ctx->vocab.id_to_token, out_ids.data(), out_ids.size());
+    if (getenv("HIGGS_DEBUG")) {
+        fprintf(stderr, "[higgs] raw %zu tokens, raw text:\n>>>%s<<<\n", out_ids.size(), text.c_str());
+    }
     // Strip an optional <think>...</think> reasoning block.
     size_t ts = text.find("<think>");
     if (ts != std::string::npos) {
@@ -1712,9 +1738,15 @@ extern "C" float* higgs_stt_run_encoder(higgs_stt_context* ctx, const float* mel
         fprintf(stderr, "higgs_stt: mel feature mismatch (%d vs %d)\n", n_mels, (int)hp.n_mels);
         return nullptr;
     }
-    std::vector<float> mel = higgs_stt_pad_mel(mel_features, n_mels, T_mel);
+    // Lay the row-major (n_mels, T_mel) mel into the graph's (T_mel, n_mels)
+    // input tensor: buf[t + T_mel*f] = mel[f*T_mel + t]. No padding — the chunk
+    // is encoded at its true length.
+    std::vector<float> mel((size_t)T_mel * n_mels);
+    for (int f = 0; f < n_mels; f++)
+        for (int t = 0; t < T_mel; t++)
+            mel[(size_t)t + (size_t)T_mel * f] = mel_features[(size_t)f * T_mel + t];
 
-    ggml_cgraph* gf = higgs_stt_build_graph_encoder(ctx);
+    ggml_cgraph* gf = higgs_stt_build_graph_encoder(ctx, T_mel);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         fprintf(stderr, "higgs_stt: failed to alloc encoder graph\n");
@@ -2054,26 +2086,13 @@ extern "C" int higgs_stt_align_words(struct higgs_stt_context* ctx, const float*
     // for now and add a kv field on the next converter bump.
     constexpr float TIMESTAMP_SEGMENT_TIME_MS = 80.0f;
 
-    // 1. Mel
-    int n_mels = 0, T_mel = 0;
-    float* mel;
-    {
-        higgs_stt_bench_stage _b("mel");
-        mel = higgs_stt_compute_mel(ctx, samples, n_samples, &n_mels, &T_mel);
-    }
-    if (!mel) {
-        fprintf(stderr, "higgs_stt[align]: mel failed\n");
-        return -2;
-    }
-
-    // 2. Audio encoder
+    // 1+2. Chunked mel + audio encoder/projector (see higgs_stt_encode_audio).
     int N_enc = 0, pdim = 0;
     float* audio_embeds;
     {
         higgs_stt_bench_stage _b("encoder");
-        audio_embeds = higgs_stt_run_encoder(ctx, mel, n_mels, T_mel, &N_enc, &pdim);
+        audio_embeds = higgs_stt_encode_audio(ctx, samples, n_samples, &N_enc, &pdim);
     }
-    free(mel);
     if (!audio_embeds) {
         fprintf(stderr, "higgs_stt[align]: encoder failed\n");
         return -3;

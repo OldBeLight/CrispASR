@@ -583,6 +583,26 @@ catch_discover_tests(test-mini-omni2
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test - higgs-stt — live integration tests for higgs-audio-v3-stt ASR
+add_executable(test-higgs-stt
+    test_higgs_stt_live.cpp
+)
+target_include_directories(test-higgs-stt PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-higgs-stt PRIVATE
+    Catch2::Catch2WithMain
+    higgs_stt
+)
+catch_discover_tests(test-higgs-stt
+    TEST_SPEC "[higgs-stt]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── test - moss-audio — live integration tests for MOSS-Audio-4B audio understanding
 add_executable(test-moss-audio
     test_moss_audio_live.cpp

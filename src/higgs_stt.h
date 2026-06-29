@@ -63,6 +63,16 @@ float* higgs_stt_run_conv(struct higgs_stt_context* ctx,
 float* higgs_stt_run_encoder(struct higgs_stt_context* ctx, const float* mel_features, int n_mels, int T_mel,
                              int* out_N_total, int* out_proj_dim);
 
+// Full audio→embeddings path exactly as higgs_stt_transcribe uses it: split the
+// waveform into chunk_size_seconds (4 s) chunks, run the Whisper tower +
+// projector on each chunk independently, and concatenate the per-chunk audio
+// embeddings. Returns a malloc'd (N_total, proj_dim=2048) row-major buffer the
+// caller frees; sets *out_N_total / *out_proj_dim. This is what should be
+// compared against the reference (model._apply_audio_tower_whisper) — NOT a
+// single padded 30 s window.
+float* higgs_stt_encode_audio(struct higgs_stt_context* ctx, const float* samples, int n_samples, int* out_N_total,
+                              int* out_proj_dim);
+
 // Run the Qwen3 0.6B LLM forward (text-only, no audio injection, no KV cache).
 // Useful for differential testing the LLM forward in isolation against the
 // HF reference. Returns malloc'd float buffer of shape (n_tokens, vocab_size)

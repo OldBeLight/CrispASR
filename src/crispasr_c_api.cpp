@@ -72,6 +72,10 @@
 #include "qwen3_asr.h"
 #define CA_HAVE_QWEN3 1
 #endif
+#if __has_include("higgs_stt.h")
+#include "higgs_stt.h"
+#define CA_HAVE_HIGGS_STT 1
+#endif
 #if __has_include("cohere.h")
 #include "cohere.h"
 #define CA_HAVE_COHERE 1
@@ -1240,6 +1244,8 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "cohere";
     else if (strcmp(arch, "qwen3-asr") == 0 || strcmp(arch, "qwen3asr") == 0)
         backend = "qwen3";
+    else if (strcmp(arch, "higgs-stt") == 0)
+        backend = "higgs-stt";
     else if (strcmp(arch, "voxtral") == 0)
         backend = "voxtral";
     else if (strcmp(arch, "voxtral4b") == 0)
@@ -1490,6 +1496,9 @@ struct crispasr_session {
 #endif
 #ifdef CA_HAVE_QWEN3
     qwen3_asr_context* qwen3_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_HIGGS_STT
+    higgs_stt_context* higgs_ctx = nullptr;
 #endif
 #ifdef CA_HAVE_COHERE
     cohere_context* cohere_ctx = nullptr;
@@ -1888,6 +1897,21 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         p.flash_attn = g_open_flash_attn_tls;
         s->qwen3_ctx = qwen3_asr_init_from_file(model_path, p);
         if (!s->qwen3_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_HIGGS_STT
+    if (s->backend == "higgs-stt" || s->backend == "higgs_stt" || s->backend == "higgs-audio-v3-stt") {
+        higgs_stt_context_params p = higgs_stt_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        p.flash_attn = g_open_flash_attn_tls;
+        s->higgs_ctx = higgs_stt_init_from_file(model_path, p);
+        if (!s->higgs_ctx) {
             delete s;
             return nullptr;
         }
@@ -3714,6 +3738,25 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
     if ((s->backend == "mini-omni2" || s->backend == "mini_omni2" || s->backend == "miniomni2") && s->mini_omni2_ctx) {
         mini_omni2_set_ask(s->mini_omni2_ctx, s->ask.empty() ? nullptr : s->ask.c_str());
         char* text = mini_omni2_transcribe(s->mini_omni2_ctx, pcm, n_samples);
+        if (!text) {
+            delete r;
+            return nullptr;
+        }
+        crispasr_session_seg seg;
+        seg.text = text;
+        seg.t0 = 0;
+        seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        free(text);
+        r->segments.push_back(std::move(seg));
+        return r;
+    }
+#endif
+#ifdef CA_HAVE_HIGGS_STT
+    if ((s->backend == "higgs-stt" || s->backend == "higgs_stt" || s->backend == "higgs-audio-v3-stt") &&
+        s->higgs_ctx) {
+        // Whole-file chunked encode + ChatML greedy decode lives in
+        // higgs_stt_transcribe() (the CLI adapter drives the same call).
+        char* text = higgs_stt_transcribe(s->higgs_ctx, pcm, n_samples);
         if (!text) {
             delete r;
             return nullptr;
@@ -6573,6 +6616,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_QWEN3
     if (s->qwen3_ctx)
         qwen3_asr_free(s->qwen3_ctx);
+#endif
+#ifdef CA_HAVE_HIGGS_STT
+    if (s->higgs_ctx)
+        higgs_stt_free(s->higgs_ctx);
 #endif
 #ifdef CA_HAVE_COHERE
     if (s->cohere_ctx)
