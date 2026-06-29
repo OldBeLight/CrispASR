@@ -285,29 +285,20 @@ struct granite_speech_context {
 
     int n_threads = 4;
 
-    // Cached bucketed LLM-decode graph (CUDA-graph-capture friendly). Built once
-    // for a fixed KV bucket length; per decode step only the input tensor
-    // *contents* change (positions, causal_mask, and — once fused — input_ids),
-    // keeping graph topology + node shapes constant so ggml's CUDA-graph capture
-    // engages (see PERFORMANCE.md / megapar StaticCache lesson). The bucket
-    // covers [prompt_len .. prompt_len + max_new) so no re-capture mid-decode.
+    // Cached bucketed LLM-decode graph: fixed KV read extent (dec_bucket_len)
+    // keeps topology shape-stable across steps for CUDA-graph capture. nullptr
+    // until granite_speech_set_decode_bucket is called.
     ggml_cgraph* cached_dec_gf = nullptr;
     ggml_context* cached_dec_ctx = nullptr;
     std::vector<uint8_t> cached_dec_meta;
-    int cached_dec_bucket = 0;  // fixed Lk the cached graph was built for
-    std::vector<uint8_t> dec_mask_buf;  // host staging for the Lk fp16 mask
-    // When >0, single-token run_llm_kv calls route through the bucketed
-    // CUDA-graph-capture path (granite_run_bucket_decode). Set by the backend
-    // before the decode loop; 0 disables (legacy per-step rebuild path).
+    int cached_dec_bucket = 0;         // fixed Lk the cached graph was built for
+    std::vector<uint8_t> dec_mask_buf; // host staging for the Lk fp16 mask
     int dec_bucket_len = 0;
-    // Argmax-fused variant of cached_dec_gf: appends a ggml_argmax node so the
-    // greedy loop D2Hs only a single int32 token id instead of the full ~100k
-    // vocab logits + a host argmax scan (the megapar in-graph-argmax trick).
-    // Built lazily by granite_greedy_decode_step; nullptr until first used.
+    // Argmax-fused variant: appends ggml_argmax so the greedy loop D2Hs one
+    // int32 token id instead of the full vocab logits. Built lazily.
     ggml_cgraph* cached_argmax_gf = nullptr;
     // True when cached_argmax_gf folds the embed lookup inline (non-quantized
-    // token embedding). When true the step sets "input_ids"; else it sets
-    // "inputs_embeds" (pre-computed by the separate embed graph).
+    // token embedding); otherwise the caller supplies a pre-computed embeds.
     bool dec_fused_embed = false;
 
     // §176s: cached encoder graph — reused when (T, with_rpe) matches.
@@ -2218,7 +2209,7 @@ static ggml_cgraph* granite_build_llm_kv(granite_speech_context* ctx, int n_past
     return gf;
 }
 
-// Forward decls for the Phase 1 bucketed decode path (defined below).
+// Forward decl for the bucketed decode path (defined below).
 static float* granite_run_bucket_decode(granite_speech_context* ctx, const float* input_embed, int n_past,
                                         int bucket_len);
 
@@ -2230,9 +2221,8 @@ extern "C" float* granite_speech_run_llm_kv(struct granite_speech_context* ctx, 
     const int d = (int)hp.llm_d_model;
     const int vocab = (int)hp.llm_vocab_size;
 
-    // Fast path: single-token decode with a configured bucket routes through
-    // the cached shape-stable graph (CUDA-graph capture). Prefill (n_tokens>1)
-    // and the no-bucket case keep the original per-call rebuild path.
+    // Single-token decode with a configured bucket reuses the cached graph
+    // (CUDA-graph capture). Prefill and no-bucket fall through to the rebuild path.
     if (n_tokens == 1 && ctx->dec_bucket_len > 0 && n_past < ctx->dec_bucket_len) {
         float* r = granite_run_bucket_decode(ctx, inputs_embeds, n_past, ctx->dec_bucket_len);
         if (r) {
@@ -2355,31 +2345,8 @@ extern "C" void granite_speech_set_decode_bucket(struct granite_speech_context* 
     ctx->dec_bucket_len = bucket_len;
 }
 
-// ---------------------------------------------------------------------------
-// Fast bucketed LLM decode path (Phase 1: CUDA-graph-capture friendly).
-//
-// The stock granite_speech_run_llm_kv rebuilds the 40-layer cgraph + re-allocs
-// the sched graph every token AND grows the KV read length Lk = n_past+1 each
-// step. The growing shape defeats ggml's CUDA-graph capture (warmup never
-// stabilises), so the ~280 tiny GEMV launches/token stay as host dispatches —
-// the dominant cost for launch-bound decode (see megapar / PERFORMANCE.md).
-//
-// This path pins Lk to a fixed bucket and routes the KV write through
-// ggml_set_rows with a runtime `positions` index tensor, so graph topology +
-// every node shape is constant across decode steps. Only input *data* changes
-// (positions, causal_mask), which ggml_cuda_graph_update_required does NOT
-// count as a property change — so capture engages after warmup and the whole
-// 40-layer step replays as one cudaGraphLaunch. Mirrors outetts's bucket mode
-// and megapar's StaticCache.
-//
-// Bucket sizing: covers [n_past_after_prefill .. + max_new_tokens). Built once
-// per (initial_n_past, bucket_len); reused for every decode step thereafter.
-// The mask is a persistent Lk×1 fp16 input updated each step so padded slots
-// [n_past+1 .. Lk) are masked to -inf (their KV cache rows are stale).
-// ---------------------------------------------------------------------------
-
-// Build (or reuse) the cached bucketed single-token decode graph for bucket_len.
-// Returns the cached cgraph. Topology is invariant for a given bucket_len.
+// Bucketed single-token decode: pin the KV read extent so graph topology is
+// constant across steps, enabling CUDA-graph capture. See PERFORMANCE.md.
 static ggml_cgraph* granite_build_bucket_decode(granite_speech_context* ctx, int bucket_len) {
     if (ctx->cached_dec_gf && ctx->cached_dec_bucket == bucket_len)
         return ctx->cached_dec_gf;
@@ -2397,10 +2364,8 @@ static ggml_cgraph* granite_build_bucket_decode(granite_speech_context* ctx, int
     const int d = (int)hp.llm_d_model;
     const int n_layers = (int)hp.llm_n_layers;
 
-    // Persistent arena for the graph's tensor metadata — must outlive all
-    // decode steps that reuse the cached graph. Sized the same way as
-    // compute_meta (ggml_tensor_overhead * 16384 + graph overhead) so the full
-    // 40-layer single-token decode graph fits with headroom.
+    // Persistent arena for the graph's tensor metadata (must outlive all steps
+    // that reuse the cached graph). Sized like compute_meta.
     ctx->cached_dec_meta.assign(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false), 0);
     ggml_init_params ip = {ctx->cached_dec_meta.size(), ctx->cached_dec_meta.data(), true};
     ctx->cached_dec_ctx = ggml_init(ip);
@@ -2440,8 +2405,8 @@ static ggml_cgraph* granite_build_bucket_decode(granite_speech_context* ctx, int
                       b.ffn_norm_w,  b.ffn_gate_w, b.ffn_up_w, b.ffn_down_w};
     }
 
-    // fixed_kv_len pins the KV read extent; kv_indices=positions routes the
-    // write through set_rows with a runtime row index -> topology-stable.
+    // fixed_kv_len pins the KV read extent; kv_indices routes the write via
+    // set_rows with a runtime row index, keeping topology shape-stable.
     ggml_tensor* cur = core_granite_llm::build_decoder(ctx0, gf, embeds, positions, causal_mask, ctx->kv_k, ctx->kv_v,
                                                        /*n_past=*/0, blocks, m.llm.output_norm_w, llm_hp,
                                                        /*is_causal=*/true,
@@ -2458,9 +2423,8 @@ static ggml_cgraph* granite_build_bucket_decode(granite_speech_context* ctx, int
     return gf;
 }
 
-// One bucketed single-token decode step. Reuses the cached graph; updates only
-// input data. Returns malloc'd (vocab,) logits (matches granite_speech_run_llm_kv
-// contract so the shared greedy/beam loop is unchanged).
+// One bucketed single-token decode step. Reuses the cached graph; returns
+// malloc'd (vocab,) logits to match the run_llm_kv contract.
 static float* granite_run_bucket_decode(granite_speech_context* ctx, const float* input_embed, int n_past,
                                         int bucket_len) {
     const auto& hp = ctx->model.hparams;
@@ -2478,8 +2442,7 @@ static float* granite_run_bucket_decode(granite_speech_context* ctx, const float
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), &pos, 0, sizeof(int32_t));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inputs_embeds"), input_embed, 0, (size_t)d * sizeof(float));
 
-    // Mask: allow slots [0 .. n_past], mask [n_past+1 .. bucket_len) to -inf.
-    // Slot n_past is the just-written key (the current token); it must attend.
+    // Mask slots [n_past+1 .. bucket_len) to -inf (their KV rows are stale).
     ctx->dec_mask_buf.assign((size_t)bucket_len * sizeof(ggml_fp16_t), 0);
     ggml_fp16_t* pmask = (ggml_fp16_t*)ctx->dec_mask_buf.data();
     ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
@@ -2497,41 +2460,33 @@ static float* granite_run_bucket_decode(granite_speech_context* ctx, const float
     return result;
 }
 
-// Build (or reuse) the argmax-fused bucketed decode graph. Same as
-// granite_build_bucket_decode but appends ggml_argmax over the vocab logits,
-// so a greedy step returns a single int32 token id (4-byte D2H) instead of the
-// full ~100k-float vocab (400 KB D2H + host argmax scan). Tie-break is strict >
-// (lowest index wins), identical to core_greedy_decode::argmax and to ggml's
-// CUDA argmax kernel — so greedy token selection is bit-identical to the host
-// path. logits tensor is still named "logits" (kept as a graph output) so a
-// caller that needs the full vocab (sampling / best-of-N) can read it back.
+// Bucketed decode graph with an appended ggml_argmax over the vocab logits.
+// Greedy token selection uses strict-> (lowest index), matching
+// core_greedy_decode::argmax and ggml's CUDA argmax kernel — bit-identical to
+// the host path. "logits" is kept as a graph output for callers needing the
+// full vocab (sampling / best-of-N).
 static ggml_cgraph* granite_build_argmax_decode(granite_speech_context* ctx, int bucket_len) {
     if (ctx->cached_argmax_gf && ctx->cached_dec_bucket == bucket_len)
         return ctx->cached_argmax_gf;
 
-    // Build on top of the base bucket graph's arena; argmax adds one node.
+    // Build on the base bucket graph's arena (it owns the metadata arena);
+    // argmax adds one node.
     ggml_context* ctx0 = ctx->cached_dec_ctx;
     if (!ctx0 || !ctx->cached_dec_gf || ctx->cached_dec_bucket != bucket_len) {
-        // Ensure the base graph exists first (it owns the arena).
         granite_build_bucket_decode(ctx, bucket_len);
         ctx0 = ctx->cached_dec_ctx;
     }
 
-    // Fused-embed mode: when the token embedding is a non-quantized type (F16/
-    // F32), ggml_get_rows is capture-safe, so we fold the embed lookup into
-    // this graph — one graph/token instead of two (separate embed graph +
-    // decode graph). For k-quant embeddings (Q4_K etc.) get_rows_cuda_kquant
-    // host-syncs and can't be captured, so those keep embed as a separate
-    // (uncaptured) graph and pass a pre-computed F32 embeds input.
+    // Fused-embed mode: fold the embed lookup into this graph when the token
+    // embedding is non-quantized (capture-safe get_rows). k-quant embeddings
+    // can't be captured (get_rows_cuda_kquant host-syncs), so those keep the
+    // embed as a separate graph and pass a pre-computed F32 input.
     const auto& m = ctx->model;
     const bool fused_embed = m.llm.token_embd_w && !ggml_is_quantized(m.llm.token_embd_w->type);
 
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
-    // Re-resolve the logits input the base builder would produce, then append
-    // argmax. We rebuild the forward here (cheap: graph build is host-side) to
-    // keep the argmax graph self-contained in its own cgraph (ggml's CUDA
-    // graph capture keys on cgraph->nodes[0], so the argmax variant needs its
-    // own cgraph to capture independently from the logits variant).
+    // Rebuild the forward in its own cgraph (capture keys on cgraph->nodes[0],
+    // so the argmax variant must not share the logits variant's cgraph).
     const auto& hp = m.hparams;
     const int d = (int)hp.llm_d_model;
     const int n_layers = (int)hp.llm_n_layers;
@@ -2590,20 +2545,16 @@ static ggml_cgraph* granite_build_argmax_decode(granite_speech_context* ctx, int
     return gf;
 }
 
-// One argmax-fused greedy decode step. For non-quantized token embeddings the
-// embed lookup is folded into this graph (one graph/token); for k-quant
-// embeddings the caller pre-computes the embed via the separate embed graph and
-// passes it. Runs the 40-layer forward + argmax, returns the chosen token id.
-// *out_logit (optional) receives that token's logit value. Returns -1 on failure.
+// One argmax-fused greedy decode step. Runs the forward + argmax and returns
+// the chosen token id; *out_logit (optional) receives that token's logit.
+// Returns -1 on failure.
 static int granite_greedy_decode_step(granite_speech_context* ctx, int32_t token_id, const float* input_embed,
                                       int n_past, int bucket_len, float* out_logit) {
     ggml_cgraph* gf = granite_build_argmax_decode(ctx, bucket_len);
-    // NOTE: reset+alloc every step. The documented sched reuse pattern
-    // (build once, alloc once, then set+compute per step — ggml-backend.h:285)
-    // interacts badly with ggml's CUDA-graph capture here: skipping the alloc on
-    // a stable graph produced "CUDA error: invalid argument" mid-decode. The
-    // sched alloc on a cached plan is cheap, and CUDA-graph capture already
-    // removes the dominant per-launch cost, so we keep the safe per-step alloc.
+    // reset+alloc every step: the documented sched reuse shortcut
+    // (ggml-backend.h:285) breaks CUDA-graph capture here ("CUDA error:
+    // invalid argument" mid-decode). The alloc on a cached plan is cheap and
+    // capture already removes the dominant per-launch cost.
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
         return -1;
@@ -2615,8 +2566,7 @@ static int granite_greedy_decode_step(granite_speech_context* ctx, int32_t token
     if (ctx->dec_fused_embed) {
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "input_ids"), &token_id, 0, sizeof(int32_t));
     } else {
-        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inputs_embeds"), input_embed, 0,
-                                (size_t)d * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inputs_embeds"), input_embed, 0, (size_t)d * sizeof(float));
     }
 
     ctx->dec_mask_buf.assign((size_t)bucket_len * sizeof(ggml_fp16_t), 0);
@@ -2634,10 +2584,8 @@ static int granite_greedy_decode_step(granite_speech_context* ctx, int32_t token
     ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "argmax"), &token, 0, sizeof(int32_t));
 
     if (out_logit) {
-        // Read back the chosen token's logit for optional probability scoring.
         float lv = 0.0f;
-        ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "logits"), &lv, (size_t)token * sizeof(float),
-                                sizeof(float));
+        ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "logits"), &lv, (size_t)token * sizeof(float), sizeof(float));
         *out_logit = lv;
     }
     return (int)token;
@@ -2651,9 +2599,7 @@ extern "C" int32_t* granite_speech_greedy_decode(struct granite_speech_context* 
         return nullptr;
     }
     const int bucket = ctx->dec_bucket_len;
-    // Build the (cached) graph up front so dec_fused_embed is resolved before
-    // the loop: when the embed is folded in, each step passes just the token id
-    // and no separate embed graph runs.
+    // Build the graph up front so dec_fused_embed is resolved before the loop.
     granite_build_argmax_decode(ctx, bucket);
 
     std::vector<int32_t> tokens;

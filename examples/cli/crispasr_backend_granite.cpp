@@ -382,12 +382,8 @@ public:
         dec_cfg.frequency_penalty = params.frequency_penalty;
         dec_cfg.seed = params.seed;
 
-        // Enable the CUDA-graph-capture-friendly bucketed decode (Phase 1).
-        // The bucket covers [total_prompt .. total_prompt + max_new] so no
-        // re-capture mid-decode; capped to the 4096 KV cache. Single-token
-        // forward calls then reuse one cached shape-stable graph. Only on GPU
-        // (capture is meaningless on CPU) and only when the decode will fit
-        // the bucket — beam search keeps its legacy per-step path.
+        // GPU only: enable the bucketed CUDA-graph-capture decode. Beam
+        // search and CPU keep the legacy per-step path.
         const bool use_bucket = use_gpu_;
         if (use_bucket) {
             const int bucket = std::min(total_prompt + max_new + 1, 4096);
@@ -423,12 +419,9 @@ public:
             next_p = core_greedy_decode::softmax_of(logits, vocab, next, logits[next]);
             free(logits);
 
-            // Fast path: greedy + single-run (the common transcript case) uses
-            // the argmax-fused decode graph — one 4-byte D2H/token vs the
-            // shared loop's ~400 KB vocab D2H + host argmax scan. Token
-            // selection is bit-identical (same strict-> tie-break). Sampling
-            // and best-of-N fall through to the shared loop (they need full
-            // logits + per-token probs).
+            // Greedy + single-run: use the argmax-fused decode graph
+            // (bit-identical token selection). Sampling/best-of-N fall through
+            // to the shared loop (they need full logits + per-token probs).
             const bool fast_greedy = (n_runs == 1) && (dec_cfg.temperature == 0.0f) && use_bucket;
             if (fast_greedy) {
                 int n_out = 0;
@@ -437,13 +430,13 @@ public:
                 if (ids && n_out > 0) {
                     core_greedy_decode::Result r;
                     r.tokens.assign(ids, ids + n_out);
-                    r.probs.assign(n_out, 1.0f);  // probs unused when n_runs == 1
+                    r.probs.assign(n_out, 1.0f); // probs unused when n_runs == 1
                     free(ids);
                     best_score = 1.0;
                     best_dec = std::move(r);
-                    continue;  // skip the shared loop this run
+                    continue; // skip the shared loop this run
                 }
-                free(ids);  // NULL on failure -> fall through to shared loop
+                free(ids); // NULL on failure -> fall through to shared loop
             }
 
             auto dec = core_greedy_decode::run_with_probs(ctx_,

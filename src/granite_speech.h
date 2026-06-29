@@ -67,23 +67,13 @@ void granite_speech_kv_reset(struct granite_speech_context* ctx);
 float* granite_speech_run_llm_kv(struct granite_speech_context* ctx, const float* inputs_embeds, int n_tokens,
                                  int n_past, int* out_n_tokens, int* out_vocab_size);
 
-// Enable the CUDA-graph-capture-friendly bucketed decode path. When bucket_len
-// > 0, subsequent single-token run_llm_kv calls reuse a cached shape-stable
-// graph pinned to a fixed KV read extent (bucket_len) instead of rebuilding the
-// 40-layer graph each step. Call after prefill with bucket_len >= n_past +
-// max_new_tokens. Set bucket_len = 0 to revert to the legacy per-step path.
-// Ignored on CPU backends / multi-token prefill (those always use run_llm_kv's
-// rebuild path). Requires the KV cache initialised to >= bucket_len.
+// Enable bucketed decode for CUDA-graph capture. Call after prefill with
+// bucket_len >= n_past + max_new_tokens (0 disables; requires KV cache >= bucket_len).
 void granite_speech_set_decode_bucket(struct granite_speech_context* ctx, int bucket_len);
 
-// Argmax-fused greedy decode over the bucketed capture-friendly graph. Given
-// the first token + its n_past, runs the decode loop returning the generated
-// token ids (including first_token, stopping at eos_id or max_new_tokens).
-// Each step uses an in-graph ggml_argmax so only a 4-byte token id is copied
-// D2H (vs ~400 KB vocab + host argmax scan). Greedy/temperature-0 only; uses
-// the same strict-> tie-break as core_greedy_decode::argmax, so token
-// selection is bit-identical to the shared greedy loop. Returns malloc'd
-// int32 array of length *out_n (caller frees); NULL on failure.
+// Argmax-fused greedy decode over the bucketed graph. Returns malloc'd token
+// ids (incl. first_token, stopping at eos_id/max_new_tokens); bit-identical to
+// core_greedy_decode::argmax. NULL on failure. Caller frees *out_n ids.
 int32_t* granite_speech_greedy_decode(struct granite_speech_context* ctx, int32_t first_token, int initial_n_past,
                                       int max_new_tokens, int eos_id, int* out_n);
 
