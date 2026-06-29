@@ -706,6 +706,26 @@ catch_discover_tests(test-cosyvoice3-params
     PROPERTIES LABELS "unit;cosyvoice3"
 )
 
+# ─── test-dots-tts-params — Catch2 unit tests for dots_tts_context_params defaults
+# and null-guard coverage. No GGUF required. ───────────────────────────────────
+if (TARGET dots-tts)
+add_executable(test-dots-tts-params
+    test-dots-tts-params.cpp
+)
+target_include_directories(test-dots-tts-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-dots-tts-params PRIVATE
+    Catch2::Catch2WithMain
+    dots-tts
+    chatterbox
+)
+catch_discover_tests(test-dots-tts-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;dots-tts"
+)
+endif()
+
 # ─── test-funasr-params — Catch2 unit tests for funasr_context_params defaults
 # and null-guard coverage. No GGUF required. ───────────────────────────────────
 add_executable(test-funasr-params

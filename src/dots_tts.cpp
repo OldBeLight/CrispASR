@@ -1829,6 +1829,8 @@ struct dots_tts_context_params dots_tts_context_default_params(void) {
 }
 
 struct dots_tts_context* dots_tts_init_from_file(const char* path_model, struct dots_tts_context_params params) {
+    if (!path_model || !*path_model)
+        return nullptr;
     auto* ctx = new dots_tts_context();
     ctx->params = params;
     ctx->rng.seed(params.seed > 0 ? params.seed : 42);
