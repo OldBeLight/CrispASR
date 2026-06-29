@@ -175,6 +175,29 @@ ggml-vulkan gallocr/graph dump, not MoltenVK. A **chunked codec decode** (decode
 time-windows under the breaking length, where short inputs are proven correct) is
 the pragmatic GPU-native workaround and sidesteps the root cause entirely.
 
+**Chunked-decode design (to implement + validate when the box is free).** Add
+`tada_codec_decode` a chunked wrapper, gated (e.g. `CRISPASR_TADA_CODEC_CHUNK=<N>`,
+default off; auto-on for the Vulkan-native codec). The codec upsamples 480×
+(strides 4·4·5·6) and is feed-forward; the only cross-frame coupling is (a) the
+block attention (each frame attends to its block + the previous block) and (b) the
+conv receptive field across the 4 decoder blocks. So decode is chunkable with a
+context margin:
+  - Split the `n_frames` features into windows of `N` (start ~192, below the
+    observed break; tune by bisecting the threshold between 93 ok and 522 broken).
+  - For window `[a,b)`, run the existing `build_decode_graph` on the *extended*
+    slice `[a-CTX, b+CTX)` (clamped), `CTX` ≈ 64 frames to cover both the conv
+    receptive field and the prev-block attention reach.
+  - **RoPE positions must be absolute**: set `codec_pos[i] = (a-CTX)+i`, not 0-based,
+    so attention matches the full decode for the kept region.
+  - Build the block mask from the *sliced* `token_masks[a-CTX : b+CTX]` (block ids
+    are relative-safe — the mask only encodes same/prev block).
+  - Keep only the PCM for `[a,b)`: trim `CTX*480` samples from each side (except at
+    the true sequence start/end); concatenate windows.
+  - Validate: ASR-roundtrip vs the CPU codec, and check for boundary clicks (peak
+    discontinuity at window seams); widen `CTX` / add a short crossfade if needed.
+Risk: a conv vocoder can click at seams; the CTX-trim should prevent it but needs
+the ASR + waveform check. Keep CPU-codec as the default fallback until validated.
+
 **Caveat — MoltenVK can't fully validate GPU numerics.** MoltenVK's `mul_mm` /
 `mul_mat_vec` downconvert src0 to f16 regardless of stored dtype (storing F32 FM
 weights changed nothing; `GGML_VK_DISABLE_F16=1` barely moved cond cosine,
