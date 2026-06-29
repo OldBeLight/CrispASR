@@ -1833,12 +1833,24 @@ struct dots_tts_context* dots_tts_init_from_file(const char* path_model, struct 
     ctx->params = params;
     ctx->rng.seed(params.seed > 0 ? params.seed : 42);
 
-    // Initialize backend
+    // Initialize backend. Every dots.tts graph runs on a single backend via raw
+    // ggml_gallocr (no ggml_backend_sched), so there are no cross-backend copy
+    // hazards — GPU is just init_best() with all weights + KV caches resident on
+    // it. Opt out with CRISPASR_DOTS_TTS_CPU=1.
     ctx->backend_cpu = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
 
-    ctx->backend = ctx->backend_cpu; // CPU-only for now
-    // TODO: GPU backend selection
+    const char* cpu_env = std::getenv("CRISPASR_DOTS_TTS_CPU");
+    const bool force_cpu = cpu_env && *cpu_env && *cpu_env != '0';
+    if (params.use_gpu && !force_cpu) {
+        ctx->backend = ggml_backend_init_best();
+        if (!ctx->backend)
+            ctx->backend = ctx->backend_cpu;
+    } else {
+        ctx->backend = ctx->backend_cpu;
+    }
+    if (params.verbosity >= 1)
+        std::fprintf(stderr, "dots_tts: backend = %s\n", ggml_backend_name(ctx->backend));
 
     // Load core model
     if (!dots_load_core(ctx, path_model, params.verbosity)) {
