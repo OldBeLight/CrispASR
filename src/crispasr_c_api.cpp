@@ -2426,7 +2426,10 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
             delete s;
             return nullptr;
         }
-        // Auto-resolve vocoder GGUF next to the model
+        // Auto-resolve vocoder + speaker-encoder GGUFs next to the model. The
+        // speaker encoder is optional (only needed for voice cloning via
+        // crispasr_session_set_voice); load it eagerly so set_voice just applies
+        // the reference WAV.
         {
             std::string mp = model_path ? model_path : "";
             auto sep = mp.find_last_of("/\\");
@@ -2438,6 +2441,15 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
                 if (f) {
                     fclose(f);
                     dots_tts_set_vocoder_path(s->dots_tts_ctx, cp.c_str());
+                    break;
+                }
+            }
+            for (const char* name : {"dots-tts-soar-spk-f16.gguf", "dots-tts-soar-spk.gguf", "dots-tts-spk-f16.gguf"}) {
+                std::string cp = dir + "/" + name;
+                FILE* f = fopen(cp.c_str(), "rb");
+                if (f) {
+                    fclose(f);
+                    dots_tts_set_speaker_path(s->dots_tts_ctx, cp.c_str());
                     break;
                 }
             }
@@ -5630,6 +5642,16 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
 #ifdef CA_HAVE_ZONOS
     if (s->zonos_ctx) {
         return zonos_tts_set_voice(s->zonos_ctx, path);
+    }
+#endif
+#ifdef CA_HAVE_DOTS_TTS
+    if (s->dots_tts_ctx) {
+        // Voice cloning from a reference WAV (the speaker encoder was loaded at
+        // open). Caller is responsible for consent (the CLI/server layer gates
+        // it). ref_text is unused — dots.tts conditions on the CAM++ x-vector.
+        if (!ends_with_wav(path))
+            return -2;
+        return dots_tts_set_voice_prompt(s->dots_tts_ctx, path);
     }
 #endif
 #ifdef CA_HAVE_QWEN3_TTS

@@ -427,6 +427,12 @@ struct dots_tts_context {
     dots_kv_cache llm_kv;
     dots_kv_cache penc_kv;
 
+    // Incremental PatchEncoder streaming state (dots_penc_step): the last latent
+    // frame for the stride-2 causal conv window across patches, and the count of
+    // encoder tokens already in penc_kv. Reset per utterance.
+    std::vector<float> penc_conv_tail; // (input_dim,); empty → zero pad (patch 0)
+    int penc_n_cached = 0;
+
     // Backends
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_t backend = nullptr;
@@ -1259,6 +1265,140 @@ static void dots_penc_forward(dots_tts_context* ctx, const float* latents, int n
 
     ggml_gallocr_free(galloc);
     ggml_free(ctx0);
+}
+
+// Reset the incremental PatchEncoder stream — call once per utterance before the
+// AR loop so the first dots_penc_step starts from an empty cache + zero conv pad.
+static void dots_penc_reset(dots_tts_context* ctx) {
+    ctx->penc_conv_tail.clear();
+    ctx->penc_n_cached = 0;
+}
+
+// Incremental PatchEncoder: append ONE patch (input_dim × patch_size new latent
+// frames) and emit its single LLM embedding (out_dim) using the persistent
+// penc_kv cache + conv_tail. Mathematically the streaming form of
+// dots_penc_forward (decode_patch with conv_tail + per-layer causal KV), but
+// O(N) per patch vs the full recompute's O(N²) — so long utterances stay linear.
+//
+// The PatchEncoder uses NO RoPE, so core_attn::kv_self_attn is reused with
+// all-zero positions: RoPE at position 0 is the identity (no rotation), giving
+// exactly the position-independent attention the encoder expects, while the
+// proven cache write/read mechanics handle the streaming K/V.
+static void dots_penc_step(dots_tts_context* ctx, const float* new_latents, float* out_embed) {
+    auto& pe = ctx->penc;
+    const int in_dim = (int)pe.input_dim;
+    const int H = (int)pe.hidden_size;
+    const int nh = (int)pe.n_heads;
+    const int hd = (int)pe.head_dim;
+    const int patch = ctx->patch_size;           // new latent frames this step
+    const int out_ds_rate = ctx->patch_size / 2; // new encoder tokens (== 2)
+    const int T = out_ds_rate;
+    const int n_past = ctx->penc_n_cached;
+
+    size_t n_tensors = pe.n_layers * 80 + 256;
+    ggml_init_params ip = {n_tensors * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, n_tensors, false);
+
+    // Conv input: [conv_tail | patch new frames] = (patch+1) frames. The stride-2
+    // k=2 (p=0) conv yields `out_ds_rate` tokens covering [tail,f0],[f1,f2],...,
+    // exactly matching the full recompute's symmetric-pad windows. For patch 0
+    // the tail is zero (== the recompute's left pad).
+    const int T_conv = patch + 1;
+    ggml_tensor* cin = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, in_dim, T_conv); // (in_dim, T_conv)
+    ggml_set_name(cin, "penc_step_in");
+    ggml_set_input(cin);
+
+    ggml_tensor* cinT = ggml_cont(ctx0, ggml_transpose(ctx0, cin));                      // (T_conv, in_dim)
+    ggml_tensor* ds = ggml_conv_1d(ctx0, pe.ds_conv_w, cinT, /*s*/ 2, /*p*/ 0, /*d*/ 1); // (T, in_dim)
+    ds = ggml_cont(ctx0, ggml_transpose(ctx0, ds));                                      // (in_dim, T)
+    if (pe.ds_conv_b)
+        ds = ggml_add(ctx0, ds, pe.ds_conv_b);
+
+    ggml_tensor* cur = ggml_mul_mat(ctx0, pe.in_proj, ds); // (H, T)
+    if (pe.in_proj_b)
+        cur = ggml_add(ctx0, cur, pe.in_proj_b);
+
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T); // all 0 → no-RoPE
+    ggml_set_name(positions, "penc_step_pos");
+    ggml_set_input(positions);
+    ggml_tensor* mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_past + T, T);
+    ggml_set_name(mask, "penc_step_mask");
+    ggml_set_input(mask);
+
+    core_attn::KvSelfAttnParams atp{};
+    atp.head_dim = hd;
+    atp.n_heads = nh;
+    atp.n_kv_heads = nh; // MHA: grp == 1, no GQA expansion
+    atp.n_kv_grp = 1;
+    atp.attn_scale = 1.0f / std::sqrt((float)hd);
+    atp.rope_theta = 10000.0f; // unused at position 0
+    atp.n_ctx_orig = 4096;
+    atp.qk_norm_eps = 1e-6f; // unused (no q/k norm)
+
+    for (uint32_t il = 0; il < pe.n_layers; il++) {
+        auto& L = pe.layers[il];
+        ggml_tensor* residual = cur;
+        ggml_tensor* h = rms_norm(ctx0, cur, L.attn_norm, 1e-6f);
+        ggml_tensor* attn = core_attn::kv_self_attn(
+            ctx0, gf, h, L.q_proj, L.k_proj, L.v_proj, L.o_proj, /*q_norm=*/nullptr, /*k_norm=*/nullptr, positions,
+            mask, ctx->penc_kv.k, ctx->penc_kv.v, (int)il, n_past, atp, /*qkv_w=*/nullptr, /*fixed_kv_len=*/0,
+            /*kv_indices=*/nullptr, /*q_b=*/nullptr, /*k_b=*/nullptr, /*v_b=*/nullptr, /*o_b=*/L.o_proj_b);
+        cur = ggml_add(ctx0, residual, attn);
+
+        residual = cur;
+        h = rms_norm(ctx0, cur, L.ffn_norm, 1e-6f);
+        h = ggml_mul_mat(ctx0, L.ffn_up, h);
+        if (L.ffn_up_b)
+            h = ggml_add(ctx0, h, L.ffn_up_b);
+        h = ggml_silu(ctx0, h);
+        h = ggml_mul_mat(ctx0, L.ffn_down, h);
+        if (L.ffn_down_b)
+            h = ggml_add(ctx0, h, L.ffn_down_b);
+        cur = ggml_add(ctx0, residual, h);
+    }
+
+    // Group the out_ds_rate tokens → (H*out_ds_rate, 1) → out_proj → (out_dim, 1).
+    cur = ggml_cont(ctx0, cur);
+    cur = ggml_reshape_2d(ctx0, cur, H * out_ds_rate, 1);
+    cur = ggml_mul_mat(ctx0, pe.out_proj, cur);
+    if (pe.out_proj_b)
+        cur = ggml_add(ctx0, cur, pe.out_proj_b);
+    ggml_set_name(cur, "penc_step_out");
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gf, cur);
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    ggml_gallocr_alloc_graph(galloc, gf);
+
+    std::vector<float> conv_in((size_t)in_dim * T_conv, 0.0f);
+    if (!ctx->penc_conv_tail.empty())
+        std::memcpy(conv_in.data(), ctx->penc_conv_tail.data(), (size_t)in_dim * sizeof(float));
+    std::memcpy(conv_in.data() + in_dim, new_latents, (size_t)in_dim * patch * sizeof(float));
+    ggml_backend_tensor_set(cin, conv_in.data(), 0, conv_in.size() * sizeof(float));
+
+    std::vector<int32_t> pos((size_t)T, 0);
+    ggml_backend_tensor_set(positions, pos.data(), 0, (size_t)T * sizeof(int32_t));
+
+    int Lk = n_past + T;
+    std::vector<ggml_fp16_t> mask_data((size_t)Lk * T, ggml_fp32_to_fp16(-INFINITY));
+    for (int q = 0; q < T; q++)
+        for (int k = 0; k < n_past + q + 1; k++)
+            mask_data[(size_t)q * Lk + k] = ggml_fp32_to_fp16(0.0f);
+    ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+
+    ggml_backend_graph_compute(ctx->backend, gf);
+
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "penc_step_out");
+    ggml_backend_tensor_get(out, out_embed, 0, ggml_nbytes(out));
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx0);
+
+    // Advance stream state: cache grew by T tokens; the last new frame becomes the
+    // conv_tail for the next patch's first stride-2 window.
+    ctx->penc_n_cached += T;
+    ctx->penc_conv_tail.assign(new_latents + (size_t)(patch - 1) * in_dim, new_latents + (size_t)patch * in_dim);
 }
 
 // ===========================================================================
@@ -2242,6 +2382,10 @@ float* dots_tts_synthesize(struct dots_tts_context* ctx, const char* text, int* 
     }
     append_hidden(cur_hidden.data()); // h0
 
+    dots_penc_reset(ctx); // start the incremental PatchEncoder stream
+    const char* penc_verify_env = std::getenv("CRISPASR_DOTS_PENC_VERIFY");
+    const bool penc_verify = penc_verify_env && *penc_verify_env && *penc_verify_env != '0';
+
     int n_patches_done = 0;
     for (int patch_idx = 0; patch_idx < max_patches; patch_idx++) {
         dots_bench_stage b_patch("patch_generate");
@@ -2312,15 +2456,32 @@ float* dots_tts_synthesize(struct dots_tts_context* ctx, const char* text, int* 
         // Grow FM history with the NORMALIZED latent.
         append_latent(z_norm.data());
 
-        // PatchEncoder over ALL accumulated denorm latents → last patch embedding.
-        int n_total = (int)(all_latents.size() / latent_dim);
-        int n_emb = n_total / patch_size;
-        std::vector<float> embeds((size_t)n_emb * llm_dim);
+        // Incremental PatchEncoder: stream this patch's denorm latents → its one
+        // LLM embedding via the persistent KV cache (O(N) per patch). Identical
+        // to the full recompute but linear; CRISPASR_DOTS_PENC_VERIFY=1 runs both
+        // and prints the cosine so the streaming path can be audited.
+        std::vector<float> emb_step((size_t)llm_dim);
         {
-            dots_bench_stage b2("penc_forward");
-            dots_penc_forward(ctx, all_latents.data(), n_total, embeds.data());
+            dots_bench_stage b2("penc_step");
+            dots_penc_step(ctx, z_denorm.data(), emb_step.data());
         }
-        const float* llm_embedding = embeds.data() + (size_t)(n_emb - 1) * llm_dim;
+        if (penc_verify) {
+            int n_total = (int)(all_latents.size() / latent_dim);
+            int n_emb = n_total / patch_size;
+            std::vector<float> embeds((size_t)n_emb * llm_dim);
+            dots_penc_forward(ctx, all_latents.data(), n_total, embeds.data());
+            const float* ref = embeds.data() + (size_t)(n_emb - 1) * llm_dim;
+            double dot = 0, na = 0, nb = 0, mx = 0;
+            for (int i = 0; i < llm_dim; i++) {
+                dot += (double)emb_step[i] * ref[i];
+                na += (double)emb_step[i] * emb_step[i];
+                nb += (double)ref[i] * ref[i];
+                mx = std::max(mx, std::fabs((double)emb_step[i] - ref[i]));
+            }
+            double cos = (na > 0 && nb > 0) ? dot / (std::sqrt(na) * std::sqrt(nb)) : 0.0;
+            std::fprintf(stderr, "dots_tts: [penc-verify] patch %d cos=%.6f max|Δ|=%.5f\n", patch_idx, cos, mx);
+        }
+        const float* llm_embedding = emb_step.data();
 
         // Feed the penc embedding into the LLM → next conditioning hidden.
         {
