@@ -2342,7 +2342,7 @@ class CrispasrSession {
   }
 
   // ---------------------------------------------------------------------------
-  // TTS synthesis (vibevoice, qwen3-tts, kokoro, orpheus, chatterbox, zonos-tts, lfm2-audio, and others)
+  // TTS synthesis (vibevoice, qwen3-tts, kokoro, orpheus, chatterbox, zonos-tts, lfm2-audio, dots-tts, and others)
   // ---------------------------------------------------------------------------
 
   /// Load a separate codec GGUF (qwen3-tts only; no-op for other backends).

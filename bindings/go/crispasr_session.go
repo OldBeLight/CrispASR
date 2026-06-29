@@ -4,7 +4,8 @@ package whisper
 // CrispASR Session API for TTS-capable backends (kokoro, vibevoice,
 // qwen3-tts, orpheus, chatterbox, csm, dia, zonos-tts, speecht5, fastpitch,
 // melotts, piper, parler-tts, outetts, indextts, voxcpm2-tts,
-// cosyvoice3-tts, pocket-tts, f5-tts, bark, kugelaudio, tada, lfm2-audio, ...)
+// cosyvoice3-tts, pocket-tts, f5-tts, bark, kugelaudio, tada, lfm2-audio,
+// dots-tts, ...)
 // and S2S-capable backends (lfm2-audio, mini-omni2), plus the kokoro
 // per-language model + voice resolver (PLAN #56 opt 2b).
 

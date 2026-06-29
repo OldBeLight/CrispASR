@@ -187,6 +187,7 @@ regression test against `samples/jfk.wav`:
 | orpheus | Llama-3.2 talker + SNAC RVQ codec | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu |
 | chatterbox | T3 (Llama / GPT-2) + S3Gen (Conformer + UNet1D CFM + HiFTGen) | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu, fft |
 | zonos-tts | 26L GQA transformer + 9-codebook DAC @ 44.1 kHz; CFG; voice cloning from WAV | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, gated_mlp |
+| dots-tts | Qwen2.5-1.5B LLM + 24L VAESemanticEncoder + 18L DiT flow-matching head (CFG Euler) + BigVGAN @ 48 kHz; continuous-latent AR | ✔ | mixed (DiT must stay F16; LLM+penc Q8) | — | CPU | gguf_loader, kv_self_attn, swiglu, lstm, snake_beta, istft |
 | m2m100 | facebook/m2m100 12L+12L transformer (text-to-text translation; WMT21 4.7B variant via `--backend m2m100-wmt21`) | ✔ | — | ✔ (cross-attn) | CUDA / Metal | gguf_loader, kv_self_attn |
 | madlad / t5 | T5 encoder-decoder (MADLAD-400 12L+12L, gated-GELU, RMSNorm, bucketed rel-pos bias). Tokens match Python SP bit-by-bit; translation outputs match the HF reference. | ✔ | — | ✔ (cross-attn) | CUDA / Metal | gguf_loader, ffn |
 

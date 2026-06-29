@@ -334,15 +334,17 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     }
 
     // dots.tts: Qwen2.5-1.5B LLM + 18L DiT flow-matching + 24L PatchEncoder.
-    // The DiT conditioning pathway (AdaLN, timestep MLP, input/final projections)
-    // must stay at source precision — quantization noise compounds through
-    // 16 Euler ODE steps × 18 layers × 2 (CFG) = 576 forward passes.
-    // Safe to quantize: LLM attn/ffn projections, DiT attn/ffn projections,
-    // PatchEncoder attn/ffn projections. Keep at source precision:
-    //   - dit.time_emb.* — timestep conditioning (compounds through ODE steps)
-    //   - dit.in_proj.* — DiT input projection
-    //   - dit.final_*.* — DiT output projection + AdaLN
-    //   - dit.blk.*.adaln.* — per-block AdaLN modulation
+    // The ENTIRE DiT (velocity field predictor) must stay at source precision:
+    // it runs in a CFG flow-matching loop (16 Euler ODE steps × 18 layers × 2
+    // CFG = 576 forwards) where per-step q8 noise compounds and DERAILS
+    // generation (validated: q8 DiT blocks → flow-match cos 0.994 → no-EOS
+    // runaway / garbled audio). So keep ALL dots.dit.* at F16, not just the
+    // conditioning pathway — the attn/ffn block weights matter too. The LLM
+    // (cos 0.999 on q8, dots-tts-llm diff) and PatchEncoder (cos 0.9999 on q8)
+    // blocks quantize safely, so q8 LLM + q8 penc + F16 DiT gives a ~2 GB core
+    // with an accurate flow-match (mixed-quant footprint default). Keep at
+    // source precision:
+    //   - dots.dit.* — the whole flow-matching head (blocks + AdaLN + in/final/time)
     //   - hidden_proj.* — LLM→DiT condition projection
     //   - latent_proj.* — latent→DiT input
     //   - coordinate_proj.* — noise coordinate projection
@@ -426,8 +428,7 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                sname == "cosyvoice3.s3tok.fsq.proj.w")) &&
             !is_f5tts &&
             !(is_dots_tts &&
-              (sname.find("dots.dit.time_emb.") == 0 || sname.find("dots.dit.in_proj.") == 0 ||
-               sname.find("dots.dit.final_") == 0 || sname.find(".adaln.") != std::string::npos ||
+              (sname.find("dots.dit.") == 0 || sname.find(".adaln.") != std::string::npos ||
                sname.find("dots.hidden_proj.") == 0 || sname.find("dots.latent_proj.") == 0 ||
                sname.find("dots.coordinate_proj.") == 0 || sname.find("dots.xvec_proj.") == 0 ||
                sname.find("dots.eos_proj.") == 0 || sname.find("dots.llm.tok_emb.") == 0 ||

@@ -184,6 +184,7 @@ quick-start commands and engine selection guidance.
 | piper | — | — | 22 | — | — |
 | pocket-tts | yes | temp | 24 | yes | — |
 | tada | yes | temp | 24 | yes | — |
+| dots-tts | TODO | — | 48 | yes | — |
 
 \* CustomVoice variant only; Base uses baked speakers via `--voice <name>`.
 
