@@ -310,18 +310,19 @@ extern "C" struct ark_asr_context* ark_asr_init_from_file(const char* path_model
         return nullptr;
     }
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    // Default to CPU: the GPU/sched path emits no tokens (validated empty on M1
-    // Metal 2026-06-29 — the cross-backend audio-injection / KV graph needs the
-    // per-tensor backend tagging the tightened ggml sched wants, same failure
-    // class as mimo-asr PLAN #115). CPU is verbatim (en + de). Opt into the
-    // unvalidated GPU path with CRISPASR_ARKASR_GPU=1.
-    const bool want_gpu = std::getenv("CRISPASR_ARKASR_GPU") != nullptr;
-    if (params.use_gpu && want_gpu) {
+    // GPU default. Validated verbatim on M1 Metal (en jfk + de De-Abwasch,
+    // 2026-06-29): ~5.6x faster prefill, ~neutral per-token decode (single-token
+    // decode is bandwidth/dispatch-bound on unified memory), ~1.7x faster overall
+    // on jfk. (An earlier port build "emitted no tokens" on GPU; the current
+    // flash-attn + KV path no longer reproduces it.) Force CPU with
+    // CRISPASR_ARKASR_CPU=1. CUDA/other GPUs not yet validated.
+    const bool force_cpu = std::getenv("CRISPASR_ARKASR_CPU") != nullptr;
+    if (params.use_gpu && !force_cpu) {
         ctx->backend = ggml_backend_init_best();
         if (!ctx->backend) {
             ctx->backend = ctx->backend_cpu;
         } else if (params.verbosity >= 1) {
-            fprintf(stderr, "ark_asr: GPU backend active (CRISPASR_ARKASR_GPU=1, unvalidated)\n");
+            fprintf(stderr, "ark_asr: GPU backend active (Metal-validated; CRISPASR_ARKASR_CPU=1 to force CPU)\n");
         }
     } else {
         ctx->backend = ctx->backend_cpu;
@@ -727,10 +728,13 @@ static void ark_fill_mask(std::vector<ggml_fp16_t>& mask, int T, int n_past) {
 // Run one decoder graph; returns malloc'd logits [vocab] for the last position.
 static float* ark_run_decoder(ark_asr_context* ctx, const int32_t* ids, int T, int n_past, bool inject,
                               const float* audio_features, const float* keep_mask) {
+    static const bool timing = std::getenv("CRISPASR_ARKASR_TIMING") != nullptr;
+    const int64_t t0 = timing ? ggml_time_us() : 0;
     ggml_cgraph* gf = ark_build_decoder_graph(ctx, T, n_past, inject);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
         return nullptr;
+    const int64_t t1 = timing ? ggml_time_us() : 0;
 
     auto set_t = [&](const char* nm, const void* data, size_t bytes) {
         ggml_tensor* t = ggml_graph_get_tensor(gf, nm);
@@ -763,6 +767,11 @@ static float* ark_run_decoder(ark_asr_context* ctx, const int32_t* ids, int T, i
     }
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
         return nullptr;
+    if (timing) {
+        const int64_t t2 = ggml_time_us();
+        fprintf(stderr, "[ark-timing] T=%d n_past=%d build+alloc=%.2fms compute=%.2fms (%.1f%% build)\n", T, n_past,
+                (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, 100.0 * (t1 - t0) / (double)(t2 - t0));
+    }
 
     ggml_tensor* lt = ggml_graph_get_tensor(gf, "logits");
     const int vocab = (int)ctx->hp.llm_vocab;
