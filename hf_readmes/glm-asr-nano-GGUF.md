@@ -35,7 +35,7 @@ All variants produce correct transcription on test audio.
 
 - **Architecture:** Whisper encoder (1280d, 32L, partial RoPE) + 4-frame projector + Llama LLM (2048d, 28L, GQA 16/4)
 - **Parameters:** 1.5B
-- **Languages:** 17 (Mandarin, English, Cantonese, + 14 more)
+- **Languages:** Mandarin (+ Chinese dialects), English, Cantonese (model card metadata declares `en`, `zh`; prose adds Cantonese 粤语 + other Chinese dialects). Not a general multilingual model — no Japanese/Korean/European-language support.
 - **License:** MIT
 - **Outperforms OpenAI Whisper V3** on benchmarks (lowest avg error rate 4.10)
 

@@ -35,6 +35,29 @@ public:
         if (!params.target_lang.empty())
             tgt_lang_ = params.target_lang;
         cp.target_lang = tgt_lang_.empty() ? nullptr : tgt_lang_.c_str();
+
+        // GLM-ASR-Nano-2512 is trained on Chinese (+ Chinese dialects), English,
+        // and Cantonese only (model card metadata: language: [en, zh]; prose adds
+        // Cantonese + "other dialects"). For any other `-l <lang>` the transcribe
+        // path still sends a "Please transcribe in <lang>." hint, but the model
+        // has no such language and will hallucinate (#199: `-l ja`). Warn instead
+        // of silently mistranscribing; the hint may still help steer zh/en/yue,
+        // so those stay silent. Skips the warning under --translate (target_lang
+        // is the output language there, a separate feature).
+        if (!params.no_prints && !params.translate && !params.language.empty() && params.language != "auto") {
+            const std::string& l = params.language;
+            const bool glm_lang = (l == "zh" || l == "en" || l == "yue" || l == "zh-en" || l == "zh_en" ||
+                                   l == "chinese" || l == "english" || l == "cantonese");
+            if (!glm_lang) {
+                fprintf(stderr,
+                        "crispasr[glm-asr]: WARNING: this model only transcribes Chinese (+ Chinese "
+                        "dialects), English, and Cantonese; '-l %s' is not supported and likely produces "
+                        "hallucinations. For %s, use a native backend — e.g. reazonspeech / parakeet "
+                        "(parakeet-tdt-0.6b-ja) / fastconformer-ctc / funasr (zh,yue,en,ja,ko).\n",
+                        l.c_str(), crispasr_iso_to_english_lang(l).c_str());
+            }
+        }
+
         ctx_ = glm_asr_init_from_file(params.model.c_str(), cp);
         return ctx_ != nullptr;
     }
