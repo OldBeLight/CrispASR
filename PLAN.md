@@ -255,12 +255,22 @@ bugs and CPU↔GPU divergence (sched cross-backend traps, the q8_0-on-CPU scare,
   regression); run `-bs 4` on a noisy/accented clip to see if WER actually improves
   or beam is just cost.
 
-**Audit tooling (LOW, reusable):**
-- [ ] Generalize the manual wiring cross-check into `tools/check-backend-wiring.py`:
-  for every backend, verify presence across factory / c_api `available_backends` /
-  registry / Go LDFLAGS / feature-matrix / cli.md-beam / streaming / test /
-  reference-dumper, and print a pass/gap matrix (standalone dumpers like bark/melotts
-  are an accepted pattern — don't flag them). CI-friendly; no models/GPU.
+**Audit tooling (reusable):**
+- [x] `tools/check-backend-wiring.py` (commit `ccc04a02`) — audits every canonical
+  backend against the required surface (factory / c_api dispatch + `available_backends`
+  / feature-matrix / cli.md-beam) and reports advisory coverage gaps (test, reference
+  dumper, README, registry, streaming). Aliases + standalone dumpers handled; Go check
+  delegates to `sync_go_cgo_ldflags.py` (advisory; macOS bare `--check` unreliable).
+  Linked from `docs/contributing.md`. 49 canonical PASS required.
+
+**Older-backend coverage gaps the audit surfaced (LOW cleanup — not blocking):**
+Run `python tools/check-backend-wiring.py` to re-list. As of `ccc04a02`:
+- [ ] **missing a test** (add a `test-<x>-params.cpp` null-guard/defaults test):
+  `fastconformer-ctc`, `wav2vec2`, `voxcpm2-tts`, `firered-asr`, `moonshine-streaming`.
+- [ ] **missing a reference dumper** (diff-harness coverage): `fastconformer-ctc`,
+  `wav2vec2`, `m2m100`, `kyutai-stt`, `gemma4-e2b`. (Some may be intentional — e.g.
+  m2m100 is text-only MT; gemma4-e2b shares the gemma path. Confirm before adding.)
+- [ ] **`qwen3-tts`** — no `streaming.md` row despite the streaming cap.
 
 ---
 
