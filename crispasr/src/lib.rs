@@ -378,11 +378,72 @@ impl Session {
                 ),
             }
         };
+        self.parse_session_result(res, "crispasr_session_transcribe")
+    }
+
+    /// Chunked-encode transcribe (issue #208). Forces the Parakeet backend
+    /// through its bounded long-form path (NeMo-exact single-pass +
+    /// silence-split for non-JA models, overlapping streamed encoder for the
+    /// JA-only model) regardless of audio length, so long files transcribe
+    /// in bounded time instead of one O(T²) full-length FastConformer encode
+    /// (which on the Metal backend grinds for minutes and looks like a hang
+    /// to the caller).
+    ///
+    /// `chunk_seconds <= 0` keeps the per-model defaults; otherwise it caps
+    /// the non-JA single-pass pieces / sizes the JA streamed window.
+    /// `overlap_seconds < 0` uses the default. For non-Parakeet backends the
+    /// chunk parameters are inert and this is equivalent to
+    /// [`Self::transcribe`].
+    pub fn transcribe_chunked(
+        &self,
+        pcm: &[f32],
+        chunk_seconds: i32,
+        overlap_seconds: i32,
+    ) -> Result<Vec<SessionSegment>, String> {
+        self.transcribe_chunked_with_language(pcm, chunk_seconds, overlap_seconds, None)
+    }
+
+    /// Language-aware chunked-encode transcribe (issue #208). See
+    /// [`Self::transcribe_chunked`] for the chunking semantics and
+    /// [`Self::transcribe_with_language`] for the `language` semantics.
+    pub fn transcribe_chunked_with_language(
+        &self,
+        pcm: &[f32],
+        chunk_seconds: i32,
+        overlap_seconds: i32,
+        language: Option<&str>,
+    ) -> Result<Vec<SessionSegment>, String> {
+        if pcm.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lang_c = match language {
+            Some(l) if !l.is_empty() => {
+                Some(CString::new(l).map_err(|e| format!("language NUL: {e}"))?)
+            }
+            _ => None,
+        };
+        let res = unsafe {
+            crispasr_sys::crispasr_session_transcribe_chunked_lang(
+                self.handle,
+                pcm.as_ptr(),
+                pcm.len() as i32,
+                chunk_seconds,
+                overlap_seconds,
+                lang_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+            )
+        };
+        self.parse_session_result(res, "crispasr_session_transcribe_chunked")
+    }
+
+    /// Parse a raw session-result handle into [`SessionSegment`]s and free
+    /// it. `ctx` names the call site for the null-result error message.
+    fn parse_session_result(
+        &self,
+        res: *mut crispasr_sys::CrispasrSessionResult,
+        ctx: &str,
+    ) -> Result<Vec<SessionSegment>, String> {
         if res.is_null() {
-            return Err(format!(
-                "crispasr_session_transcribe failed for backend {:?}",
-                self.backend()
-            ));
+            return Err(format!("{ctx} failed for backend {:?}", self.backend()));
         }
 
         let mut out = Vec::new();
@@ -868,9 +929,8 @@ impl Session {
     /// Set an opt-in repeated generated-token penalty for autoregressive
     /// session backends. Pass `<= 0.0` to disable it.
     pub fn set_frequency_penalty(&self, penalty: f32) -> Result<(), String> {
-        let rc = unsafe {
-            crispasr_sys::crispasr_session_set_frequency_penalty(self.handle, penalty)
-        };
+        let rc =
+            unsafe { crispasr_sys::crispasr_session_set_frequency_penalty(self.handle, penalty) };
         if rc != 0 {
             return Err(format!("set_frequency_penalty failed (rc={})", rc));
         }
@@ -918,7 +978,8 @@ impl Session {
 
     /// Enable/disable sampling (`false` = greedy). Honoured by TADA.
     pub fn set_do_sample(&self, enable: bool) -> Result<(), String> {
-        let rc = unsafe { crispasr_sys::crispasr_session_set_do_sample(self.handle, enable as i32) };
+        let rc =
+            unsafe { crispasr_sys::crispasr_session_set_do_sample(self.handle, enable as i32) };
         if rc != 0 && rc != -2 {
             return Err(format!("set_do_sample failed (rc={})", rc));
         }
@@ -936,8 +997,7 @@ impl Session {
 
     /// Set the repetition penalty (1.0 = no penalty). Honoured by chatterbox.
     pub fn set_repetition_penalty(&self, r: f32) -> Result<(), String> {
-        let rc =
-            unsafe { crispasr_sys::crispasr_session_set_repetition_penalty(self.handle, r) };
+        let rc = unsafe { crispasr_sys::crispasr_session_set_repetition_penalty(self.handle, r) };
         if rc != 0 && rc != -2 {
             return Err(format!("set_repetition_penalty failed (rc={})", rc));
         }
@@ -947,8 +1007,7 @@ impl Session {
     /// Set the classifier-free-guidance weight (chatterbox). 0 disables CFG;
     /// 0.5 is the upstream default.
     pub fn set_cfg_weight(&self, cfg_weight: f32) -> Result<(), String> {
-        let rc =
-            unsafe { crispasr_sys::crispasr_session_set_cfg_weight(self.handle, cfg_weight) };
+        let rc = unsafe { crispasr_sys::crispasr_session_set_cfg_weight(self.handle, cfg_weight) };
         if rc != 0 && rc != -2 {
             return Err(format!("set_cfg_weight failed (rc={})", rc));
         }
@@ -968,9 +1027,8 @@ impl Session {
 
     /// Set the emotion-exaggeration scalar (chatterbox). 0.5 is the upstream default.
     pub fn set_exaggeration(&self, exaggeration: f32) -> Result<(), String> {
-        let rc = unsafe {
-            crispasr_sys::crispasr_session_set_exaggeration(self.handle, exaggeration)
-        };
+        let rc =
+            unsafe { crispasr_sys::crispasr_session_set_exaggeration(self.handle, exaggeration) };
         if rc != 0 && rc != -2 {
             return Err(format!("set_exaggeration failed (rc={})", rc));
         }
@@ -980,8 +1038,7 @@ impl Session {
     /// Set the upper bound on speech tokens per synthesize call (chatterbox).
     /// Default ≈1000 tokens ≈ 20 s.
     pub fn set_max_speech_tokens(&self, n: i32) -> Result<(), String> {
-        let rc =
-            unsafe { crispasr_sys::crispasr_session_set_max_speech_tokens(self.handle, n) };
+        let rc = unsafe { crispasr_sys::crispasr_session_set_max_speech_tokens(self.handle, n) };
         if rc != 0 && rc != -2 {
             return Err(format!("set_max_speech_tokens failed (rc={})", rc));
         }
@@ -991,8 +1048,7 @@ impl Session {
     /// Set the per-phoneme length-scale / speaking-rate scalar. Honoured by
     /// kokoro today; other backends silently no-op. 1.0 = upstream default.
     pub fn set_length_scale(&self, scale: f32) -> Result<(), String> {
-        let rc =
-            unsafe { crispasr_sys::crispasr_session_set_length_scale(self.handle, scale) };
+        let rc = unsafe { crispasr_sys::crispasr_session_set_length_scale(self.handle, scale) };
         if rc != 0 && rc != -2 {
             return Err(format!("set_length_scale failed (rc={})", rc));
         }
@@ -1105,8 +1161,7 @@ impl Session {
     /// transcribe or synthesize call (used by LLM-style backends).
     pub fn set_ask(&self, prompt: &str) -> Result<(), String> {
         let cprompt = CString::new(prompt).map_err(|e| e.to_string())?;
-        let rc =
-            unsafe { crispasr_sys::crispasr_session_set_ask(self.handle, cprompt.as_ptr()) };
+        let rc = unsafe { crispasr_sys::crispasr_session_set_ask(self.handle, cprompt.as_ptr()) };
         if rc != 0 {
             return Err(format!("set_ask failed (rc={})", rc));
         }
@@ -2345,23 +2400,49 @@ pub struct ParakeetResult {
 impl ParakeetResult {
     pub fn text(&self) -> String {
         let p = unsafe { crispasr_sys::crispasr_parakeet_result_text(self.handle) };
-        if p.is_null() { String::new() } else { unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned() }
+        if p.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+        }
     }
-    pub fn n_words(&self) -> i32 { unsafe { crispasr_sys::crispasr_parakeet_result_n_words(self.handle) } }
+    pub fn n_words(&self) -> i32 {
+        unsafe { crispasr_sys::crispasr_parakeet_result_n_words(self.handle) }
+    }
     pub fn word_text(&self, i: i32) -> String {
         let p = unsafe { crispasr_sys::crispasr_parakeet_result_word_text(self.handle, i) };
-        if p.is_null() { String::new() } else { unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned() }
+        if p.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+        }
     }
-    pub fn word_t0(&self, i: i32) -> i64 { unsafe { crispasr_sys::crispasr_parakeet_result_word_t0(self.handle, i) } }
-    pub fn word_t1(&self, i: i32) -> i64 { unsafe { crispasr_sys::crispasr_parakeet_result_word_t1(self.handle, i) } }
-    pub fn n_tokens(&self) -> i32 { unsafe { crispasr_sys::crispasr_parakeet_result_n_tokens(self.handle) } }
+    pub fn word_t0(&self, i: i32) -> i64 {
+        unsafe { crispasr_sys::crispasr_parakeet_result_word_t0(self.handle, i) }
+    }
+    pub fn word_t1(&self, i: i32) -> i64 {
+        unsafe { crispasr_sys::crispasr_parakeet_result_word_t1(self.handle, i) }
+    }
+    pub fn n_tokens(&self) -> i32 {
+        unsafe { crispasr_sys::crispasr_parakeet_result_n_tokens(self.handle) }
+    }
     pub fn token_text(&self, i: i32) -> String {
         let p = unsafe { crispasr_sys::crispasr_parakeet_result_token_text(self.handle, i) };
-        if p.is_null() { String::new() } else { unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned() }
+        if p.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+        }
     }
-    pub fn token_t0(&self, i: i32) -> i64 { unsafe { crispasr_sys::crispasr_parakeet_result_token_t0(self.handle, i) } }
-    pub fn token_t1(&self, i: i32) -> i64 { unsafe { crispasr_sys::crispasr_parakeet_result_token_t1(self.handle, i) } }
-    pub fn token_p(&self, i: i32) -> f32 { unsafe { crispasr_sys::crispasr_parakeet_result_token_p(self.handle, i) } }
+    pub fn token_t0(&self, i: i32) -> i64 {
+        unsafe { crispasr_sys::crispasr_parakeet_result_token_t0(self.handle, i) }
+    }
+    pub fn token_t1(&self, i: i32) -> i64 {
+        unsafe { crispasr_sys::crispasr_parakeet_result_token_t1(self.handle, i) }
+    }
+    pub fn token_p(&self, i: i32) -> f32 {
+        unsafe { crispasr_sys::crispasr_parakeet_result_token_p(self.handle, i) }
+    }
 }
 
 impl Drop for ParakeetResult {
@@ -2376,16 +2457,37 @@ impl Drop for ParakeetResult {
 impl Parakeet {
     pub fn new(model_path: &str, n_threads: i32, use_flash: bool) -> Result<Self, String> {
         let c_path = CString::new(model_path).map_err(|e| e.to_string())?;
-        let handle = unsafe { crispasr_sys::crispasr_parakeet_init(c_path.as_ptr(), n_threads, if use_flash { 1 } else { 0 }) };
-        if handle.is_null() { return Err(format!("Failed to load Parakeet model: {model_path}")); }
+        let handle = unsafe {
+            crispasr_sys::crispasr_parakeet_init(
+                c_path.as_ptr(),
+                n_threads,
+                if use_flash { 1 } else { 0 },
+            )
+        };
+        if handle.is_null() {
+            return Err(format!("Failed to load Parakeet model: {model_path}"));
+        }
         Ok(Self { handle })
     }
 
-    pub fn transcribe(&self, pcm: &[f32], language: Option<&str>) -> Result<ParakeetResult, String> {
+    pub fn transcribe(
+        &self,
+        pcm: &[f32],
+        language: Option<&str>,
+    ) -> Result<ParakeetResult, String> {
         let lang = language.map(|l| CString::new(l).unwrap_or_default());
         let lang_ptr = lang.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
-        let res = unsafe { crispasr_sys::crispasr_parakeet_transcribe(self.handle, pcm.as_ptr(), pcm.len() as c_int, lang_ptr) };
-        if res.is_null() { return Err("crispasr_parakeet_transcribe returned null".to_string()); }
+        let res = unsafe {
+            crispasr_sys::crispasr_parakeet_transcribe(
+                self.handle,
+                pcm.as_ptr(),
+                pcm.len() as c_int,
+                lang_ptr,
+            )
+        };
+        if res.is_null() {
+            return Err("crispasr_parakeet_transcribe returned null".to_string());
+        }
         Ok(ParakeetResult { handle: res })
     }
 }
@@ -2408,57 +2510,98 @@ impl Drop for Parakeet {
 pub fn lcs_dedup_prefix_count(prev_tail: &[i32], curr: &[i32], min_lcs_length: i32) -> i32 {
     unsafe {
         crispasr_sys::crispasr_lcs_dedup_prefix_count(
-            prev_tail.as_ptr(), prev_tail.len() as c_int,
-            curr.as_ptr(), curr.len() as c_int, min_lcs_length,
+            prev_tail.as_ptr(),
+            prev_tail.len() as c_int,
+            curr.as_ptr(),
+            curr.len() as c_int,
+            min_lcs_length,
         )
     }
 }
 
 /// Run standalone VAD returning speech spans in centiseconds.
 pub fn vad_segments(
-    model_path: &str, pcm: &[f32], sample_rate: i32,
-    threshold: f32, min_speech_ms: i32, min_silence_ms: i32,
-    n_threads: i32, use_gpu: bool,
+    model_path: &str,
+    pcm: &[f32],
+    sample_rate: i32,
+    threshold: f32,
+    min_speech_ms: i32,
+    min_silence_ms: i32,
+    n_threads: i32,
+    use_gpu: bool,
 ) -> Result<Vec<(f32, f32)>, String> {
     let c_path = CString::new(model_path).map_err(|e| e.to_string())?;
     let mut out_spans: *mut f32 = std::ptr::null_mut();
     let n = unsafe {
         crispasr_sys::crispasr_vad_segments(
-            c_path.as_ptr(), pcm.as_ptr(), pcm.len() as c_int,
-            sample_rate, threshold, min_speech_ms, min_silence_ms,
-            n_threads, if use_gpu { 1 } else { 0 }, &mut out_spans,
+            c_path.as_ptr(),
+            pcm.as_ptr(),
+            pcm.len() as c_int,
+            sample_rate,
+            threshold,
+            min_speech_ms,
+            min_silence_ms,
+            n_threads,
+            if use_gpu { 1 } else { 0 },
+            &mut out_spans,
         )
     };
-    if n < 0 { return Err(format!("crispasr_vad_segments failed (rc={n})")); }
+    if n < 0 {
+        return Err(format!("crispasr_vad_segments failed (rc={n})"));
+    }
     let mut spans = Vec::with_capacity(n as usize);
     for i in 0..n as isize {
-        unsafe { spans.push((*out_spans.offset(2 * i), *out_spans.offset(2 * i + 1))); }
+        unsafe {
+            spans.push((*out_spans.offset(2 * i), *out_spans.offset(2 * i + 1)));
+        }
     }
-    if n > 0 { unsafe { crispasr_sys::crispasr_vad_free(out_spans) }; }
+    if n > 0 {
+        unsafe { crispasr_sys::crispasr_vad_free(out_spans) };
+    }
     Ok(spans)
 }
 
 /// Run unified VAD dispatcher returning speech spans in seconds.
 pub fn vad_slices(
-    model_path: &str, pcm: &[f32], sample_rate: i32,
-    threshold: f32, min_speech_ms: i32, min_silence_ms: i32,
-    speech_pad_ms: i32, max_chunk_duration_s: f32, n_threads: i32,
+    model_path: &str,
+    pcm: &[f32],
+    sample_rate: i32,
+    threshold: f32,
+    min_speech_ms: i32,
+    min_silence_ms: i32,
+    speech_pad_ms: i32,
+    max_chunk_duration_s: f32,
+    n_threads: i32,
 ) -> Result<Vec<(f32, f32)>, String> {
     let c_path = CString::new(model_path).map_err(|e| e.to_string())?;
     let mut out_spans: *mut f32 = std::ptr::null_mut();
     let n = unsafe {
         crispasr_sys::crispasr_vad_slices(
-            c_path.as_ptr(), pcm.as_ptr(), pcm.len() as c_int,
-            sample_rate, threshold, min_speech_ms, min_silence_ms,
-            speech_pad_ms, max_chunk_duration_s, n_threads, &mut out_spans,
+            c_path.as_ptr(),
+            pcm.as_ptr(),
+            pcm.len() as c_int,
+            sample_rate,
+            threshold,
+            min_speech_ms,
+            min_silence_ms,
+            speech_pad_ms,
+            max_chunk_duration_s,
+            n_threads,
+            &mut out_spans,
         )
     };
-    if n < 0 { return Err(format!("crispasr_vad_slices failed (rc={n})")); }
+    if n < 0 {
+        return Err(format!("crispasr_vad_slices failed (rc={n})"));
+    }
     let mut spans = Vec::with_capacity(n as usize);
     for i in 0..n as isize {
-        unsafe { spans.push((*out_spans.offset(2 * i), *out_spans.offset(2 * i + 1))); }
+        unsafe {
+            spans.push((*out_spans.offset(2 * i), *out_spans.offset(2 * i + 1)));
+        }
     }
-    if n > 0 { unsafe { crispasr_sys::crispasr_vad_free(out_spans) }; }
+    if n > 0 {
+        unsafe { crispasr_sys::crispasr_vad_free(out_spans) };
+    }
     Ok(spans)
 }
 
@@ -2467,10 +2610,15 @@ pub fn enhance_audio_rnnoise(pcm: &[f32]) -> Result<Vec<f32>, String> {
     let mut out = vec![0f32; pcm.len()];
     let rc = unsafe {
         crispasr_sys::crispasr_enhance_audio_rnnoise(
-            pcm.as_ptr(), pcm.len() as i32, out.as_mut_ptr(), out.len() as i32,
+            pcm.as_ptr(),
+            pcm.len() as i32,
+            out.as_mut_ptr(),
+            out.len() as i32,
         )
     };
-    if rc != 0 { return Err(format!("enhance_audio_rnnoise failed (rc={rc})")); }
+    if rc != 0 {
+        return Err(format!("enhance_audio_rnnoise failed (rc={rc})"));
+    }
     Ok(out)
 }
 
@@ -2492,8 +2640,13 @@ impl SpeakerDB {
     pub fn load(dir_path: &str) -> Result<Self, String> {
         let c_path = CString::new(dir_path).map_err(|e| e.to_string())?;
         let handle = unsafe { crispasr_sys::crispasr_speaker_db_load(c_path.as_ptr()) };
-        if handle.is_null() { return Err(format!("Failed to load speaker DB: {dir_path}")); }
-        Ok(Self { handle, dir_path: dir_path.to_string() })
+        if handle.is_null() {
+            return Err(format!("Failed to load speaker DB: {dir_path}"));
+        }
+        Ok(Self {
+            handle,
+            dir_path: dir_path.to_string(),
+        })
     }
 
     pub fn count(&self) -> i32 {
@@ -2504,8 +2657,12 @@ impl SpeakerDB {
         let mut name_buf = vec![0u8; 256];
         let score = unsafe {
             crispasr_sys::crispasr_speaker_db_match(
-                self.handle, embedding.as_ptr(), embedding.len() as i32,
-                threshold, name_buf.as_mut_ptr() as *mut c_char, 256,
+                self.handle,
+                embedding.as_ptr(),
+                embedding.len() as i32,
+                threshold,
+                name_buf.as_mut_ptr() as *mut c_char,
+                256,
             )
         };
         let name = if score >= threshold {
@@ -2522,10 +2679,15 @@ impl SpeakerDB {
         let c_name = CString::new(name).map_err(|e| e.to_string())?;
         let rc = unsafe {
             crispasr_sys::crispasr_speaker_db_enroll(
-                c_dir.as_ptr(), c_name.as_ptr(), embedding.as_ptr(), embedding.len() as i32,
+                c_dir.as_ptr(),
+                c_name.as_ptr(),
+                embedding.as_ptr(),
+                embedding.len() as i32,
             )
         };
-        if rc != 0 { return Err(format!("speaker_db_enroll failed (rc={rc})")); }
+        if rc != 0 {
+            return Err(format!("speaker_db_enroll failed (rc={rc})"));
+        }
         Ok(())
     }
 }

@@ -6,6 +6,35 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #208 2026-06-30 Parakeet session API: bounded long-audio + repeated-call collapse fixed
+
+Reporter: the session/Rust `Session::transcribe` always ran Parakeet through the
+unchunked full-length encoder (`parakeet_transcribe_ex` → one O(T²) FastConformer
+graph), so long audio "hangs" for minutes on Metal. Fixed in the session dispatch
+(`transcribe_single`, `src/crispasr_c_api.cpp`) by mirroring the CLI adapter's
+bounded long-form path: non-JA (vocab > 4096) above a memory-safe cap (300 s,
+`CRISPASR_PARAKEET_STREAM_THRESHOLD`) → NeMo-exact single-pass + silence-split
+(`parakeet_session_longform`, ported from the CLI's `transcribe_longform`, one
+session segment per piece); JA-only → the overlapping streamed encoder; short
+audio → the exact single pass (byte-identical to before). Added option-1 explicit
+entry points `crispasr_session_transcribe_chunked[_lang]` + Rust
+`Session::transcribe_chunked[_with_language]` for batch callers that want to force
+the bounded path / size the window (inert on non-Parakeet backends).
+
+**Bigger find while validating:** the §176s **encoder graph cache**
+(`cached_enc_gf`, reused when `T_mel` matches) is NOT re-entrant with the shared
+`ggml_backend_sched` — reusing the cached cgraph across `sched_reset` /
+`sched_alloc_graph` leaves compute tensors with stale buffers, so the **2nd and
+every later** same-`T_mel` encode shifts (jfk enc std 0.020 → 0.014) and the TDT
+decoder collapses to all-blank → **empty transcript**. This silently broke every
+repeated encode: long-lived sessions (the server!), the streamed/chunked paths,
+and the new silence-split path; it hid because the CLI does one encode per process.
+Fixed by making the rebuild-every-call path the default and gating the cache
+opt-in behind `CRISPASR_PARAKEET_ENC_CACHE=1` (`src/parakeet.cpp`) until it is
+reimplemented re-entrantly. Validated on `parakeet-tdt-0.6b-v3-q4_k` (M1/Metal):
+plain transcribe ×N verbatim, chunked 0 / 5 s verbatim, 60 s silence-split path
+bounded (4.1 s) and non-empty; 739/739 unit tests green. See [[LEARNINGS]].
+
 ## §192 2026-06-29 TADA Vulkan — REPEAT-f16 abort unblocked; FM time-dim divergence localized (superseded below)
 
 On branch `fix/tada-vulkan-repeat-f16` (worktree `/Volumes/backups/code/tada-vk-stash`).

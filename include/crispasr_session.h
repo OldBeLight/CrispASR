@@ -148,6 +148,21 @@ CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe_lang(c
                                                                                int n_samples, const char* language);
 CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe(crispasr_session* s, const float* pcm,
                                                                           int n_samples);
+// 0.8.7+: chunked-encode transcribe (issue #208). Forces the Parakeet
+// backend through its bounded long-form path (NeMo-exact single-pass +
+// silence-split for non-JA models, overlapping streamed encoder for the
+// JA-only model) regardless of audio length, so long files transcribe in
+// bounded time instead of one O(T^2) full-length encode. `chunk_seconds
+// <= 0` keeps the per-model defaults; otherwise it caps the non-JA
+// single-pass pieces / sizes the JA streamed window. `overlap_seconds < 0`
+// uses the default. For non-Parakeet backends the chunk params are inert
+// and this behaves exactly like crispasr_session_transcribe[_lang].
+CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe_chunked_lang(
+    crispasr_session* s, const float* pcm, int n_samples, int chunk_seconds, int overlap_seconds,
+    const char* language);
+CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe_chunked(crispasr_session* s, const float* pcm,
+                                                                                  int n_samples, int chunk_seconds,
+                                                                                  int overlap_seconds);
 CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe_vad_lang(
     crispasr_session* s, const float* pcm, int n_samples, int sample_rate, const char* vad_model_path,
     const crispasr_vad_abi_opts* opts_or_null, const char* language);

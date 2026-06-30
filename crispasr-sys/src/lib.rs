@@ -197,6 +197,33 @@ extern "C" {
         language: *const c_char,
     ) -> *mut CrispasrSessionResult;
 
+    /// 0.8.7+: chunked-encode transcribe (issue #208). Forces the
+    /// Parakeet backend through its bounded long-form path (NeMo-exact
+    /// single-pass + silence-split for non-JA models, overlapping streamed
+    /// encoder for the JA-only model) regardless of audio length, so long
+    /// files transcribe in bounded time instead of one O(T²) full-length
+    /// FastConformer encode. `chunk_seconds <= 0` keeps the per-model
+    /// defaults; otherwise it caps the non-JA single-pass pieces / sizes
+    /// the JA streamed window. `overlap_seconds < 0` uses the default. For
+    /// non-Parakeet backends the chunk params are inert and this matches
+    /// `crispasr_session_transcribe_lang`.
+    pub fn crispasr_session_transcribe_chunked_lang(
+        s: *mut CrispasrSession,
+        pcm: *const c_float,
+        n_samples: c_int,
+        chunk_seconds: c_int,
+        overlap_seconds: c_int,
+        language: *const c_char,
+    ) -> *mut CrispasrSessionResult;
+
+    pub fn crispasr_session_transcribe_chunked(
+        s: *mut CrispasrSession,
+        pcm: *const c_float,
+        n_samples: c_int,
+        chunk_seconds: c_int,
+        overlap_seconds: c_int,
+    ) -> *mut CrispasrSessionResult;
+
     /// VAD-driven session transcribe. Runs Silero VAD on the PCM buffer,
     /// merges short / overlong speech slices, stitches them into one
     /// contiguous buffer with 0.1s silence gaps, calls the backend once,
@@ -435,8 +462,10 @@ extern "C" {
         lang: *const c_char,
     ) -> c_int;
     pub fn crispasr_session_set_punctuation(s: *mut CrispasrSession, enable: c_int) -> c_int;
-    pub fn crispasr_session_set_punc_model(s: *mut CrispasrSession, punc_model: *const c_char)
-        -> c_int;
+    pub fn crispasr_session_set_punc_model(
+        s: *mut CrispasrSession,
+        punc_model: *const c_char,
+    ) -> c_int;
     pub fn crispasr_session_set_hotwords(
         s: *mut CrispasrSession,
         hotwords: *const c_char,
@@ -495,7 +524,10 @@ extern "C" {
     pub fn crispasr_session_set_min_p(s: *mut CrispasrSession, min_p: c_float) -> c_int;
     pub fn crispasr_session_set_repetition_penalty(s: *mut CrispasrSession, r: c_float) -> c_int;
     pub fn crispasr_session_set_cfg_weight(s: *mut CrispasrSession, cfg_weight: c_float) -> c_int;
-    pub fn crispasr_session_set_tts_noise_temp(s: *mut CrispasrSession, noise_temp: c_float) -> c_int;
+    pub fn crispasr_session_set_tts_noise_temp(
+        s: *mut CrispasrSession,
+        noise_temp: c_float,
+    ) -> c_int;
     pub fn crispasr_session_set_exaggeration(
         s: *mut CrispasrSession,
         exaggeration: c_float,

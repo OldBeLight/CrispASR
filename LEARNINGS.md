@@ -10,6 +10,31 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## A cached cgraph is NOT re-entrant with ggml_backend_sched — the 2nd reuse silently corrupts (#208)
+
+§176s cached the built Parakeet encoder graph (`cached_enc_gf`) and reused it
+whenever `T_mel` matched, to skip the rebuild. With the shared
+`ggml_backend_sched` this is wrong: `ggml_backend_sched_reset` +
+`ggml_backend_sched_alloc_graph` on the *same* cgraph object does not clear the
+cached compute tensors' `buffer`/`data` from the previous allocation, so the
+**second and every later** encode of that `T_mel` reads partially-stale memory.
+The failure is not a crash or NaN — the encoder output **shifts** (jfk enc std
+0.020 → 0.014, a valid-looking but wrong tensor) and the TDT decoder then emits
+only blanks → **empty transcript**. It hid for months because the CLI runs one
+encode per `T_mel` per process; it only bites a **long-lived context** that
+encodes ≥2 times: a server/session making repeated `transcribe` calls, the
+streamed/chunked long-audio encoders (same-size chunks), and silence-split
+long-form. Diagnosis was a 3-line A/B: call `transcribe` ×3 on one session →
+1st verbatim, 2nd/3rd empty; gating the cache off made all 3 verbatim. Lessons:
+(1) graph-build caching that hands a reused cgraph to a sched needs the tensors'
+backend assignment reset (or a dedicated reserved gallocr per cached graph, the
+"single-backend raw-gallocr" pattern) — you cannot just stash the cgraph;
+(2) validate any perf cache with a **repeated-call** test, not a single run — a
+one-shot CLI invocation can never surface a 2nd-use corruption; (3) "works in the
+CLI, empty from the binding" smells like cross-call context state, not a binding
+bug. Fixed by defaulting to rebuild-every-call and gating the cache opt-in
+(`CRISPASR_PARAKEET_ENC_CACHE=1`). See [[HISTORY]] #208.
+
 ## A "garbled GPU output" bug can live entirely downstream — A/B the GPUs before localizing (§192)
 
 The #192 native-Vulkan TADA garbage was localized (by a prior handover) to the

@@ -795,17 +795,36 @@ static std::vector<float> parakeet_encode_mel(parakeet_context* ctx, const float
         ctx->compute_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
     }
 
-    // §176s: reuse cached encoder graph when T_mel matches.
+    // §176s cached the built encoder graph and reused it whenever T_mel
+    // matched. That is NOT safe with the shared ggml_backend_sched: reusing
+    // the same cgraph object across sched_reset / sched_alloc_graph cycles
+    // leaves the cached compute tensors with stale buffer/data pointers from
+    // the previous allocation, so the SECOND and every later encode of the
+    // same T_mel reads partially-stale memory. The encoder output silently
+    // shifts (e.g. std 0.020 → 0.014 on jfk) and the TDT decoder collapses to
+    // all-blank → empty transcript. This breaks every repeated encode:
+    // long-lived sessions (issue #208 batch callers / the server), the
+    // streamed + chunked long-audio paths, and the silence-split long-form
+    // path. It went unnoticed because the CLI does exactly one same-T_mel
+    // encode per process.
+    //
+    // Default is therefore the correct rebuild-every-call path. The cache is
+    // kept behind an opt-in env for benchmarking only, until it is
+    // reimplemented re-entrantly (e.g. a dedicated reserved gallocr per
+    // cached graph rather than the shared sched). See issue #208.
     ggml_cgraph* gf;
-    if (ctx->cached_enc_gf && ctx->cached_enc_T_mel == T_mel) {
+    const bool use_enc_cache = getenv("CRISPASR_PARAKEET_ENC_CACHE") != nullptr;
+    if (use_enc_cache && ctx->cached_enc_gf && ctx->cached_enc_T_mel == T_mel) {
         gf = ctx->cached_enc_gf;
-    } else {
+    } else if (use_enc_cache) {
         ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
         std::swap(ctx->compute_meta, ctx->cached_enc_meta);
         gf = parakeet_build_graph_encoder(ctx, T_mel);
         std::swap(ctx->compute_meta, ctx->cached_enc_meta);
         ctx->cached_enc_gf = gf;
         ctx->cached_enc_T_mel = T_mel;
+    } else {
+        gf = parakeet_build_graph_encoder(ctx, T_mel);
     }
 
     ggml_backend_sched_reset(ctx->sched);
