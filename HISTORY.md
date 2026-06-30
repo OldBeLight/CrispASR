@@ -6,6 +6,37 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## §210 2026-06-30 Granite CUDA-graph bucketed decode (PR #207) + Metal raw-gallocr allocate-once
+
+External PR #207 (sims1253) brought **CUDA-graph capture** to granite-speech's
+LLM decode: the single-token step now runs a cached, shape-stable graph (KV read
+pinned to a fixed `Lk` bucket via `set_rows`+runtime index), plus in-graph
+`argmax` and a fused F16 embed lookup, so the ~280 GEMV launches/token replay as
+one `cudaGraphLaunch` → ~9-13× RTFx on RTX 5090, bit-identical transcripts. Also
+flips `GGML_CUDA_GRAPHS_DEFAULT=ON` (arch-gated sm_80+) and denies capture for
+k-quant `GET_ROWS` (its host sync is illegal mid-capture). Reviewed + tested on
+M1 Metal before merge (the path is gated on `use_gpu`, so it runs on Metal too,
+not just CUDA): `ctest -R granite` 9/9, jfk + fleurs_60s byte-identical between
+the bucket (GPU) and legacy (CPU) paths. Merged to main with one follow-up fix
+(`c5035969`): the argmax-fused greedy loop wrote KV at row `n_past` into the
+fixed `[0,bucket)` view without bounding `n_past` against the bucket → OOB when
+the `min(prompt+max_new+1, 4096)` clamp engages and EOS isn't hit; now stops at
+the bucket ceiling (== the hard context limit) and the per-step helpers are
+self-safe.
+
+Metal follow-up (`862dbeca`): since the bucketed graph is shape-stable and Metal
+has no capture, allocate it **once** via a persistent `ggml_gallocr` on the
+single GPU backend and reuse it every step (`granite_dec_use_gallocr`), skipping
+the per-step `sched_reset`+`sched_alloc_graph`. Default-on for non-capture
+backends, `CRISPASR_GRANITE_DEC_GALLOCR=0` opts out; CUDA/HIP and CPU-split keep
+the sched. Byte-identical, ctest 9/9. Measured (M1, Q4_K,
+`CRISPASR_GRANITE_DEC_PROFILE=1`): the win is modest on a quiet box (sched alloc
+~3 ms/step → ~0.02 ms) but large under memory pressure (alloc balloons to
+68-236 ms); the dominant ~100 ms/step is Metal per-op dispatch, which only
+indirect command buffers would fix — see [[LEARNINGS]] §210. The bucketed
+shape-stable graph is the ICB prerequisite; ICB itself is unimplemented in
+ggml-metal and is the open follow-up.
+
 ## #208 2026-06-30 Parakeet session API: bounded long-audio + repeated-call collapse fixed
 
 Reporter: the session/Rust `Session::transcribe` always ran Parakeet through the

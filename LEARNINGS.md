@@ -35,6 +35,46 @@ CLI, empty from the binding" smells like cross-call context state, not a binding
 bug. Fixed by defaulting to rebuild-every-call and gating the cache opt-in
 (`CRISPASR_PARAKEET_ENC_CACHE=1`). See [[HISTORY]] #208.
 
+## On Metal a cached decode graph is dispatch-bound, not alloc-bound — measure the step's parts, don't trust wall time (§210, PR #207)
+
+PR #207 made granite-speech's single-token LLM decode run a cached, shape-stable
+graph (fixed `Lk` bucket) so **CUDA-graph capture** engages (~9-13× on RTX 5090,
+bit-identical). The natural follow-up on Metal — which has no capture — is the
+[[HISTORY]] #208 lesson applied as a *speedup*: hand the reused cgraph a
+**dedicated reserved `ggml_gallocr` on the single GPU backend, allocate once, and
+reuse it every step** with `ggml_backend_graph_compute`, skipping the per-step
+`ggml_backend_sched_reset`+`sched_alloc_graph` that capture forces. It's correct
+(byte-identical, `granite_dec_use_gallocr` gates it: gallocr unless CUDA/HIP or a
+CPU layer-split; CUDA keeps the sched so capture still fires) and strictly less
+work — but **measuring it taught the real lesson twice over**:
+
+1. **M1 end-to-end wall time is unusable for a perf A/B.** Identical-config runs
+   swung 1.7× (3385↔5752 ms decode) purely from background macOS load
+   (`softwareupdated` at 90%, `ANECompilerService`, `cloudd`) and leftover
+   zombie procs from a timed-out batch. The fix is to **instrument the specific
+   quantity** — accumulate per-step *alloc* µs vs *compute* µs into the ctx
+   (env-gated `CRISPASR_GRANITE_DEC_PROFILE`) — which is deterministic and
+   attributable regardless of total noise. Don't A/B two configs on wall time;
+   measure the one thing your change touches, inside the step.
+
+2. **The alloc you're removing is tiny; the decode is dispatch-bound.** On a
+   quiet machine the sched per-step alloc is only ~3 ms (it *balloons* to
+   68-236 ms under memory pressure — the real robustness win on a 16 GB box),
+   while the dominant ~100 ms/step is **Metal per-op dispatch of the ~280-op
+   graph** — exactly the launch-bound cost CUDA capture eliminates and that
+   gallocr does **not** touch. `CRISPASR_METAL_N_CB` (1/2/4) made no difference,
+   and disabling concurrency/fusion only made it slower (they already help).
+   The only structural Metal fix for the dispatch floor is **indirect command
+   buffers** (`MTLIndirectCommandBuffer` — encode the fixed-shape step once,
+   replay) which **ggml-metal does not have** today; the bucketed shape-stable
+   graph is the prerequisite, so the groundwork is laid but the work is a real
+   ggml-metal feature, not a knob. Note the contrast with the chatterbox-CFM
+   gallocr **DUD** ([[HISTORY]]): there alloc was ~0.3% of a compute-heavy UNet
+   step → no win; here per-token compute is small so alloc is a *large* fraction
+   under load → gallocr helps. Same trick, opposite verdict — decided by the
+   compute/alloc ratio, which you can only know by measuring (#1). See
+   [[HISTORY]] §210.
+
 ## A "garbled GPU output" bug can live entirely downstream — A/B the GPUs before localizing (§192)
 
 The #192 native-Vulkan TADA garbage was localized (by a prior handover) to the
