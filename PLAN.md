@@ -224,6 +224,45 @@ signal. (3) Re-run each config twice for determinism before forming a hypothesis
 
 ---
 
+## Recent-backend audit — wiring gaps + easy wins (last 10 backends)
+
+Audit of the 10 most recently added backends (moss-transcribe, higgs-stt,
+ark-asr, dots-tts, nemotron, mini-omni2, lfm2-audio, tada, kugelaudio, melotts).
+Core wiring (CLI factory, c_api `available_backends`, registry, Go LDFLAGS,
+README, the auto-generated feature matrix) is complete for all 10. Remaining
+items, smallest first:
+
+**Completeness gaps (LOW):**
+- [ ] **melotts diff-harness registration** — `tools/reference_backends/melotts.py`
+  exists but is not in `REGISTERED_BACKENDS` in `tools/dump_reference.py`, so the
+  harness can't invoke it. One-line add.
+- [ ] **kugelaudio test** — no `test_*_live.cpp` *or* `test-*-params.cpp` (every
+  other recent backend has one). Add a params/smoke test.
+- [ ] **env-live-tests entries** for `tada`, `kugelaudio`, `melotts` — the other 7
+  recent backends export a `CRISPASR_MODEL_*` in `tests/env-live-tests.sh`.
+
+**Easy feature wins — beam search (LOW/MED):** `core_beam_decode` is a drop-in for
+greedy AR decoders (as in moss-transcribe / lfm2-audio). Two greedy-only ASR
+LLM-decoders can take it cheaply:
+- [ ] **higgs-stt** — Qwen3 KV-greedy decode, no `CAP_BEAM_SEARCH`. Wrap the decode
+  in `core_beam_decode::run_with_probs` (replay = embed token → `*_run_llm_kv`),
+  add the cap + `*_set_beam_size`. Gate: beam=1 must be token-identical to greedy.
+- [ ] **ark-asr** — the CLI adapter already reads `params.beam_size` but the runtime
+  ignores it (greedy). Same drop-in; add the cap. (exp/WIP, CPU-only — validate on CPU.)
+- *Not candidates:* mini-omni2 (interleaved multi-stream), nemotron (RNN-T has its
+  own beam), TTS backends (n/a).
+
+**Optimization notes (NOT easy wins — recorded so they're not mistaken for low-hanging fruit):**
+- Graph caching of the encoder/decode graph is a KNOWN trap: §176s cache is not
+  re-entrant with a shared sched (2nd reuse collapses to empty), and the
+  chatterbox/CFM graph-cache was a measured DUD (host build+alloc ≈ 0.3% of a
+  compute-bound step). Measure `ggml_time_us()` on build+alloc BEFORE porting.
+- `flash_attn_ext` is absent in tada / melotts (small attention — marginal).
+- ark-asr is CPU-only; Metal-validating it is a real win but carries the usual
+  sched/precision risk — not "easy."
+
+---
+
 ## moss-transcribe follow-ups (OPEN, LOW)
 
 The `moss-transcribe` backend (`OpenMOSS-Team/MOSS-Transcribe-preview-2B`) shipped
