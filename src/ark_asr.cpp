@@ -16,6 +16,7 @@
 #include <algorithm>
 
 #include "core/attention.h"
+#include "core/beam_decode.h"
 #include "core/bpe.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
@@ -909,27 +910,50 @@ static std::string ark_transcribe_window(ark_asr_context* ctx, const float* pcm,
     float* logits = ark_run_decoder(ctx, ids.data(), T, 0, true, feats.data(), keep.data());
     if (!logits)
         return std::string();
-    int next = argmax(logits);
-    free(logits);
 
     std::vector<int32_t> gen;
     gen.reserve((size_t)max_new);
-    gen.push_back(next);
-    int n_past = T;
-    for (int step = 1; step < max_new; step++) {
-        if (next == ctx->id_im_end)
-            break;
-        int32_t tok = next;
-        float* L = ark_run_decoder(ctx, &tok, 1, n_past, false, nullptr, nullptr);
-        if (!L)
-            break;
-        next = argmax(L);
-        free(L);
-        n_past++;
+    const int beam = ctx->params.beam_size > 0 ? ctx->params.beam_size : 1;
+
+    if (beam > 1) {
+        // Beam search via core_beam_decode replay-from-prefix. The prompt's K/V
+        // (incl. the injected audio frames) occupy slots [0, T); each beam-step
+        // rebuilds its suffix by replaying from that anchor. ark_run_decoder
+        // embeds the token ids itself and returns the last-position logits.
+        auto replay = [](ark_asr_context* c, const int32_t* toks, int n, int prompt_len) -> float* {
+            return ark_run_decoder(c, toks, n, prompt_len, false, nullptr, nullptr);
+        };
+        core_beam_decode::Config cfg;
+        cfg.max_new_tokens = max_new;
+        cfg.eos_id = ctx->id_im_end;
+        cfg.vocab_size = vocab;
+        cfg.beam_size = beam;
+        cfg.prompt_len = T;
+        auto br = core_beam_decode::run_with_probs(ctx, logits, replay, cfg);
+        logits = nullptr; // ownership transferred to core_beam_decode
+        gen = std::move(br.tokens);
+        if (!gen.empty() && gen.back() == ctx->id_im_end)
+            gen.pop_back();
+    } else {
+        int next = argmax(logits);
+        free(logits);
         gen.push_back(next);
+        int n_past = T;
+        for (int step = 1; step < max_new; step++) {
+            if (next == ctx->id_im_end)
+                break;
+            int32_t tok = next;
+            float* L = ark_run_decoder(ctx, &tok, 1, n_past, false, nullptr, nullptr);
+            if (!L)
+                break;
+            next = argmax(L);
+            free(L);
+            n_past++;
+            gen.push_back(next);
+        }
+        if (!gen.empty() && gen.back() == ctx->id_im_end)
+            gen.pop_back();
     }
-    if (!gen.empty() && gen.back() == ctx->id_im_end)
-        gen.pop_back();
 
     std::string txt = core_bpe::detokenize(ctx->vocab, gen.data(), gen.size());
     // Output cleanup. ARK opens every transcript with a bare "." token (the

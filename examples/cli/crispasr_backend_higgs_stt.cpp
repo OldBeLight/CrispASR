@@ -35,7 +35,7 @@ public:
         // split would give each window a fresh LLM context (cold-starting the
         // decoder at every boundary) and produce overlap-duplicated text —
         // diverging from the blueprint's single-pass whole-clip decode.
-        return CAP_AUTO_DOWNLOAD | CAP_FLASH_ATTN | CAP_UNBOUNDED_INPUT | CAP_INTERNAL_CHUNKING;
+        return CAP_AUTO_DOWNLOAD | CAP_FLASH_ATTN | CAP_UNBOUNDED_INPUT | CAP_INTERNAL_CHUNKING | CAP_BEAM_SEARCH;
     }
 
     bool init(const whisper_params& p) override {
@@ -67,6 +67,7 @@ public:
         } else {
             higgs_stt_set_ask(ctx_, nullptr);
         }
+        higgs_stt_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
         char* text = higgs_stt_transcribe(ctx_, samples, n_samples);
         crispasr_segment seg;
         seg.text = text ? text : "";

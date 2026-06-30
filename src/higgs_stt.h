@@ -46,6 +46,10 @@ char* higgs_stt_transcribe(struct higgs_stt_context* ctx, const float* samples, 
 // or a custom task prompt. Persists until changed.
 void higgs_stt_set_ask(struct higgs_stt_context* ctx, const char* instruction);
 
+// Beam search width. 1 = greedy (default); >1 = beam search (core_beam_decode,
+// replay-from-prefix). beam=1 is token-identical to the greedy path.
+void higgs_stt_set_beam_size(struct higgs_stt_context* ctx, int beam_size);
+
 // ---- Stage-1 helpers exposed for differential testing ----------------------
 //
 // These let a test driver feed pre-computed mel features (matching the

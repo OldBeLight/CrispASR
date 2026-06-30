@@ -224,31 +224,31 @@ signal. (3) Re-run each config twice for determinism before forming a hypothesis
 
 ---
 
-## Recent-backend audit — wiring gaps + easy wins (last 10 backends)
+## Recent-backend audit — wiring gaps + easy wins (last 10 backends) — CLOSED
 
 Audit of the 10 most recently added backends (moss-transcribe, higgs-stt,
 ark-asr, dots-tts, nemotron, mini-omni2, lfm2-audio, tada, kugelaudio, melotts).
 Core wiring (CLI factory, c_api `available_backends`, registry, Go LDFLAGS,
-README, the auto-generated feature matrix) is complete for all 10. Remaining
-items, smallest first:
+README, the auto-generated feature matrix) was complete for all 10. Follow-ups,
+all now closed:
 
-**Completeness gaps (LOW):**
-- [ ] **melotts diff-harness registration** — `tools/reference_backends/melotts.py`
-  exists but is not in `REGISTERED_BACKENDS` in `tools/dump_reference.py`, so the
-  harness can't invoke it. One-line add.
-- [ ] **kugelaudio test** — no `test_*_live.cpp` *or* `test-*-params.cpp` (every
-  other recent backend has one). Add a params/smoke test.
-- [ ] **env-live-tests entries** for `tada`, `kugelaudio`, `melotts` — the other 7
-  recent backends export a `CRISPASR_MODEL_*` in `tests/env-live-tests.sh`.
+**Completeness gaps:**
+- [x] **kugelaudio test** — added `tests/test-kugelaudio-params.cpp` (5/5 green).
+- [x] **env-live-tests entries** for `tada`, `kugelaudio`, `melotts` — added the
+  `CRISPASR_MODEL_*` exports.
+- [~] **melotts diff-harness "registration"** — NOT a real gap. `melotts.py` uses
+  the **standalone** reference-dumper pattern (run directly), which is the *majority*
+  convention: 20 of the reference dumpers are standalone (bark, csm, dia, fastpitch,
+  piper, speecht5, vibevoice, tada_codec_diff, …) and only a handful use the
+  `dump()` + `REGISTERED_BACKENDS` path. `melo` isn't even installed. Left as-is.
 
-**Easy feature wins — beam search (LOW/MED):** `core_beam_decode` is a drop-in for
-greedy AR decoders (as in moss-transcribe / lfm2-audio). Two greedy-only ASR
-LLM-decoders can take it cheaply:
-- [ ] **higgs-stt** — Qwen3 KV-greedy decode, no `CAP_BEAM_SEARCH`. Wrap the decode
-  in `core_beam_decode::run_with_probs` (replay = embed token → `*_run_llm_kv`),
-  add the cap + `*_set_beam_size`. Gate: beam=1 must be token-identical to greedy.
-- [ ] **ark-asr** — the CLI adapter already reads `params.beam_size` but the runtime
-  ignores it (greedy). Same drop-in; add the cap. (exp/WIP, CPU-only — validate on CPU.)
+**Beam search (DONE — validated token-identical greedy↔beam-2 on jfk.wav):**
+- [x] **higgs-stt** — `core_beam_decode::run_with_probs` (multi-EOS: im_end +
+  endoftext), `CAP_BEAM_SEARCH` + `higgs_stt_set_beam_size`. q4_k greedy == beam-2
+  verbatim.
+- [x] **ark-asr** — runtime beam loop (adapter already plumbed `beam_size`),
+  `CAP_BEAM_SEARCH`. `ark_run_decoder` already handles multi-token suffixes, so the
+  replay is a one-liner. q4_k greedy == beam-2 verbatim (CPU).
 - *Not candidates:* mini-omni2 (interleaved multi-stream), nemotron (RNN-T has its
   own beam), TTS backends (n/a).
 

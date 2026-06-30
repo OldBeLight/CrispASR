@@ -29,7 +29,7 @@ public:
         // default to full-audio like the reference. CAP_INTERNAL_CHUNKING makes
         // ark_asr_transcribe own the long-audio fallback (single-pass up to a
         // safety cap, else internal chunks) instead of crispasr_run's 30 s split.
-        return CAP_AUTO_DOWNLOAD | CAP_UNBOUNDED_INPUT | CAP_INTERNAL_CHUNKING | CAP_FLASH_ATTN;
+        return CAP_AUTO_DOWNLOAD | CAP_UNBOUNDED_INPUT | CAP_INTERNAL_CHUNKING | CAP_FLASH_ATTN | CAP_BEAM_SEARCH;
     }
 
     bool init(const whisper_params& params) override {

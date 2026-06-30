@@ -17,7 +17,7 @@ struct ark_asr_context_params {
     int verbosity; // 0=silent, 1=normal, 2=verbose
     bool use_gpu;
     float temperature; // 0 = greedy (only greedy is implemented for now)
-    int beam_size;     // reserved; greedy only
+    int beam_size;     // 1 = greedy (default); >1 = beam search (core_beam_decode)
 };
 
 struct ark_asr_context_params ark_asr_context_default_params(void);

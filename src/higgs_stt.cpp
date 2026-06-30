@@ -254,6 +254,7 @@ struct higgs_stt_context {
     int kv_n_used = 0;
 
     int n_threads = 4;
+    int beam_size = 1; // 1 = greedy (default); >1 = beam search (core_beam_decode)
 
     // Shared audio-tower runtime (loaded lazily on first audio call). The
     // higgs_stt_audio_tower struct above is kept around so existing in-tree
@@ -1206,6 +1207,7 @@ extern "C" const char* higgs_stt_token_text(higgs_stt_context* ctx, int id) {
 // below, granite uses the same primitives, and any future GPT-2-family
 // model gets them for free.
 #include "core/bpe.h"
+#include "core/beam_decode.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1576,6 +1578,12 @@ extern "C" void higgs_stt_set_ask(higgs_stt_context* ctx, const char* instructio
     ctx->ask = (instruction && *instruction) ? instruction : "";
 }
 
+// Beam search width. 1 = greedy (default); >1 = beam search (core_beam_decode).
+extern "C" void higgs_stt_set_beam_size(higgs_stt_context* ctx, int beam_size) {
+    if (ctx)
+        ctx->beam_size = beam_size > 0 ? beam_size : 1;
+}
+
 extern "C" char* higgs_stt_transcribe(higgs_stt_context* ctx, const float* samples, int n_samples) {
     if (!ctx || !samples || n_samples <= 0)
         return strdup("");
@@ -1645,29 +1653,55 @@ extern "C" char* higgs_stt_transcribe(higgs_stt_context* ctx, const float* sampl
     const int max_new = 1024;
     const int eos1 = (int)hp.im_end_token_id;
     const int eos2 = (int)hp.pad_token_id; // <|endoftext|>
-    for (int step = 0; step < max_new && logits; step++) {
-        int best = 0;
-        float bv = logits[0];
-        for (int i = 1; i < vs; i++)
-            if (logits[i] > bv) {
-                bv = logits[i];
-                best = i;
-            }
-        free(logits);
-        logits = nullptr;
-        if (best == eos1 || best == eos2)
-            break;
-        out_ids.push_back(best);
-        int32_t t = best;
-        float* oe = higgs_stt_embed_tokens(ctx, &t, 1);
-        if (!oe)
-            break;
-        logits = higgs_stt_run_llm_kv(ctx, oe, 1, n_past, &nt, &vs);
-        free(oe);
-        n_past++;
+
+    if (ctx->beam_size > 1 && logits) {
+        // Beam search via core_beam_decode replay-from-prefix (§167g). The
+        // prompt's K/V occupy slots [0, T_prompt); each beam-step rebuilds its
+        // suffix by replaying from that anchor.
+        auto replay = [](higgs_stt_context* c, const int32_t* toks, int n, int prompt_len) -> float* {
+            float* emb = higgs_stt_embed_tokens(c, toks, n);
+            if (!emb)
+                return nullptr;
+            float* lg = higgs_stt_run_llm_kv(c, emb, n, prompt_len, nullptr, nullptr);
+            free(emb);
+            return lg;
+        };
+        core_beam_decode::Config cfg;
+        cfg.max_new_tokens = max_new;
+        cfg.eos_ids = {eos1, eos2};
+        cfg.vocab_size = vs;
+        cfg.beam_size = ctx->beam_size;
+        cfg.prompt_len = T_prompt;
+        auto br = core_beam_decode::run_with_probs(ctx, logits, replay, cfg);
+        logits = nullptr; // ownership transferred to core_beam_decode
+        out_ids = std::move(br.tokens);
+        if (!out_ids.empty() && (out_ids.back() == eos1 || out_ids.back() == eos2))
+            out_ids.pop_back();
+    } else {
+        for (int step = 0; step < max_new && logits; step++) {
+            int best = 0;
+            float bv = logits[0];
+            for (int i = 1; i < vs; i++)
+                if (logits[i] > bv) {
+                    bv = logits[i];
+                    best = i;
+                }
+            free(logits);
+            logits = nullptr;
+            if (best == eos1 || best == eos2)
+                break;
+            out_ids.push_back(best);
+            int32_t t = best;
+            float* oe = higgs_stt_embed_tokens(ctx, &t, 1);
+            if (!oe)
+                break;
+            logits = higgs_stt_run_llm_kv(ctx, oe, 1, n_past, &nt, &vs);
+            free(oe);
+            n_past++;
+        }
+        if (logits)
+            free(logits);
     }
-    if (logits)
-        free(logits);
 
     // ---- detokenize + post-process ----
     std::string text = core_bpe::detokenize(ctx->vocab.id_to_token, out_ids.data(), out_ids.size());
