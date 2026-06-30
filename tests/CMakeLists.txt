@@ -1001,6 +1001,23 @@ catch_discover_tests(test-melotts-params
     PROPERTIES LABELS "unit;melotts"
 )
 
+# ─── test-kugelaudio-params — Catch2 unit tests for kugelaudio_context_params
+# defaults and null-guard coverage. No GGUF required. ──────────────────────────
+add_executable(test-kugelaudio-params
+    test-kugelaudio-params.cpp
+)
+target_include_directories(test-kugelaudio-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-kugelaudio-params PRIVATE
+    Catch2::Catch2WithMain
+    kugelaudio
+)
+catch_discover_tests(test-kugelaudio-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;kugelaudio"
+)
+
 # ─── test-mimoasr-params — Catch2 unit tests for mimo_asr_context_params defaults
 # and null-guard coverage. No GGUF required. ───────────────────────────────────
 add_executable(test-mimoasr-params
