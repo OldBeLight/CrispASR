@@ -19,21 +19,30 @@ by cumulative char length; composes with `--split-on-punct`
 (`examples/cli/crispasr_output.cpp`).
 
 Second issue (granite **plus**): the model's word-timestamp instruction
-("After each word add a timestamp tag … hello [T:45]") derails the decoder into a
+("After each word add a timestamp tag … hello [T:45]") derailed the decoder into a
 repetition loop ("thank you thank you …") — garbage for every output that
-triggered it (srt/vtt/--max-len and even --output-wts / json-full). Plain
-transcription is perfect. Since the new text-splitter no longer needs the model's
-timestamps for subtitles, timestamp mode is now **off by default** (opt back in
-with `CRISPASR_GRANITE_WORD_TS=1`); all granite outputs use the clean plain
-transcript with interpolated subtitle timing. This also fixes the reporter's
-"words concatenated without spaces" (that came from the word-join path now
-avoided).
+triggered it. ROOT CAUSE (found by comparing the model card prompt): the plus
+model needs IBM's **control-token chat template**
+(`<|start_of_role|>user<|end_of_role|>…<|end_of_text|><|start_of_role|>assistant…`),
+but it was routed to the legacy granite-4.0 `USER:/ASSISTANT:` wrapper. The
+discriminator `audio_token_index < 50000` misses it because granite-speech-4.1-2b-plus
+shares granite-4.0's `audio_token_index == 100352`. Plain transcription survives
+the wrong wrapper, but the demanding timestamp/SAA instructions don't — confirmed
+at max_new=200 (so not a long-decode bug): the model even emitted correctly-rising
+[T:N] tags but with "thank you" content, i.e. it had the audio duration but
+ignored its content. FIX: `use_v3_template = (audio_token_index < 50000) ||
+is_plus`, and build the user instruction once for both templates. The plus model
+now emits real word-level timestamps and speaker tags. (Supersedes the interim
+`CRISPASR_GRANITE_WORD_TS` opt-out from the first cut.) The text-only splitter
+above is still what powers `--max-len` on non-plus granite / qwen3 (which carry no
+word timings).
 
-Validated (M1/Metal, jfk.wav): non-plus granite & qwen3 `--max-len 30/25` → clean
-≤N-char SRT lines (were unsplit); plus `-osrt --max-len` and `--output-json-full`
-→ correct text (were "thank you" loops); parakeet `--max-len` still word-timed (no
-regression); 746/746 unit tests (updated the test that pinned the old
-no-split-without-words behaviour).
+Validated (M1/Metal, jfk.wav): plus `--max-len 30`/`-osrt` → correct transcript
+with real word-accurate splits (0.33/3.88/6.69/9.31 s, matching parakeet) — was a
+"thank you" loop; plus `--output-json-full` → 22 words with real `t0`/`t1`; plus
+plain unregressed; non-plus granite & qwen3 `--max-len` → text-split SRT; parakeet
+`--max-len` word-timed (no regression); 746/746 unit tests (updated the test that
+pinned the old no-split-without-words behaviour).
 
 ## §210 2026-06-30 Granite CUDA-graph bucketed decode (PR #207) + Metal raw-gallocr allocate-once
 

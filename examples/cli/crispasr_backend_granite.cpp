@@ -139,49 +139,67 @@ public:
 
         auto iso_to_eng = [](const std::string& c) -> std::string { return crispasr_iso_to_english_lang(c); };
 
+        // ---- User instruction (mode-specific), shared by both chat templates ----
+        //
+        // The PLUS variant emits native word timestamps ([T:N] tags, N =
+        // end-time centiseconds mod 1000) and speaker tags when asked, using the
+        // exact instruction strings from the model card
+        // (ibm-granite/granite-speech-4.1-2b-plus).
+        const bool is_plus = granite_speech_is_plus(ctx_);
+        const bool want_saa = is_plus && params.diarize;
+        const bool want_ts = is_plus && (params.output_wts || params.output_jsn_full || params.max_len > 0 ||
+                                         params.output_srt || params.output_vtt || params.split_on_punct);
+        std::string user_content;
+        if (want_saa && want_ts) {
+            user_content = "Speaker attribution: Transcribe and denote who is speaking "
+                           "by adding [Speaker 1]: and [Speaker 2]: tags before speaker turns. "
+                           "After each word, add a timestamp tag showing the end time in "
+                           "centiseconds, e.g. hello [T:45] world [T:82]";
+        } else if (want_saa) {
+            user_content = "Speaker attribution: Transcribe and denote who is speaking "
+                           "by adding [Speaker 1]: and [Speaker 2]: tags before speaker turns.";
+        } else if (want_ts) {
+            user_content = "Timestamps: Transcribe the speech. After each word, add a timestamp "
+                           "tag showing the end time in centiseconds, e.g. hello [T:45] world [T:82]";
+        } else if (!params.ask.empty()) {
+            user_content = params.ask;
+        } else if (params.translate) {
+            const std::string tgt =
+                params.target_lang.empty() ? std::string("English") : iso_to_eng(params.target_lang);
+            user_content = "can you translate the speech to " + tgt + "?";
+        } else if (!params.language.empty() && params.language != "auto") {
+            user_content = "can you transcribe the speech into " + iso_to_eng(params.language) + "?";
+        }
+        // Empty user_content ⇒ default plain ASR; each template supplies its own.
+
         // Chat-template selection.
         //
         // granite-4.0-1b was trained with a simple "USER: …\n ASSISTANT:"
-        // format. granite-3.x uses the IBM Granite control-token scheme:
+        // format. granite-3.x AND granite-speech-4.1 (incl. the plus variant)
+        // use the IBM Granite control-token scheme:
         //   <|start_of_role|>user<|end_of_role|>…<|end_of_text|>
         //   <|start_of_role|>assistant<|end_of_role|>
         //
-        // Discriminator: audio_token_index. granite-4.0 uses 100352 (in
-        // the 100k-vocab range), every granite-3.x variant we've seen
-        // uses a value < 50000. This is more reliable than checking for
-        // the <|start_of_role|> marker directly, because granite-4.0's
-        // vocab happens to include it as a regular token (it's in the
-        // shared GPT-NeoX table) even though the 4.0 model wasn't trained
-        // on that chat template.
-        const bool use_v3_template = (audio_tok < 50000);
+        // #205: the plus model's timestamp / SAA instructions only work through
+        // the control-token template — the legacy "USER:/ASSISTANT:" wrapper
+        // makes it ignore the audio and loop ("thank you thank you ..."), even
+        // though plain transcription survives the wrong wrapper. The
+        // audio_token_index < 50000 heuristic catches granite-3.x; OR-in is_plus
+        // so granite-speech-4.1-2b-plus (audio_token_index == 100352, same as
+        // granite-4.0) also takes the control-token path.
+        const bool use_v3_template = (audio_tok < 50000) || is_plus;
 
         std::vector<int32_t> prefix_ids, suffix_ids;
 
         if (use_v3_template) {
-            // Runtime-tokenize the granite-3.x control-token template.
-            // granite_speech_tokenize() detects <|...|> markers and
-            // emits their vocab id directly.
+            // Runtime-tokenize the control-token template.
+            // granite_speech_tokenize() detects <|...|> markers and emits their
+            // vocab id directly.
             const std::string prefix_str = "<|start_of_role|>user<|end_of_role|>";
-            std::string suffix_str = "can you transcribe the speech into a written format?"
-                                     "<|end_of_text|>\n"
-                                     "<|start_of_role|>assistant<|end_of_role|>";
-            if (!params.ask.empty()) {
-                suffix_str = params.ask + "<|end_of_text|>\n"
-                                          "<|start_of_role|>assistant<|end_of_role|>";
-            } else if (params.translate) {
-                const std::string tgt =
-                    params.target_lang.empty() ? std::string("English") : iso_to_eng(params.target_lang);
-                suffix_str = "can you translate the speech to " + tgt +
-                             "?"
-                             "<|end_of_text|>\n"
-                             "<|start_of_role|>assistant<|end_of_role|>";
-            } else if (!params.language.empty() && params.language != "auto") {
-                const std::string lang = iso_to_eng(params.language);
-                suffix_str = "can you transcribe the speech into " + lang +
-                             "?"
-                             "<|end_of_text|>\n"
-                             "<|start_of_role|>assistant<|end_of_role|>";
-            }
+            const std::string instr = user_content.empty()
+                                          ? std::string("can you transcribe the speech into a written format?")
+                                          : user_content;
+            const std::string suffix_str = instr + "<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>";
             int n = 0;
             int32_t* a = granite_speech_tokenize(ctx_, prefix_str.c_str(), &n);
             if (a && n > 0) {
@@ -196,48 +214,8 @@ public:
             } else if (a)
                 free(a);
         } else {
-            // granite-4.0/4.1 prompt: "USER: …\n ASSISTANT:"
+            // granite-4.0/4.1-1b prompt: "USER: …\n ASSISTANT:"
             prefix_ids.assign(kPrefix4, kPrefix4 + kNumPrefix4);
-
-            // PLUS variant supports SAA (speaker attribution) and word-level
-            // timestamps via mode-specific instruction strings.
-            const bool is_plus = granite_speech_is_plus(ctx_);
-            const bool want_saa = is_plus && params.diarize;
-            // #205: the plus model's word-timestamp instruction derails the
-            // decoder into a repetition loop ("thank you thank you ...") and
-            // returns garbage for EVERY output mode that used to request it
-            // (srt/vtt/--max-len/--split-on-punct and even --output-wts /
-            // json-full). It is therefore OFF by default — all outputs use a
-            // clean plain-text transcription, with subtitle line-splitting and
-            // per-word timings interpolated downstream
-            // (crispasr_make_disp_segments). Set CRISPASR_GRANITE_WORD_TS=1 to
-            // re-enable the model's native timestamp mode (for explicit
-            // per-word-timestamp outputs, once the model/prompt is fixed).
-            const bool want_ts = is_plus && (params.output_wts || params.output_jsn_full) &&
-                                 getenv("CRISPASR_GRANITE_WORD_TS") != nullptr;
-
-            std::string user_content;
-            if (want_saa && want_ts) {
-                user_content = "Speaker attribution: Transcribe and denote who is speaking "
-                               "by adding [Speaker 1]: and [Speaker 2]: tags before speaker turns. "
-                               "After each word, add a timestamp tag showing the end time in "
-                               "centiseconds, e.g. hello [T:45] world [T:82]";
-            } else if (want_saa) {
-                user_content = "Speaker attribution: Transcribe and denote who is speaking "
-                               "by adding [Speaker 1]: and [Speaker 2]: tags before speaker turns.";
-            } else if (want_ts) {
-                user_content = "Timestamps: Transcribe the speech. After each word, add a timestamp "
-                               "tag showing the end time in centiseconds, e.g. hello [T:45] world [T:82]";
-            } else if (!params.ask.empty()) {
-                user_content = params.ask;
-            } else if (params.translate) {
-                const std::string tgt =
-                    params.target_lang.empty() ? std::string("English") : iso_to_eng(params.target_lang);
-                user_content = "can you translate the speech to " + tgt + "?";
-            } else if (!params.language.empty() && params.language != "auto") {
-                user_content = "can you transcribe the speech into " + iso_to_eng(params.language) + "?";
-            }
-
             if (!user_content.empty()) {
                 const std::string instr = user_content + "\n ASSISTANT:";
                 int n = 0;
@@ -295,13 +273,6 @@ public:
             return out;
         }
 
-        const bool is_plus = granite_speech_is_plus(ctx_);
-        const bool want_saa = is_plus && params.diarize;
-        // #205: the plus timestamp mode derails the decoder, so it is off by
-        // default (opt in with CRISPASR_GRANITE_WORD_TS=1). See the comment at
-        // the prompt-construction site.
-        const bool want_ts =
-            is_plus && (params.output_wts || params.output_jsn_full) && getenv("CRISPASR_GRANITE_WORD_TS") != nullptr;
         const int max_new = params.max_new_tokens > 0 ? params.max_new_tokens : (want_ts ? 4096 : 200);
 
         // ---- Beam search path ----
@@ -613,11 +584,8 @@ public:
         // output can be structured — fall back to the batch transcribe() base path.
         const bool is_plus = granite_speech_is_plus(ctx_);
         const bool want_saa = is_plus && params.diarize;
-        // #205: the plus timestamp mode derails the decoder, so it is off by
-        // default (opt in with CRISPASR_GRANITE_WORD_TS=1). See the comment at
-        // the prompt-construction site.
-        const bool want_ts =
-            is_plus && (params.output_wts || params.output_jsn_full) && getenv("CRISPASR_GRANITE_WORD_TS") != nullptr;
+        const bool want_ts = is_plus && (params.output_wts || params.output_jsn_full || params.max_len > 0 ||
+                                         params.output_srt || params.output_vtt || params.split_on_punct);
         if (params.beam_size > 1 || want_saa || want_ts) {
             CrispasrBackend::transcribe_streaming(samples, n_samples, t_offset_cs, params, on_text);
             return;
