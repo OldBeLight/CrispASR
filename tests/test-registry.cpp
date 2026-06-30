@@ -357,6 +357,11 @@ TEST_CASE("registry: moss-audio has entry", "[unit][registry]") {
     REQUIRE(crispasr_registry_lookup("moss-audio", e));
 }
 
+TEST_CASE("registry: moss-transcribe has entry", "[unit][registry]") {
+    CrispasrRegistryEntry e;
+    REQUIRE(crispasr_registry_lookup("moss-transcribe", e));
+}
+
 TEST_CASE("registry: sensevoice has entry", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("sensevoice", e));

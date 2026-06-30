@@ -274,6 +274,7 @@ the full decode to finish:
 | `voxtral4b` | LLM greedy (Mistral LLM) | Per-step encoder-frame injection via `pre_hook` |
 | `glm-asr` | LLM greedy (GLM BPE) | Adapter-side greedy loop using exported step APIs |
 | `moss-audio` | LLM greedy (GPT-2 BPE) | Via `moss_audio_process_cb` |
+| `moss-transcribe` | LLM greedy (GPT-2 BPE) | Via `moss_transcribe_transcribe_cb` |
 | `gemma4-e2b` | LLM greedy (SentencePiece) | Via `gemma4_e2b_transcribe_cb`; control tokens filtered |
 | `moonshine-streaming` | LLM greedy (SentencePiece) | Via `moonshine_streaming_transcribe_cb` |
 | `kyutai-stt` | LLM greedy (SentencePiece) | Via `kyutai_stt_transcribe_cb`; padding tokens filtered in C lib |
