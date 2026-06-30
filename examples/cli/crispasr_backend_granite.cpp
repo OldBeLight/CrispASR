@@ -510,7 +510,14 @@ public:
         int64_t ts_last_t = t_offset_cs;
         int64_t ts_offset_cs = 0;
         auto parse_ts = [&](const std::string& text, std::vector<crispasr_word>& words) -> std::string {
-            static const std::regex ts_re(R"((\S+)\s*\[T:(\d+)\])");
+            // The word is any run of non-space, non-'[' characters. \S+ here is
+            // greedy across the bracket: when the model emits run-on word/tag
+            // pairs with no spaces ("if[T:7962]you[T:7970]got"), it collapses
+            // the whole run into one token, producing the spaceless "ifyougot"
+            // text (#205). Stopping at '[' splits each word correctly whether or
+            // not the model spaces the pairs; the spaced form ("hello [T:45]
+            // world") is unchanged.
+            static const std::regex ts_re(R"(([^\[\s]+)\s*\[T:(\d+)\])");
             std::sregex_iterator it(text.begin(), text.end(), ts_re);
             std::sregex_iterator end;
             std::string clean;

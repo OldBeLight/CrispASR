@@ -6,6 +6,23 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #205e 2026-06-30 Granite-plus timestamps: fix spaceless text on run-on [T:] pairs
+
+Reporter (AppleSheeple) confirmed `--max-len` works on `main` but flagged that the
+plus model's text comes out word-concatenated ("ifyougotsomethingtosay"). Root
+cause: the `[T:N]` parser's word capture was `(\S+)`, which is greedy *across* the
+`[`. The model card spaces its pairs ("hello [T:45] world [T:82]") and jfk parses
+fine, but on continuous dialogue the plus model emits run-on pairs with no spaces
+("if[T:7962]you[T:7970]got") — there `\S+` swallows the whole run plus the
+embedded tags into a single token, and the rebuilt text loses every space.
+
+Fix: capture the word as `([^\[\s]+)` (non-space, non-`[`), so each word splits at
+the bracket whether or not the model spaces the pairs. Verified by simulation that
+the spaced form is byte-identical (no regression) and the run-on form now splits
+into `if / you / got` → text "if you got". Runtime confirmation on the reporter's
+2.5-min sample is pending (model lives on an external disk that's currently
+detached); the change is a strict regex-robustness improvement.
+
 ## #205d 2026-06-30 Granite: keyword biasing (KWB) + incremental decoding (prefix_text)
 
 Wires up the last two granite-speech capabilities from the model card.
