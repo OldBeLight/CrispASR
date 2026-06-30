@@ -265,12 +265,16 @@ bugs and CPU↔GPU divergence (sched cross-backend traps, the q8_0-on-CPU scare,
 
 **Older-backend coverage gaps the audit surfaced (LOW cleanup — not blocking):**
 Run `python tools/check-backend-wiring.py` to re-list. As of `ccc04a02`:
-- [ ] **missing a test** (add a `test-<x>-params.cpp` null-guard/defaults test):
-  `fastconformer-ctc`, `wav2vec2`, `voxcpm2-tts`, `firered-asr`, `moonshine-streaming`.
+- [x] **missing a test** — added `test-{voxcpm2-tts,firered-asr,moonshine-streaming}-params.cpp`
+  (the three with a standalone `*_context_default_params`/`init_from_file`/`free` API).
+  `fastconformer-ctc` and `wav2vec2` are **shared encoder components** (no standalone
+  context — used by parakeet/canary etc.), so a params test is N/A; left as-is.
 - [ ] **missing a reference dumper** (diff-harness coverage): `fastconformer-ctc`,
-  `wav2vec2`, `m2m100`, `kyutai-stt`, `gemma4-e2b`. (Some may be intentional — e.g.
-  m2m100 is text-only MT; gemma4-e2b shares the gemma path. Confirm before adding.)
-- [ ] **`qwen3-tts`** — no `streaming.md` row despite the streaming cap.
+  `wav2vec2`, `m2m100`, `kyutai-stt`, `gemma4-e2b`. Mostly *intentional* — m2m100 is
+  text-only MT (no audio diff), gemma4-e2b shares the gemma path, the encoder
+  components diff via their host backends. Confirm per-backend before adding; not a
+  blanket gap.
+- [ ] **`qwen3-tts`** — no `streaming.md` row despite the streaming cap (1-line doc).
 
 ---
 

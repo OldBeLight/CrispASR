@@ -1018,6 +1018,26 @@ catch_discover_tests(test-kugelaudio-params
     PROPERTIES LABELS "unit;kugelaudio"
 )
 
+# ─── params/null-guard unit tests for backends the wiring audit flagged as
+# missing a test (tools/check-backend-wiring.py). No GGUF required. ─────────────
+add_executable(test-voxcpm2-tts-params test-voxcpm2-tts-params.cpp)
+target_include_directories(test-voxcpm2-tts-params PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-voxcpm2-tts-params PRIVATE Catch2::Catch2WithMain voxcpm2_tts)
+catch_discover_tests(test-voxcpm2-tts-params
+    TEST_SPEC "[unit]" PROPERTIES LABELS "unit;voxcpm2-tts")
+
+add_executable(test-firered-asr-params test-firered-asr-params.cpp)
+target_include_directories(test-firered-asr-params PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-firered-asr-params PRIVATE Catch2::Catch2WithMain firered-asr)
+catch_discover_tests(test-firered-asr-params
+    TEST_SPEC "[unit]" PROPERTIES LABELS "unit;firered-asr")
+
+add_executable(test-moonshine-streaming-params test-moonshine-streaming-params.cpp)
+target_include_directories(test-moonshine-streaming-params PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-moonshine-streaming-params PRIVATE Catch2::Catch2WithMain moonshine_streaming crispasr-core)
+catch_discover_tests(test-moonshine-streaming-params
+    TEST_SPEC "[unit]" PROPERTIES LABELS "unit;moonshine-streaming")
+
 # ─── test-mimoasr-params — Catch2 unit tests for mimo_asr_context_params defaults
 # and null-guard coverage. No GGUF required. ───────────────────────────────────
 add_executable(test-mimoasr-params
