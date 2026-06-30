@@ -6,6 +6,51 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## moss-transcribe 2026-06-30 MOSS-Transcribe-preview-2B ASR backend (Qwen3-Omni encoder + Qwen3-1.7B)
+
+Port of `OpenMOSS-Team/MOSS-Transcribe-preview-2B` (~2.4 B, Apache-2.0): the stock
+transformers Qwen3-Omni-MoE audio encoder (128-mel → 3×Conv2d stride-2 → `conv_out`
+7680→1280 no-bias → sinusoidal pos → 32 pre-LN layers, 1280d/20h/FFN 5120,
+block-diagonal **windowed** attention → `ln_post` → `proj1`+GELU → `proj2`→2048) +
+a Gated-MLP adapter (2048→8192→2048) + a Qwen3-1.7B LM (QK-norm, SwiGLU, RoPE
+θ=1e6, **tied embeddings**) with masked-scatter audio-token injection. ~90 % of the
+runtime reuses the sibling `moss-audio` backend and `core/{mel,attention,ffn,bpe,
+gguf_loader}`; only the encoder head and the windowed attention are new. No DeepStack.
+
+THE BUG — the entire pipeline was structurally correct yet the output was garbage
+("Verm -100 years from now …"). The canonical inference loads
+`chat_template_default.py`, which frames the audio in ChatML
+(`<|im_start|>user\n<|audio_start|>`·audio·`<|audio_end|><|im_end|>\n<|im_start|>assistant\n`).
+I had used the bare legacy audio layout, so the model never received the
+`assistant` cue and hallucinated. The diff harness localized it precisely: mel cos
+1.0, `enc_layer_0` cos 1.0 (conv + windowed attention structurally exact), and the
+first decode-token argmax MATCHED the PyTorch reference — yet both emitted "Verm",
+because the reference *also* used the legacy layout. **Matching-but-both-wrong is
+the signature that the engine is correct and the harness input (the prompt) is the
+bug** (see LEARNINGS). After switching `build_prompt` to the template (and fixing an
+undersized prompt buffer — `T_enc+8` vs the needed `T_enc+10` — that had silently
+truncated the output to empty), C++ and the bf16 reference both decode jfk.wav
+verbatim: *"and so my fellow americans ask not what your country can do for you ask
+what you can do for your country."* q4_k and q8_0 are both verbatim.
+
+Two more correctness notes: the mel must drop the trailing Whisper STFT frame
+(`stft[..., :-1]` → `n_samples/hop` frames; `core_mel` produces one extra, so the
+audio-token count drifts by one if not truncated); and the README's `MelConfig`
+(128 bins / n_fft 400) overrides the file's 80/640 defaults — the latter are a red
+herring contradicting the encoder's `conv_out` sizing.
+
+Validated on a 16 GB M1 where the full 2.4 B PyTorch reference OOMs (>12 GB and
+crashed the box twice): a **two-phase low-memory reference dumper** loads only the
+encoder+adapter (f32, ~2.6 GB) for the audio stages, frees them, then loads only the
+Qwen3-1.7B LM standalone (`Qwen3Model`, bf16, ~3.4 GB) + a tied `lm_head` via
+`F.linear(h, embed_w)` for the prefill/decode stages — never the monolithic
+`MossForCausalLM` at once (see LEARNINGS). Full wiring per `docs/contributing.md`
+(runtime `src/moss_transcribe.{h,cpp}`, converter, CLI adapter + factory, c_api,
+registry, quantize keeping enc/adapter/tied-embed at F16, Go LDFLAGS, live test,
+`crispasr-diff` branch + reference backend). Shipped `9f3c5ede`; q4_k (2.63 GB) on
+`cstr/MOSS-Transcribe-preview-2B-GGUF` (card `22818f7a`). f16/q8_0 held back for
+bandwidth.
+
 ## #205 2026-06-30 `--max-len` for text-only backends + granite-plus timestamp-mode derail
 
 Reporter: `--max-len` had no effect on granite / qwen3 (worked on whisper/cohere).

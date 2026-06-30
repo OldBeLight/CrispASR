@@ -224,6 +224,30 @@ signal. (3) Re-run each config twice for determinism before forming a hypothesis
 
 ---
 
+## moss-transcribe follow-ups (OPEN, LOW)
+
+The `moss-transcribe` backend (`OpenMOSS-Team/MOSS-Transcribe-preview-2B`) shipped
+`9f3c5ede` — q4_k verbatim on jfk.wav, validated against the PyTorch reference via
+`crispasr-diff`. See HISTORY (`## moss-transcribe`) and LEARNINGS. Remaining optional
+work:
+
+- **Publish f16 + q8_0** to `cstr/MOSS-Transcribe-preview-2B-GGUF` (q4_k + card are
+  live; f16/q8_0 were held back for WLAN bandwidth). Re-stage from
+  `/Volumes/backups/ai/moss-transcribe-preview-2b-{f16,q8_0}.gguf` and
+  `hf upload-large-folder` into the existing repo; both already produce the verbatim
+  transcript locally (q8_0 even keeps the trailing period).
+- **GPU validation beyond Metal.** Metal (default) and CPU both verbatim; CUDA/Vulkan
+  untested. The LM reuses `core_attn::kv_self_attn` (covered by the §192/#200 Vulkan
+  F16-GQA guard), so the encoder's windowed `flash_attn_ext` + the conv front-end are
+  the parts to check on CUDA.
+- **Multilingual eval.** Authors report 4.87 % avg WER; only English (jfk) validated
+  here. The model is zh/en — spot-check a Chinese clip.
+- **Encoder precision.** Encoder/adapter run F16 (cos ~0.98 vs the f32 reference);
+  byte-exact at layer 0, so this is pure F16 weight precision, not a bug. An f32
+  encoder path is not worth it (decode is verbatim), but noted for completeness.
+
+---
+
 ## Priority ordering
 
 | Priority | Item | Effort | Status |

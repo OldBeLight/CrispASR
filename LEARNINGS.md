@@ -10,6 +10,51 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## When the engine and the PyTorch reference produce the SAME wrong output, the engine is right — the harness input (usually the prompt) is the bug (moss-transcribe)
+
+The MOSS-Transcribe port passed every numerical diff stage — mel cos 1.0,
+`enc_layer_0` cos 1.0 (so conv front-end + windowed attention were bit-exact), and
+the first decode-token **argmax matched the reference** — but the transcript was
+garbage ("Verm -100 years from now …"). The instinct is "the diff passes, so where's
+the bug?". The answer: the bug was in *what we fed the model*, and both the C++
+runtime and the Python reference fed it the same wrong thing, so they agreed with
+each other while both being wrong. I had built the prompt as the bare audio layout
+`[<|im_start|>, <|audio_start|>, audio…, <|audio_end|>]`; the real model wants the
+`chat_template_default.py` ChatML framing
+(`<|im_start|>user\n<|audio_start|>`·audio·`<|audio_end|><|im_end|>\n<|im_start|>assistant\n`).
+Without the `assistant` cue the model never enters transcribe mode and hallucinates.
+
+Lessons: (1) a diff harness validates the *engine*, not the *task setup* — if the
+reference reuses the runtime's (wrong) prompt/preprocessing, a clean diff proves
+nothing about the prompt. Cross-check the prompt against the model's
+`chat_template*` / processor, not just the layer activations. (2) "C++ == reference,
+both wrong" is a *positive* signal: it rules out the compute graph and points at the
+shared input. Compare to the granite-plus case (#205) where the timing was right but
+the content was wrong → wrong chat template; same family of bug. (3) A second,
+unrelated foot-gun stacked on top: the prompt buffer was sized `T_enc+8` but the
+template needs `T_enc+10`, so `build_prompt` returned −1 and the transcribe silently
+produced *empty* output — size prompt scratch generously and check the return.
+
+## Stage the PyTorch reference load — encoder and LM as separate standalone modules, never the monolithic `*ForCausalLM` (moss-transcribe)
+
+On a 16 GB box the obvious `MossForCausalLM(config)` + `load_state_dict` reference
+OOMs at >12 GB **and crashed the machine twice** — the default-dtype init allocates
+the whole 2.4 B model in float32 (~9.6 GB) before any bf16 weights load, and even a
+bf16 in-place stream peaks ~5 GB on top of everything else. The fix is to never
+hold the whole model: the diff stages are independent, so dump them in phases.
+Phase A instantiates *only* `Qwen3OmniMoeAudioEncoder` + the adapter (`MossGatedMLP`)
+standalone (~0.6 B, ~2.6 GB f32), streams just the `model.audio_model.*` /
+`model.audio_adapter.*` tensors into them (the 1.7 B LM weights are never read), runs
+the encoder, saves the adapter output, and frees everything. Phase B then loads
+*only* `Qwen3Model` standalone (bf16, ~3.4 GB) with a tied `lm_head` reconstructed as
+`F.linear(hidden, embed_tokens.weight)`, splices the saved Phase-A output into the
+prompt embeds, and runs the prefill + a manual greedy loop. Peak ≈ max(phase) ≈
+3.4 GB instead of >12 GB. Two gotchas in Phase B's manual decode: build the model
+under `torch.set_default_dtype(torch.bfloat16)` (else the float32 init spikes), and
+pass `cache_position` on every cached step — omitting it gives wrong RoPE positions
+and the *reference* derails into a "Y. Y. Y." runaway that looks exactly like a
+quantization failure but is a decode-loop bug in the harness, not the model.
+
 ## Parakeet single-pass DROPS whole sections of long audio — chunk-and-merge, and pick the reference clip carefully (#208b)
 
 Parakeet's TDT decoder loses track once the input runs past ~30 s: a single
