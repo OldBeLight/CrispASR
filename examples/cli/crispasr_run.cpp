@@ -1548,7 +1548,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
         if (encoder_path.empty())
             encoder_path = resolve_aux("tada-encoder-f16.gguf");
         if (aligner_path.empty()) {
-            const std::string lang = params.language.empty() ? "en" : params.language;
+            const std::string lang = (params.language.empty() || params.language == "auto") ? "en" : params.language;
             aligner_path = resolve_aux("tada-aligner-" + lang + ".gguf");
             if (aligner_path.empty() && lang != "en")
                 aligner_path = resolve_aux("tada-aligner-en.gguf");
