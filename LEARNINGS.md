@@ -39,6 +39,15 @@ is robust to q8 logit rounding. `token_values` cos tracks position drift because
 the encoder pools features **at** the aligned positions, so a shifted alignment
 degrades the acoustic prompt too.
 
+Follow-up (norms/biases/convs/pos_conv): these stay F32 by **runtime
+requirement, not just precaution**. `wav2vec2_compute_logits` reads them via
+`tensor_data_f32()` — a raw `float*` view (src/wav2vec2-ggml.cpp:916–1280) — so
+storing them F16 halves the byte count and triggers
+`GGML_ASSERT(offset+size <= ggml_nbytes … tensor read out of bounds)` on the
+first logits pass. Verified: converting them F16 (494 MB) crashes on load. So
+**520 MB q8-everything is the true floor** — going smaller would need those
+CPU-side reads to handle F16, for ~26 MB, not worth it.
+
 ## A production default that diverges from the upstream reference is a whole class of bug the stage-cosine diff can't see (#192 TADA)
 
 TADA's #192 "last word clipped / crammed tempo" survived every numerical diff because the
