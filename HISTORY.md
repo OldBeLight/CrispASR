@@ -6,6 +6,53 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #192 2026-07-01 TADA CPU quality (last-word / tempo), cand>1 viability, `.wav` voice cloning + `--align`
+
+Closed out the CPU-side complaints in #192 and shipped the voice-cloning + forced-alignment
+features. Ground truth was the real `HumeAI/tada-3b-ml` run offline via
+`.codex-scratch/issue192/run_tada_python_original.py` (HF_HOME=`.cache/huggingface.bak`).
+
+1. **Last-word clip / crammed tempo — two divergences from the reference.**
+   (a) The CLI/c_api defaulted `num_acoustic_candidates=4`; upstream `InferenceOptions`
+   default is **1**. The C++ best-of-N ranker used the reconstruction ("likelihood") scorer,
+   which scores the **acoustic dims only** and is therefore blind to — and sometimes *prefers*
+   — a candidate with an outlier gray-code **duration**. On "I went to school and back in four
+   hours" that pushed a 43-frame gap into one token → ASR "…and forth"; N=1 → verbatim "…four
+   hours" across seeds. Defaulted back to 1 (`10a116e0`). A parallel session had pushed the
+   opposite (`75ee3d9d`, cand 4→8); that mangles 1b/q4_k too — cand=1 supersedes it.
+   (b) `8ddf2bb8` ran `num_prompt + shift(5)` steps; the reference runs exactly `num_prompt`
+   (the 5 trailing EOTs are already baked in by `_add_bos_eos`). The extra 5 appended trailing
+   junk frames → "…for out". Default `extra_steps=0`; `CRISPASR_TADA_EXTRA_STEPS` overrides.
+
+2. **cand>1 made viable (`a0a0432a`).** Added duration-aware selection to `fm_solve_rank_candidates`
+   and defaulted cand>1 to **`duration_median`** (a Python-provided scorer): pick the candidate
+   whose per-token duration is closest to the median. Fixes cand=4/8 "four hours" across seeds.
+   `CRISPASR_TADA_SCORER=likelihood|hybrid` A/Bs. No scorer beats cand=1 on all inputs
+   (duration_median can mispick "hello world"), so cand=1 stays the recommended default and
+   cand>1 is opt-in via `TADA_NUM_CANDIDATES`. German re-validated (cand=1 coherent — the old
+   "cand=1 garbage" claim was a harness-artifact-era artifact).
+
+3. **`.wav` voice cloning works end-to-end (`01772a3f`).** Root cause of empty synth:
+   `convert-tada-aligner-to-gguf.py` silently dropped `tokenizer.ggml.merges` (called an absent
+   `get_merges()` in `try/except:pass`), so C++ `core_bpe` byte-fell-back (26-char transcript →
+   26 tokens vs ~6 BPE) — the ref's acoustic-token count mismatched the runtime's BPE prompt
+   tokenization → prompt phase swallowed the input. Parse `tokenizer.json` `model.merges` (280147
+   merges). Also fixed the `--make-ref` input-file guard (`cli.cpp`) and made `--voice` fail loudly
+   on unresolved refs / `.wav` (was silently using the default voice). Auto-download the
+   encoder/aligner from the model repo (`41e46c7d`), `--language auto`→en (`bc87d360`).
+
+4. **All 10 language aligners published (q8_0).** `tada-aligner-{en(both repos),ar,ch,de,es,fr,it,ja,pl,pt}`
+   on `cstr/tada-tts-3b-ml-GGUF`; `en` also on the 1b repo. Aligner **q8_0 is bit-identical to f16**
+   for alignment (positions max|Δ|=0 frames, token_values cos=1.0 — the F32 `lm_head` that drives
+   the CTC alignment is preserved; only the wav2vec2 encoder layers quantize; 1.19 GB → 906 MB).
+
+5. **New `--align` verb (`fcbc8718`).** The aligner is a wav2vec2 CTC model over the Llama-3.2 BPE
+   vocab; exposed forced alignment as word timestamps:
+   `crispasr --backend tada-3b-ml -m … --auto-download --align --voice a.wav --ref-text "…" --align-format srt|json|plain`.
+   Reuses the make-ref encoder/aligner resolution; groups BPE tokens→words (space-marker boundary);
+   `position/50fps = seconds`. Free (text-less) CTC decode does **not** work — argmax is all-blank
+   (`CRISPASR_TADA_CTC_ASR` probe) → it is a *forced* aligner, not a recogniser.
+
 ## #205f 2026-06-30 Granite long-audio: chunk-context drops slices + spaceless rebuild (REAL no-spaces fix)
 
 Reproduced the reporter's two remaining complaints on the actual 2.5-min sample

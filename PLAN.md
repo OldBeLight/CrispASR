@@ -23,7 +23,17 @@ determinism, so it structurally cannot see (a) a production default diverging
 from upstream, (b) decode-policy bugs (greedy looping / cut-off words), or (c)
 perceptual pathologies. The cheap config-parity guard is **DONE** (a
 defaults-audit unit test, `tests/test-tada-params.cpp`, asserting the C++
-defaults equal upstream `InferenceOptions`). Three larger extensions remain:
+defaults equal upstream `InferenceOptions`).
+
+**Gap exposed by #192 (2026-07-01):** that guard checks the *library* default
+(`tada_context_default_params`, which correctly had `num_acoustic_candidates=1`),
+but the actual reported bug lived in the **CLI/c_api adapter** which overrode it
+to 4 (and a parallel session to 8). The parity test never sees the adapter
+override. The audit should also assert the CLI-adapter/c_api resolved defaults
+equal upstream — not just the library struct. (The cand default is now back to 1;
+`extra_steps` back to 0.)
+
+Three larger extensions remain:
 
 1. **Per-step talker logits in the diff.** Dump the talker logits at each
    generation step in both the Python reference and the C++ runtime and compare
@@ -78,16 +88,26 @@ test-all-backends.py passes 18/18 transcribe + 51/54 feature tests (3 stream ski
 
 ---
 
-## #201 follow-up — generate a TADA voice ref from audio+transcript at query time (OPEN)
+## #201 follow-up — generate a TADA voice ref from audio+transcript at query time (OPEN — offline path now DONE)
 
 The switch-voice half of #201 shipped (commit `a5cd7510`): the server reloads a
-prebaked `tada-ref-*.gguf` per request, no restart. The remaining half from the
-reporter is **on-the-fly ref generation** — accept raw audio (+ transcript) at
-inference time and bake the reference server-side, instead of requiring an
-offline `--make-ref` pass first.
+prebaked `tada-ref-*.gguf` per request, no restart.
 
-Today a `.wav` passed to `voice` is rejected (CLI adapter + session ABI both
-`return -2`/warn) because the make-ref pipeline isn't loaded in the server.
+**Offline `--make-ref` is now DONE end-to-end (#192, 2026-07-01).** The pipeline
+produces a working ref (the empty-synth bug was a missing `tokenizer.ggml.merges`
+in the aligner GGUF → byte-level fallback; fixed in `convert-tada-aligner-to-gguf.py`).
+`--make-ref` is reachable (input-file guard fixed), auto-downloads the
+encoder/aligner from the model repo (`--auto-download`), and all 10 language
+aligners (q8_0, 906 MB) + encoder are published on `cstr/tada-tts-{1b,3b-ml}-GGUF`.
+`--align` (word-timestamp) mode was added on the same aligner path. `--voice <wav>`
+at synth time now **fails loudly** and points at `--make-ref` (was silently using
+the default voice).
+
+The remaining OPEN half is **on-the-fly ref generation at inference time** —
+accept raw audio (+ transcript) in the server / a single synth call and bake the
+reference in-memory, instead of the two-step `--make-ref` then `--voice ref.gguf`.
+Today a `.wav` passed to `voice` at synth time is rejected (fails loudly) because
+the make-ref pipeline isn't loaded in the backend/server.
 
 **Approach:** the make-ref pipeline already exists in C++ (`src/tada_encoder.{h,cpp}`
 + wav2vec2 aligner runtime; CLI `--make-ref` drives it via wav2vec2 aligner → BPE

@@ -10,6 +10,55 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## A production default that diverges from the upstream reference is a whole class of bug the stage-cosine diff can't see (#192 TADA)
+
+TADA's #192 "last word clipped / crammed tempo" survived every numerical diff because the
+diff harness pins the reference to a non-default mode for determinism. The actual bug was
+the *CLI default*: `num_acoustic_candidates=4` where upstream `InferenceOptions` defaults to
+**1**. Best-of-4 mangled "…four hours" → "…and forth"; N=1 was verbatim. The fix was to match
+the upstream default, found only by running the real model (`HumeAI/tada-3b-ml`) at *its*
+default and comparing text + `time_before`, not by looking at cosines. Lessons: (1) when a
+port has "knobs", diff the **default config** against upstream, not just the forward pass;
+(2) reproduce the reporter's exact sentence against the real model — the reference `time_before`
+`[19,2,11,8,11,11,9,11,9,9,10,10]` (smooth) vs ours `[…,43,…,2]` (spike) named the bug instantly.
+Also: a parallel session "fixed" the same symptom the other way (cand 4→**8**); more candidates
+on a bad scorer is not a fix — it got lucky on one model/seed and still mangled 1b/q4_k.
+
+## Best-of-N only helps if the scorer measures what you care about — TADA's reconstruction scorer is blind to duration outliers (#192)
+
+TADA draws N flow-matching noise samples per token and keeps the "best". The default
+reconstruction ("likelihood") scorer computes MSE on the **acoustic dims only**, so a candidate
+with great acoustics but an outlier gray-code **duration** (a 43-frame gap in a ~10-frame
+context) scores well and gets picked — making cand>1 *worse* than a single draw. The cure is to
+score the thing that fails: `duration_median` (a Python-provided scorer) picks the candidate
+whose per-token duration is closest to the median, dropping the timing outliers that are the
+whole reason to draw >1. Even so, no single scorer wins on every input (duration_median can
+mispick acoustics elsewhere), so the honest answer was "N=1 is the reliable default; N>1 is an
+opt-in lottery." When best-of-N underperforms best-of-1, suspect the scorer, not the sampler.
+
+## A converter that embeds a tokenizer MUST embed the merges — a silent `try/except: pass` byte-fallback breaks everything downstream (#192)
+
+`convert-tada-aligner-to-gguf.py` wrote `tokenizer.ggml.tokens` but its merge extraction
+(`tokenizer.backend_tokenizer.model.get_merges()`, absent in the pinned `tokenizers`) threw
+inside a `try/except: pass`, so `tokenizer.ggml.merges` was silently missing. With no merges,
+C++ `core_bpe::tokenize_simple` falls back to **byte-level** tokens — a 26-char transcript
+becomes 26 tokens instead of ~6 BPE tokens. That mismatched the runtime's BPE prompt
+tokenization (acoustic-token count ≠ text-token count) and made voice cloning synthesize
+silence. The tell was "tokenized 'And so my fellow Americans' → 26 tokens" (== the byte count).
+Parse `tokenizer.json`'s `model.merges` directly (handles both `"a b"` and `["a","b"]` formats)
+and **fail loudly** if extraction yields nothing. Corollary: quantizing the aligner to q8_0 is
+bit-identical for alignment because the F32 `lm_head` (the CTC projection the DP reads) is
+preserved — only the wav2vec2 encoder layers quantize.
+
+## A forced aligner is not an ASR model — its free CTC argmax is all-blank (#192)
+
+The TADA aligner is a wav2vec2 CTC model over the Llama-3.2 128k BPE vocab and gives excellent
+per-token timecodes — but only in *forced* mode (given the transcript, the DP finds where each
+token fits). A free greedy CTC decode (argmax per frame, collapse blanks) on jfk audio produced
+**0 tokens** — the argmax is the blank/pad on all 549 frames. Trained-for-alignment CTC models
+are peaky toward blank without the text prior; don't expect them to transcribe. They are ideal
+for a `--align` word-timestamp / subtitle mode, not for recognition.
+
 ## When the engine and the PyTorch reference produce the SAME wrong output, the engine is right — the harness input (usually the prompt) is the bug (moss-transcribe)
 
 The MOSS-Transcribe port passed every numerical diff stage — mel cos 1.0,
