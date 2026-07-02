@@ -310,6 +310,39 @@ struct PCSResult {
     std::vector<std::vector<bool>> cap_preds; // [N][max_chars] — per-char upper/lower
 };
 
+// Read a weight/bias tensor into an F32 buffer, dequantizing if needed.
+//
+// The CPU-side SBD/truecase heads (and post_emb) below run in plain C++, so we
+// must pull their weights out of the GGUF as F32. A raw
+// `ggml_backend_tensor_get(t, buf, 0, n_elem*sizeof(float))` only works when the
+// tensor is stored F32 — but the q4_k/q4_0 converter quantizes these head
+// matrices (head.{post,pre,sbd,tc}.fc*.weight). For a quantized tensor
+// `ggml_nbytes(t)` is far smaller than `n_elem*4`, so the raw read asserts
+// "tensor read out of bounds" and aborts (the shipped-default q4_k crash).
+//
+// This helper reads the tensor's *native* bytes (sized by ggml_nbytes) and
+// dequantizes per row via the type's `to_float` trait, so it is correct for
+// F32, F16, and any block-quantized type. Rows are ne[0]-long and each is
+// block-quantized independently in GGUF, so we dequantize row-by-row using
+// ggml_row_size() for the stride (never t->nb[], which is wrong for quantized
+// tensors).
+static void pcs_read_tensor_f32(ggml_tensor* t, std::vector<float>& out) {
+    const int64_t n_elem = ggml_nelements(t);
+    out.resize((size_t)n_elem);
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, out.data(), 0, (size_t)n_elem * sizeof(float));
+        return;
+    }
+    const int64_t ne0 = t->ne[0];
+    const int64_t n_rows = ne0 > 0 ? n_elem / ne0 : 0;
+    const size_t row_size = ggml_row_size(t->type, ne0);
+    std::vector<uint8_t> raw(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+    const ggml_type_traits* tr = ggml_get_type_traits(t->type);
+    for (int64_t r = 0; r < n_rows; r++)
+        tr->to_float(raw.data() + (size_t)r * row_size, out.data() + (size_t)r * ne0, ne0);
+}
+
 static PCSResult pcs_run(pcs_context& ctx, const std::vector<int>& token_ids) {
     const int N = (int)token_ids.size();
     const int seq_len = N + 2; // CLS + tokens + SEP
@@ -495,7 +528,7 @@ static PCSResult pcs_run(pcs_context& ctx, const std::vector<int>& token_ids) {
         post_emb_dim = (int)ctx.post_emb_w->ne[0]; // ne[0] = embedding_dim (4)
         int n_emb = (int)ctx.post_emb_w->ne[1];    // ne[1] = n_labels (17)
         post_emb_data.resize(n_emb * post_emb_dim);
-        ggml_backend_tensor_get(ctx.post_emb_w, post_emb_data.data(), 0, post_emb_data.size() * sizeof(float));
+        pcs_read_tensor_f32(ctx.post_emb_w, post_emb_data);
     }
 
 
@@ -505,18 +538,18 @@ static PCSResult pcs_run(pcs_context& ctx, const std::vector<int>& token_ids) {
         int sbd_in = d + post_emb_dim;           // 768 + 4 = 772
         int sbd_mid = (int)ctx.sbd_fc1_w->ne[1]; // ne[1]=128 (ne[0]=772=input)
 
-        std::vector<float> sbd_fc1_w_data(sbd_in * sbd_mid);
-        ggml_backend_tensor_get(ctx.sbd_fc1_w, sbd_fc1_w_data.data(), 0, sbd_fc1_w_data.size() * sizeof(float));
+        std::vector<float> sbd_fc1_w_data;
+        pcs_read_tensor_f32(ctx.sbd_fc1_w, sbd_fc1_w_data);
         std::vector<float> sbd_fc1_b_data(sbd_mid, 0.0f);
         if (ctx.sbd_fc1_b)
-            ggml_backend_tensor_get(ctx.sbd_fc1_b, sbd_fc1_b_data.data(), 0, sbd_fc1_b_data.size() * sizeof(float));
+            pcs_read_tensor_f32(ctx.sbd_fc1_b, sbd_fc1_b_data);
 
         int sbd_out = 2;
-        std::vector<float> sbd_fc2_w_data(sbd_mid * sbd_out);
-        ggml_backend_tensor_get(ctx.sbd_fc2_w, sbd_fc2_w_data.data(), 0, sbd_fc2_w_data.size() * sizeof(float));
+        std::vector<float> sbd_fc2_w_data;
+        pcs_read_tensor_f32(ctx.sbd_fc2_w, sbd_fc2_w_data);
         std::vector<float> sbd_fc2_b_data(sbd_out, 0.0f);
         if (ctx.sbd_fc2_b)
-            ggml_backend_tensor_get(ctx.sbd_fc2_b, sbd_fc2_b_data.data(), 0, sbd_fc2_b_data.size() * sizeof(float));
+            pcs_read_tensor_f32(ctx.sbd_fc2_b, sbd_fc2_b_data);
 
         for (int t = 0; t < N; t++) {
             // Build input: [hidden[t], post_emb[post_pred[t]]]
@@ -554,17 +587,17 @@ static PCSResult pcs_run(pcs_context& ctx, const std::vector<int>& token_ids) {
         int tc_mid = (int)ctx.tc_fc1_w->ne[1]; // ne[1]=128 (ne[0]=769=input)
         int tc_out = 16;
 
-        std::vector<float> tc_fc1_w_data(tc_in * tc_mid);
-        ggml_backend_tensor_get(ctx.tc_fc1_w, tc_fc1_w_data.data(), 0, tc_fc1_w_data.size() * sizeof(float));
+        std::vector<float> tc_fc1_w_data;
+        pcs_read_tensor_f32(ctx.tc_fc1_w, tc_fc1_w_data);
         std::vector<float> tc_fc1_b_data(tc_mid, 0.0f);
         if (ctx.tc_fc1_b)
-            ggml_backend_tensor_get(ctx.tc_fc1_b, tc_fc1_b_data.data(), 0, tc_fc1_b_data.size() * sizeof(float));
+            pcs_read_tensor_f32(ctx.tc_fc1_b, tc_fc1_b_data);
 
-        std::vector<float> tc_fc2_w_data(tc_mid * tc_out);
-        ggml_backend_tensor_get(ctx.tc_fc2_w, tc_fc2_w_data.data(), 0, tc_fc2_w_data.size() * sizeof(float));
+        std::vector<float> tc_fc2_w_data;
+        pcs_read_tensor_f32(ctx.tc_fc2_w, tc_fc2_w_data);
         std::vector<float> tc_fc2_b_data(tc_out, 0.0f);
         if (ctx.tc_fc2_b)
-            ggml_backend_tensor_get(ctx.tc_fc2_b, tc_fc2_b_data.data(), 0, tc_fc2_b_data.size() * sizeof(float));
+            pcs_read_tensor_f32(ctx.tc_fc2_b, tc_fc2_b_data);
 
         for (int t = 0; t < N; t++) {
             std::vector<float> inp(tc_in);
