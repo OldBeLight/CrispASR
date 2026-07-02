@@ -1111,6 +1111,7 @@ static void qwen3_asr_build_llm_body(qwen3_asr_context* ctx, ggml_context* ctx0,
 
     cur = ggml_rms_norm(ctx0, cur, eps);
     cur = ggml_mul(ctx0, cur, m.llm.output_norm_w);
+
     cur = ggml_mul_mat(ctx0, m.llm.output_w, cur);
 
     ggml_set_name(cur, "logits");

@@ -323,6 +323,7 @@ public:
                 next = core_greedy_decode::argmax(logits + last_off, vocab);
             }
             next_p = core_greedy_decode::softmax_of(logits + last_off, vocab, next, logits[last_off + next]);
+
             free(logits);
 
             auto dec = core_greedy_decode::run_with_probs(ctx_,
