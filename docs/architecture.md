@@ -731,6 +731,24 @@ Character-based tokenizer (39 symbols en-us, 43 de-de with umlauts).
 Env vars: `CRISPASR_BANANAMIND_DEBUG=1` (per-step decoder diagnostics),
 `BANANAMIND_TTS_BENCH=1` (per-stage timing).
 
+**Tacotron2 generalization note.** BananaMind is a "Tacotron-lite" variant
+of the standard Tacotron2 architecture (NVIDIA, 1712.05884). The main
+difference is the decoder RNN: BananaMind uses 2× GRU cells with
+reduction_factor=4, while standard Tacotron2 uses 2-layer LSTM with
+reduction_factor=1 and always-on prenet dropout. The encoder, attention
+mechanism, postnet, and HiFi-GAN vocoder are architecturally identical.
+~145 Tacotron2 models exist on HuggingFace (SpeechBrain, torchaudio,
+ESPnet frameworks), but most are small single-speaker models with low
+download counts and the architecture is largely superseded by VITS,
+VALLE, and flow-matching TTS. Porting a specific standard Tacotron2 model
+would require: (1) a per-framework converter (weight naming differs), (2)
+an LSTM decoder branch in `run_decoder()` alongside the existing GRU path
+(the gate math differs: 4 gates i/f/g/o vs 3 gates r/z/n), and (3)
+always-on prenet dropout. The BananaMind runtime is designed to serve as
+the template for this — all hyperparameters are already read from GGUF KV
+metadata, so a standard Tacotron2 GGUF just needs a `decoder_rnn_type`
+key to select the LSTM path.
+
 ### pocket-tts
 
 Kyutai Pocket TTS (100M, MIT / CC-BY-4.0). Continuous-latent AR TTS —
