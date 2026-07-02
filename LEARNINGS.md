@@ -10,6 +10,22 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## Two concurrent HuggingFace uploads from one machine cause spurious mid-batch failures — serialize them (#192 aligner re-ship)
+
+Uploading a batch of GGUFs while another `hf`/`upload_file` job runs on the same
+machine looks like random flakiness but is deterministic: the two contend for the
+CAS/Xet endpoint and outbound bandwidth, and the *starved* one fails in ways that
+don't obviously say "contention." During the aligner batch, a parallel English
+re-upload running alongside it made `it`/`ja` **conversions** fail (the converter's
+safetensors download was bandwidth-starved) and `ch`/`pl` **uploads** fail their
+post-upload `list_repo_tree` verification. Killing the concurrent upload and
+re-running the batch serially fixed all four on the first pass, no code change.
+So: **one HF upload at a time per machine.** Bake sequential discipline into batch
+scripts — `create → upload → verify-on-HF → rm local → next` — and never kick off
+a second uploader "to save time." (Same root cause as the higgs-stt note that two
+concurrent Xet uploads throttle to bandwidth≈1.) Verify with the committed
+`list_repo_tree` size, not the uploader's own exit code.
+
 ## Quantizing a forced-aligner: q8 everywhere (incl. lm_head) is bit-identical; q4 on the encoder is not (#192 TADA aligner)
 
 The TADA voice-reference aligner is a wav2vec2 CTC model over the Llama-3.2 128k
