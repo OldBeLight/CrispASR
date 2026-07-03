@@ -347,6 +347,53 @@ pool-reset.{md,patch}` (file at ggml-org/llama.cpp once confirmed on native HW).
 Verified on MoltenVK: async on + guard transcribes jfk and jfk×3 verbatim with no
 perf regression (the `waitIdle` is a no-op when idle).
 
+### #215e 2026-07-03 ROOT CAUSE: cached conv graph across slices = use-after-free; GPU restored
+
+Found by working the bug from the correctness side instead of chasing the crash
+site. Vulkan validation layers run on MoltenVK (no native HW needed): core +
+**precise sync validation** on jfk3 = clean, so the API usage is valid — the crash
+must live in code paths the M1 never takes. The big one is UMA: discrete GPUs use
+the staging/transfer machinery the crash implicates. Added a
+`GGML_VK_FORCE_NON_UMA=1` debug knob to vendored ggml-vulkan (pretend-discrete on
+UMA) — and with it, **jfk3 segfaulted on the M1**, same shape as the reporter's
+crash: slice 1 clean, slice 2 conv chunk 0 dies. The macOS crash report showed the
+truth: NULL deref in `ggml_backend_sched_backend_from_buffer` during
+`sched_alloc_graph` — and an ASan build then proved it under the **default**
+config: **heap-use-after-free**, read in `ggml_backend_sched_backend_from_buffer`
+(ggml-backend.cpp:878), freed by `ggml_gallocr_reserve_n_impl` (gallocr regrow),
+allocated by the same in an earlier `sched_alloc_graph`.
+
+Mechanism: `run_encoder` cached the conv-stem cgraph across encoder invocations.
+Slice 1 allocs it (tensor->buffer set to the gallocr's buffers); the larger
+xf/adapter/decode graphs then **regrow** the shared sched's gallocr, freeing those
+`ggml_backend_buffer` structs; slice 2's first conv-chunk `sched_alloc_graph`
+walks the cached graph and reads the freed structs to pick backends. On macOS the
+freed chunk is occasionally recycled → clean NULL segfault (which is why it never
+reproduced locally); on Linux glibc the chunk retains plausible garbage → the
+sched proceeds and uses stale vk_buffer handles → destroyed VkBuffer/VkDeviceMemory
+usage tramples the driver heap → the fault surfaces at the *next* driver call —
+`vkResetCommandPool`, on a provably idle queue, exactly the reporter's backtrace.
+Explains every observation: needs ≥2 slices, q8_0 AND q4_k, RADV AND NVIDIA, CPU
+fine, MoltenVK "fine". Same class as the parakeet §176s lesson (enc graph cache
+NOT re-entrant with a shared sched) and most likely TADA #192.
+
+Fix: rebuild the conv graph at every `moss_transcribe_run_encoder` entry (reuse
+across the intra-call chunk loop stays — identical allocs, no regrow in between,
+so §176s-style savings are kept); same invalidation at `moss_audio_run_encoder`
+entry. Reverted the #215d platform-gated CPU fallback — GPU is default again on
+native Vulkan; `CRISPASR_MOSS_{TRANSCRIBE,AUDIO}_FORCE_CPU=1` kept as escape
+hatches (the `*_VULKAN_NATIVE` envs are gone). Kept: #215a manual encoder
+attention on Vulkan (re-testing flash there is a separate follow-up now that the
+repro harness exists).
+
+Verified: fixed build × 3 runs of jfk3 under `GGML_VK_FORCE_NON_UMA=1` + full
+Vulkan validation — zero crashes, zero hazards, verbatim transcript; ASan build
+on jfk3 default — zero reports (was: 1 UAF per multi-slice run). AUDIT
+FOLLOW-UP: canary (`cached_enc_gf` + decoder on one sched — vulnerable when
+consecutive slices have equal T_mel), canary_ctc, chatterbox_s3gen
+(`unet_cached_gf`) share the cross-call cached-graph pattern and need the same
+treatment or a shared clear-after-use helper.
+
 ### #215d 2026-07-03 the sync theories were WRONG — platform-gated CPU fallback
 
 The reporter tested the #215c build on a **Radeon** (debug `bt full` attached to

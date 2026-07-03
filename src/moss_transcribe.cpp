@@ -777,13 +777,25 @@ extern "C" float* moss_transcribe_run_encoder(struct moss_transcribe_context* ct
 
     std::vector<float> hidden((size_t)d * T_enc, 0.0f); // (d, T_enc) ne-order (d fast)
 
-    // Build/cache conv-stem graph (fixed chunk_T).
-    if (!ctx->cached_conv_gf) {
-        ctx->cached_conv_meta.assign(ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(4096, false), 0);
-        ggml_init_params aip = {ctx->cached_conv_meta.size(), ctx->cached_conv_meta.data(), true};
-        ctx->cached_conv_ctx = ggml_init(aip);
-        ctx->cached_conv_gf = moss_transcribe_build_conv_graph(ctx, chunk_T, ctx->cached_conv_ctx);
+    // Build the conv-stem graph fresh on every encoder invocation (#215).
+    // The graph is still reused across the per-chunk loop below, which is
+    // safe: the chunk allocs are identical, so the sched's gallocr never
+    // regrows in between. Caching it ACROSS invocations is a use-after-free:
+    // the larger xf/adapter/decode graphs regrow the shared sched's gallocr,
+    // freeing the ggml_backend_buffer structs this graph's tensors still
+    // point to, and the next sched_alloc_graph reads them (ASan:
+    // heap-use-after-free in ggml_backend_sched_backend_from_buffer). On
+    // native Vulkan the stale pointers instead corrupt the driver heap and
+    // fault later, at vkResetCommandPool — the #215 RADV/NVIDIA segfault.
+    if (ctx->cached_conv_ctx) {
+        ggml_free(ctx->cached_conv_ctx);
+        ctx->cached_conv_ctx = nullptr;
+        ctx->cached_conv_gf = nullptr;
     }
+    ctx->cached_conv_meta.assign(ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(4096, false), 0);
+    ggml_init_params aip = {ctx->cached_conv_meta.size(), ctx->cached_conv_meta.data(), true};
+    ctx->cached_conv_ctx = ggml_init(aip);
+    ctx->cached_conv_gf = moss_transcribe_build_conv_graph(ctx, chunk_T, ctx->cached_conv_ctx);
 
     int out_off = 0;
     for (int c = 0; c < num_chunks; c++) {
@@ -1505,34 +1517,15 @@ extern "C" struct moss_transcribe_context* moss_transcribe_init_from_file(
     if (ctx->backend_cpu)
         ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
-        // #215: moss-transcribe segfaults on NATIVE Vulkan (RADV/NVIDIA) inside the
-        // encoder — vkResetCommandPool faults in the driver during graph cleanup once
-        // the shared context has accumulated state across audio slices. Draining the
-        // queue before the reset AND disabling async both proved insufficient on real
-        // hardware (the reporter's backtrace shows the fault persists after the queue
-        // is provably idle → graph-scale state corruption, not pending buffers). It
-        // only hits native Vulkan drivers; MoltenVK is verified safe, as are CUDA and
-        // Metal. MoltenVK is the ONLY Vulkan implementation on Apple platforms, and
-        // there is no native Vulkan driver on macOS — so "native Vulkan" == a Vulkan
-        // backend on a non-Apple build. Gating on the platform is a compile-time
-        // decision: no device-string parsing and no env-before-device-creation race.
-        // Force the (still-crashing) native GPU path for A/B with
-        // CRISPASR_MOSS_TRANSCRIBE_VULKAN_NATIVE=1.
-#if !defined(__APPLE__)
-    if (backend_is_vulkan(ctx->backend)) {
-        const char* force_native = std::getenv("CRISPASR_MOSS_TRANSCRIBE_VULKAN_NATIVE");
-        if (!(force_native && force_native[0] == '1')) {
-            ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend);
-            const char* desc = dev ? ggml_backend_dev_description(dev) : "";
-            fprintf(stderr,
-                    "moss_transcribe: native Vulkan backend (%s) — running on CPU (encoder "
-                    "segfaults in vkResetCommandPool on RADV/NVIDIA, issue #215). CUDA/Metal/"
-                    "MoltenVK use the GPU; set CRISPASR_MOSS_TRANSCRIBE_VULKAN_NATIVE=1 to force GPU.\n",
-                    desc);
+    // #215 resolved: the native-Vulkan (RADV/NVIDIA) segfault was a use-after-free
+    // in run_encoder's conv-stem graph cached across encoder invocations (see the
+    // comment there); the GPU is the default again on all Vulkan drivers.
+    // CRISPASR_MOSS_TRANSCRIBE_FORCE_CPU=1 remains as an escape hatch.
+    {
+        const char* force_cpu = std::getenv("CRISPASR_MOSS_TRANSCRIBE_FORCE_CPU");
+        if (force_cpu && force_cpu[0] == '1')
             ctx->backend = ctx->backend_cpu;
-        }
     }
-#endif
     if (ggml_backend_is_cpu(ctx->backend))
         ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
 

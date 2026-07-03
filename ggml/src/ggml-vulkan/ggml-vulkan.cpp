@@ -5158,7 +5158,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         device->subgroup_size = subgroup_props.subgroupSize;
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
-        device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+        // CrispASR: GGML_VK_FORCE_NON_UMA=1 pretends the device is discrete so the
+        // staging-buffer/transfer paths can be exercised (and raced) on UMA
+        // hardware — used to reproduce issue #215 on MoltenVK.
+        device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu &&
+                      getenv("GGML_VK_FORCE_NON_UMA") == nullptr;
         if (sm_builtins) {
             device->shader_core_count = sm_props.shaderSMCount;
         } else if (amd_shader_core_properties2) {

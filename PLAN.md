@@ -359,6 +359,34 @@ all now closed:
 
 ---
 
+## #215e follow-up — audit cross-call cached cgraphs for the gallocr UAF (OPEN, HIGH)
+
+The #215 root cause (HISTORY #215e) is generic: a cgraph cached ACROSS
+`sched_alloc_graph` invocations keeps `tensor->buffer` pointers into gallocr
+buffers that any larger interleaved graph on the same sched frees on regrow; the
+next alloc of the cached graph reads freed `ggml_backend_buffer` structs
+(ASan-verified on moss-transcribe) and on native Vulkan writes through stale
+`vk_buffer` handles → driver-heap corruption → delayed driver crash
+(vkResetCommandPool). moss_transcribe + moss_audio are fixed (rebuild/invalidate
+per encoder invocation). Same pattern still present in:
+
+- **canary** (`cached_enc_gf`, keyed on T_mel, decoder graphs interleave on the
+  same sched) — vulnerable whenever consecutive slices have equal T_mel (uniform
+  30 s chunks!). Repro recipe: ASan build + >=2 equal-length slices.
+- **canary_ctc** (`cached_gf`, two alloc sites) — check whether both graph shapes
+  share one sched.
+- **chatterbox_s3gen** (`unet_cached_gf` + many other graphs on the shared sched).
+- Grep beyond these: `grep -rn "cached_.*gf" src/` and any new §176s-style caches.
+
+Options per site: (a) rebuild/invalidate at entry like moss (loses cross-call
+cache benefit), or (b) a shared clear-after-use helper that walks the cached
+graph right after compute and NULLs buffer/data on non-WEIGHTS tensors (keeps
+the graph-build savings; usage flag must be read while the buffer is still
+alive). Verify each with the #215e harness: ASan build + `GGML_VK_FORCE_NON_UMA=1`
++ Vulkan validation layers on MoltenVK (see HISTORY #215e).
+
+---
+
 ## moss-transcribe follow-ups (OPEN, LOW)
 
 The `moss-transcribe` backend (`OpenMOSS-Team/MOSS-Transcribe-preview-2B`) shipped
