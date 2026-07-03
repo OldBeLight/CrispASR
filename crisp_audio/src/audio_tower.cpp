@@ -28,6 +28,15 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 
+// audio_tower.cpp is shared: CrispASR builds it standalone (no imatrix), and
+// CrispEmbed builds it with its src/ on the include path (imatrix.h present) so
+// a multimodal calibration run exercises the audio-tower tensors. Feature-detect
+// so the SAME source compiles in both; keep the __has_include guard intact.
+#if __has_include("imatrix.h")
+#include "imatrix.h"
+#define CRISP_AUDIO_HAS_IMATRIX 1
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -561,6 +570,10 @@ struct crisp_audio_context* crisp_audio_init_from_file(const char* gguf_path, co
     // on its assigned backend rather than letting the scheduler migrate.
     ctx->sched = ggml_backend_sched_new(backends.data(), nullptr, (int)backends.size(), kGraphCapacity, false, false);
 
+#ifdef CRISP_AUDIO_HAS_IMATRIX
+    crispembed_imatrix_install(ctx->sched); // no-op unless CRISPEMBED_IMATRIX_OUT is set
+#endif
+
     if (ctx->verbosity >= 1) {
         fprintf(stderr,
                 "crisp_audio: loaded dialect=qwen_omni d_model=%u layers=%u "
@@ -574,6 +587,9 @@ struct crisp_audio_context* crisp_audio_init_from_file(const char* gguf_path, co
 void crisp_audio_free(struct crisp_audio_context* ctx) {
     if (!ctx)
         return;
+#ifdef CRISP_AUDIO_HAS_IMATRIX
+    crispembed_imatrix_flush(); // one-shot binaries exit past atexit
+#endif
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model_buf)
@@ -585,6 +601,27 @@ void crisp_audio_free(struct crisp_audio_context* ctx) {
     if (ctx->backend)
         ggml_backend_free(ctx->backend);
     delete ctx;
+}
+
+// Dequant-safe host read: mel_filters is a 2-D tensor, so on a quantized GGUF it
+// is stored Q8_0/Q4_K and a raw n*sizeof(float) ggml_backend_tensor_get overruns
+// ggml_nbytes → out-of-bounds abort (audio crashed on ANY quantized model). Read
+// the raw block and dequantize via type-traits instead.
+static void mel_read_f32(ggml_tensor* t, std::vector<float>& out) {
+    const int64_t n = ggml_nelements(t);
+    out.resize((size_t)n);
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, out.data(), 0, (size_t)n * sizeof(float));
+        return;
+    }
+    std::vector<uint8_t> raw(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+    if (t->type == GGML_TYPE_F16) {
+        ggml_fp16_to_fp32_row((const ggml_fp16_t*)raw.data(), out.data(), n);
+    } else {
+        const auto* tt = ggml_get_type_traits(t->type);
+        tt->to_float(raw.data(), out.data(), n);
+    }
 }
 
 float* crisp_audio_compute_mel(struct crisp_audio_context* ctx, const float* samples, int n_samples, int* out_n_mels,
@@ -603,10 +640,9 @@ float* crisp_audio_compute_mel(struct crisp_audio_context* ctx, const float* sam
     const int n_mels = (int)hp.n_mels;
     const int n_freqs = n_fft / 2 + 1;
 
-    std::vector<float> hann(n_fft);
-    ggml_backend_tensor_get(ctx->w.mel_window, hann.data(), 0, (size_t)n_fft * sizeof(float));
-    std::vector<float> filt((size_t)n_freqs * n_mels);
-    ggml_backend_tensor_get(ctx->w.mel_filters, filt.data(), 0, filt.size() * sizeof(float));
+    std::vector<float> hann, filt;
+    mel_read_f32(ctx->w.mel_window, hann);  // 1-D (usually F32) — safe either way
+    mel_read_f32(ctx->w.mel_filters, filt); // 2-D — quantized on q4_k/q8_0 GGUFs
 
     core_mel::Params p;
     p.n_fft = n_fft;
