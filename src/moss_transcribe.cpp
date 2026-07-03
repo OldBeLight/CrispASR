@@ -1505,8 +1505,34 @@ extern "C" struct moss_transcribe_context* moss_transcribe_init_from_file(
     if (ggml_backend_is_cpu(ctx->backend))
         ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
 
-    // Encoder attention path selection (issue #215). flash_attn_ext segfaults on
-    // Vulkan during graph cleanup → default to the manual attention path there.
+    // #215: moss-transcribe segfaults on Vulkan inside the encoder's per-chunk
+    // sched loop — ggml_vk_command_pool_cleanup (resetCommandPool) faults in the
+    // native RADV/NVIDIA driver after enough graph-compute cycles (reporter:
+    // "multiple slices are needed"; scales with audio length). The encoder
+    // manual-attention guard (7255c4e2) did NOT stop it — the trigger is the many
+    // rapid sched_reset/alloc/compute cycles, not flash_attn_ext, and the
+    // per-token LM decode loop would hit the same path next. Not reproducible on
+    // MoltenVK (Metal translation never resets the vendor command pool the same
+    // way). Until the ggml-vulkan resource-lifecycle bug is fixed upstream, run
+    // the whole model on CPU when the GPU backend is Vulkan; CUDA/Metal are
+    // unaffected. Opt back into the crashing native path with
+    // CRISPASR_MOSS_TRANSCRIBE_VULKAN_NATIVE=1.
+    if (backend_is_vulkan(ctx->backend)) {
+        const char* native = std::getenv("CRISPASR_MOSS_TRANSCRIBE_VULKAN_NATIVE");
+        if (!(native && native[0] == '1')) {
+            fprintf(stderr, "moss_transcribe: Vulkan backend detected — running on CPU "
+                            "(encoder segfaults on native Vulkan during graph cleanup, issue "
+                            "#215). Use CUDA/Metal for GPU acceleration, or set "
+                            "CRISPASR_MOSS_TRANSCRIBE_VULKAN_NATIVE=1 to force the Vulkan path.\n");
+            ctx->backend = ctx->backend_cpu;
+            ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        }
+    }
+
+    // Encoder attention path selection (issue #215). Only reached with a real GPU
+    // backend (Vulkan requires the VULKAN_NATIVE opt-in above). flash_attn_ext
+    // segfaults on Vulkan, so under that opt-in the encoder uses the manual
+    // soft_max_ext path.
     {
         const char* force_flash = std::getenv("CRISPASR_MOSS_TRANSCRIBE_ENC_FLASH");
         const char* force_manual = std::getenv("CRISPASR_MOSS_TRANSCRIBE_ENC_MANUAL");

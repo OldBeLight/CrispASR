@@ -237,6 +237,34 @@ exact code shape via moss-transcribe. No moss-audio omni model was available loc
 for an end-to-end A/B, so it is verified by code-pattern equivalence + clean compile,
 not a fresh diff run — worth a jfk A/B once the omni GGUF is on hand.
 
+### #215b 2026-07-03 the manual-attn guard was insufficient — CPU fallback on Vulkan
+
+Reporter (AppleSheeple) confirmed the manual-attention guard above did NOT fix the
+crash: it still segfaults with **multiple slices** (`jfk` looped 3× via
+`ffmpeg -stream_loop 2`). So `flash_attn_ext` was NOT the cause — the trigger is
+the encoder's per-chunk sched loop doing many rapid
+`sched_reset/alloc/compute` cycles (the cached conv-stem graph runs once per 100
+mel frames, scaling with audio length → "multiple slices"). The fault is
+`ggml_vk_command_pool_cleanup → resetCommandPool` in the native RADV/NVIDIA driver
+after enough cycles ("Requires command buffers to be done") — a ggml-vulkan
+resource-lifecycle issue, not moss math. The crash surfaces in the encoder, but
+the per-token LM decode loop (even more sched cycles) would hit the same path.
+Still not reproducible on MoltenVK (its Metal translation never resets the vendor
+command pool the same way), so no local repro — the fix is chosen for *certainty*,
+not verified against the crash.
+
+Fix: when the GPU backend is Vulkan, run the **whole moss-transcribe model on CPU**
+(swap `ctx->backend = ctx->backend_cpu` before load, tada-#192 precedent) — zero
+Vulkan execution ⇒ a Vulkan crash is impossible, by construction. CUDA/Metal are
+unaffected (unchanged GPU path). Opt back into the native Vulkan path (which also
+re-enables the manual-attn encoder from #215a) with
+`CRISPASR_MOSS_TRANSCRIBE_VULKAN_NATIVE=1`. Same guard applied to `moss-audio`
+(`CRISPASR_MOSS_AUDIO_VULKAN_NATIVE=1`). Verified on the local Vulkan (MoltenVK)
+build: `--gpu-backend vulkan` now prints the CPU-fallback notice and transcribes
+jfk×3 verbatim; the native opt-in still runs the Vulkan path. Trade-off: AMD-only
+users lose GPU accel for moss until the upstream ggml-vulkan bug is fixed — pending
+the reporter confirming the fallback resolves the segfault on real hardware.
+
 ## #205 2026-06-30 `--max-len` for text-only backends + granite-plus timestamp-mode derail
 
 Reporter: `--max-len` had no effect on granite / qwen3 (worked on whisper/cohere).
