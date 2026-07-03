@@ -6767,6 +6767,18 @@ Legend: ✅ have · ⚠️ partial/manual · ❌ missing · 🎁 inherited-via-g
    is the real gate; the single first-token-logit cosine is a proxy that can
    mislead. Harness verdict now gates on CER (cosine tiebreaks easy quants).
    Lesson: imatrix's payoff grows as bits shrink — biggest at q3_k/iq3.
+   **FLEET RUN (Kaggle `chr1str/crispasr-imatrix-quant`, CUDA, ~105 min):**
+   calibrated+quantized q4_k & q3_k imatrix for 5 ASR-LLM decoders on the CC0
+   corpus, A/B CER vs f16, uploaded to each HF repo. **imatrix improved CER on
+   8/10, tied 2/10 (ark-3b), 0 regressions:**
+   - qwen3-asr-0.6b: q4_k 0.008→0.000, q3_k 0.664→0.623
+   - **mega-asr-1.7b: q4_k 0.132→0.010 (−0.122!), q3_k 0.389→0.132 (−0.257)** ← headline
+   - moss-transcribe-2b: q4_k 0.150→0.102, q3_k 0.259→0.170
+   - higgs-stt: q4_k 0.050→0.014, q3_k 0.010→0.003
+   - ark-asr-3b: q4_k/q3_k tied (heavy F16 guards → little quantized)
+   Also VALIDATES the imatrix producer on **CUDA** (was open). Kernel at
+   `tools/kaggle/imatrix-quant/`; safety gates (empty imatrix→skip, CER>0.8→no
+   upload) guard against a bad producer. Log at /Volumes/backups/code/kaggle-out.
    Still **OPEN**: wiring the collector into the remaining (non-ASR-decoder)
    backends if we ever want imatrix there too.
 2. **FA default-on audit.** Upstream flipped flash-attn to baseline. Re-check
