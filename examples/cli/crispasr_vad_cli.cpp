@@ -86,8 +86,24 @@ std::vector<crispasr_audio_slice> crispasr_compute_audio_slices(const float* sam
         auto slices = crispasr_compute_vad_slices(samples, n_samples, sample_rate, vad_path.c_str(), opts);
         if (!slices.empty())
             return slices;
-        // VAD model load failed or detected no speech — fall through
-        // to fixed chunking so the CLI still produces output.
+        // Issue #213: when the VAD model loaded successfully but detected
+        // no speech, return empty (= no transcription). Previously we fell
+        // through to energy-based chunking, which fed silent chunks to the
+        // ASR model and caused hallucinated text.
+        //
+        // Only fall through to the energy-chunk fallback when the model
+        // itself failed to load (the library logs a warning to stderr in
+        // that case). We detect this by checking if the model file exists
+        // and is readable — if it does, the VAD ran and "no speech" is the
+        // correct answer.
+        FILE* f = fopen(vad_path.c_str(), "rb");
+        if (f) {
+            fclose(f);
+            // Model file exists → VAD ran, no speech detected.
+            return slices;
+        }
+        // Model file missing/unreadable → fall through to energy chunking.
+        fprintf(stderr, "crispasr: VAD model '%s' not accessible, falling back to fixed chunking\n", vad_path.c_str());
     }
 
     // VAD-free fallback: cut at lowest-RMS 100 ms within the last 5 s of
