@@ -11674,3 +11674,54 @@ only phonemizer (Windows, no espeak-ng), there's no fallback for edge cases.
 `CRISPASR_KOKORO_G2P=espeak-first` lets users with espeak-ng installed prefer
 it for higher-quality output, while `builtin-only` is useful for GPL-free
 deployments that want deterministic results.
+
+## 2026-07 — SentencePiece tokenizer taxonomy: greedy longest-match is wrong for BOTH Unigram and BPE
+
+An audit of the shared `crisp_punc` engines and the m2m100 translation backend found
+that several tokenizers used **greedy longest-match** subword segmentation. Greedy is
+correct only for **WordPiece** (BERT). It is wrong for the two SentencePiece model types,
+in different ways, and mis-segmentation silently degrades every downstream head:
+
+- **SP Unigram** (XLM-RoBERTa: pcs, fullstop-punc, fireredpunc's `is_sentencepiece` path)
+  needs **Viterbi** (maximise the sum of piece log-probs). Greedy mis-splits multi-subword
+  words (e.g. "delayed" → wrong pieces), corrupting embeddings (measured per-token cos as
+  low as 0.13). Fix: inline Viterbi over `tokenizer.ggml.scores` (the SP piece log-probs),
+  which the converters must now emit. Landed for pcs (`crisp_punc/src/pcs.cpp`,
+  `tokenize_sp_viterbi`) and fireredpunc; GGUFs re-uploaded with scores.
+- **SP BPE** (M2M-100 / wmt21: scores are `-merge_rank`, not log-probs) needs **merge-order**
+  tokenization — the shared `core_spm::tokenize_bpe` (merge the highest-score adjacent pair
+  whose concatenation is a vocab piece). Greedy was the m2m100 backend's tokenizer since its
+  initial commit (`502505fd`, self-labeled "for basic testing") — never a regression, always
+  broken. Two GGUF-side bugs blocked the BPE tokenizer even after switching algorithms:
+  1. **Scores mis-aligned.** The converter mapped SP scores by a constant id offset
+     (`spm_id = m2m_id - 1`). That is WRONG whenever `vocab.json` is not a constant-offset
+     reorder of the SP model (true for m2m100_418M, not for wmt21). Score **by string**
+     (`sp.piece_to_id(tok)`) instead — verified 0/127607 mismatches vs SP.
+  2. **Vocab incomplete.** `vocab.json` can omit SP pieces that are needed only as
+     *intermediate* merges (m2m100_418M omits ~390, e.g. "esterd" building "esterday").
+     Without them BPE stalls short (`▁y est erd ay` instead of `▁y esterday`). Fix: the
+     converter appends the missing SP pieces at ids ≥ `vocab_size` with their SP scores; the
+     engine uses them for merging and maps any *final* token id ≥ `vocab_size` to `<unk>`
+     (exactly HF's `M2M100Tokenizer.convert_token_to_id`). These pieces never have an
+     embedding row because they are never emitted as final tokens.
+
+Result: m2m100-418m f16 reproduces HF (`AutoModelForSeq2SeqLM`) translations **exactly**
+(token counts + output); q8_0 matches except rare quant-floor decode flips. wmt21-dense-24
+(4.7B) was re-converted on Kaggle (`tools/kaggle/wmt21-convert/`) — its `vocab.json` was
+already complete (0 intermediates) and its scores already correct, so its only bug was the
+engine's greedy tokenizer; all three wmt21 GGUFs verified 0/128000 score mismatch + BPE
+reproduces SP. General rule: **for a SentencePiece BPE model the GGUF tokenizer needs the
+FULL SP vocab (incl. non-final intermediate pieces) with by-string scores, or BPE diverges.**
+
+Debug env: `M2M100_DEBUG=1` dumps the BPE path + pieces; `PCS_DEBUG` / `PCS_FORCE_CPU`
+similar for the punctuation engines.
+
+### 2026-07 — GELU "gelu" is exact erf, not the tanh approximation
+
+`ggml_gelu` is the tanh approximation; `ggml_gelu_erf` is exact. A model whose HF config
+`hidden_act="gelu"` (BERT, RoBERTa, XLM-R, DeBERTa-v2/v3, LiLT) is **exact erf** — using
+`ggml_gelu` drifts and flips borderline argmaxes over many layers. Only `gelu_new` /
+`gelu_pytorch_tanh` / `gelu_fast` (GPT-2, Gemma, SigLIP) are genuinely tanh, and
+`quick_gelu` (CLIP) is `ggml_gelu_quick`. Fixed in `bert_encoder.cpp` (bert-base-uncased,
+MeloTTS conditioning) and, in the shared crisp_punc lib, in `pcs.cpp` + `fireredpunc.cpp`.
+Verify each hit against the model's real `config.json`, not intuition.
