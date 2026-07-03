@@ -418,44 +418,33 @@ static void cif_predict(paraformer_context* ctx, const float* enc_out, int T, in
         alphas[t] = 1.0f / (1.0f + std::exp(-val)); // sigmoid
     }
 
-    // CIF accumulation: integrate alphas, fire when ≥ 1.0.
-    //
-    // Accumulate in DOUBLE. The number of fired tokens — and therefore the
-    // transcript length — is decided by this running sum crossing 1.0 (and the
-    // tail crossing `tail_threshold`). A float32 sum over T frames is sensitive
-    // to codegen (FMA fusion, evaluation order, optimisation level): the -O3
-    // production builds and the -O1/instrumented sanitizer builds accumulate a
-    // few ULP differently, which is enough to flip a boundary frame and
-    // gain/drop one token — a real transcript diff (e.g. the JFK ending falling
-    // off), with no memory fault. Doubling the accumulator makes the firing
-    // boundary stable across every build config. Weights are double too so the
-    // partial-token blend is consistent; the embeddings stay float32.
-    const double tail_threshold = 0.45;
-    double accum = 0.0;
+    // CIF accumulation: integrate alphas, fire when ≥ 1.0
+    const float tail_threshold = 0.45f;
+    float accum = 0.0f;
     std::vector<float> fired; // (D,) vectors, one per fired token
     std::vector<float> partial((size_t)D, 0.0f);
 
     for (int t = 0; t < T; t++) {
-        const double alpha = alphas[t];
+        float alpha = alphas[t];
         accum += alpha;
-        if (accum >= 1.0) {
+        if (accum >= 1.0f) {
             // Fire: blend current frame
-            const double remainder = 1.0 - (accum - alpha);
+            float remainder = 1.0f - (accum - alpha);
             for (int d = 0; d < D; d++) {
-                partial[d] += (float)(remainder * enc_out[(size_t)t * D + d]);
+                partial[d] += remainder * enc_out[(size_t)t * D + d];
             }
             fired.insert(fired.end(), partial.begin(), partial.end());
             if (fire_frames)
                 fire_frames->push_back(t);
             // Start new token with leftover
-            const double leftover = accum - 1.0;
+            float leftover = accum - 1.0f;
             for (int d = 0; d < D; d++) {
-                partial[d] = (float)(leftover * enc_out[(size_t)t * D + d]);
+                partial[d] = leftover * enc_out[(size_t)t * D + d];
             }
             accum = leftover;
         } else {
             for (int d = 0; d < D; d++) {
-                partial[d] += (float)(alpha * enc_out[(size_t)t * D + d]);
+                partial[d] += alpha * enc_out[(size_t)t * D + d];
             }
         }
     }

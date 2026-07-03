@@ -331,7 +331,7 @@ jobs:
             sed -i "s|archive.ubuntu.com|azure.archive.ubuntu.com|g" /etc/apt/sources.list
             sed -i "s|security.ubuntu.com|azure.archive.ubuntu.com|g" /etc/apt/sources.list
             for i in 1 2 3 4 5; do apt update && break || sleep 10; done
-            apt install -y build-essential cmake git
+            apt install -y build-essential cmake git curl
             cmake . -DCMAKE_BUILD_TYPE=Debug \
               -DWHISPER_SANITIZE_${{ matrix.sanitizer }}=ON \
               -DGGML_OPENMP=OFF
