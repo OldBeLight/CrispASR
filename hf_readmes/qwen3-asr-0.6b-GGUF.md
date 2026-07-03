@@ -65,9 +65,37 @@ This is the **first speech-LLM** in the CrispASR family — every other model in
 | `qwen3-asr-0.6b.gguf`        | 1.88 GB | F16 |
 | `qwen3-asr-0.6b-q8_0.gguf`   | 961 MB  | Q8_0, near-lossless |
 | `qwen3-asr-0.6b-q4_k.gguf`   | 676 MB  | **Q4_K — recommended default**, faster than realtime on a 4-core CPU |
+| `qwen3-asr-0.6b-q4_k-imatrix.gguf` | 540 MB | Q4_K, **importance-matrix calibrated** — smaller variant (the LM head is quantised too), with an imatrix to recover the resulting logit error. See below. |
+| `qwen3-asr-0.6b-en-de.imatrix.gguf` | 913 KB | The importance matrix itself (CC0 Common Voice EN+DE calibration), for reproducibility / re-quantising other sizes. |
 
 All quantisations produce the correct transcript on `samples/jfk.wav`:
 > And so, my fellow Americans, ask not what your country can do for you; ask what you can do for your country.
+
+### About the imatrix variant
+
+`-q4_k-imatrix.gguf` is a **smaller** Q4_K build (540 MB vs 676 MB) that also
+quantises the large `output.weight` / LM head — normally left at higher
+precision because its error goes straight into the logits. To compensate, it is
+quantised with an **importance matrix**: per-column activation statistics
+collected by running real audio through the F16 model
+(`CRISPASR_IMATRIX_OUT`), so the quantiser spends precision on the columns the
+model actually uses (the same idea as llama.cpp's `llama-imatrix`, but computed
+from **audio** rather than a text corpus).
+
+Calibrated on a **CC0 [Mozilla Common Voice](https://commonvoice.mozilla.org)**
+English + German sample. Measured with the `tools/imatrix_ab.py` A/B harness
+(prefill first-token-logit cosine vs the F16 gold, held-out clips):
+
+| | mean cos vs F16 | delta |
+| --- | ---: | ---: |
+| Q4_K (same recipe, no imatrix) | 0.890 | — |
+| **Q4_K + imatrix** | **0.941** | **+0.051** (every EN/DE clip improved; DE most) |
+
+So the imatrix recovers about half the fidelity lost by the extra compression,
+at no size cost. Use the plain `-q4_k.gguf` (676 MB) if you'd rather keep the LM
+head at full precision; use `-q4_k-imatrix.gguf` when size matters most.
+**Calibration language coverage matters** — an English-only corpus made the
+imatrix *worse*; the EN+DE mix is what produced the gains above.
 
 The mel filterbank from `WhisperFeatureExtractor` is **baked into the GGUF** as `audio.mel_filters` (along with `audio.mel_window`), so the C++ runtime computes the log-mel spectrogram natively without needing torch / librosa / scipy at inference time.
 
