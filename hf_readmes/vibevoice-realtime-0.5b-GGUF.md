@@ -33,8 +33,15 @@ GGUF conversion of [microsoft/VibeVoice-Realtime-0.5B](https://huggingface.co/mi
 | File | Quant | Size | Notes |
 |---|---|---:|---|
 | `vibevoice-realtime-0.5b-tts-f16.gguf` | F16 | 2.0 GB | Full precision, reference quality |
-| `vibevoice-realtime-0.5b-q8_0.gguf`    | Q8_0 | 1.1 GB | Near-lossless |
-| `vibevoice-realtime-0.5b-q4_k.gguf`    | Q4_K | 607 MB | **Recommended** — perfect ASR round-trip |
+| `vibevoice-realtime-0.5b-q8_0.gguf`    | Q8_0 | 1.2 GB | Near-lossless |
+| `vibevoice-realtime-0.5b-q4_k.gguf`    | Q4_K | 699 MB | **Recommended** — perfect ASR round-trip |
+
+> The Q8_0/Q4_K files keep the diffusion prediction head, connectors and
+> EOS classifier at full precision (only the two Qwen2 backbones are
+> quantized). The head runs under classifier-free guidance over 20 solver
+> steps, so quantizing it could push the first frames onto a wrong
+> trajectory that decodes as a brief non-speech "music"/hum onset before
+> the voice; keeping it at full precision avoids that at a small size cost.
 
 ## Voice prompts
 
