@@ -22,7 +22,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <regex>
 #include <string>
+#include <utility>
 #include <vector>
 #include <thread>
 #include <cmath>
@@ -78,6 +80,56 @@ static bool crispasr_load_imatrix(const std::string& path) {
     ggml_free(ctx);
     fprintf(stderr, "imatrix: loaded importance vectors for %d tensors from '%s'\n", loaded, path.c_str());
     return loaded > 0;
+}
+
+// Per-tensor type overrides from --tensor-type <regex>=<type> (repeatable).
+// First matching rule wins; applied AFTER the arch guards, so it can force a
+// guarded tensor to quantize, pin a body tensor higher, or keep something at
+// F16 — the llama.cpp `--tensor-type` mechanism. Value may be f16/f32 or any
+// quant type below.
+static std::vector<std::pair<std::regex, ggml_type>> g_type_overrides;
+static std::vector<std::string> g_type_override_src; // original "regex=type" text, for logs
+
+static ggml_type crispasr_parse_type_name(const std::string& s) {
+    static const std::map<std::string, ggml_type> M = {
+        {"f32", GGML_TYPE_F32},     {"f16", GGML_TYPE_F16},     {"q4_0", GGML_TYPE_Q4_0},
+        {"q4_1", GGML_TYPE_Q4_1},   {"q5_0", GGML_TYPE_Q5_0},   {"q5_1", GGML_TYPE_Q5_1},
+        {"q8_0", GGML_TYPE_Q8_0},   {"q2_k", GGML_TYPE_Q2_K},   {"q3_k", GGML_TYPE_Q3_K},
+        {"q4_k", GGML_TYPE_Q4_K},   {"q5_k", GGML_TYPE_Q5_K},   {"q6_k", GGML_TYPE_Q6_K},
+        {"iq4_nl", GGML_TYPE_IQ4_NL}, {"iq4_xs", GGML_TYPE_IQ4_XS},
+    };
+    auto it = M.find(s);
+    return it == M.end() ? GGML_TYPE_COUNT : it->second;
+}
+
+// Return `want` if it tiles `ncols`, else a compatible smaller-block fallback,
+// else GGML_TYPE_COUNT (can't quantize this row width).
+static ggml_type crispasr_row_fit(ggml_type want, int64_t ncols) {
+    if (ncols % ggml_blck_size(want) == 0)
+        return want;
+    ggml_type fb = GGML_TYPE_COUNT;
+    switch (want) {
+    case GGML_TYPE_Q2_K:
+    case GGML_TYPE_Q3_K:
+    case GGML_TYPE_Q4_K:
+        fb = GGML_TYPE_Q4_0;
+        break;
+    case GGML_TYPE_Q5_K:
+        fb = GGML_TYPE_Q5_0;
+        break;
+    case GGML_TYPE_Q6_K:
+        fb = GGML_TYPE_Q8_0;
+        break;
+    case GGML_TYPE_IQ4_XS:
+        fb = GGML_TYPE_IQ4_NL;
+        break;
+    case GGML_TYPE_IQ4_NL:
+        fb = GGML_TYPE_Q4_0;
+        break;
+    default:
+        break;
+    }
+    return (fb != GGML_TYPE_COUNT && ncols % ggml_blck_size(fb) == 0) ? fb : GGML_TYPE_COUNT;
 }
 
 static bool crispasr_model_quantize(const std::string& fname_inp, const std::string& fname_out, ggml_ftype ftype) {
@@ -464,6 +516,9 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     // sizes.
     const int n_tensors = gguf_get_n_tensors(ctx_in);
     std::vector<ggml_type> target_types(n_tensors);
+    // Per-rule --tensor-type match counters (summarised after the first pass).
+    std::vector<int> override_hits(g_type_overrides.size(), 0);
+    std::vector<int> override_skips(g_type_overrides.size(), 0);
 
     // Allocate a scratch ggml context for creating modified tensor descriptors.
     ggml_init_params scratch_params = {ggml_tensor_overhead() * (size_t)n_tensors + 1024, nullptr, true};
@@ -643,6 +698,30 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             target_types[i] = t->type;
         }
 
+        // User per-tensor override (--tensor-type <regex>=<type>). First match
+        // wins; overrides the arch guards above. A quant override on a <2-D or
+        // ill-tiled row is skipped (with a note) rather than corrupting output.
+        for (size_t r = 0; r < g_type_overrides.size(); r++) {
+            if (!std::regex_search(sname, g_type_overrides[r].first))
+                continue;
+            ggml_type ov = g_type_overrides[r].second;
+            if (ggml_is_quantized(ov)) {
+                if (ggml_n_dims(t) < 2) {
+                    override_skips[r]++;
+                    break;
+                }
+                ggml_type fit = crispasr_row_fit(ov, ncols);
+                if (fit == GGML_TYPE_COUNT) {
+                    override_skips[r]++;
+                    break;
+                }
+                ov = fit;
+            }
+            target_types[i] = ov;
+            override_hits[r]++;
+            break;
+        }
+
         // Create a tensor descriptor with the target type for ctx_out
         if (target_types[i] != t->type) {
             struct ggml_tensor* t_out = ggml_new_tensor(ctx_scratch, target_types[i], ggml_n_dims(t), t->ne);
@@ -651,6 +730,14 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
         } else {
             gguf_add_tensor(ctx_out, t);
         }
+    }
+
+    for (size_t r = 0; r < g_type_overrides.size(); r++) {
+        printf("%s: tensor-type override '%s' → %d tensors", __func__, g_type_override_src[r].c_str(),
+               override_hits[r]);
+        if (override_skips[r])
+            printf(" (%d skipped: <2-D or row width)", override_skips[r]);
+        printf("\n");
     }
 
     // Allocate output file
@@ -766,20 +853,50 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                 fputc(0, fout);
 
             printf("done\n");
-        } else if (target_types[i] == GGML_TYPE_F16 && type == GGML_TYPE_F32) {
-            // Granite encoder F32 → F16 downcast (or any F32→F16 target)
-            printf("F32 -> F16... ");
+        } else if ((qtype_used == GGML_TYPE_F16 || qtype_used == GGML_TYPE_F32) && qtype_used != type) {
+            // Up/down-cast to F16 or F32 from ANY source (F32/F16/quantized):
+            // e.g. the granite encoder F32→F16 downcast, or a --tensor-type
+            // override pinning a quantized tensor to F16. Read → F32 → write.
+            printf("%s -> %s... ", ggml_type_name(type), ggml_type_name(qtype_used));
             const int64_t nelements = ggml_nelements(t);
             std::vector<float> f32(nelements);
-            if (fread(f32.data(), sizeof(float), nelements, fin) != (size_t)nelements) {
-                fprintf(stderr, "failed to read f32 data\n");
-                return false;
+            if (type == GGML_TYPE_F32) {
+                if (fread(f32.data(), sizeof(float), nelements, fin) != (size_t)nelements) {
+                    fprintf(stderr, "failed to read f32 data\n");
+                    return false;
+                }
+            } else if (type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> f16in(nelements);
+                if (fread(f16in.data(), sizeof(ggml_fp16_t), nelements, fin) != (size_t)nelements) {
+                    fprintf(stderr, "failed to read f16 data\n");
+                    return false;
+                }
+                for (int64_t j = 0; j < nelements; j++)
+                    f32[j] = ggml_fp16_to_fp32(f16in[j]);
+            } else {
+                std::vector<uint8_t> qbuf(size);
+                if (fread(qbuf.data(), 1, size, fin) != size) {
+                    fprintf(stderr, "failed to read quantized source data\n");
+                    return false;
+                }
+                const ggml_type_traits* tr = ggml_get_type_traits(type);
+                if (!tr || !tr->to_float) {
+                    fprintf(stderr, "no dequantizer for source type %s\n", ggml_type_name(type));
+                    return false;
+                }
+                tr->to_float(qbuf.data(), f32.data(), nelements);
             }
-            std::vector<ggml_fp16_t> f16(nelements);
-            for (int64_t j = 0; j < nelements; j++)
-                f16[j] = ggml_fp32_to_fp16(f32[j]);
-            const size_t out_bytes = (size_t)nelements * sizeof(ggml_fp16_t);
-            fwrite(f16.data(), 1, out_bytes, fout);
+            size_t out_bytes;
+            if (qtype_used == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> f16(nelements);
+                for (int64_t j = 0; j < nelements; j++)
+                    f16[j] = ggml_fp32_to_fp16(f32[j]);
+                out_bytes = (size_t)nelements * sizeof(ggml_fp16_t);
+                fwrite(f16.data(), 1, out_bytes, fout);
+            } else {
+                out_bytes = (size_t)nelements * sizeof(float);
+                fwrite(f32.data(), 1, out_bytes, fout);
+            }
             size_t pad = GGML_PAD(out_bytes, GGUF_DEFAULT_ALIGNMENT) - out_bytes;
             for (size_t j = 0; j < pad; j++)
                 fputc(0, fout);
@@ -844,6 +961,30 @@ int main(int argc, char** argv) {
                 return 1;
             }
             imatrix_path = argv[++i];
+        } else if (a == "--tensor-type") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--tensor-type requires <regex>=<type>\n");
+                return 1;
+            }
+            std::string rule = argv[++i];
+            size_t eq = rule.rfind('=');
+            if (eq == std::string::npos) {
+                fprintf(stderr, "--tensor-type expects <regex>=<type>, got '%s'\n", rule.c_str());
+                return 1;
+            }
+            std::string pat = rule.substr(0, eq), tn = rule.substr(eq + 1);
+            ggml_type ot = crispasr_parse_type_name(tn);
+            if (ot == GGML_TYPE_COUNT) {
+                fprintf(stderr, "--tensor-type: unknown type '%s'\n", tn.c_str());
+                return 1;
+            }
+            try {
+                g_type_overrides.emplace_back(std::regex(pat), ot);
+                g_type_override_src.push_back(rule);
+            } catch (const std::regex_error& e) {
+                fprintf(stderr, "--tensor-type: bad regex '%s': %s\n", pat.c_str(), e.what());
+                return 1;
+            }
         } else {
             pos.push_back(a);
         }
@@ -851,10 +992,14 @@ int main(int argc, char** argv) {
 
     if (pos.size() != 3) {
         fprintf(stderr, "usage: %s model-f16.gguf model-quant.gguf type [--imatrix <file>]\n", argv[0]);
+        fprintf(stderr, "             [--tensor-type <regex>=<type> ...]\n");
         fprintf(stderr, "  input may be F16/F32 OR an already-quantized (e.g. q8_0) GGUF — a\n");
         fprintf(stderr, "  quantized source is dequantized then re-quantized to the target.\n");
         fprintf(stderr, "  --imatrix <f>  use an importance-matrix GGUF to steer k-quant/IQ\n");
         fprintf(stderr, "                 precision (improves quality, esp. for iq4_* / low-bit).\n");
+        fprintf(stderr, "  --tensor-type <regex>=<type>  per-tensor precision override (repeatable,\n");
+        fprintf(stderr, "                 first match wins, overrides the built-in arch guards).\n");
+        fprintf(stderr, "                 e.g. --tensor-type 'output\\.weight=q8_0' --tensor-type '\\.ffn=q6_k'\n");
         ggml_print_ftypes(stderr);
         return 1;
     }

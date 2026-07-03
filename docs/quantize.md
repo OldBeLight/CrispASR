@@ -51,7 +51,8 @@ scripts/dev-build.sh --target crispasr-quantize
 ## Usage
 
 ```bash
-./build/bin/crispasr-quantize <input.gguf> <output.gguf> <type> [--imatrix <file>]
+./build/bin/crispasr-quantize <input.gguf> <output.gguf> <type> \
+    [--imatrix <file>] [--tensor-type <regex>=<type> ...]
 ```
 
 `<type>` is one of the `ggml_ftype` names below.
@@ -69,6 +70,20 @@ model actually uses (activation-weighted error instead of plain L2,
 the same idea as llama.cpp's `llama-imatrix`). It helps most for the
 low-bit types (`iq4_*`, `q3_k`, `q2_k`); it is always safe to pass
 (missing / shape-mismatched entries fall back to unweighted).
+
+`--tensor-type <regex>=<type>` (optional, repeatable) overrides the
+per-tensor precision for tensors whose name matches `<regex>`, on top of
+the built-in per-architecture guards. First matching rule wins. `<type>`
+may be `f16` / `f32` or any quant type below; a quant that doesn't tile a
+tensor's row width falls back (or is skipped, with a note). The match is a
+**partial** regex (llama.cpp semantics) — anchor with `^…$` for an exact
+name. Examples:
+
+```bash
+# Keep the LM head at Q8_0 while the body is Q4_K, and pin FFN gates to Q6_K:
+crispasr-quantize model-f16.gguf model.gguf q4_k \
+    --tensor-type '^output\.weight$=q8_0' --tensor-type '\.ffn_gate\.=q6_k'
+```
 
 ### Supported types
 
@@ -146,6 +161,12 @@ done
     mega-asr-1.7b-iq4_xs.gguf iq4_xs --imatrix mega-asr.imatrix.gguf
 ```
 
+A small **CC0** starter corpus (Common Voice EN + DE) lives at
+[`cstr/crispasr-imatrix-calib`](https://huggingface.co/datasets/cstr/crispasr-imatrix-calib)
+(see [`tools/imatrix-calib/`](../tools/imatrix-calib/)). The A/B harness
+[`tools/imatrix_ab.py`](../tools/imatrix_ab.py) measures the effect
+(prefill-logit cosine + transcript CER vs the f16 gold).
+
 Notes:
 
 - **No-op unless the env var is set** — production paths are unaffected.
@@ -154,7 +175,9 @@ Notes:
   `CRISPASR_IMATRIX_OUT` is set.
 - Calibrate on **in-distribution audio** (the languages / domain you
   care about), not a single clip — the matrix is only as good as the
-  corpus that produced it.
+  corpus that produced it. Measured on qwen3-asr-0.6b q4_k: an EN+DE
+  Common Voice set lifted cosine-to-f16 **0.890 → 0.941**, while an
+  English-only set **regressed** it. Language/domain coverage is decisive.
 - Implemented for the ASR backends whose large weights actually benefit
   (whisper, parakeet, canary, cohere, qwen3-asr / mega-asr, higgs-stt,
   ark-asr, moss-transcribe, granite, glm-asr, mimo-asr, voxtral). The

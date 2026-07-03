@@ -83,8 +83,10 @@ model actually uses (the same idea as llama.cpp's `llama-imatrix`, but computed
 from **audio** rather than a text corpus).
 
 Calibrated on a **CC0 [Mozilla Common Voice](https://commonvoice.mozilla.org)**
-English + German sample. Measured with the `tools/imatrix_ab.py` A/B harness
-(prefill first-token-logit cosine vs the F16 gold, held-out clips):
+English + German sample, published at
+[`cstr/crispasr-imatrix-calib`](https://huggingface.co/datasets/cstr/crispasr-imatrix-calib).
+Measured with the `tools/imatrix_ab.py` A/B harness (prefill first-token-logit
+cosine vs the F16 gold, held-out clips):
 
 | | mean cos vs F16 | delta |
 | --- | ---: | ---: |

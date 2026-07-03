@@ -6754,10 +6754,15 @@ Legend: ✅ have · ⚠️ partial/manual · ❌ missing · 🎁 inherited-via-g
    covers the audio-conditioned decoder activations. No off-the-shelf ASR-audio
    imatrix corpus exists; **CC0 Common Voice (EN/DE/…)** is the clean-license
    build source (LibriSpeech/FLEURS are CC-BY).
-   Still **OPEN**: (a) an explicit quantize-time `--tensor-type <regex>=<type>`
-   override CLI (today the per-tensor precision rules are hard-coded arch
-   guards in `crispasr-quantize/main.cpp`, not user-overridable); (b) wiring
-   the collector into the remaining backends if we want imatrix there too.
+   **DONE (per-tensor override)**: `--tensor-type <regex>=<type>` (repeatable,
+   first-match-wins, partial regex like llama.cpp) overrides the arch guards;
+   value may be f16/f32/any quant with row-width fallback. `crispasr-quantize`
+   now has full llama.cpp-parity quant knobs. **A/B harness** also gained a
+   transcript-CER signal (alongside logit cosine): on qwen3-asr-0.6b q4_k the
+   EN+DE win holds (cos +0.05, CER 0.0 = no transcript regression). Calibration
+   set published CC0 at `cstr/crispasr-imatrix-calib` (+ `tools/imatrix-calib/`).
+   Still **OPEN**: wiring the collector into the remaining (non-ASR-decoder)
+   backends if we ever want imatrix there too.
 2. **FA default-on audit.** Upstream flipped flash-attn to baseline. Re-check
    our two known FA bugs — batched-FA corruption (§176h) and the Vulkan
    GQA-REPEAT-f16 path — against the *current* `FLASH_ATTN_EXT` in vendored
