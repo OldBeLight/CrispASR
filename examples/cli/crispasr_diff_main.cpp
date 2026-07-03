@@ -5839,6 +5839,10 @@ int main(int argc, char** argv) {
         auto cp = moss_transcribe_context_default_params();
         cp.n_threads = 4;
         cp.verbosity = 1;
+        if (const char* g = std::getenv("CRISPASR_DIFF_USE_GPU"); g && g[0] == '1') {
+            cp.use_gpu = true;
+            fprintf(stderr, "[crispasr-diff] CRISPASR_DIFF_USE_GPU=1 -> moss_transcribe use_gpu=true\n");
+        }
         moss_transcribe_context* ctx = moss_transcribe_init_from_file(model_path.c_str(), cp);
         if (!ctx) {
             fprintf(stderr, "failed to load moss-transcribe model\n");

@@ -237,33 +237,41 @@ exact code shape via moss-transcribe. No moss-audio omni model was available loc
 for an end-to-end A/B, so it is verified by code-pattern equivalence + clean compile,
 not a fresh diff run — worth a jfk A/B once the omni GGUF is on hand.
 
-### #215b 2026-07-03 the manual-attn guard was insufficient — CPU fallback on Vulkan
+### #215b 2026-07-03 real GPU fix — the async command-pool bug; disable Vulkan async
 
-Reporter (AppleSheeple) confirmed the manual-attention guard above did NOT fix the
-crash: it still segfaults with **multiple slices** (`jfk` looped 3× via
-`ffmpeg -stream_loop 2`). So `flash_attn_ext` was NOT the cause — the trigger is
-the encoder's per-chunk sched loop doing many rapid
-`sched_reset/alloc/compute` cycles (the cached conv-stem graph runs once per 100
-mel frames, scaling with audio length → "multiple slices"). The fault is
-`ggml_vk_command_pool_cleanup → resetCommandPool` in the native RADV/NVIDIA driver
-after enough cycles ("Requires command buffers to be done") — a ggml-vulkan
-resource-lifecycle issue, not moss math. The crash surfaces in the encoder, but
-the per-token LM decode loop (even more sched cycles) would hit the same path.
-Still not reproducible on MoltenVK (its Metal translation never resets the vendor
-command pool the same way), so no local repro — the fix is chosen for *certainty*,
-not verified against the crash.
+Reporter (AppleSheeple) confirmed the manual-attention guard did NOT fix the crash:
+it still segfaults with **multiple slices** (`jfk` looped 3× via
+`ffmpeg -stream_loop 2`). So `flash_attn_ext` was never the cause. Root cause found
+by reading ggml-vulkan: `ggml_vk_queue_command_pools_cleanup` resets the compute
+command pool once `buffers_in_use() >= 10` (`cleanup_frequency`), and it is called
+from the synchronous buffer-transfer helpers (`ggml_vk_buffer_write_2d` /
+`_read`, i.e. every `ggml_backend_tensor_set/get`). In **async** mode
+(`device->support_async`, default on non-Intel) `ggml_backend_vk_graph_compute`
+does NOT synchronize before returning (deferred to the sched split boundary), so
+command buffers from prior graph computes stay `in_use` and pending. moss runs one
+small graph per ~1 s of audio (mel `tensor_set` → conv `graph_compute` → conv
+`tensor_get`, per 100-mel-frame chunk), so after ~10 chunks the next chunk's
+`tensor_set` calls `command_pool_cleanup → vkResetCommandPool` while earlier chunks'
+buffers are still executing on the GPU → the native RADV/NVIDIA driver faults.
+That is exactly the "multiple slices" trigger (need ≥10 accumulated buffers). Not
+reproducible on MoltenVK — Metal auto-manages command-buffer lifetime, so
+"reset while pending" is simply not a failure mode there (which is why single-jfk
+*and* jfk×3 run clean locally under every flash/manual combination).
 
-Fix: when the GPU backend is Vulkan, run the **whole moss-transcribe model on CPU**
-(swap `ctx->backend = ctx->backend_cpu` before load, tada-#192 precedent) — zero
-Vulkan execution ⇒ a Vulkan crash is impossible, by construction. CUDA/Metal are
-unaffected (unchanged GPU path). Opt back into the native Vulkan path (which also
-re-enables the manual-attn encoder from #215a) with
-`CRISPASR_MOSS_TRANSCRIBE_VULKAN_NATIVE=1`. Same guard applied to `moss-audio`
-(`CRISPASR_MOSS_AUDIO_VULKAN_NATIVE=1`). Verified on the local Vulkan (MoltenVK)
-build: `--gpu-backend vulkan` now prints the CPU-fallback notice and transcribes
-jfk×3 verbatim; the native opt-in still runs the Vulkan path. Trade-off: AMD-only
-users lose GPU accel for moss until the upstream ggml-vulkan bug is fixed — pending
-the reporter confirming the fallback resolves the segfault on real hardware.
+Fix: keep moss ON the GPU but disable Vulkan async — `setenv("GGML_VK_DISABLE_ASYNC",
+"1", 0)` before `crispasr_init_gpu_backend()` (the env is read at device creation).
+With async off, every `graph_compute` fully drains the GPU before returning, so a
+later `command_pool_cleanup` only ever resets buffers whose work is already done →
+`vkResetCommandPool` is safe. CUDA/Metal ignore the env; `overwrite=0` respects an
+explicit user value; opt back into async with `CRISPASR_MOSS_TRANSCRIBE_VULKAN_ASYNC=1`
+/ `CRISPASR_MOSS_AUDIO_VULKAN_ASYNC=1`. Cost: ~10-15% slower than native async (vs.
+no GPU at all with the earlier CPU fallback — reverted). Same class as upstream
+ggml-org/llama.cpp#17302; worth an upstream fix to the async command-buffer
+lifecycle (then this env can be dropped). Verified on the local MoltenVK build:
+async on vs off produce byte-identical transcripts, moss stays on Vulkan, jfk×3
+verbatim. The crash-gone confirmation needs real RADV/NVIDIA hardware (reporter).
+The encoder manual-attn path (#215a) and the diff harness `CRISPASR_DIFF_USE_GPU=1`
+toggle for moss-transcribe are retained.
 
 ## #205 2026-06-30 `--max-len` for text-only backends + granite-plus timestamp-mode derail
 

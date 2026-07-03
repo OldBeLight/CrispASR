@@ -2110,6 +2110,21 @@ extern "C" struct moss_audio_context* moss_audio_init_from_file(const char* path
     ctx->n_threads = params.n_threads;
     ctx->model_path = path_model;
 
+    // #215: like moss-transcribe, the moss-audio encoder segfaults on native
+    // Vulkan (RADV/NVIDIA) — ggml-vulkan's async command-buffer lifecycle resets
+    // the command pool (ggml_vk_queue_command_pools_cleanup, buffers_in_use>=10)
+    // while buffers are still pending → vkResetCommandPool faults after enough
+    // small per-chunk graph computes. Disable Vulkan async so every graph_compute
+    // drains the GPU first; buffers never reach the mid-flight reset and moss-audio
+    // stays on the GPU (~10-15% slower than native async). Must be set before the
+    // Vulkan device is created (i.e. before crispasr_init_gpu_backend); harmless
+    // for CUDA/Metal. Override with CRISPASR_MOSS_AUDIO_VULKAN_ASYNC=1.
+    if (params.use_gpu) {
+        const char* keep_async = std::getenv("CRISPASR_MOSS_AUDIO_VULKAN_ASYNC");
+        if (!(keep_async && keep_async[0] == '1'))
+            setenv("GGML_VK_DISABLE_ASYNC", "1", 0);
+    }
+
     // Backend selection
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
@@ -2120,29 +2135,9 @@ extern "C" struct moss_audio_context* moss_audio_init_from_file(const char* path
     if (ggml_backend_is_cpu(ctx->backend))
         ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
 
-    // #215: like moss-transcribe, the moss-audio encoder segfaults on native
-    // Vulkan (RADV/NVIDIA) inside the per-chunk sched loop —
-    // ggml_vk_command_pool_cleanup (resetCommandPool) faults after enough
-    // graph-compute cycles. The manual-attention guard is not sufficient (the
-    // trigger is the many rapid sched cycles, not flash_attn_ext). Until the
-    // ggml-vulkan resource-lifecycle bug is fixed upstream, run the whole model on
-    // CPU when the GPU backend is Vulkan; CUDA/Metal are unaffected. Opt back into
-    // the crashing native path with CRISPASR_MOSS_AUDIO_VULKAN_NATIVE=1.
-    if (backend_is_vulkan(ctx->backend)) {
-        const char* native = std::getenv("CRISPASR_MOSS_AUDIO_VULKAN_NATIVE");
-        if (!(native && native[0] == '1')) {
-            fprintf(stderr, "moss_audio: Vulkan backend detected — running on CPU (encoder "
-                            "segfaults on native Vulkan during graph cleanup, issue #215). Use "
-                            "CUDA/Metal for GPU acceleration, or set "
-                            "CRISPASR_MOSS_AUDIO_VULKAN_NATIVE=1 to force the Vulkan path.\n");
-            ctx->backend = ctx->backend_cpu;
-            ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
-        }
-    }
-
-    // Encoder attention path selection (issue #215). Only reached with a real GPU
-    // backend (Vulkan requires the VULKAN_NATIVE opt-in above). flash_attn_ext
-    // segfaults on Vulkan, so under that opt-in the encoder uses the manual path.
+    // Encoder attention path (issue #215). On Vulkan the encoder uses the manual
+    // soft_max_ext attention rather than flash_attn_ext (avoids the FA split-k /
+    // mask-opt resource path).
     {
         const char* force_flash = std::getenv("CRISPASR_MOSS_AUDIO_ENC_FLASH");
         const char* force_manual = std::getenv("CRISPASR_MOSS_AUDIO_ENC_MANUAL");

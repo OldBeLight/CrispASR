@@ -1496,6 +1496,28 @@ extern "C" struct moss_transcribe_context* moss_transcribe_init_from_file(
     ctx->n_threads = params.n_threads;
     ctx->model_path = path_model;
 
+    // #215: moss-transcribe segfaults on Vulkan (RADV/NVIDIA) inside the encoder's
+    // per-chunk sched loop. Root cause is ggml-vulkan's *async* command-buffer
+    // lifecycle: ggml_vk_queue_command_pools_cleanup resets the command pool once
+    // buffers_in_use() >= 10 (cleanup_frequency), and in async mode that reset can
+    // fire while command buffers are still pending on the GPU → vkResetCommandPool
+    // faults in the vendor driver. That is exactly why "multiple slices" are
+    // needed: you must accumulate >=10 command buffers first (moss runs one small
+    // graph per ~1 s of audio, so ~10 s of audio trips it). Disabling Vulkan async
+    // submission makes every graph_compute fully drain the GPU before returning,
+    // so command buffers never accumulate to the mid-flight reset — moss stays on
+    // the GPU (~10-15% slower than native async, vs. no GPU at all). The env is
+    // read when the Vulkan device is first created, so it MUST be set before
+    // crispasr_init_gpu_backend(); it is harmless for CUDA/Metal (ignored) and
+    // overwrite=0 respects an explicit user setting. Same class as upstream
+    // ggml-org/llama.cpp#17302; remove once the ggml-vulkan async lifecycle is
+    // fixed. Override with CRISPASR_MOSS_TRANSCRIBE_VULKAN_ASYNC=1 to keep async.
+    if (params.use_gpu) {
+        const char* keep_async = std::getenv("CRISPASR_MOSS_TRANSCRIBE_VULKAN_ASYNC");
+        if (!(keep_async && keep_async[0] == '1'))
+            setenv("GGML_VK_DISABLE_ASYNC", "1", 0);
+    }
+
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
@@ -1505,34 +1527,9 @@ extern "C" struct moss_transcribe_context* moss_transcribe_init_from_file(
     if (ggml_backend_is_cpu(ctx->backend))
         ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
 
-    // #215: moss-transcribe segfaults on Vulkan inside the encoder's per-chunk
-    // sched loop — ggml_vk_command_pool_cleanup (resetCommandPool) faults in the
-    // native RADV/NVIDIA driver after enough graph-compute cycles (reporter:
-    // "multiple slices are needed"; scales with audio length). The encoder
-    // manual-attention guard (7255c4e2) did NOT stop it — the trigger is the many
-    // rapid sched_reset/alloc/compute cycles, not flash_attn_ext, and the
-    // per-token LM decode loop would hit the same path next. Not reproducible on
-    // MoltenVK (Metal translation never resets the vendor command pool the same
-    // way). Until the ggml-vulkan resource-lifecycle bug is fixed upstream, run
-    // the whole model on CPU when the GPU backend is Vulkan; CUDA/Metal are
-    // unaffected. Opt back into the crashing native path with
-    // CRISPASR_MOSS_TRANSCRIBE_VULKAN_NATIVE=1.
-    if (backend_is_vulkan(ctx->backend)) {
-        const char* native = std::getenv("CRISPASR_MOSS_TRANSCRIBE_VULKAN_NATIVE");
-        if (!(native && native[0] == '1')) {
-            fprintf(stderr, "moss_transcribe: Vulkan backend detected — running on CPU "
-                            "(encoder segfaults on native Vulkan during graph cleanup, issue "
-                            "#215). Use CUDA/Metal for GPU acceleration, or set "
-                            "CRISPASR_MOSS_TRANSCRIBE_VULKAN_NATIVE=1 to force the Vulkan path.\n");
-            ctx->backend = ctx->backend_cpu;
-            ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
-        }
-    }
-
-    // Encoder attention path selection (issue #215). Only reached with a real GPU
-    // backend (Vulkan requires the VULKAN_NATIVE opt-in above). flash_attn_ext
-    // segfaults on Vulkan, so under that opt-in the encoder uses the manual
-    // soft_max_ext path.
+    // Encoder attention path (issue #215). On Vulkan the encoder uses the manual
+    // soft_max_ext attention rather than flash_attn_ext (avoids the FA split-k /
+    // mask-opt resource path; it is the same op sequence the LM decode runs).
     {
         const char* force_flash = std::getenv("CRISPASR_MOSS_TRANSCRIBE_ENC_FLASH");
         const char* force_manual = std::getenv("CRISPASR_MOSS_TRANSCRIBE_ENC_MANUAL");
