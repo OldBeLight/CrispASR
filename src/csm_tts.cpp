@@ -887,6 +887,17 @@ static ggml_tensor* build_mimi_dec_transformer(ggml_context* ctx, const std::vec
     int T = (int)x->ne[1];
     int dim = (int)x->ne[0];
 
+    // Optional causal + sliding-window mask (symmetric with kyutai_stt's Mimi
+    // encoder). OPT-IN via CRISPASR_MIMI_CAUSAL, default OFF (nullptr = today's
+    // full non-causal attention). Filled by the caller after alloc. See
+    // LEARNINGS "Mimi codec transformer runs non-causal".
+    ggml_tensor* attn_mask = nullptr;
+    if (std::getenv("CRISPASR_MIMI_CAUSAL")) {
+        attn_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, T, T); // [Lk, Lq]
+        ggml_set_name(attn_mask, "mimi_dec_causal_mask");
+        ggml_set_input(attn_mask);
+    }
+
     ggml_tensor* positions = ggml_arange(ctx, 0.0f, (float)T, 1.0f);
     positions = ggml_cast(ctx, positions, GGML_TYPE_I32);
 
@@ -920,8 +931,9 @@ static ggml_tensor* build_mimi_dec_transformer(ggml_context* ctx, const std::vec
         K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
         V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
 
-        // Non-causal full attention for decoder transformer
-        ggml_tensor* attn = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, 1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
+        // Non-causal by default; causal+windowed if the mask was built
+        // (CRISPASR_MIMI_CAUSAL).
+        ggml_tensor* attn = ggml_flash_attn_ext(ctx, Q, K, V, attn_mask, 1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
         attn = ggml_reshape_2d(ctx, attn, dim, T);
 
         attn = ggml_mul_mat(ctx, L.attn_out_w, attn);
@@ -1970,6 +1982,20 @@ mimi_decode:
         // Set upsampled input data
         ggml_tensor* inp = ggml_graph_get_tensor(graph, "mimi_upsampled");
         ggml_backend_tensor_set(inp, continuous.data(), 0, continuous.size() * sizeof(float));
+
+        // Fill the optional Mimi causal+sliding-window mask (CRISPASR_MIMI_CAUSAL):
+        // attend iff key k <= query q AND (q - k) < window (moshi Mimi = 250).
+        if (ggml_tensor* mmask = ggml_graph_get_tensor(graph, "mimi_dec_causal_mask")) {
+            const int Tm = (int)mmask->ne[1];
+            const int window = 250;
+            std::vector<ggml_fp16_t> md((size_t)Tm * Tm, ggml_fp32_to_fp16(0.0f));
+            const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+            for (int q = 0; q < Tm; q++)
+                for (int k = 0; k < Tm; k++)
+                    if (k > q || (q - k) >= window)
+                        md[(size_t)q * Tm + k] = ninf;
+            ggml_backend_tensor_set(mmask, md.data(), 0, md.size() * sizeof(ggml_fp16_t));
+        }
 
         // Compute
         ggml_backend_sched_graph_compute(ctx->sched, graph);
