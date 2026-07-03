@@ -795,8 +795,23 @@ weights at F16 (audio codecs are precision-sensitive).
 12L encoder + 12L decoder transformer (d=1024, 16 heads, FFN=4096, ReLU,
 pre-norm) + SentencePiece BPE (128K vocab, 100 language codes) +
 sinusoidal positional embeddings + cross-attention KV cache + greedy
-decode. en→de exact match to the Python reference; Q8_0 (~502 MB)
-preserves quality.
+decode. f16 == HF (`AutoModelForSeq2SeqLM`) exactly (token counts + output);
+q8_0 (~502 MB) matches except rare quant-floor decode flips; m2m100-f16 is
+registered for exact parity.
+
+**Tokenizer (2026-07 fix).** M2M-100's SP model is **BPE**, not Unigram — its
+`tokenizer.ggml.scores` are `-merge_rank`, and tokenization uses merge order via
+`core_spm::tokenize_bpe` (merge the highest-score adjacent pair whose
+concatenation is a vocab piece). The original backend used greedy longest-match
+(always, since the initial commit — never a regression), which mis-split
+multi-subword words and degraded translations. Two GGUF-side requirements make
+the BPE faithful: (1) score pieces **by string** (`sp.piece_to_id`), because
+`vocab.json` is not a constant-offset reorder of the SP model; (2) include SP
+pieces that only ever appear as **intermediate merges** (m2m100_418M's vocab.json
+omits ~390, e.g. "esterd" building "esterday") — the converter appends them at ids
+≥ `vocab_size` with SP scores, and the engine maps any final token id ≥ vocab_size
+to `<unk>` (matching HF `convert_token_to_id`). wmt21's vocab.json is already
+complete (0 intermediates). See LEARNINGS "SentencePiece tokenizer taxonomy".
 
 **WMT21** (`wmt21-dense-24-wide-en-x` + `wmt21-dense-24-wide-x-en`):
 Same architecture scaled to 4.7B parameters (24L encoder, wider FFN).
