@@ -1808,6 +1808,23 @@ catch_discover_tests(test-lcs-dedup-driver
     PROPERTIES LABELS "unit;lcs;lcs-dedup"
 )
 
+# ─── test-ngram-loop-fix — Catch2 unit tests for core_ngram::fix_loops, the
+# shared greedy-n-gram-loop collapse used by higgs-audio-v3-stt and
+# moss-transcribe to clean degenerate repeated-phrase output (issue #218).
+add_executable(test-ngram-loop-fix
+    test-ngram-loop-fix.cpp
+)
+target_include_directories(test-ngram-loop-fix PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-ngram-loop-fix PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-ngram-loop-fix
+    TEST_SPEC "[ngram-loop]"
+    PROPERTIES LABELS "unit;ngram-loop"
+)
+
 # ─── test-lcs-c-abi — pin the public C ABI surface for the LCS dedup.
 # Verifies that `crispasr_lcs_dedup_prefix_count` is exported from
 # libcrispasr and agrees with the in-tree algorithm on the same

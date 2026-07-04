@@ -44,6 +44,7 @@
 #include "core/mel.h"
 #include "core/bpe.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/ngram_loop_fix.h"   // core_ngram::fix_loops (issue #218)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1474,6 +1475,25 @@ static char* moss_transcribe_impl(struct moss_transcribe_context* ctx, const flo
     }
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "moss_transcribe: %zu tokens: \"%s\"\n", generated.size(), result.substr(0, 120).c_str());
+
+    // Collapse degenerate greedy n-gram loops (issue #218). Greedy decode
+    // occasionally falls into a repeated-phrase attractor ("Hey, hey, hey, ..."
+    // / "run hey hey hey run ...") and emits it up to max_new; upstream MOSS has
+    // no post-process for this, so we clean the text here. The transform is a
+    // no-op on non-degenerate transcripts (only immediate n-gram repeats beyond
+    // the cap are trimmed), so it leaves clean slices byte-identical. Opt out
+    // with CRISPASR_MOSS_TRANSCRIBE_NO_LOOPFIX=1 for raw upstream-parity output
+    // (e.g. token/text diff-harness comparisons against the Python reference).
+    {
+        const char* no_fix = std::getenv("CRISPASR_MOSS_TRANSCRIBE_NO_LOOPFIX");
+        if (!(no_fix && no_fix[0] == '1')) {
+            std::string fixed = core_ngram::fix_loops(result);
+            if (fixed != result && ctx->params.verbosity >= 1)
+                fprintf(stderr, "moss_transcribe: collapsed n-gram loop(s) (%zu → %zu chars)\n", result.size(),
+                        fixed.size());
+            result = std::move(fixed);
+        }
+    }
 
     char* out = (char*)malloc(result.size() + 1);
     memcpy(out, result.c_str(), result.size() + 1);

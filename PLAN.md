@@ -394,6 +394,18 @@ The `moss-transcribe` backend (`OpenMOSS-Team/MOSS-Transcribe-preview-2B`) shipp
 `crispasr-diff`. See HISTORY (`## moss-transcribe`) and LEARNINGS. Remaining optional
 work:
 
+- **DONE #218 — greedy n-gram loop collapse.** On the reporter's 145 s `t32-145s.wav`
+  (auto-sliced into 6×30 s), two slices' greedy decode fell into a repeated-phrase
+  attractor and emitted "Hey, hey, hey, …" up to the 512-token cap (slice 2: 511 tokens,
+  ~490 of them "hey,"; slice 5: "run hey hey hey hey hey run" cycles). Upstream MOSS has
+  no post-process for this. Fixed by collapsing immediately-repeated n-grams in the
+  decoded text — the same algorithm higgs-stt already ships (its `ngram_loop_fix.py`
+  port), now extracted to the shared header `src/core/ngram_loop_fix.h`
+  (`core_ngram::fix_loops`) and used by both. Pure text post-process → token/logit
+  parity vs the Python reference is unchanged, and it is a no-op on non-degenerate
+  slices (verified: clean slices byte-identical, jfk diff-harness unaffected). Opt out
+  with **`CRISPASR_MOSS_TRANSCRIBE_NO_LOOPFIX=1`** for raw upstream-parity output. Unit
+  coverage: `tests/test-ngram-loop-fix.cpp` (`[ngram-loop]`, label `unit`).
 - **Publish f16 + q8_0** to `cstr/MOSS-Transcribe-preview-2B-GGUF` (q4_k + card are
   live; f16/q8_0 were held back for WLAN bandwidth). Re-stage from
   `/Volumes/backups/ai/moss-transcribe-preview-2b-{f16,q8_0}.gguf` and

@@ -1210,6 +1210,7 @@ extern "C" const char* higgs_stt_token_text(higgs_stt_context* ctx, int id) {
 #include "core/bpe.h"
 #include "core/beam_decode.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/ngram_loop_fix.h"   // core_ngram::fix_loops (shared with moss-transcribe)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1456,73 +1457,10 @@ extern "C" void higgs_stt_free(higgs_stt_context* ctx) {
     delete ctx;
 }
 
-// Port of the model's ngram_loop_fix.py (text post-processing). Greedy decode
-// on this model degenerates into repeated n-gram loops; the upstream pipeline
-// collapses them in `_post_process` rather than constraining generation, so we
-// reproduce that here. Collapse immediately-repeated n-grams (n from max_n down
-// to 1) to at most max_rep reps (3 for unigrams, 2 otherwise).
-static std::vector<std::string> higgs_collapse(const std::vector<std::string>& w, int n, int max_rep) {
-    std::vector<std::string> out;
-    const int L = (int)w.size();
-    int i = 0;
-    auto tail_eq = [&]() {
-        for (int k = 0; k < n; k++)
-            if (w[i + k] != out[out.size() - n + k])
-                return false;
-        return true;
-    };
-    while (i < L) {
-        bool matched = false;
-        if ((int)out.size() >= n && i + n <= L && tail_eq()) {
-            int reps = 1;
-            while ((int)out.size() >= n * (reps + 1)) {
-                bool eq = true;
-                const size_t b = out.size() - (size_t)n * (reps + 1);
-                for (int k = 0; k < n; k++)
-                    if (out[b + k] != out[out.size() - n + k]) {
-                        eq = false;
-                        break;
-                    }
-                if (!eq)
-                    break;
-                reps++;
-            }
-            if (reps >= max_rep) {
-                i += n;
-                matched = true;
-            }
-        }
-        if (!matched) {
-            out.push_back(w[i]);
-            i++;
-        }
-    }
-    return out;
-}
-
-static std::string higgs_fix_ngram_loops(const std::string& text, int max_n = 16) {
-    std::vector<std::string> words;
-    size_t i = 0;
-    while (i < text.size()) {
-        while (i < text.size() && std::isspace((unsigned char)text[i]))
-            i++;
-        size_t j = i;
-        while (j < text.size() && !std::isspace((unsigned char)text[j]))
-            j++;
-        if (j > i)
-            words.push_back(text.substr(i, j - i));
-        i = j;
-    }
-    for (int n = max_n; n >= 1; n--)
-        words = higgs_collapse(words, n, n == 1 ? 3 : 2);
-    std::string out;
-    for (size_t k = 0; k < words.size(); k++) {
-        if (k)
-            out += ' ';
-        out += words[k];
-    }
-    return out;
-}
+// Greedy decode on this model degenerates into repeated n-gram loops; the
+// upstream pipeline collapses them in `_post_process` (ngram_loop_fix.py) rather
+// than constraining generation, so we reproduce that here via the shared
+// core_ngram::fix_loops helper (also used by moss-transcribe, issue #218).
 
 // Encode audio the way higgs-audio does: split into chunk_size_seconds (4 s)
 // chunks, run the Whisper tower + projector on EACH chunk independently (chunk-
@@ -1723,7 +1661,7 @@ extern "C" char* higgs_stt_transcribe(higgs_stt_context* ctx, const float* sampl
     size_t e = text.find_last_not_of(" \t\r\n");
     text = (b == std::string::npos) ? "" : text.substr(b, e - b + 1);
     // Collapse degenerate greedy n-gram loops (model's _post_process step).
-    text = higgs_fix_ngram_loops(text);
+    text = core_ngram::fix_loops(text);
     return strdup(text.c_str());
 }
 
