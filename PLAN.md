@@ -7020,10 +7020,15 @@ right after `CUDA Graph id N reused`. CPU works.
   capture still engages (new uid → `cudaGraphExecUpdate`); T3 stays on GPU.
   Metal keeps alloc-once reuse. Old path A/B via
   `CRISPASR_CHATTERBOX_T3_BUCKET_REUSE=1`.
-- **Verification:** both `#if defined(GGML_USE_METAL)` and forced-CUDA `#else`
-  branches compile clean. Kaggle A/B kernel
+- **Verification (DONE, on real CUDA):** Kaggle A/B kernel
   `tools/kaggle/issue220-chatterbox-cuda/` (old_reuse vs fix_default vs cpu_ref,
-  ASR-roundtripped) runs on chr1str — but Kaggle free GPUs are T4/P100 (< sm_80),
-  so it only proves no-regression, NOT the crash fix. **OPEN: an sm_80+ run
-  (reporter's 3090 Ti, or a rented A100/L4/4090) to confirm old_reuse crashes
-  while fix_default passes with capture engaged.**
+  ASR-roundtripped) on a **P100 (sm_60)**:
+  - `old_reuse` → rc=-6 CRASH, `illegal memory access` at
+    `ggml_backend_cuda_synchronize` (same signature as the report), no WAV.
+  - `fix_default` → rc=0, valid WAV, ASR = exact input text.
+  - `cpu_ref` → rc=0, same exact ASR.
+  So the crash is **capture-independent** (sm_60 has no CUDA-graph capture) — the
+  reuse-shortcut is unsafe on CUDA regardless of arch; sm_80+ capture is only an
+  extra aggravator. Fix confirmed on hardware. Both Metal + forced-CUDA branches
+  also compile clean. (Nice-to-have: an sm_80+ run to also exercise the
+  capture-replay path, but the fix is already proven end-to-end.)

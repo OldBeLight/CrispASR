@@ -16,8 +16,11 @@ once per bucket then only re-ran `graph_compute` each step (the M1
 graph's `uid` and, on a uid match, replays it verbatim with capture-time device
 pointers; the reuse-shortcut never mints a new uid, so decode step ~2 replays a
 stale capture → illegal access (the CUDA twin of the Vulkan #170 T3 segfault).
-CUDA-graph capture is arch-gated to sm_80+, so it only bites Ampere+ cards — a
-T4/P100 (incl. Kaggle free tier) never captures and never crashed.
+The bug is capture-independent: a Kaggle P100 (sm_60, no CUDA-graph capture)
+reproduced the identical `illegal memory access` at `ggml_backend_cuda_synchronize`
+on the old path, while the fix produced audio that ASR-round-tripped to the exact
+input text (== CPU reference). sm_80+ capture is only an extra aggravator (the
+"CUDA Graph id N reused" stale-replay the reporter's log showed).
 
 Fix (commit c78b187b): on a non-Metal GPU backend, `sched_reset` +
 `sched_alloc_graph` the bucket step sched every step — the granite/outetts

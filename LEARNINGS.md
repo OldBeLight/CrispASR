@@ -11873,14 +11873,24 @@ fast-path and replays a **stale** capture → illegal access. It's the CUDA twin
 of the Vulkan null-subbuffer segfault (#170) that already keeps T3 on CPU there,
 and the same class as qwen3-tts #52/#56.
 
-**Two non-obvious gates that shaped the fix and its testing:**
-1. **CUDA-graph capture is hard-gated to sm_80+** (`cc < GGML_CUDA_CC_AMPERE →
-   disable_due_to_gpu_arch`, ggml-cuda.cu). Below Ampere there is no capture, so
-   the reuse-shortcut is harmless — which is exactly why this never showed on a
-   T4/P100 (Kaggle free tier) and only bit a real Ampere+ card. **Corollary: you
-   cannot reproduce this bug on Kaggle's free GPUs; a repro needs sm_80+.**
-2. The reuse-shortcut is **correct on Metal** (no capture at all) and is the
-   validated §186 M1 fast path — so the fix must not blanket-remove it.
+**The capture story is an aggravator, not the whole bug (verified 2026-07-04).**
+I first assumed the crash *required* CUDA-graph capture — which is hard-gated to
+sm_80+ (`cc < GGML_CUDA_CC_AMPERE → disable_due_to_gpu_arch`, ggml-cuda.cu) — and
+therefore that a T4/P100 could not reproduce it. **Wrong.** The Kaggle A/B kernel
+on a **P100 (sm_60, capture DISABLED, no "CUDA Graph id N reused" line)** still
+crashed the old reuse-shortcut with the *identical* `illegal memory access` at
+`ggml_backend_cuda_synchronize` (ggml-cuda.cu:3151), rc=-6, at decode step ~2 —
+while `fix_default` produced a valid WAV that ASR-round-tripped to the *exact*
+input text, byte-comparable to the CPU reference. So the reuse-shortcut (a sched
+allocated once and reused without per-step `reset`+`alloc`) is **unsafe on CUDA
+independent of graph capture** — capture on sm_80+ is just an *additional* way it
+detonates (stale captured-executable replay), which is why the reporter's sm_86
+log showed the extra "reused" line. Lesson: **don't gate a "needs feature X"
+repro theory on a code-path arch check until you've actually run it — the same
+symptom had a second, capture-independent cause, and the "cheap" GPU reproduced
+it fine.** The reuse-shortcut is still **correct on Metal** (no capture, unified
+memory) and is the validated §186 M1 fast path, so the fix keeps it there and
+only reset+allocs per step on a non-Metal GPU.
 
 **Fix.** On a non-Metal GPU backend, `ggml_backend_sched_reset` +
 `ggml_backend_sched_alloc_graph` the bucket step sched **every step**. This mints

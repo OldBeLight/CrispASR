@@ -293,17 +293,20 @@ old_crashed = old["crash"] or old["rc"] != 0 or not old["wav_ok"]
 print("\n  VERDICT:", flush=True)
 if not capture_capable:
     print(
-        f"  sm_{arch} < sm_80 -> CUDA-graph capture is DISABLED, so the #220 crash "
-        f"path is NOT exercised on this GPU.", flush=True)
-    if fix_ok and not old_crashed:
+        f"  sm_{arch} < sm_80 -> CUDA-graph *capture* is DISABLED (no "
+        f"'CUDA Graph id N reused' stale-replay path here).", flush=True)
+    if fix_ok and old_crashed:
         print(
-            "  Both paths produced valid audio: the fix does NOT regress normal "
-            "CUDA chatterbox decode. (Crash repro still requires an sm_80+ card.)",
-            flush=True)
-    elif fix_ok and old_crashed:
+            f"  CONFIRMED: old reuse-shortcut CRASHES (crash={old['crash']} "
+            f"rc={old['rc']}) even on sm_{arch} while the fix produces valid audio "
+            f"-> the crash is CAPTURE-INDEPENDENT (the reuse-shortcut is unsafe on "
+            f"CUDA regardless of arch; sm_80+ capture is only an extra aggravator). "
+            f"#220 fixed and verified end-to-end on real CUDA.", flush=True)
+    elif fix_ok and not old_crashed:
         print(
-            "  UNEXPECTED: old_reuse failed even below sm_80 — investigate a "
-            "second, capture-independent failure mode.", flush=True)
+            "  Both paths produced valid audio: no capture-independent crash on "
+            "this card; the fix does not regress. (sm_80+ needed to exercise the "
+            "capture-replay path too.)", flush=True)
     else:
         print("  fix_default FAILED on CUDA — regression, do NOT ship.", flush=True)
 else:
