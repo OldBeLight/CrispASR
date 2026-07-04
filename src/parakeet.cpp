@@ -353,6 +353,25 @@ static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, co
     model.buf = wl.buf;
     model.tensors = std::move(wl.tensors);
 
+    // Pure-CTC guard. A NeMo EncDecCTCModelBPE (parakeet-ctc-*,
+    // stt_*_fastconformer_ctc_*) has only an encoder + a CTC classification
+    // head — no RNN-T prediction network and no joint. The parakeet backend is
+    // the transducer (TDT/RNN-T) runtime and cannot run such a model. Detect it
+    // up front and point the user at the CTC backend, rather than emitting a wall
+    // of "required tensor not found" errors and then dereferencing null weights.
+    // Such a GGUF carries arch "canary-ctc" and runs on --backend fastconformer-ctc.
+    if (model.tensors.find("decoder.embed.weight") == model.tensors.end() &&
+        model.tensors.find("decoder.lstm.0.w_ih") == model.tensors.end()) {
+        fprintf(stderr,
+                "parakeet: this GGUF has no RNN-T decoder/joint tensors — it is a pure CTC\n"
+                "parakeet: model (EncDecCTCModelBPE), not a transducer, so it cannot run on the\n"
+                "parakeet: parakeet (transducer) backend. Run it with the CTC backend instead:\n"
+                "parakeet: drop '--backend parakeet' to auto-detect, or pass '--backend fastconformer-ctc'.\n"
+                "parakeet: (If you converted it yourself, use\n"
+                "parakeet:  models/convert-stt-fastconformer-ctc-to-gguf.py, not convert-parakeet-to-gguf.py.)\n");
+        return false;
+    }
+
     // ---- bind named tensors into the per-layer structs ----
 
     // Mel preprocessor (optional — may be absent if recomputed at runtime)

@@ -55,14 +55,20 @@ huggingface-cli download cstr/parakeet-ctc-1.1b-ja-GGUF \
     parakeet-ctc-1.1b-ja-q8_0.gguf --local-dir .
 
 # 3. Transcribe a 16 kHz mono WAV
-./build/bin/crispasr --backend parakeet \
+./build/bin/crispasr \
     -m parakeet-ctc-1.1b-ja-q8_0.gguf -f your-japanese-audio.wav -t 8
 ```
+
+> **Backend:** this is a **CTC** model — let crispasr auto-detect it (as
+> above, no `--backend`) or pass `--backend fastconformer-ctc` explicitly.
+> Do **not** pass `--backend parakeet`: that is the RNN-T/TDT *transducer*
+> runtime and it will reject a CTC model with *"required tensor
+> 'decoder.embed.weight' not found"*.
 
 crispasr can also fetch the model for you by its registry name:
 
 ```bash
-./build/bin/crispasr --backend parakeet -m parakeet-ctc-1.1b-ja \
+./build/bin/crispasr -m parakeet-ctc-1.1b-ja \
     --auto-download -f your-japanese-audio.wav
 ```
 
@@ -73,7 +79,7 @@ FastConformer models drift on long single-pass windows (the safe
 single-pass window is ~12 s):
 
 ```bash
-./build/bin/crispasr --backend parakeet -m parakeet-ctc-1.1b-ja-q8_0.gguf \
+./build/bin/crispasr -m parakeet-ctc-1.1b-ja-q8_0.gguf \
     -f long-japanese-audio.wav --vad -t 8
 ```
 
@@ -102,7 +108,10 @@ single-pass window is ~12 s):
 3. NeMo state-dict keys are remapped to ggml-friendly names — matmul
    tensors as F16, norms / biases / mel filterbank as F32 — and the
    F16 GGUF is quantised to Q8_0 and Q4_K.
-4. Inference runs through `src/parakeet.{h,cpp}` in CrispASR.
+4. The GGUF carries the `canary-ctc` architecture tag; inference runs
+   through the shared FastConformer-CTC runtime (`--backend
+   fastconformer-ctc`, auto-detected from the filename), **not** the
+   RNN-T `parakeet` transducer backend.
 
 ## Licence
 

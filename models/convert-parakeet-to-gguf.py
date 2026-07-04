@@ -325,6 +325,27 @@ def convert(nemo_path: Path, out_path: Path, quant: str | None = None,
     import yaml
     cfg = yaml.safe_load(nemo_data["config_str"])
 
+    # Pure-CTC guard. A NeMo EncDecCTCModelBPE (parakeet-ctc-*,
+    # stt_*_fastconformer_ctc_*) has an encoder + a CTC classification head
+    # (`decoder.decoder_layers.0.weight`) but no RNN-T prediction network
+    # (`decoder.prediction.*`) and no joint. This converter targets the
+    # transducer (RNN-T/TDT) family; converting a pure-CTC model here would
+    # silently drop the CTC head and emit an unusable encoder-only GGUF.
+    # Redirect the user to the FastConformer-CTC converter instead.
+    has_rnnt_pred = any(k.startswith("decoder.prediction.") for k in sd)
+    has_joint = any(k.startswith("joint.") for k in sd)
+    has_ctc_head = "decoder.decoder_layers.0.weight" in sd
+    if not has_rnnt_pred and not has_joint and has_ctc_head:
+        sys.exit(
+            "This is a pure-CTC model (EncDecCTCModelBPE): it has a CTC head but no\n"
+            "RNN-T prediction/joint network, so it cannot run on the parakeet\n"
+            "(transducer) backend. Convert it with the FastConformer-CTC converter:\n"
+            f"    python models/convert-stt-fastconformer-ctc-to-gguf.py \\\n"
+            f"        --nemo {nemo_path} --output {out_path}\n"
+            "The resulting GGUF (arch 'canary-ctc') runs with '--backend fastconformer-ctc'\n"
+            "or auto-detects when you omit --backend."
+        )
+
     import io as _io
     sp = spm.SentencePieceProcessor()
     sp.LoadFromSerializedProto(nemo_data["spm_bytes"])
