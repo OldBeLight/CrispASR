@@ -1505,6 +1505,12 @@ struct crispasr_session {
     crispasr_progress_callback progress_cb = nullptr;
     void* progress_ud = nullptr;
 
+    // Per-segment streaming callback — fired for every committed segment
+    // at the end of each transcribe call. Defaults to _default_segment_cb
+    // which feeds the global polling buffer for Dart FFI.
+    crispasr_segment_callback segment_cb = nullptr;
+    void* segment_ud = nullptr;
+
     // Exactly one of these pointers is non-null based on `backend`.
     whisper_context* whisper_ctx = nullptr;
 #ifdef CA_HAVE_PARAKEET
@@ -1722,6 +1728,53 @@ struct crispasr_session_result {
     std::string backend;
 };
 
+// ── Streamed-segment polling buffer (Dart FFI path) ─────────────────────
+// The default segment callback pushes segments here; Dart polls via
+// crispasr_get_streamed_segment_count / crispasr_drain_streamed_segments.
+static std::mutex g_seg_mutex;
+static std::vector<crispasr_session_seg> g_streamed_segments;
+static std::atomic<int> g_seg_count{0};
+
+static void _default_segment_cb(const char* text, int64_t t0, int64_t t1, int /*idx*/, void* /*ud*/) {
+    std::lock_guard<std::mutex> lk(g_seg_mutex);
+    crispasr_session_seg seg;
+    seg.text = text;
+    seg.t0 = t0;
+    seg.t1 = t1;
+    g_streamed_segments.push_back(std::move(seg));
+    g_seg_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+CA_EXPORT int crispasr_get_streamed_segment_count(void) {
+    return g_seg_count.load(std::memory_order_relaxed);
+}
+
+CA_EXPORT crispasr_session_result* crispasr_drain_streamed_segments(void) {
+    std::lock_guard<std::mutex> lk(g_seg_mutex);
+    if (g_streamed_segments.empty()) return nullptr;
+    auto* r = new crispasr_session_result;
+    r->segments = std::move(g_streamed_segments);
+    g_streamed_segments.clear();
+    g_seg_count.store(0, std::memory_order_relaxed);
+    return r;
+}
+
+CA_EXPORT void crispasr_reset_streamed_segments(void) {
+    std::lock_guard<std::mutex> lk(g_seg_mutex);
+    g_streamed_segments.clear();
+    g_seg_count.store(0, std::memory_order_relaxed);
+}
+
+// Fire the session's segment callback for every segment in `r`.
+// Called from the public transcribe entry points after the result is built.
+static void _fire_segment_callbacks(crispasr_session* s, crispasr_session_result* r) {
+    if (!s || !r || !s->segment_cb) return;
+    for (int i = 0; i < (int)r->segments.size(); ++i) {
+        const auto& seg = r->segments[i];
+        s->segment_cb(seg.text.c_str(), seg.t0, seg.t1, i, s->segment_ud);
+    }
+}
+
 // Per-token data fed into emit_words_from_tokens. Backends with their own
 // token-prob APIs project into this shape so the word-grouping logic stays
 // in one place.
@@ -1828,6 +1881,12 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
     s->model_path = model_path;
     s->backend = backend_name;
     s->n_threads = n_threads > 0 ? n_threads : 4;
+
+    // Register the default segment callback so the Dart polling buffer
+    // is populated out of the box. Users can override via
+    // crispasr_session_set_segment_callback after open.
+    s->segment_cb = _default_segment_cb;
+    s->segment_ud = nullptr;
 
     if (s->backend == "whisper") {
         whisper_context_params cparams = whisper_context_default_params();
@@ -3487,6 +3546,7 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
     if (n_runs <= 1) {
         crispasr_session_result* r = transcribe_single(s, pcm, n_samples, language);
         apply_session_punc_model(s, r);
+        _fire_segment_callbacks(s, r);
         return r;
     }
 
@@ -3516,6 +3576,7 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
         }
     }
     apply_session_punc_model(s, best);
+    _fire_segment_callbacks(s, best);
     return best;
 }
 
@@ -3711,6 +3772,15 @@ CA_EXPORT void crispasr_session_set_progress_callback(crispasr_session* s, crisp
         return;
     s->progress_cb = cb;
     s->progress_ud = cb ? user_data : nullptr;
+}
+
+CA_EXPORT void crispasr_session_set_segment_callback(
+    crispasr_session* s,
+    crispasr_segment_callback cb,
+    void* user_data) {
+    if (!s) return;
+    s->segment_cb = cb ? cb : _default_segment_cb;
+    s->segment_ud = cb ? user_data : nullptr;
 }
 
 static crispasr_session_result* transcribe_single(crispasr_session* s, const float* pcm, int n_samples,

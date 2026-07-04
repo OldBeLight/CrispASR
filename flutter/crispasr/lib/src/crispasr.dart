@@ -4436,6 +4436,73 @@ void resetTranscriptionProgress({String? libPath}) {
 }
 
 // ---------------------------------------------------------------------------
+// Streamed-segment polling (per-segment streaming callback, Dart side)
+// ---------------------------------------------------------------------------
+
+/// Number of new segments available for polling. Returns 0 when the C
+/// symbol is absent (pre-streaming builds) or the buffer is empty.
+int getStreamedSegmentCount({String? libPath}) {
+  final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
+  if (!lib.providesSymbol('crispasr_get_streamed_segment_count')) return 0;
+  final fn = lib.lookupFunction<Int32 Function(), int Function()>(
+      'crispasr_get_streamed_segment_count');
+  return fn();
+}
+
+/// Drain all buffered streamed segments. Returns an empty list when the C
+/// symbol is absent or no segments have been committed since the last drain.
+/// The returned result is freed automatically after reading.
+List<SessionSegment> drainStreamedSegments({String? libPath}) {
+  final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
+  if (!lib.providesSymbol('crispasr_drain_streamed_segments')) return const [];
+  final drain = lib.lookupFunction<Pointer<Void> Function(), Pointer<Void> Function()>(
+      'crispasr_drain_streamed_segments');
+  final res = drain();
+  if (res == nullptr) return const [];
+
+  // Read segments using the same accessors as CrispasrSession._readSegments.
+  final nSegs = lib.lookupFunction<Int32 Function(Pointer<Void>), int Function(Pointer<Void>)>(
+      'crispasr_session_result_n_segments')(res);
+  final segText = lib.lookupFunction<
+      Pointer<Utf8> Function(Pointer<Void>, Int32),
+      Pointer<Utf8> Function(Pointer<Void>, int)>(
+    'crispasr_session_result_segment_text',
+  );
+  final segT0 = lib.lookupFunction<
+      Int64 Function(Pointer<Void>, Int32),
+      int Function(Pointer<Void>, int)>('crispasr_session_result_segment_t0');
+  final segT1 = lib.lookupFunction<
+      Int64 Function(Pointer<Void>, Int32),
+      int Function(Pointer<Void>, int)>('crispasr_session_result_segment_t1');
+
+  final out = <SessionSegment>[];
+  for (var i = 0; i < nSegs; i++) {
+    final tp = segText(res, i);
+    final text = tp == nullptr ? '' : tp.toDartString();
+    final t0 = segT0(res, i) / 100.0;
+    final t1 = segT1(res, i) / 100.0;
+    out.add(SessionSegment(text: text.trim(), start: t0, end: t1));
+  }
+
+  // Free the result.
+  final free = lib.lookupFunction<Void Function(Pointer<Void>), void Function(Pointer<Void>)>(
+      'crispasr_session_result_free');
+  free(res);
+
+  return out;
+}
+
+/// Reset the streamed-segment buffer. Call before starting a new
+/// transcription to discard stale segments from the previous run.
+void resetStreamedSegments({String? libPath}) {
+  final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
+  if (!lib.providesSymbol('crispasr_reset_streamed_segments')) return;
+  final fn = lib.lookupFunction<Void Function(), void Function()>(
+      'crispasr_reset_streamed_segments');
+  fn();
+}
+
+// ---------------------------------------------------------------------------
 // C2: Stereo audio decode
 // ---------------------------------------------------------------------------
 

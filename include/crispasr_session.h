@@ -78,6 +78,38 @@ typedef void (*crispasr_progress_callback)(int processed, int total, void* user_
 // stored, not copied; keep it valid for the duration of transcribe calls.
 CRISPASR_SESSION_API void crispasr_session_set_progress_callback(crispasr_session* s, crispasr_progress_callback cb,
                                                                  void* user_data);
+
+/// Per-segment streaming callback. Fired each time a new segment is
+/// committed during transcription. The segment text and timing are
+/// passed directly — the callback must copy any data it needs (the
+/// pointers are valid only for the duration of the call).
+typedef void (*crispasr_segment_callback)(
+    const char* text,       // segment text (UTF-8, null-terminated)
+    int64_t t0_cs,          // start time in centiseconds
+    int64_t t1_cs,          // end time in centiseconds
+    int segment_index,      // 0-based segment index within this transcription
+    void* user_data         // opaque pointer from registration
+);
+
+/// Register a per-segment streaming callback on the session.
+/// Pass NULL to clear. The callback is invoked on the transcription
+/// thread — it must be fast and non-blocking.
+CRISPASR_SESSION_API void crispasr_session_set_segment_callback(
+    crispasr_session* s,
+    crispasr_segment_callback cb,
+    void* user_data);
+
+/// Number of streamed segments available for polling (Dart FFI path).
+CRISPASR_SESSION_API int crispasr_get_streamed_segment_count(void);
+
+/// Drain all buffered streamed segments into a new result. Caller owns the
+/// returned pointer (free with crispasr_session_result_free). Returns NULL
+/// when the buffer is empty.
+CRISPASR_SESSION_API crispasr_session_result* crispasr_drain_streamed_segments(void);
+
+/// Clear the streamed-segment buffer. Call before starting a new
+/// transcription to discard stale segments from the previous run.
+CRISPASR_SESSION_API void crispasr_reset_streamed_segments(void);
 CRISPASR_SESSION_API void crispasr_params_set_language(whisper_full_params* p, const char* lang);
 CRISPASR_SESSION_API void crispasr_params_set_translate(whisper_full_params* p, int v);
 CRISPASR_SESSION_API void crispasr_params_set_detect_language(whisper_full_params* p, int v);
