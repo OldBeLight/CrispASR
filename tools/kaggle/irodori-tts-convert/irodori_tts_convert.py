@@ -44,18 +44,10 @@ log("Kernel started")
 REPO = WORK / "CrispASR"
 if not REPO.exists():
     log("Cloning CrispASR (feat/irodori-tts branch)...")
-    try:
-        subprocess.check_call([
-            "git", "clone", "--depth", "1", "--branch", "feat/irodori-tts",
-            "https://github.com/CrispStrobe/CrispASR.git", str(REPO),
-        ])
-    except subprocess.CalledProcessError:
-        # Branch may not be pushed yet — try main and use bundled converter
-        log("feat/irodori-tts branch not found, cloning main...")
-        subprocess.check_call([
-            "git", "clone", "--depth", "1",
-            "https://github.com/CrispStrobe/CrispASR.git", str(REPO),
-        ])
+    subprocess.check_call([
+        "git", "clone", "--depth", "1", "--branch", "feat/irodori-tts",
+        "https://github.com/CrispStrobe/CrispASR.git", str(REPO),
+    ])
 
 sys.path.insert(0, str(REPO / "tools" / "kaggle"))
 import kaggle_harness as kh
@@ -107,10 +99,7 @@ log(f"Downloaded: {ckpt_path} ({os.path.getsize(ckpt_path) / 1024 / 1024:.1f} MB
 
 kh.step("converting to GGUF (F16)")
 
-# Use bundled converter (works even if main branch doesn't have it yet)
-converter_path = Path(__file__).resolve().parent / "convert_irodori_tts_to_gguf.py"
-if not converter_path.exists():
-    converter_path = REPO / "models" / "convert-irodori-tts-to-gguf.py"
+converter_path = REPO / "models" / "convert-irodori-tts-to-gguf.py"
 
 output_f16 = WORK / "irodori-tts-500m-v3-f16.gguf"
 
