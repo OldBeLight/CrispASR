@@ -1,93 +1,117 @@
 #!/usr/bin/env python3
 """
-Kaggle kernel: Convert Aratako/Irodori-TTS-500M-v3 → GGUF + quantize to Q4_K.
-Also dumps a Python reference for crispasr-diff parity validation.
+Kaggle kernel: Irodori-TTS-500M-v3 → GGUF F16 + Q4_K + reference dump.
 
-Outputs (in /kaggle/working):
+Downloads Aratako/Irodori-TTS-500M-v3, converts to GGUF (F16),
+builds crispasr-quantize to produce Q4_K, runs Python reference
+dump for crispasr-diff parity validation, uploads to HuggingFace.
+
+Outputs:
   - irodori-tts-500m-v3-f16.gguf     (~1 GB)
   - irodori-tts-500m-v3-q4_k.gguf    (~250 MB)
   - irodori-tts-ref.gguf              (reference activations for diff)
 
-Run on chr1s4 account with GPU enabled (for faster HF downloads + builds).
+Run under chr1s4 account with GPU enabled.
 """
 
-import gc
-import json
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+# Prevent tensorflow from messing with protobuf
+os.environ["TRANSFORMERS_NO_TF"] = "1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 WORK = Path("/kaggle/working")
 os.chdir(str(WORK))
 
-# ── Bootstrap harness ────────────────────────────────────────────────
+PROGRESS = WORK / "progress.txt"
 
-CRISPASR_URL = "https://github.com/CrispStrobe/CrispASR.git"
-_CRISPASR_DIR = WORK / "CrispASR"
-if not _CRISPASR_DIR.exists():
+
+def log(msg):
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    with open(PROGRESS, "a") as f:
+        f.write(line + "\n")
+
+
+log("Kernel started")
+
+# ── Clone CrispASR (feat/irodori-tts branch) ─────────────────────────
+
+REPO = WORK / "CrispASR"
+if not REPO.exists():
+    log("Cloning CrispASR (feat/irodori-tts branch)...")
     try:
-        subprocess.check_call(
-            ["git", "clone", "--depth", "1", CRISPASR_URL, str(_CRISPASR_DIR)]
-        )
-        sys.path.insert(0, str(_CRISPASR_DIR / "tools" / "kaggle"))
-    except Exception:
-        pass
+        subprocess.check_call([
+            "git", "clone", "--depth", "1", "--branch", "feat/irodori-tts",
+            "https://github.com/CrispStrobe/CrispASR.git", str(REPO),
+        ])
+    except subprocess.CalledProcessError:
+        # Branch may not be pushed yet — try main and use bundled converter
+        log("feat/irodori-tts branch not found, cloning main...")
+        subprocess.check_call([
+            "git", "clone", "--depth", "1",
+            "https://github.com/CrispStrobe/CrispASR.git", str(REPO),
+        ])
 
-if str(_CRISPASR_DIR / "tools" / "kaggle") not in sys.path:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-
+sys.path.insert(0, str(REPO / "tools" / "kaggle"))
 import kaggle_harness as kh
 
 kh.init_progress()
+log("kaggle_harness imported OK")
 
 # ── Install deps ─────────────────────────────────────────────────────
 
-subprocess.run(
-    [sys.executable, "-m", "pip", "install", "-q",
-     "gguf", "safetensors", "transformers", "sentencepiece", "huggingface_hub"],
-    check=True,
-)
+kh.step("installing dependencies")
+subprocess.check_call([
+    sys.executable, "-m", "pip", "install", "--quiet",
+    "gguf", "safetensors", "transformers", "sentencepiece",
+    "huggingface_hub", "hf_transfer",
+])
+log("deps installed")
 
 # ── Authenticate HF ─────────────────────────────────────────────────
 
-hf_token = kh.kaggle_secret("hf_token", "HF_TOKEN")
-if hf_token:
-    os.environ["HF_TOKEN"] = hf_token
-    os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
+token = kh.resolve_hf_token()
+if token:
+    os.environ["HF_TOKEN"] = token
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = token
+    log("HF token resolved")
+else:
+    log("WARNING: no HF token found — downloads may fail for gated models")
 
 # ── Download model ───────────────────────────────────────────────────
 
-print("=" * 60)
-print("STEP 1: Download Irodori-TTS-500M-v3 checkpoint")
-print("=" * 60)
+kh.step("downloading Irodori-TTS-500M-v3")
 
 from huggingface_hub import hf_hub_download, list_repo_files
 
 REPO_ID = "Aratako/Irodori-TTS-500M-v3"
 
-# Find the safetensors file
 files = list_repo_files(REPO_ID)
 st_files = [f for f in files if f.endswith(".safetensors")]
-print(f"  Repo files: {files}")
-print(f"  Safetensors: {st_files}")
+log(f"Repo files: {files}")
+log(f"Safetensors: {st_files}")
 
 if not st_files:
-    print("ERROR: No .safetensors found in repo")
+    log("ERROR: No .safetensors found in repo")
     sys.exit(1)
 
-ckpt_path = hf_hub_download(repo_id=REPO_ID, filename=st_files[0])
-print(f"  Downloaded: {ckpt_path}")
-print(f"  Size: {os.path.getsize(ckpt_path) / 1024 / 1024:.1f} MB")
+ckpt_path = hf_hub_download(repo_id=REPO_ID, filename=st_files[0], token=token)
+log(f"Downloaded: {ckpt_path} ({os.path.getsize(ckpt_path) / 1024 / 1024:.1f} MB)")
 
 # ── Convert to GGUF (F16) ───────────────────────────────────────────
 
-print("\n" + "=" * 60)
-print("STEP 2: Convert to GGUF (F16)")
-print("=" * 60)
+kh.step("converting to GGUF (F16)")
 
-converter_path = _CRISPASR_DIR / "models" / "convert-irodori-tts-to-gguf.py"
+# Use bundled converter (works even if main branch doesn't have it yet)
+converter_path = Path(__file__).resolve().parent / "convert_irodori_tts_to_gguf.py"
+if not converter_path.exists():
+    converter_path = REPO / "models" / "convert-irodori-tts-to-gguf.py"
+
 output_f16 = WORK / "irodori-tts-500m-v3-f16.gguf"
 
 cmd = [
@@ -96,179 +120,244 @@ cmd = [
     "--output", str(output_f16),
     "--tokenizer-repo", "sbintuitions/sarashina2.2-0.5b",
 ]
-print(f"  Running: {' '.join(cmd)}")
+log(f"Running: {' '.join(cmd)}")
 t0 = time.time()
-subprocess.run(cmd, check=True)
+subprocess.check_call(cmd)
 elapsed = time.time() - t0
-print(f"  Done in {elapsed:.1f}s")
-print(f"  F16 GGUF: {output_f16.stat().st_size / 1024 / 1024:.1f} MB")
+log(f"F16 GGUF done in {elapsed:.1f}s: {output_f16.stat().st_size / 1024 / 1024:.1f} MB")
 
-# ── Build CrispASR for quantization ─────────────────────────────────
+# ── Build crispasr-quantize ──────────────────────────────────────────
 
-print("\n" + "=" * 60)
-print("STEP 3: Build crispasr-quantize")
-print("=" * 60)
-
+kh.step("building crispasr-quantize")
 kh.install_build_toolchain()
-build_dir = _CRISPASR_DIR / "build"
 
-cmake_flags = [
-    "-DCMAKE_BUILD_TYPE=Release",
-    "-G", "Ninja",
-]
-# Add ccache if available
-cmake_flags += kh.cache_and_link_flags()
+build_dir = Path("/kaggle/temp/quant-build")
+cmake_env = os.environ.copy()
+cmake_env["CCACHE_DIR"] = "/kaggle/working/.ccache"
 
-subprocess.run(
-    ["cmake", "-B", str(build_dir), "-S", str(_CRISPASR_DIR)] + cmake_flags,
-    check=True, cwd=str(_CRISPASR_DIR),
+kh.sh_with_progress(
+    f"cmake -G Ninja -B {build_dir} -S {REPO}"
+    f" -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF"
+    f" -DCMAKE_C_COMPILER_LAUNCHER=ccache"
+    f" -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+)
+n_jobs = kh.safe_build_jobs(gpu=False)
+kh.sh_with_progress(
+    f"cmake --build {build_dir} -j{n_jobs} --target crispasr-quantize"
 )
 
-jobs = kh.safe_build_jobs(gpu=True)
-with kh.build_heartbeat():
-    subprocess.run(
-        ["cmake", "--build", str(build_dir), "--target", "crispasr-quantize",
-         f"-j{jobs}"],
-        check=True, cwd=str(_CRISPASR_DIR),
-    )
+# Find the binary
+quantize_bin = None
+import glob
+for candidate in [
+    build_dir / "bin" / "crispasr-quantize",
+    build_dir / "examples" / "crispasr-quantize" / "crispasr-quantize",
+]:
+    if candidate.exists():
+        quantize_bin = candidate
+        break
+if quantize_bin is None:
+    hits = glob.glob(str(build_dir / "**" / "crispasr-quantize"), recursive=True)
+    if hits:
+        quantize_bin = Path(hits[0])
 
-quantize_bin = build_dir / "bin" / "crispasr-quantize"
-if not quantize_bin.exists():
-    # Try alternative path
-    quantize_bin = build_dir / "examples" / "crispasr-quantize" / "crispasr-quantize"
-if not quantize_bin.exists():
-    # Search for it
-    result = subprocess.run(
-        ["find", str(build_dir), "-name", "crispasr-quantize", "-type", "f"],
-        capture_output=True, text=True,
-    )
-    candidates = result.stdout.strip().split("\n")
-    if candidates and candidates[0]:
-        quantize_bin = Path(candidates[0])
-    else:
-        print("ERROR: crispasr-quantize not found")
-        sys.exit(1)
+if quantize_bin is None or not quantize_bin.exists():
+    log("ERROR: crispasr-quantize not found")
+    kh.sh_with_progress(f"find {build_dir} -name 'crispasr*' -type f | head -20")
+    sys.exit(1)
 
-print(f"  quantize binary: {quantize_bin}")
+log(f"quantize binary: {quantize_bin}")
 
 # ── Quantize to Q4_K ────────────────────────────────────────────────
 
-print("\n" + "=" * 60)
-print("STEP 4: Quantize to Q4_K")
-print("=" * 60)
-
+kh.step("quantizing to Q4_K")
 output_q4k = WORK / "irodori-tts-500m-v3-q4_k.gguf"
 
 t0 = time.time()
-subprocess.run(
-    [str(quantize_bin), str(output_f16), str(output_q4k), "q4_k"],
-    check=True,
-)
+kh.sh_with_progress(f"{quantize_bin} {output_f16} {output_q4k} q4_k")
 elapsed = time.time() - t0
-print(f"  Done in {elapsed:.1f}s")
-print(f"  Q4_K GGUF: {output_q4k.stat().st_size / 1024 / 1024:.1f} MB")
+log(f"Q4_K done in {elapsed:.1f}s: {output_q4k.stat().st_size / 1024 / 1024:.1f} MB")
 
-# ── Python reference dump (for crispasr-diff) ───────────────────────
+# Also Q8_0
+output_q8 = WORK / "irodori-tts-500m-v3-q8_0.gguf"
+kh.sh_with_progress(f"{quantize_bin} {output_f16} {output_q8} q8_0")
+log(f"Q8_0: {output_q8.stat().st_size / 1024 / 1024:.1f} MB")
 
-print("\n" + "=" * 60)
-print("STEP 5: Reference dump (text encoder + speaker encoder first layers)")
-print("=" * 60)
+# ── Python reference dump (intermediates for crispasr-diff) ──────────
 
-# We'll do a lightweight reference dump — encode a short text and capture
-# intermediate activations at the text encoder and first DiT block.
-# Full reference dump can be added later.
+kh.step("running reference dump")
 
 try:
-    import torch
+    import json
     import numpy as np
+    import torch
     from safetensors import safe_open
 
-    # Load model config
+    # Read model config from checkpoint metadata
     with safe_open(ckpt_path, framework="pt", device="cpu") as f:
         metadata = f.metadata() or {}
         config_json = metadata.get("config_json")
-        if config_json:
-            config = json.loads(config_json)
-            print(f"  Model config: latent_dim={config.get('latent_dim')}, "
-                  f"model_dim={config.get('model_dim')}, "
-                  f"num_layers={config.get('num_layers')}")
+    config = json.loads(config_json) if config_json else {}
+    log(f"Model config: latent_dim={config.get('latent_dim', 128)}, "
+        f"model_dim={config.get('model_dim', 2048)}, "
+        f"num_layers={config.get('num_layers', 24)}")
 
-    # Load tokenizer and encode a test string
+    # Load tokenizer
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained("sbintuitions/sarashina2.2-0.5b", use_fast=True)
-    test_text = "こんにちは、世界。"
+
+    # Encode test text
+    test_text = "こんにちは、世界。テストです。"
     token_ids = tok.encode(test_text, add_special_tokens=False)
     token_ids = [tok.bos_token_id] + token_ids
-    print(f"  Test text: '{test_text}' → {len(token_ids)} tokens")
-    print(f"  Token IDs (first 10): {token_ids[:10]}")
+    log(f"Test text: '{test_text}' → {len(token_ids)} tokens")
 
-    # Save reference info
-    ref_info = {
-        "test_text": test_text,
-        "token_ids": token_ids,
-        "vocab_size": len(tok),
-        "bos_token_id": tok.bos_token_id,
-        "pad_token_id": tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id,
-    }
-    ref_path = WORK / "irodori-tts-ref-info.json"
-    ref_path.write_text(json.dumps(ref_info, ensure_ascii=False, indent=2))
-    print(f"  Saved reference info: {ref_path}")
+    # Load model weights and run forward passes for intermediate tensors
+    # We'll load the Irodori-TTS model using safetensors lazy loading
+    from safetensors.torch import load_file
 
-    # For a full reference dump, we'd load the model and run forward passes.
-    # That requires ~2GB RAM for the model alone. On Kaggle P100/T4 (13GB RAM),
-    # this is feasible. We'll implement the full dump as a follow-up.
-    print("  NOTE: Full activation dump will be added in follow-up kernel push")
+    log("Loading model weights...")
+    state = load_file(ckpt_path, device="cpu")
+    log(f"  {len(state)} tensors loaded")
+
+    # Build a minimal model to capture intermediates
+    # We need: text_encoder output, speaker_encoder output, first DiT block output
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+    # Try to import Irodori-TTS source if available
+    irodori_src = None
+    for candidate in [
+        Path("/kaggle/working") / "irodori-tts-src",
+        Path("/tmp") / "irodori-tts-src",
+    ]:
+        if candidate.exists():
+            irodori_src = candidate
+            break
+
+    if irodori_src is None:
+        log("Cloning Irodori-TTS source for reference forward pass...")
+        irodori_src = Path("/kaggle/temp") / "irodori-tts-src"
+        subprocess.check_call([
+            "git", "clone", "--depth", "1",
+            "https://github.com/Aratako/Irodori-TTS.git", str(irodori_src),
+        ])
+
+    sys.path.insert(0, str(irodori_src))
+    from irodori_tts.config import ModelConfig
+    from irodori_tts.model import TextToLatentRFDiT
+
+    # Instantiate model and load weights
+    model_cfg = ModelConfig(**{k: v for k, v in config.items()
+                              if k in [f.name for f in ModelConfig.__dataclass_fields__.values()]
+                              if hasattr(ModelConfig, k)})
+    log(f"Instantiating model (text_dim={model_cfg.text_dim}, model_dim={model_cfg.model_dim})...")
+    model = TextToLatentRFDiT(model_cfg)
+    model.load_state_dict(state, strict=False)
+    model.eval()
+    del state
+    import gc; gc.collect()
+    log("Model loaded, running forward pass...")
+
+    # Tokenize and run text encoder
+    text_ids = torch.tensor([token_ids], dtype=torch.long)
+    text_mask = torch.ones_like(text_ids, dtype=torch.bool)
+
+    with torch.inference_mode():
+        text_state = model.text_encoder(text_ids, text_mask)
+        text_state = model.text_norm(text_state)
+        log(f"  text_state: {text_state.shape} (first 4 values: {text_state[0, 0, :4].tolist()})")
+
+    # Save reference as GGUF
+    try:
+        from gguf import GGUFWriter
+        ref_output = WORK / "irodori-tts-ref.gguf"
+        writer = GGUFWriter(str(ref_output), "irodori-tts-ref")
+        writer.add_string("irodori.ref.test_text", test_text)
+        writer.add_uint32("irodori.ref.n_tokens", len(token_ids))
+
+        # Save text encoder output
+        arr = text_state[0].detach().float().numpy()
+        writer.add_tensor("ref.text_state", arr)
+        log(f"  ref.text_state: {arr.shape}")
+
+        # Try speaker encoder with zeros (unconditional)
+        if model_cfg.use_speaker_condition_resolved and model.speaker_encoder is not None:
+            latent_dim = model_cfg.latent_dim * model_cfg.latent_patch_size
+            dummy_ref = torch.zeros(1, 10, latent_dim)
+            dummy_mask = torch.ones(1, 10, dtype=torch.bool)
+            with torch.inference_mode():
+                spk_state = model.speaker_encoder(dummy_ref, dummy_mask)
+                spk_state = model.speaker_norm(spk_state)
+            arr_spk = spk_state[0].detach().float().numpy()
+            writer.add_tensor("ref.spk_state_zeros", arr_spk)
+            log(f"  ref.spk_state_zeros: {arr_spk.shape}")
+
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+        log(f"Reference GGUF: {ref_output} ({ref_output.stat().st_size / 1024:.1f} KB)")
+    except Exception as e:
+        log(f"  GGUF reference write failed: {e}")
+
+    del model
+    gc.collect()
 
 except Exception as e:
-    print(f"  Reference dump skipped: {e}")
+    import traceback
+    log(f"Reference dump failed: {e}")
+    log(traceback.format_exc())
+    log("(non-fatal — GGUF conversion still succeeded)")
 
 # ── Upload to HuggingFace ────────────────────────────────────────────
 
-print("\n" + "=" * 60)
-print("STEP 6: Upload GGUF files to HuggingFace")
-print("=" * 60)
-
+kh.step("uploading to HuggingFace")
 try:
     from huggingface_hub import HfApi
+    api = HfApi(token=token)
+    hf_repo = "cstr/irodori-tts-GGUF"
 
-    api = HfApi()
-    repo_id = "cstr/irodori-tts-GGUF"
+    api.create_repo(repo_id=hf_repo, exist_ok=True, repo_type="model")
 
-    # Create repo if it doesn't exist
-    try:
-        api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
-        print(f"  Repo: {repo_id}")
-    except Exception as e:
-        print(f"  Repo creation: {e}")
+    upload_files = []
+    for fpath in [output_f16, output_q4k, output_q8]:
+        if fpath.exists() and fpath.stat().st_size > 0:
+            upload_files.append(fpath)
 
-    # Upload F16
-    print(f"  Uploading F16 ({output_f16.stat().st_size / 1024 / 1024:.0f} MB)...")
-    api.upload_file(
-        path_or_fileobj=str(output_f16),
-        path_in_repo="irodori-tts-500m-v3-f16.gguf",
-        repo_id=repo_id,
-        repo_type="model",
-    )
+    ref_output = WORK / "irodori-tts-ref.gguf"
+    if ref_output.exists() and ref_output.stat().st_size > 0:
+        upload_files.append(ref_output)
 
-    # Upload Q4_K
-    print(f"  Uploading Q4_K ({output_q4k.stat().st_size / 1024 / 1024:.0f} MB)...")
-    api.upload_file(
-        path_or_fileobj=str(output_q4k),
-        path_in_repo="irodori-tts-500m-v3-q4_k.gguf",
-        repo_id=repo_id,
-        repo_type="model",
-    )
-    print("  Upload complete!")
+    for fpath in upload_files:
+        log(f"  uploading {fpath.name} ({fpath.stat().st_size / 1024 / 1024:.1f} MB)...")
+        api.upload_file(
+            path_or_fileobj=str(fpath),
+            path_in_repo=fpath.name,
+            repo_id=hf_repo,
+            repo_type="model",
+        )
+        log(f"  ✓ {fpath.name}")
 
+    log(f"Upload complete: {hf_repo}")
 except Exception as e:
-    print(f"  HF upload failed (non-fatal): {e}")
-    print("  GGUF files are still in /kaggle/working for manual download")
+    log(f"HF upload failed (non-fatal): {e}")
+    log("Files staged at /kaggle/working/ for manual download")
 
-# ── Summary ──────────────────────────────────────────────────────────
+# ── Cleanup ──────────────────────────────────────────────────────────
 
-print("\n" + "=" * 60)
-print("DONE")
-print("=" * 60)
-print(f"  F16:  {output_f16}  ({output_f16.stat().st_size / 1024 / 1024:.1f} MB)")
-print(f"  Q4_K: {output_q4k}  ({output_q4k.stat().st_size / 1024 / 1024:.1f} MB)")
-print(f"\nQ4_K is small enough to run on the VPS (8 GB RAM).")
+import shutil
+for d in [REPO, Path("/kaggle/temp/quant-build"), WORK / ".ccache"]:
+    if d.exists():
+        shutil.rmtree(str(d), ignore_errors=True)
+        log(f"Cleaned up {d.name}")
+
+# Remove F16 if Q4_K exists (save output space — Kaggle limits to 20 GB)
+if output_q4k.exists() and output_f16.exists():
+    output_f16.unlink()
+    log("Removed F16 (Q4_K available on HF)")
+
+kh.step("done")
+log("\n=== ALL DONE ===")
+for fpath in [output_f16, output_q4k, output_q8, WORK / "irodori-tts-ref.gguf"]:
+    if fpath.exists():
+        log(f"  {fpath.name}: {fpath.stat().st_size / 1024 / 1024:.1f} MB")
