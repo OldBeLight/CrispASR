@@ -1988,8 +1988,35 @@ static float* run_t3_kv_bucket(chatterbox_context* c, const float* embeds, int n
     if (!step_sched)
         return nullptr;
 
+        // §220: on a non-Metal GPU backend the pre-built step graph runs through
+        // CUDA-graph capture (Vulkan binds subbuffers similarly). ggml-cuda keys a
+        // captured executable on the split graph's `uid` (ggml-backend.cpp assigns a
+        // fresh uid only inside sched_alloc_graph) and, on a uid match, replays it
+        // verbatim with the device pointers baked in at capture time
+        // (ggml-cuda.cu "CUDA Graph id N reused"). The original §186 fast path
+        // allocated the step sched once per bucket and then only re-ran graph_compute
+        // each step — so the uid never changed and the second decode step replayed a
+        // stale capture, tripping "CUDA error: an illegal memory access" (#220) — the
+        // CUDA analogue of the Vulkan null-subbuffer segfault (#170). Resetting +
+        // re-allocating the sched every step re-splits the graph (new uid →
+        // cudaGraphExecUpdate refreshes the pointers) while the cached cgraph keeps
+        // nodes[0] stable so capture still engages; this is the granite/outetts
+        // CUDA-graph-bucket pattern documented in §210. Metal has no graph capture, so
+        // keep the cheaper alloc-once reuse there (the validated §186 M1 path).
+        // Opt back into the old reuse path for A/B or bisection with
+        // CRISPASR_CHATTERBOX_T3_BUCKET_REUSE=1.
+#if defined(GGML_USE_METAL)
+    const bool realloc_each_step = false;
+#else
+    static const bool s_force_reuse = []() {
+        const char* s = std::getenv("CRISPASR_CHATTERBOX_T3_BUCKET_REUSE");
+        return s && (s[0] == '1' || s[0] == 'y' || s[0] == 'Y');
+    }();
+    const bool realloc_each_step = !s_force_reuse && c->backend && c->backend != c->backend_cpu;
+#endif
+
     int& active = cfg ? c->t3_active_bucket_cfg : c->t3_active_bucket;
-    if (active != idx) {
+    if (realloc_each_step || active != idx) {
         ggml_backend_sched_reset(step_sched);
         if (!ggml_backend_sched_alloc_graph(step_sched, gf)) {
             fprintf(stderr, "chatterbox: t3_bucket%s[%d] alloc failed\n", cfg ? "_cfg" : "", idx);
