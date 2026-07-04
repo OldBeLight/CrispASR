@@ -279,6 +279,26 @@ catch_discover_tests(test-cpu-ops-to-f32
     PROPERTIES LABELS "unit"
 )
 
+# ─── test-vibevoice-quant-carveout — regression guard for issue #171 ──────────
+# Asserts crispasr-quantize keeps the VibeVoice diffusion prediction head and
+# connectors/EOS (pred.*, at_conn.*, se_conn.*, tts_eos.*, tts_types.*) at source
+# precision while quantizing the LM backbone + VAE decoder — the split that
+# prevents a quantized diffusion head from decoding a "music"/hum onset. Runs the
+# built binary on a tiny committed fixture GGUF; skips gracefully if the example
+# tool isn't built.
+# crispasr-quantize lives in examples/, which is added AFTER tests/ — so guard on
+# the build option (the $<TARGET_FILE:> generator expression resolves after all
+# subdirectories are processed, so the forward reference is fine).
+if(CRISPASR_BUILD_EXAMPLES)
+    add_test(NAME test-vibevoice-quant-carveout
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test-vibevoice-quant-carveout.sh
+            $<TARGET_FILE:crispasr-quantize>
+            ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/vibevoice-quant-carveout.gguf)
+    set_tests_properties(test-vibevoice-quant-carveout PROPERTIES
+        LABELS "unit;gh;regression-171"
+        TIMEOUT 120)
+endif()
+
 # ─── test - stream - finalize — Catch2 unit tests for the streaming
 # `final.text` stitcher used by `--stream-json` finalize_utterance.
 # Header-only target (no crispasr lib needed): the helper is a pure
