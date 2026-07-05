@@ -86,7 +86,7 @@ struct irodori_hparams {
     float cfg_scale_text = 3.0f;
     float cfg_scale_speaker = 5.0f;
     int sample_rate = 48000;
-    int codec_hop_length = 320;
+    int codec_hop_length = 1920; // Semantic-DACVAE-Japanese-32dim: strides [12,10,8,2] = 1920
 
     int patched_latent_dim() const { return latent_dim * latent_patch_size; }
     int head_dim() const { return model_dim / num_heads; }

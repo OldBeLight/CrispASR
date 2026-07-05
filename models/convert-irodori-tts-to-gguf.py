@@ -85,8 +85,8 @@ IRODORI_HPARAMS = dict(
     cfg_scale_text=3.0,
     cfg_scale_speaker=5.0,
     sample_rate=48000,
-    # From DAC-VAE codec
-    codec_hop_length=320,
+    # From Semantic-DACVAE-Japanese-32dim: strides [12,10,8,2] = 1920
+    codec_hop_length=1920,
 )
 
 
