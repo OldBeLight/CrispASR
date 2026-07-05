@@ -1349,9 +1349,27 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
 
     IRODORI_DBG("[irodori] ODE complete. latent shape: %d x %d\n", patched_steps, latent_d);
 
+    // Dump latent for external DACVAE decode (env-gated)
+    {
+        const char* dump_env = std::getenv("CRISPASR_IRODORI_DUMP_LATENT");
+        if (dump_env && *dump_env && *dump_env != '0') {
+            std::string lat_path = dump_env;
+            if (lat_path == "1")
+                lat_path = "irodori_latent.bin";
+            FILE* f = std::fopen(lat_path.c_str(), "wb");
+            if (f) {
+                std::fwrite(x_t.data(), sizeof(float), x_t.size(), f);
+                std::fclose(f);
+                std::fprintf(stderr, "[irodori] latent dumped to '%s' (%d frames × %d dims)\n", lat_path.c_str(),
+                             patched_steps, latent_d);
+            }
+        }
+    }
+
     // ── Step 4: Output ──
     // The latent (patched_steps × latent_d) needs DAC-VAE decoding to produce PCM.
     // For now, output silence and log that DAC-VAE decode is needed.
+    // TODO: integrate DACVAE decoder from dacvae-ja-32dim-f16.gguf
     int n_pcm = latent_steps * hp.codec_hop_length;
     float* out = (float*)std::malloc(n_pcm * sizeof(float));
     if (!out)
