@@ -183,6 +183,14 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         x_t = torch.randn(1, T_latent, latent_d, dtype=model.dtype)
         cond_1d = cond_embed[:, None, :]  # (1, 1, D*3) broadcast
 
+        # Prepare speaker state (zeros = unconditional, but must not be None
+        # when speaker conditioning is enabled in the model config)
+        spk_state_for_dit = None
+        spk_mask_for_dit = None
+        if model_cfg.use_speaker_condition_resolved:
+            spk_state_for_dit = torch.zeros(1, 1, model_cfg.speaker_dim, dtype=model.dtype)
+            spk_mask_for_dit = torch.zeros(1, 1, dtype=torch.bool)
+
         # In projection
         x = model.in_proj(x_t)
         if "dit_in_proj" in stages:
@@ -197,7 +205,7 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
             x = model.blocks[0](
                 x=x, cond_embed=cond_1d,
                 text_state=text_state, text_mask=text_mask,
-                speaker_state=None, speaker_mask=None,
+                speaker_state=spk_state_for_dit, speaker_mask=spk_mask_for_dit,
                 caption_state=None, caption_mask=None,
                 freqs_cis=freqs,
             )
@@ -209,7 +217,7 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         v_pred = model.forward_with_encoded_conditions(
             x_t=x_t, t=t_tensor.to(dtype=model.dtype),
             text_state=text_state, text_mask=text_mask,
-            speaker_state=None, speaker_mask=None,
+            speaker_state=spk_state_for_dit, speaker_mask=spk_mask_for_dit,
         )
         if "v_pred_step0" in stages:
             results["v_pred_step0"] = v_pred[0].float().numpy()
