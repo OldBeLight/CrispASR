@@ -252,6 +252,14 @@ static ggml_tensor* rms_norm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* wei
     return ggml_mul(ctx, x, weight);
 }
 
+// mul_mat + cast to F32 (weights may be F16/Q4_K, need F32 for element-wise ops)
+static ggml_tensor* mul_mat_f32(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x) {
+    ggml_tensor* y = ggml_mul_mat(ctx, w, x);
+    if (y->type != GGML_TYPE_F32)
+        y = ggml_cast(ctx, y, GGML_TYPE_F32);
+    return y;
+}
+
 // ── Timestep embedding (CPU) ────────────────────────────────────────
 
 static void compute_timestep_embedding(float t, int dim, std::vector<float>& out) {
@@ -557,16 +565,19 @@ static void apply_low_rank_adaln(ggml_context* ctx, const irodori_low_rank_adaln
 
     auto lr_mod = [&](ggml_tensor* cond, ggml_tensor* down, ggml_tensor* up_w, ggml_tensor* up_b) -> ggml_tensor* {
         ggml_tensor* h = ggml_silu(ctx, cond);
-        h = ggml_mul_mat(ctx, down, h);
-        h = ggml_mul_mat(ctx, up_w, h);
+        h = mul_mat_f32(ctx, down, h);
+        h = mul_mat_f32(ctx, up_w, h);
         if (up_b)
             h = ggml_add(ctx, h, up_b);
         return ggml_add(ctx, h, cond); // residual connection
     };
 
-    ggml_tensor* shift = lr_mod(cond_shift, adaln.shift_down, adaln.shift_up_w, adaln.shift_up_b);
-    ggml_tensor* scale = lr_mod(cond_scale, adaln.scale_down, adaln.scale_up_w, adaln.scale_up_b);
-    ggml_tensor* gate = lr_mod(cond_gate, adaln.gate_down, adaln.gate_up_w, adaln.gate_up_b);
+    ggml_tensor* shift =
+        ggml_cast(ctx, lr_mod(cond_shift, adaln.shift_down, adaln.shift_up_w, adaln.shift_up_b), GGML_TYPE_F32);
+    ggml_tensor* scale =
+        ggml_cast(ctx, lr_mod(cond_scale, adaln.scale_down, adaln.scale_up_w, adaln.scale_up_b), GGML_TYPE_F32);
+    ggml_tensor* gate =
+        ggml_cast(ctx, lr_mod(cond_gate, adaln.gate_down, adaln.gate_up_w, adaln.gate_up_b), GGML_TYPE_F32);
 
     // RMSNorm + modulate: x_normed * (1 + scale) + shift
     ggml_tensor* x_norm = ggml_rms_norm(ctx, x, norm_eps);
@@ -620,16 +631,16 @@ static ggml_tensor* build_dit_block_graph(ggml_context* ctx, const irodori_tts_c
     // Self Q/K/V
     IRODORI_DBG("[irodori]       QKV self proj (wq: %dx%d, h_attn: %dx%d)...\n", (int)blk.wq->ne[0], (int)blk.wq->ne[1],
                 (int)h_attn->ne[0], (int)h_attn->ne[1]);
-    ggml_tensor* q = ggml_mul_mat(ctx, blk.wq, h_attn);
-    ggml_tensor* k_self = ggml_mul_mat(ctx, blk.wk, h_attn);
-    ggml_tensor* v_self = ggml_mul_mat(ctx, blk.wv, h_attn);
+    ggml_tensor* q = mul_mat_f32(ctx, blk.wq, h_attn);
+    ggml_tensor* k_self = mul_mat_f32(ctx, blk.wk, h_attn);
+    ggml_tensor* v_self = mul_mat_f32(ctx, blk.wv, h_attn);
     IRODORI_DBG("[irodori]       QKV self done\n");
 
     // Text context K/V
     IRODORI_DBG("[irodori]       text KV proj (wk_text: %dx%d, text_state: %dx%d)...\n", (int)blk.wk_text->ne[0],
                 (int)blk.wk_text->ne[1], (int)text_state->ne[0], (int)text_state->ne[1]);
-    ggml_tensor* k_text = ggml_mul_mat(ctx, blk.wk_text, text_state);
-    ggml_tensor* v_text = ggml_mul_mat(ctx, blk.wv_text, text_state);
+    ggml_tensor* k_text = mul_mat_f32(ctx, blk.wk_text, text_state);
+    ggml_tensor* v_text = mul_mat_f32(ctx, blk.wv_text, text_state);
     IRODORI_DBG("[irodori]       text KV done\n");
 
     // Speaker context K/V
@@ -637,8 +648,8 @@ static ggml_tensor* build_dit_block_graph(ggml_context* ctx, const irodori_tts_c
     ggml_tensor* v_spk = nullptr;
     int T_kv_total = T_latent + T_text;
     if (spk_state && T_ref > 0) {
-        k_spk = ggml_mul_mat(ctx, blk.wk_spk, spk_state);
-        v_spk = ggml_mul_mat(ctx, blk.wv_spk, spk_state);
+        k_spk = mul_mat_f32(ctx, blk.wk_spk, spk_state);
+        v_spk = mul_mat_f32(ctx, blk.wv_spk, spk_state);
         T_kv_total += T_ref;
     }
 
@@ -686,17 +697,17 @@ static ggml_tensor* build_dit_block_graph(ggml_context* ctx, const irodori_tts_c
 
     // Flash attention: Q(hd, T_q, nh), K(hd, T_kv, nh), V(hd, T_kv, nh)
     ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q, k_cat, v_cat, nullptr, 1.0f / std::sqrt((float)hd), 0.0f, 0.0f);
-    // Result: (hd, nh, T_latent) → reshape to (D, T_latent)
+    attn_out = ggml_cast(ctx, attn_out, GGML_TYPE_F32);
     attn_out = ggml_reshape_2d(ctx, attn_out, D, T_latent);
 
     // Gated attention
-    ggml_tensor* g = ggml_mul_mat(ctx, blk.gate, h_attn);
+    ggml_tensor* g = mul_mat_f32(ctx, blk.gate, h_attn);
     g = ggml_sigmoid(ctx, g);
     attn_out = ggml_mul(ctx, attn_out, g);
-    attn_out = ggml_mul_mat(ctx, blk.wo, attn_out);
+    attn_out = mul_mat_f32(ctx, blk.wo, attn_out);
 
-    // gate_attn * attn_out
-    attn_out = ggml_mul(ctx, gate_attn, attn_out);
+    // gate_attn * attn_out (gate is 1D, attn_out is 2D — larger tensor first for ggml_mul)
+    attn_out = ggml_mul(ctx, attn_out, gate_attn);
     x = ggml_add(ctx, x, attn_out);
 
     // ── MLP path ──
@@ -704,8 +715,12 @@ static ggml_tensor* build_dit_block_graph(ggml_context* ctx, const irodori_tts_c
     ggml_tensor* gate_mlp = nullptr;
     apply_low_rank_adaln(ctx, blk.adaln_mlp, x, cond_shift, cond_scale, cond_gate_raw, hp.norm_eps, &h_mlp, &gate_mlp);
 
-    ggml_tensor* mlp_out = core_ffn::swiglu(ctx, h_mlp, blk.mlp_w1, blk.mlp_w3, blk.mlp_w2);
-    mlp_out = ggml_mul(ctx, gate_mlp, mlp_out);
+    // SwiGLU may produce F16 from quantized weights — need F32 for gate mul
+    ggml_tensor* gate_proj = mul_mat_f32(ctx, blk.mlp_w1, h_mlp);
+    ggml_tensor* up_proj = mul_mat_f32(ctx, blk.mlp_w3, h_mlp);
+    ggml_tensor* mlp_out = ggml_mul(ctx, ggml_silu(ctx, gate_proj), up_proj);
+    mlp_out = mul_mat_f32(ctx, blk.mlp_w2, mlp_out);
+    mlp_out = ggml_mul(ctx, mlp_out, gate_mlp);
     x = ggml_add(ctx, x, mlp_out);
 
     return x;
@@ -1003,7 +1018,7 @@ static std::vector<float> run_dit_forward(irodori_tts_context* ctx, const float*
     // Build graph: in_proj → DiT blocks → out_norm → out_proj
     IRODORI_DBG("[irodori]     in_proj: (%d,%d) x (%d,%d)\n", (int)w.in_proj_w->ne[0], (int)w.in_proj_w->ne[1],
                 latent_d, T_latent);
-    ggml_tensor* x = ggml_mul_mat(g, w.in_proj_w, x_in);
+    ggml_tensor* x = mul_mat_f32(g, w.in_proj_w, x_in);
     x = ggml_add(g, x, w.in_proj_b);
     IRODORI_DBG("[irodori]     after in_proj: (%d,%d)\n", (int)x->ne[0], (int)x->ne[1]);
 
@@ -1019,7 +1034,7 @@ static std::vector<float> run_dit_forward(irodori_tts_context* ctx, const float*
     }
 
     x = rms_norm(g, x, w.out_norm, hp.norm_eps);
-    x = ggml_mul_mat(g, w.out_proj_w, x);
+    x = mul_mat_f32(g, w.out_proj_w, x);
     x = ggml_add(g, x, w.out_proj_b);
     ggml_set_name(x, "v_pred");
     ggml_set_output(x);
@@ -1042,12 +1057,14 @@ static std::vector<float> run_dit_forward(irodori_tts_context* ctx, const float*
         return {};
     }
 
-    IRODORI_DBG("[irodori]     setting inputs: x_in.buf=%p cond_in.buf=%p text_in.buf=%p\n", (void*)x_in->buffer,
-                (void*)cond_in->buffer, (void*)text_in->buffer);
-    ggml_backend_tensor_set(x_in, x_t_data, 0, T_latent * latent_d * sizeof(float));
-    ggml_backend_tensor_set(cond_in, cond_embed_data, 0, D * 3 * sizeof(float));
-    ggml_backend_tensor_set(text_in, text_state_data, 0, T_text * hp.text_dim * sizeof(float));
-    if (spk_in) {
+    // Set inputs (only if allocated — unused inputs have null buffers)
+    if (x_in->buffer)
+        ggml_backend_tensor_set(x_in, x_t_data, 0, T_latent * latent_d * sizeof(float));
+    if (cond_in->buffer)
+        ggml_backend_tensor_set(cond_in, cond_embed_data, 0, D * 3 * sizeof(float));
+    if (text_in->buffer)
+        ggml_backend_tensor_set(text_in, text_state_data, 0, T_text * hp.text_dim * sizeof(float));
+    if (spk_in && spk_in->buffer) {
         ggml_backend_tensor_set(spk_in, spk_state_data, 0, T_ref * hp.speaker_dim * sizeof(float));
     }
 
@@ -1083,11 +1100,11 @@ static std::vector<float> run_timestep_cond(irodori_tts_context* ctx, float t) {
     ggml_set_input(emb_in);
 
     // cond_module: Linear(512,2048) → SiLU → Linear(2048,2048) → SiLU → Linear(2048, 2048*3)
-    ggml_tensor* h = ggml_mul_mat(g, w.cond_0_w, emb_in);
+    ggml_tensor* h = mul_mat_f32(g, w.cond_0_w, emb_in);
     h = ggml_silu(g, h);
-    h = ggml_mul_mat(g, w.cond_2_w, h);
+    h = mul_mat_f32(g, w.cond_2_w, h);
     h = ggml_silu(g, h);
-    h = ggml_mul_mat(g, w.cond_4_w, h);
+    h = mul_mat_f32(g, w.cond_4_w, h);
     ggml_set_name(h, "cond_embed");
     ggml_set_output(h);
 
