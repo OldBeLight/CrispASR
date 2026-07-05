@@ -50,10 +50,34 @@ if not REPO.exists():
     ])
 
 sys.path.insert(0, str(REPO / "tools" / "kaggle"))
-import kaggle_harness as kh
-
-kh.init_progress()
-log("kaggle_harness imported OK")
+# Fallback: if clone path doesn't have harness, use bundled copy
+if not (REPO / "tools" / "kaggle" / "kaggle_harness.py").exists():
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import kaggle_harness as kh
+    kh.init_progress()
+    log("kaggle_harness imported OK")
+except Exception as e:
+    log(f"kaggle_harness import failed: {e} — continuing without harness")
+    # Minimal stubs
+    class _KH:
+        def step(self, msg): log(f"[step] {msg}")
+        def resolve_hf_token(self):
+            import os
+            for p in ["/kaggle/input/crispasr-hf-token/hf_token.txt",
+                      "/kaggle/input/datasets/chr1str/crispasr-hf-token/hf_token.txt",
+                      "/kaggle/input/datasets/chr1s4/crispasr-hf-token/hf_token.txt"]:
+                if os.path.exists(p):
+                    return open(p).read().strip()
+            return os.environ.get("HF_TOKEN")
+        def install_build_toolchain(self): pass
+        def sh_with_progress(self, cmd):
+            subprocess.check_call(cmd, shell=True)
+        def safe_build_jobs(self, gpu=False): return 2
+        def build_heartbeat(self, msg=""):
+            from contextlib import nullcontext
+            return nullcontext()
+    kh = _KH()
 
 # ── Install deps ─────────────────────────────────────────────────────
 
