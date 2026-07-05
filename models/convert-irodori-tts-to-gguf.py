@@ -302,8 +302,8 @@ def map_top_level(state: dict, writer: GGUFWriter):
 
 # ── Tokenizer ─────────────────────────────────────���──────────────────
 
-def load_tokenizer_vocab(tokenizer_repo: str) -> list[str]:
-    """Load tokenizer vocab from HuggingFace repo."""
+def load_tokenizer_data(tokenizer_repo: str) -> tuple[list[str], list[float], int, int]:
+    """Load tokenizer vocab, scores, BOS and PAD IDs from HuggingFace repo."""
     try:
         from transformers import AutoTokenizer
     except ImportError:
@@ -311,6 +311,25 @@ def load_tokenizer_vocab(tokenizer_repo: str) -> list[str]:
 
     tok = AutoTokenizer.from_pretrained(tokenizer_repo, use_fast=True)
     vocab_size = len(tok)
+
+    # Try to get SentencePiece model for scores
+    scores = [0.0] * vocab_size
+    try:
+        import sentencepiece as spm
+        sp_model = None
+        # Try to find the sp model file
+        if hasattr(tok, 'vocab_file') and tok.vocab_file:
+            sp_model = spm.SentencePieceProcessor()
+            sp_model.Load(tok.vocab_file)
+        elif hasattr(tok, 'sp_model') and tok.sp_model:
+            sp_model = tok.sp_model
+        if sp_model:
+            for i in range(min(vocab_size, sp_model.GetPieceSize())):
+                scores[i] = sp_model.GetScore(i)
+            print(f"  Loaded {sp_model.GetPieceSize()} SentencePiece scores")
+    except Exception as e:
+        print(f"  WARNING: could not load SP scores: {e}")
+
     vocab = []
     for i in range(vocab_size):
         try:
@@ -320,7 +339,12 @@ def load_tokenizer_vocab(tokenizer_repo: str) -> list[str]:
             vocab.append(token)
         except Exception:
             vocab.append(f"<unk_{i}>")
-    return vocab
+
+    bos_id = tok.bos_token_id if tok.bos_token_id is not None else -1
+    pad_id = tok.pad_token_id if tok.pad_token_id is not None else (
+        tok.eos_token_id if tok.eos_token_id is not None else -1)
+
+    return vocab, scores, bos_id, pad_id
 
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -401,13 +425,16 @@ def main():
         elif isinstance(v, str):
             writer.add_string(f"irodori.{k}", v)
 
-    # Write tokenizer vocab
+    # Write tokenizer vocab + scores
     if not args.no_vocab:
         print(f"Loading tokenizer: {args.tokenizer_repo}")
-        vocab = load_tokenizer_vocab(args.tokenizer_repo)
-        writer.add_array(f"irodori.tokenizer.tokens", vocab)
+        vocab, scores, bos_id, pad_id = load_tokenizer_data(args.tokenizer_repo)
+        writer.add_array("tokenizer.ggml.tokens", vocab)
+        writer.add_array("tokenizer.ggml.scores", np.array(scores, dtype=np.float32))
+        writer.add_uint32("tokenizer.ggml.bos_token_id", bos_id if bos_id >= 0 else 0)
+        writer.add_uint32("tokenizer.ggml.pad_token_id", pad_id if pad_id >= 0 else 0)
         writer.add_uint32(f"irodori.tokenizer.vocab_size", len(vocab))
-        print(f"  vocab_size={len(vocab)}")
+        print(f"  vocab_size={len(vocab)}, bos_id={bos_id}, pad_id={pad_id}")
 
     # Write model weights
     print("Converting text encoder...")
