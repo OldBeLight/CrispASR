@@ -1318,12 +1318,14 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
         }
     }
 
-    // ── Step 2: Encode speaker reference (or zeros for unconditional) ──
-    // The DiT's JointAttention REQUIRES speaker context tensors even when
-    // unconditional (no_ref=True). Pass zeros with False mask.
-    int T_ref = 1; // minimum 1 frame for the zeroed speaker context
-    std::vector<float> spk_state(T_ref * hp.speaker_dim, 0.0f);
-    // TODO: when ref_latent is set, run speaker encoder instead of zeros.
+    // ── Step 2: Encode speaker reference ──
+    // For unconditional generation (no reference), don't pass speaker state.
+    // Python masks it with attn_mask=False; since C++ flash_attn doesn't
+    // support masking, we skip speaker KV entirely (equivalent when mask is
+    // all-False: attention doesn't attend to speaker positions).
+    // TODO: when ref_latent is set, run speaker encoder and pass it.
+    int T_ref = 0;
+    std::vector<float> spk_state;
 
     // ── Step 3: Euler RF ODE solver ──
     IRODORI_DBG("[irodori] ODE solver: %d steps\n", ctx->ode_steps);
@@ -1375,7 +1377,7 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
         IRODORI_DBG("[irodori]   step %d: running DiT forward...\n", step);
         // DiT forward: conditioned pass
         auto v_cond = run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_state.data(), T_text,
-                                      spk_state.data(), T_ref);
+                                      spk_state.empty() ? nullptr : spk_state.data(), T_ref);
         if (v_cond.empty()) {
             std::fprintf(stderr, "[irodori] DiT forward failed at step %d\n", step);
             return 0;
