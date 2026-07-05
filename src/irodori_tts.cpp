@@ -248,7 +248,10 @@ static void precompute_freqs_cis(int dim, int max_len, float theta, std::vector<
 // ── RMSNorm (graph op) ──────────────────────────────────────────────
 
 static ggml_tensor* rms_norm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weight, float eps) {
+    x = ggml_cast(ctx, x, GGML_TYPE_F32);
     x = ggml_rms_norm(ctx, x, eps);
+    if (weight->type != GGML_TYPE_F32)
+        weight = ggml_cast(ctx, weight, GGML_TYPE_F32);
     return ggml_mul(ctx, x, weight);
 }
 
@@ -605,6 +608,13 @@ static ggml_tensor* build_dit_block_graph(ggml_context* ctx, const irodori_tts_c
     int hd = hp.head_dim();
     int nh = hp.num_heads;
 
+    // Ensure all inputs are F32
+    x = ggml_cast(ctx, x, GGML_TYPE_F32);
+    cond_embed = ggml_cast(ctx, cond_embed, GGML_TYPE_F32);
+    text_state = ggml_cast(ctx, text_state, GGML_TYPE_F32);
+    if (spk_state)
+        spk_state = ggml_cast(ctx, spk_state, GGML_TYPE_F32);
+
     // Null check all weight tensors
     if (!blk.wq || !blk.wk || !blk.wv || !blk.wo || !blk.gate || !blk.q_norm || !blk.k_norm || !blk.wk_text ||
         !blk.wv_text || !blk.adaln_attn.shift_down || !blk.adaln_attn.shift_up_w || !blk.adaln_mlp.shift_down ||
@@ -659,13 +669,13 @@ static ggml_tensor* build_dit_block_graph(ggml_context* ctx, const irodori_tts_c
     // Reshape to (hd, nh, T) for QK norm, then permute to (hd, T, nh) for flash attn
     q = ggml_reshape_3d(ctx, q, hd, nh, T_latent);
     q = ggml_rms_norm(ctx, q, hp.norm_eps);
-    q = ggml_mul(ctx, q, blk.q_norm);
+    q = ggml_mul(ctx, q, ggml_cast(ctx, blk.q_norm, GGML_TYPE_F32));
     q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3)); // (hd, nh, T) → (hd, T, nh)
 
     // Self K/V
     k_self = ggml_reshape_3d(ctx, k_self, hd, nh, T_latent);
     k_self = ggml_rms_norm(ctx, k_self, hp.norm_eps);
-    k_self = ggml_mul(ctx, k_self, blk.k_norm);
+    k_self = ggml_mul(ctx, k_self, ggml_cast(ctx, blk.k_norm, GGML_TYPE_F32));
     k_self = ggml_cont(ctx, ggml_permute(ctx, k_self, 0, 2, 1, 3));
     v_self = ggml_reshape_3d(ctx, v_self, hd, nh, T_latent);
     v_self = ggml_cont(ctx, ggml_permute(ctx, v_self, 0, 2, 1, 3));
@@ -673,7 +683,7 @@ static ggml_tensor* build_dit_block_graph(ggml_context* ctx, const irodori_tts_c
     // Text K/V
     k_text = ggml_reshape_3d(ctx, k_text, hd, nh, T_text);
     k_text = ggml_rms_norm(ctx, k_text, hp.norm_eps);
-    k_text = ggml_mul(ctx, k_text, blk.k_norm);
+    k_text = ggml_mul(ctx, k_text, ggml_cast(ctx, blk.k_norm, GGML_TYPE_F32));
     k_text = ggml_cont(ctx, ggml_permute(ctx, k_text, 0, 2, 1, 3));
     v_text = ggml_reshape_3d(ctx, v_text, hd, nh, T_text);
     v_text = ggml_cont(ctx, ggml_permute(ctx, v_text, 0, 2, 1, 3));
@@ -684,7 +694,7 @@ static ggml_tensor* build_dit_block_graph(ggml_context* ctx, const irodori_tts_c
     if (k_spk && v_spk) {
         k_spk = ggml_reshape_3d(ctx, k_spk, hd, nh, T_ref);
         k_spk = ggml_rms_norm(ctx, k_spk, hp.norm_eps);
-        k_spk = ggml_mul(ctx, k_spk, blk.k_norm);
+        k_spk = ggml_mul(ctx, k_spk, ggml_cast(ctx, blk.k_norm, GGML_TYPE_F32));
         k_spk = ggml_cont(ctx, ggml_permute(ctx, k_spk, 0, 2, 1, 3));
         v_spk = ggml_reshape_3d(ctx, v_spk, hd, nh, T_ref);
         v_spk = ggml_cont(ctx, ggml_permute(ctx, v_spk, 0, 2, 1, 3));
