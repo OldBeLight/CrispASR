@@ -172,6 +172,28 @@ output_q8 = WORK / "irodori-tts-500m-v3-q8_0.gguf"
 kh.sh_with_progress(f"{quantize_bin} {output_f16} {output_q8} q8_0")
 log(f"Q8_0: {output_q8.stat().st_size / 1024 / 1024:.1f} MB")
 
+# ── Convert DACVAE decoder ───────────────────────────────────────────
+
+kh.step("converting DACVAE decoder")
+
+try:
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", "--quiet",
+        "git+https://github.com/facebookresearch/dacvae.git",
+    ])
+
+    dacvae_gguf = WORK / "dacvae-ja-32dim-f16.gguf"
+    dacvae_converter = REPO / "models" / "convert-dacvae-to-gguf.py"
+    subprocess.check_call([
+        sys.executable, str(dacvae_converter),
+        "--model", "Aratako/Semantic-DACVAE-Japanese-32dim",
+        "--output", str(dacvae_gguf),
+    ])
+    log(f"DACVAE GGUF: {dacvae_gguf.stat().st_size / 1024 / 1024:.1f} MB")
+except Exception as e:
+    log(f"DACVAE conversion failed (non-fatal): {e}")
+    dacvae_gguf = None
+
 # ── Python reference dump (intermediates for crispasr-diff) ──────────
 
 kh.step("running reference dump")
@@ -316,6 +338,9 @@ try:
     ref_output = WORK / "irodori-tts-ref.gguf"
     if ref_output.exists() and ref_output.stat().st_size > 0:
         upload_files.append(ref_output)
+    dacvae_gguf_path = WORK / "dacvae-ja-32dim-f16.gguf"
+    if dacvae_gguf_path.exists() and dacvae_gguf_path.stat().st_size > 0:
+        upload_files.append(dacvae_gguf_path)
 
     for fpath in upload_files:
         log(f"  uploading {fpath.name} ({fpath.stat().st_size / 1024 / 1024:.1f} MB)...")
