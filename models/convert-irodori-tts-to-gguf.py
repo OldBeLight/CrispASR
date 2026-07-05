@@ -430,7 +430,7 @@ def main():
         print(f"Loading tokenizer: {args.tokenizer_repo}")
         vocab, scores, bos_id, pad_id = load_tokenizer_data(args.tokenizer_repo)
         writer.add_array("tokenizer.ggml.tokens", vocab)
-        writer.add_array("tokenizer.ggml.scores", np.array(scores, dtype=np.float32))
+        writer.add_array("tokenizer.ggml.scores", [float(s) for s in scores])
         writer.add_uint32("tokenizer.ggml.bos_token_id", bos_id if bos_id >= 0 else 0)
         writer.add_uint32("tokenizer.ggml.pad_token_id", pad_id if pad_id >= 0 else 0)
         writer.add_uint32(f"irodori.tokenizer.vocab_size", len(vocab))
