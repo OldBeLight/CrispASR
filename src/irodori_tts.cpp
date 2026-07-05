@@ -514,21 +514,21 @@ static ggml_tensor* build_speaker_encoder_graph(ggml_context* ctx, const irodori
     const auto& hp = model->hparams;
 
     // Input projection + scale by 1/6
-    ggml_tensor* x = ggml_mul_mat(ctx, w.spk_in_proj_w, latent_in);
+    ggml_tensor* x = mul_mat_f32(ctx, w.spk_in_proj_w, latent_in);
     x = ggml_add(ctx, x, w.spk_in_proj_b);
     x = ggml_scale(ctx, x, 1.0f / 6.0f);
     x = ggml_mul(ctx, x, mask_f);
 
-    // Same transformer block structure as text encoder
+    // Same transformer block structure as text encoder (with same fixes)
     for (int i = 0; i < hp.speaker_layers; i++) {
         const auto& blk = w.spk_blocks[i];
 
         ggml_tensor* residual = x;
         ggml_tensor* h = rms_norm(ctx, x, blk.attn_norm, hp.norm_eps);
 
-        ggml_tensor* q = ggml_mul_mat(ctx, blk.wq, h);
-        ggml_tensor* k = ggml_mul_mat(ctx, blk.wk, h);
-        ggml_tensor* v = ggml_mul_mat(ctx, blk.wv, h);
+        ggml_tensor* q = mul_mat_f32(ctx, blk.wq, h);
+        ggml_tensor* k = mul_mat_f32(ctx, blk.wk, h);
+        ggml_tensor* v = mul_mat_f32(ctx, blk.wv, h);
 
         int hd = hp.speaker_head_dim();
         int nh = hp.speaker_heads;
@@ -537,26 +537,33 @@ static ggml_tensor* build_speaker_encoder_graph(ggml_context* ctx, const irodori
         v = ggml_reshape_3d(ctx, v, hd, nh, T_ref);
 
         q = ggml_rms_norm(ctx, q, hp.norm_eps);
-        q = ggml_mul(ctx, q, blk.q_norm);
+        q = ggml_mul(ctx, q, ggml_cast(ctx, blk.q_norm, GGML_TYPE_F32));
         k = ggml_rms_norm(ctx, k, hp.norm_eps);
-        k = ggml_mul(ctx, k, blk.k_norm);
+        k = ggml_mul(ctx, k, ggml_cast(ctx, blk.k_norm, GGML_TYPE_F32));
 
-        // RoPE (standard interleaved)
+        // RoPE in (hd, nh, T) layout then permute to (hd, T, nh) for flash attn
         q = ggml_rope_ext(ctx, q, pos_ids, nullptr, hd, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         k = ggml_rope_ext(ctx, k, pos_ids, nullptr, hd, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+        k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+        v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
 
         ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f / std::sqrt((float)hd), 0.0f, 0.0f);
+        attn_out = ggml_cast(ctx, attn_out, GGML_TYPE_F32);
         attn_out = ggml_reshape_2d(ctx, attn_out, hp.speaker_dim, T_ref);
 
-        ggml_tensor* g = ggml_mul_mat(ctx, blk.gate, h);
+        ggml_tensor* g = mul_mat_f32(ctx, blk.gate, h);
         g = ggml_sigmoid(ctx, g);
         attn_out = ggml_mul(ctx, attn_out, g);
-        attn_out = ggml_mul_mat(ctx, blk.wo, attn_out);
+        attn_out = mul_mat_f32(ctx, blk.wo, attn_out);
         x = ggml_add(ctx, residual, attn_out);
 
         residual = x;
         h = rms_norm(ctx, x, blk.mlp_norm, hp.norm_eps);
-        ggml_tensor* mlp_out = core_ffn::swiglu(ctx, h, blk.mlp_w1, blk.mlp_w3, blk.mlp_w2);
+        ggml_tensor* gate_proj = mul_mat_f32(ctx, blk.mlp_w1, h);
+        ggml_tensor* up_proj = mul_mat_f32(ctx, blk.mlp_w3, h);
+        ggml_tensor* mlp_out = ggml_mul(ctx, ggml_silu(ctx, gate_proj), up_proj);
+        mlp_out = mul_mat_f32(ctx, blk.mlp_w2, mlp_out);
         x = ggml_add(ctx, residual, mlp_out);
         x = ggml_mul(ctx, x, mask_f);
     }
