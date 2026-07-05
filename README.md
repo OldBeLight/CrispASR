@@ -415,7 +415,7 @@ crispasr --backend cohere -m $TC/cohere-transcribe-q5_0.gguf \
 These LID providers are available:
 
 - `--lid-backend whisper` (default) — uses a small multilingual ggml-*.bin model via the crispasr C API. Auto-downloads ~75 MB on first use. 99 languages.
-- `--lid-backend silero` — native GGUF port of Silero's 95-language classifier. 16 MB F32, pure C++. Faster and smaller than whisper-tiny but slightly less accurate on long audio (>20s).
+- `--lid-backend silero` — native GGUF port of Silero's 95-language classifier. 16 MB F32. Runs as a ggml graph (multi-threaded SIMD on CPU, GPU offload on Metal/CUDA; on Vulkan the graph is routed to CPU pending an upstream kernel fix). Analyzes the first 30 s of audio (`CRISPASR_SILERO_LID_MAX_S` overrides); `CRISPASR_SILERO_LID_LEGACY=1` restores the old scalar path.
 - `--lid-backend ecapa` — **recommended**: ECAPA-TDNN (Apache-2.0). Purpose-built for language ID. Very high accuracy on TTS benchmark. Two variants via `--lid-model`:
   - [`cstr/ecapa-lid-107-GGUF`](https://huggingface.co/cstr/ecapa-lid-107-GGUF) — VoxLingua107, 43 MB F16, 107 languages, ISO codes (en, de, ...). **Default.**
   - [`cstr/ecapa-lid-commonlanguage-GGUF`](https://huggingface.co/cstr/ecapa-lid-commonlanguage-GGUF) — CommonLanguage, 40 MB F16, 45 languages, full names (English, German, ...).
