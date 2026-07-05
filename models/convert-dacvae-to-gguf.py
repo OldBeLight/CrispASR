@@ -63,8 +63,16 @@ def main():
     except ImportError:
         sys.exit("pip install dacvae (or git+https://github.com/facebookresearch/dacvae.git)")
 
-    print(f"Loading DACVAE: {args.model}")
-    model = DACVAE.load(args.model).eval()
+    # Resolve model path: HF repo ID → download weights.pth first
+    model_path = args.model
+    if not Path(model_path).exists() and "/" in model_path:
+        from huggingface_hub import hf_hub_download
+        print(f"Downloading DACVAE from HuggingFace: {model_path}")
+        model_path = hf_hub_download(repo_id=model_path, filename="weights.pth")
+        print(f"  Downloaded: {model_path}")
+
+    print(f"Loading DACVAE: {model_path}")
+    model = DACVAE.load(model_path).eval()
     state = model.state_dict()
 
     # Extract config
@@ -98,33 +106,29 @@ def main():
     writer.add_uint32("dacvae.n_decoder_blocks", n_blocks)
 
     # ── VAE bottleneck out_proj: NormConv1d(codebook_dim → latent_dim, k=1) ──
-    # NormConv1d stores weight_v, weight_g (weight norm decomposition)
-    # After weight_norm removal: weight = g * v / ||v||
-    # We need to reconstruct the effective weight
     def get_conv_weight(prefix):
         """Get effective weight from weight-normed conv."""
         if f"{prefix}.weight" in state:
             return state[f"{prefix}.weight"], state.get(f"{prefix}.bias")
-        # Weight norm decomposition
+        # Weight norm decomposition: weight = g * v / ||v||
         v = state[f"{prefix}.weight_v"]
         g = state[f"{prefix}.weight_g"]
-        # weight = g * v / ||v||
         norm = torch.linalg.norm(v.reshape(v.shape[0], -1), dim=1, keepdim=True)
         norm = norm.unsqueeze(-1) if v.ndim == 3 else norm
         weight = g * v / (norm + 1e-12)
         bias = state.get(f"{prefix}.bias")
         return weight, bias
 
-    # out_proj
-    w, b = get_conv_weight("quantizer.out_proj.conv")
+    # out_proj (NormConv1d stores weight at module level, not under .conv)
+    w, b = get_conv_weight("quantizer.out_proj")
     print(f"  out_proj: weight {list(w.shape)}, bias {list(b.shape) if b is not None else None}")
     write_tensor(writer, "dacvae.out_proj.w", to_f16(w))
     if b is not None:
         write_tensor(writer, "dacvae.out_proj.b", to_f32(b))
 
     # ── Decoder ──
-    # in_conv: Conv1d(latent_dim → decoder_dim, k=7)
-    w, b = get_conv_weight("decoder.model.0.conv")
+    # in_conv: NormConv1d(latent_dim → decoder_dim, k=7)
+    w, b = get_conv_weight("decoder.model.0")
     print(f"  in_conv: weight {list(w.shape)}")
     write_tensor(writer, "dacvae.dec.in_conv.w", to_f16(w))
     if b is not None:
