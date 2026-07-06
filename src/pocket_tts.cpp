@@ -46,6 +46,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <random>
 #include <string>
@@ -3399,10 +3400,91 @@ int pocket_tts_set_voice(struct pocket_tts_context* ctx, const float* ref_pcm_24
     const int D = (int)m.flow_lm_hp.d_model;
     const int LD = (int)m.mimi_hp.inner_dim;
 
-    // 1. Encode reference audio -> latents
+    // §224: conditioning latents are deterministic per (encoder weights,
+    // reference PCM), cost ~2 s to compute (39 s before the ggml mimi port)
+    // and only ~17 KB to store — cache them on disk in the shared crispasr
+    // cache dir, keyed by an FNV-1a hash of the PCM and an encoder-weight
+    // fingerprint. CRISPASR_POCKET_VOICE_CACHE=0 disables.
+    std::string latent_cache_path;
+    {
+        const char* e = std::getenv("CRISPASR_POCKET_VOICE_CACHE");
+        const bool cache_on = !(e && *e && *e == '0');
+        if (cache_on && m.seanet_enc.initial_conv_w) {
+            uint64_t h = 1469598103934665603ull; // FNV-1a 64
+            auto mix = [&h](const void* p, size_t n) {
+                const uint8_t* b = (const uint8_t*)p;
+                for (size_t i = 0; i < n; i++) {
+                    h ^= b[i];
+                    h *= 1099511628211ull;
+                }
+            };
+            mix(ref_pcm_24khz, (size_t)n_ref_samples * sizeof(float));
+            mix(&n_ref_samples, sizeof(n_ref_samples));
+            // Encoder fingerprint: first bytes + total size of the initial conv.
+            ggml_tensor* fp = m.seanet_enc.initial_conv_w;
+            size_t fp_n = std::min<size_t>(4096, ggml_nbytes(fp));
+            std::vector<uint8_t> fp_buf(fp_n);
+            ggml_backend_tensor_get(fp, fp_buf.data(), 0, fp_n);
+            mix(fp_buf.data(), fp_n);
+            uint64_t total = (uint64_t)ggml_nbytes(fp);
+            mix(&total, sizeof(total));
+
+            char name[64];
+            snprintf(name, sizeof(name), "pocket-voice-%016llx.latents", (unsigned long long)h);
+            // Same resolution order as crispasr_cache::dir() (which lives in
+            // crispasr-lib, ABOVE this target — can't link it from here):
+            // CRISPASR_CACHE_DIR → CRISPASR_MODELS_DIR → $HOME/.cache/crispasr.
+            std::string cdir;
+            if (const char* d = std::getenv("CRISPASR_CACHE_DIR"); d && *d)
+                cdir = d;
+            else if (const char* d2 = std::getenv("CRISPASR_MODELS_DIR"); d2 && *d2)
+                cdir = d2;
+            else if (const char* home = std::getenv("HOME"); home && *home)
+                cdir = std::string(home) + "/.cache/crispasr";
+            std::error_code ec;
+            if (!cdir.empty() &&
+                (std::filesystem::is_directory(cdir, ec) || std::filesystem::create_directories(cdir, ec)))
+                latent_cache_path = cdir + "/" + name;
+        }
+    }
+
+    // 1. Encode reference audio -> latents (or load from the cache)
     float* ref_latents = nullptr;
     int n_ref_frames = 0;
-    mimi_encode(ctx, ref_pcm_24khz, n_ref_samples, &ref_latents, &n_ref_frames);
+    if (!latent_cache_path.empty()) {
+        if (FILE* f = fopen(latent_cache_path.c_str(), "rb")) {
+            uint32_t magic = 0, nf = 0, ld = 0;
+            if (fread(&magic, 4, 1, f) == 1 && magic == 0x50564c31u /* 'PVL1' */ && fread(&nf, 4, 1, f) == 1 &&
+                fread(&ld, 4, 1, f) == 1 && (int)ld == LD && nf > 0 && nf < 1000000) {
+                ref_latents = (float*)malloc((size_t)nf * LD * sizeof(float));
+                if (ref_latents && fread(ref_latents, sizeof(float), (size_t)nf * LD, f) == (size_t)nf * LD) {
+                    n_ref_frames = (int)nf;
+                    if (ctx->verbosity >= 1)
+                        fprintf(stderr, "pocket_tts: voice latents loaded from cache (%d frames)\n", n_ref_frames);
+                } else {
+                    free(ref_latents);
+                    ref_latents = nullptr;
+                }
+            }
+            fclose(f);
+        }
+    }
+    if (!ref_latents) {
+        mimi_encode(ctx, ref_pcm_24khz, n_ref_samples, &ref_latents, &n_ref_frames);
+        if (ref_latents && n_ref_frames > 0 && !latent_cache_path.empty()) {
+            std::string tmp = latent_cache_path + ".tmp";
+            if (FILE* f = fopen(tmp.c_str(), "wb")) {
+                uint32_t magic = 0x50564c31u, nf = (uint32_t)n_ref_frames, ld = (uint32_t)LD;
+                bool ok = fwrite(&magic, 4, 1, f) == 1 && fwrite(&nf, 4, 1, f) == 1 && fwrite(&ld, 4, 1, f) == 1 &&
+                          fwrite(ref_latents, sizeof(float), (size_t)nf * LD, f) == (size_t)nf * LD;
+                fclose(f);
+                if (ok)
+                    rename(tmp.c_str(), latent_cache_path.c_str());
+                else
+                    remove(tmp.c_str());
+            }
+        }
+    }
     if (!ref_latents || n_ref_frames <= 0) {
         fprintf(stderr, "pocket_tts: mimi_encode failed for voice reference\n");
         return -1;
