@@ -120,7 +120,7 @@ public:
 
         const std::vector<float> pcm24 = resample_16k_to_24k(samples, n_samples);
         const char* context = params.context.empty() ? nullptr : params.context.c_str();
-        char* text = vibevoice_transcribe(ctx_, pcm24.data(), (int)pcm24.size(), context);
+        char* text = vibevoice_transcribe_with_context(ctx_, pcm24.data(), (int)pcm24.size(), context);
         if (!text)
             return out;
 

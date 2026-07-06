@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
     generate_sine(pcm_long, 440.0f, sr, 2.0f);
 
     std::cout << "Step 1: Transcribing short buffer (" << pcm_short.size() << " samples)..." << std::endl;
-    char* text1 = vibevoice_transcribe(ctx, pcm_short.data(), (int)pcm_short.size(), nullptr);
+    char* text1 = vibevoice_transcribe(ctx, pcm_short.data(), (int)pcm_short.size());
     if (text1) {
         std::cout << "Result 1: " << text1 << std::endl;
         free(text1);
@@ -54,7 +54,7 @@ int main(int argc, char** argv) {
 
     std::cout << "Step 2: Transcribing long buffer (" << pcm_long.size() << " samples)..." << std::endl;
     // BEFORE FIX: This would crash with GGML_ASSERT in ggml_view_3d
-    char* text2 = vibevoice_transcribe(ctx, pcm_long.data(), (int)pcm_long.size(), nullptr);
+    char* text2 = vibevoice_transcribe(ctx, pcm_long.data(), (int)pcm_long.size());
     if (text2) {
         std::cout << "Result 2: " << text2 << std::endl;
         free(text2);
@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
     std::cout << "Step 3: Transcribing even longer buffer (4.0 seconds)..." << std::endl;
     std::vector<float> pcm_vlong;
     generate_sine(pcm_vlong, 440.0f, sr, 4.0f);
-    char* text3 = vibevoice_transcribe(ctx, pcm_vlong.data(), (int)pcm_vlong.size(), nullptr);
+    char* text3 = vibevoice_transcribe(ctx, pcm_vlong.data(), (int)pcm_vlong.size());
     if (text3) {
         std::cout << "Result 3: " << text3 << std::endl;
         free(text3);

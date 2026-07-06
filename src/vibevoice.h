@@ -42,11 +42,19 @@ void vibevoice_set_tts_steps(struct vibevoice_context* ctx, int steps);
 void vibevoice_set_seed(struct vibevoice_context* ctx, uint32_t seed);
 
 // Transcribe raw 24kHz mono PCM audio.
-// `context` is optional free-form hotword/metadata text spliced into the
-// prompt (NULL or empty/whitespace-only for the default prompt); matches
-// `context_info` in microsoft/VibeVoice's vibevoice_asr_processor.py.
 // Returns malloc'd UTF-8 string, caller frees with free().
-char* vibevoice_transcribe(struct vibevoice_context* ctx, const float* samples, int n_samples, const char* context);
+char* vibevoice_transcribe(struct vibevoice_context* ctx, const float* samples, int n_samples);
+
+// Variant of vibevoice_transcribe() that additionally splices free-form
+// hotword/metadata text into the prompt. `context` may be NULL, or empty/
+// whitespace-only, for the default prompt (identical output to
+// vibevoice_transcribe()); matches `context_info` in microsoft/VibeVoice's
+// vibevoice_asr_processor.py. A distinct symbol rather than a new parameter
+// on vibevoice_transcribe() to avoid an ABI break: both are extern "C" and
+// exported from libcrispasr.so, so changing an existing signature in place
+// would silently corrupt any caller still built against the 3-arg form.
+char* vibevoice_transcribe_with_context(struct vibevoice_context* ctx, const float* samples, int n_samples,
+                                        const char* context);
 
 // Variant that additionally returns per-emitted-token ids and softmax
 // probabilities. Free with vibevoice_result_free.
@@ -58,7 +66,13 @@ struct vibevoice_result {
 };
 
 struct vibevoice_result* vibevoice_transcribe_with_probs(struct vibevoice_context* ctx, const float* samples,
-                                                         int n_samples, const char* context);
+                                                         int n_samples);
+
+// Context-aware counterpart of vibevoice_transcribe_with_probs(), see
+// vibevoice_transcribe_with_context() above.
+struct vibevoice_result* vibevoice_transcribe_with_probs_and_context(struct vibevoice_context* ctx,
+                                                                     const float* samples, int n_samples,
+                                                                     const char* context);
 void vibevoice_result_free(struct vibevoice_result* r);
 
 // Token-id → vocab piece (raw, with Qwen2/GPT-2 byte-level BPE markers
