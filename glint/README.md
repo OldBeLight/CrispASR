@@ -24,15 +24,14 @@ the build finds libmp3lame it stays in as an optional MP3 fallback:
 used automatically if glint fails, or forced with
 `CRISPASR_MP3_ENCODER=lame` for A/B comparisons.
 
-To sync from the glint repo, always take a **committed** state (the
-working tree there may hold another session's WIP):
+Syncing is automated: the `sync-glint` GitHub workflow pulls the
+committed state of `CrispStrobe/glint` main (on repository_dispatch
+from glint pushes, daily schedule, or manual dispatch), regenerates
+the CMake source list and the sync marker below, runs the
+`test_tts_provenance "[mp3],[aac]"` suite, and pushes to main. The
+`validate-glint-fresh` release job fails a release whose in-tree copy
+is behind glint main. To sync by hand, run `tools/sync-glint.sh` —
+never `cp` from a glint working tree (it may hold another session's
+WIP; the script always takes a committed state).
 
-```bash
-git -C ../glint archive HEAD -- src include/glint/glint.h LICENSE | tar -x -C glint/
-```
-
-then update the sync marker below, mirror any GLINT_SOURCES changes in
-`glint/CMakeLists.txt`, and re-run the TTS provenance unit tests
-(`test_tts_provenance "[mp3],[aac]"`).
-
-Synced at upstream commit: `059d235` (feat: AAC-LC encoder, phase 1).
+Synced at upstream commit: `6ae5a8910ea6da66f079c04b2e0c856f463254e9` (ci: notify CrispASR on push to main (repository_dispatch glint-push)).

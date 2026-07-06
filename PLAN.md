@@ -7146,3 +7146,14 @@ kernels compile-time guarded + runtime dispatched, so no special flags.
 - Streaming TTS still rejects mp3/aac (full-file encoding); glint has a
   callback streaming API — chunked `audio/mpeg` streaming is a natural
   follow-up if wanted.
+- **Auto-sync (§225b):** `tools/sync-glint.sh` + `sync-glint` workflow
+  (repository_dispatch `glint-push` from glint's notify-crispasr
+  workflow, daily cron fallback, manual dispatch) keep `glint/` at
+  upstream main's committed state — regenerates GLINT_SOURCES, bumps
+  the README sync marker, gates on `test_tts_provenance "[mp3],[aac]"`
+  before pushing. `validate-glint-fresh` in release.yml fails a release
+  whose marker is behind glint main, so releases always ship current
+  glint. Instant dispatch needs a `CRISPASR_SYNC_PAT` secret in the
+  glint repo (Contents r/w on CrispASR); without it the daily cron
+  covers it. First sync pulled the AAC psy-shaping upstream commit
+  (30fb4fcd, aac_psy.cpp auto-added to the source list).
