@@ -7082,14 +7082,22 @@ CPU-pinning after ggml removed sched auto-copy of CPU weights):
   in-graph (titanet ASP recipe), inverse-default (Accelerate GEMM head, 57 ms,
   stays default on Apple). Verified en/zh identical on Metal + Vulkan.
   Remaining: trunk graph ~1.3 s on M1 — profile Metal residency.
-- **mimo_tokenizer — OPEN (disease 3):** GPU backend init'd, ALL weights
-  loaded to backend_cpu, comment still says "encoder forward graph picks
-  per-op" → encoder graphs silently CPU-pinned. Fix = firered-style
-  load_weights_split; needs the mimo GGUF + parity check.
-- **pocket_tts — OPEN (disease 3):** same silent CPU-pinning (comment claims
-  "sched auto-copies to GPU for graph ops"). Harder: 32 eager
-  tensor_f32_data readers (flow head + AR loop) require per-tensor CPU/GPU
-  classification before split-loading; validate with TTS→ASR roundtrip.
+- **mimo_tokenizer — CURED (4027f37c):** weights now load on the compute
+  backend (all reads are tensor_get / host-cached RVQ codebooks → full GPU
+  residency safe). Smoke 22.4 s/71.7 s-user → 15.9 s/1.5 s-user; full
+  mimo-asr pipeline 10.3 → 7.6 s, transcripts char-identical en+zh.
+  CRISPASR_MIMO_TOK_CPU=1 restores CPU weights.
+- **pocket_tts — CURED differently (63ae5a43):** the actual hotspot was NOT
+  the backbone graphs but the eager mimi ENCODER re-run per invocation for
+  voice conditioning: SEANet scalar convs 27.5 s + per-timestep transformer
+  12.1 s. conv1d_ggml drop-in (identical layout contract) + batched
+  transformer linears via mul_mat on the F16 weights (attention math
+  untouched) → synthesis 43 → 5.6 s. Conditioning latents cos=0.99999994 vs
+  scalar; TTS→ASR roundtrip verbatim. CRISPASR_POCKET_MIMI_SCALAR=1 =
+  ground truth; POCKET_MIMI_DUMP=<path> dumps latents. The GPU-residency
+  split for the backbone remains possible but is no longer the bottleneck.
+  OPEN idea: cache conditioning latents keyed by voice-file hash (17 KB) to
+  skip re-encoding entirely on repeat runs.
 - **openvoice2 — OPEN (disease 1):** WaveNet (16 layers, bulk of voice
   conversion) is hand-rolled conv, Accelerate on Apple / scalar elsewhere
   (§176d note). Titanet-class cure; opt-in feature, measure first.
