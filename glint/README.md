@@ -34,4 +34,4 @@ is behind glint main. To sync by hand, run `tools/sync-glint.sh` —
 never `cp` from a glint working tree (it may hold another session's
 WIP; the script always takes a committed state).
 
-Synced at upstream commit: `c0e4a8cc3f8fd2a1f5fee90cdcab779f6dd09e30` (chore: trim small-buffers AAC output buffer to two max frames (3328 B)).
+Synced at upstream commit: `fbb9cc686f58a917bf65d1b58546dad22c314be5` (docs: v0.8.0 release notes + fresh league log).
