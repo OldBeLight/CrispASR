@@ -282,6 +282,12 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/crispasr.pc"
 # programs, examples and tests
 #
 
+# glint — our clean-room MP3 encoder (in-tree copy of the sibling glint
+# project, MP3 core only) for TTS output (server response_format=mp3,
+# CLI --tts-output *.mp3). Static lib, only built when a consumer
+# (cli/server/tests) links it.
+add_subdirectory(glint EXCLUDE_FROM_ALL)
+
 add_subdirectory(crisp_audio)
 
 if (CRISPASR_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
