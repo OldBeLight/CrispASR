@@ -146,6 +146,15 @@ struct vibevoice_context {
     ggml_cgraph* pred_graph = nullptr;
     int pred_graph_n_frames = 0;
     std::vector<uint8_t> pred_graph_meta;
+    // Dedicated scheduler for the cached pred-head graph. A cached graph's
+    // tensors keep the buffer pointers assigned by the LAST alloc on its
+    // scheduler; if any OTHER graph on the same scheduler forces the
+    // gallocr to grow (free + realloc its compute buffer), those pointers
+    // dangle and the next sched_alloc_graph of the cached graph reads a
+    // freed ggml_backend_buffer in split_graph (issue #171 CPU segfault,
+    // ASan heap-use-after-free). A private sched only ever sees this one
+    // fixed-topology graph, so its gallocr never reallocates under it.
+    ggml_backend_sched_t pred_sched = nullptr;
     // §201 Lk-bucketed TTS LM step graphs (positive + negative KV paths)
     struct LmBucket {
         int lk = 0;
@@ -157,7 +166,16 @@ struct vibevoice_context {
     static constexpr int kLmBucketLks[kLmNBuckets] = {128, 256, 512, 1024};
     std::array<LmBucket, kLmNBuckets> lm_buckets_pos{};
     std::array<LmBucket, kLmNBuckets> lm_buckets_neg{};
-    ggml_backend_sched_t lm_step_sched = nullptr;
+    // One scheduler per KV path (0=positive, 1=negative). The CFG loop
+    // alternates positive/negative LM steps every frame; if both cached
+    // bucket graphs shared one scheduler, each alternation with different
+    // bucket sizes would realloc the gallocr and dangle the other graph's
+    // buffer pointers (same use-after-free class as pred_sched above —
+    // this is what "CUDA illegal memory access" in issue #184 was).
+    ggml_backend_sched_t lm_step_sched[2] = {nullptr, nullptr};
+    // Bucket index of the graph most recently allocated on each scheduler.
+    // Only that graph's buffer pointers are valid; switching buckets must
+    // rebuild the incoming graph (see run_lm_step).
     int lm_active_bucket_pos = -1;
     int lm_active_bucket_neg = -1;
 };
@@ -387,8 +405,11 @@ extern "C" void vibevoice_free(struct vibevoice_context* ctx) {
     for (auto& bk : ctx->lm_buckets_neg)
         if (bk.ctx)
             ggml_free(bk.ctx);
-    if (ctx->lm_step_sched)
-        ggml_backend_sched_free(ctx->lm_step_sched);
+    for (int i = 0; i < 2; i++)
+        if (ctx->lm_step_sched[i])
+            ggml_backend_sched_free(ctx->lm_step_sched[i]);
+    if (ctx->pred_sched)
+        ggml_backend_sched_free(ctx->pred_sched);
     if (ctx->kv_neg_buf)
         ggml_backend_buffer_free(ctx->kv_neg_buf);
     if (ctx->kv_neg_ctx)
@@ -2273,6 +2294,30 @@ static ggml_cgraph* get_pred_head_graph(vibevoice_context* ctx, int n_frames) {
     return ctx->pred_graph;
 }
 
+// Scheduler the pred-head graph must run on. When the graph is CACHED
+// across DPM steps (reuse_ok — CPU today), it needs a private scheduler:
+// on a shared one, any other graph that grows the gallocr (e.g. a text
+// window's LM step at a deeper n_past) frees the compute buffer the cached
+// graph's tensors still point into, and the next sched_alloc_graph reads
+// the freed ggml_backend_buffer inside split_graph — the issue #171 CPU
+// segfault (ASan: heap-use-after-free in sched_backend_from_buffer).
+// When the graph is rebuilt each call (Metal/Vulkan/CUDA bypass), the
+// shared ctx->sched is safe and keeps the historical behavior.
+// CRISPASR_VIBEVOICE_PRED_SCHED=0 forces the old shared-sched behavior
+// (regression-bisection escape hatch; reintroduces the UAF when cached).
+static ggml_backend_sched_t get_pred_head_sched(vibevoice_context* ctx) {
+    const bool reuse_ok = !backend_needs_fresh_pred_graph(ctx->backend);
+    const char* env = std::getenv("CRISPASR_VIBEVOICE_PRED_SCHED");
+    if (!reuse_ok || (env && env[0] == '0'))
+        return ctx->sched;
+    if (!ctx->pred_sched) {
+        ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+        int n_be = (ctx->backend && ctx->backend != ctx->backend_cpu) ? 2 : 1;
+        ctx->pred_sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+    }
+    return ctx->pred_sched ? ctx->pred_sched : ctx->sched;
+}
+
 static ggml_cgraph* build_pred_head_graph_impl(vibevoice_context* ctx, int n_frames, std::vector<uint8_t>& meta_buf) {
     auto& hp = ctx->model.hp;
     auto& ts = ctx->model.tensors;
@@ -3411,8 +3456,9 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                     compute_sinusoidal_embed(t, t_sin.data(), 256);
 
                     ggml_cgraph* gf = get_pred_head_graph(ctx, 2);
-                    ggml_backend_sched_reset(ctx->sched);
-                    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
+                    ggml_backend_sched_t psched = get_pred_head_sched(ctx);
+                    ggml_backend_sched_reset(psched);
+                    if (!ggml_backend_sched_alloc_graph(psched, gf))
                         break;
                     std::vector<float> z_pair(vae_dim * 2);
                     memcpy(z_pair.data(), z.data(), vae_dim * sizeof(float));
@@ -3428,7 +3474,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pred_condition"), cond_pair.data(), 0,
                                             (size_t)d_lm * 2 * sizeof(float));
 
-                    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+                    if (ggml_backend_sched_graph_compute(psched, gf) != GGML_STATUS_SUCCESS)
                         break;
                     std::vector<float> v_both(vae_dim * 2);
                     ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "pred_output"), v_both.data(), 0,
@@ -4065,13 +4111,16 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     // §201: lazy-init a dedicated scheduler for LM step bucket graphs.
     // The main ctx->sched is used by pred head / DPM between LM steps, which
     // would reset allocs; a separate sched keeps bucket allocations stable.
-    auto lm_step_sched_lazy = [&]() -> ggml_backend_sched_t {
-        if (ctx->lm_step_sched)
-            return ctx->lm_step_sched;
+    // One sched PER KV PATH (pos/neg): the CFG loop alternates the two every
+    // frame, and two cached graphs on one sched dangle each other's buffer
+    // pointers whenever the gallocr reallocs (see lm_step_sched declaration).
+    auto lm_step_sched_lazy = [&](int kv_sel) -> ggml_backend_sched_t {
+        if (ctx->lm_step_sched[kv_sel])
+            return ctx->lm_step_sched[kv_sel];
         ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
         int n_be = (ctx->backend && ctx->backend != ctx->backend_cpu) ? 2 : 1;
-        ctx->lm_step_sched = ggml_backend_sched_new(backends, nullptr, n_be, 65536, false, false);
-        return ctx->lm_step_sched;
+        ctx->lm_step_sched[kv_sel] = ggml_backend_sched_new(backends, nullptr, n_be, 65536, false, false);
+        return ctx->lm_step_sched[kv_sel];
     };
 
     // §201: pick smallest bucket whose Lk >= needed_lk.
@@ -4240,12 +4289,28 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         if (use_buckets && n_tokens == 1 && (!dump_dir || !dump_dir[0])) {
             const int idx = lm_pick_bucket(n_past + 1);
             if (idx >= 0) {
+                int& active_bk = (kv_sel == 0) ? ctx->lm_active_bucket_pos : ctx->lm_active_bucket_neg;
+                // Only the graph most recently allocated on this sched has
+                // valid buffer pointers — allocating a DIFFERENT bucket
+                // reallocs the gallocr and frees the buffer the previously
+                // cached graph points into. When switching buckets, rebuild
+                // the incoming graph fresh so sched_split_graph never reads
+                // a freed buffer (issue #171 use-after-free class). Bucket
+                // switches are rare (KV growth crossing a bucket boundary,
+                // or a new shorter request), so the rebuild cost is noise.
+                if (active_bk != idx) {
+                    auto& bk = (kv_sel == 0) ? ctx->lm_buckets_pos[idx] : ctx->lm_buckets_neg[idx];
+                    if (bk.ctx) {
+                        ggml_free(bk.ctx);
+                        bk.ctx = nullptr;
+                    }
+                    bk.gf = nullptr;
+                }
                 ggml_cgraph* gf = lm_get_or_build_bucket(kv_sel, idx);
                 if (gf) {
-                    ggml_backend_sched_t step_sched = lm_step_sched_lazy();
+                    ggml_backend_sched_t step_sched = lm_step_sched_lazy(kv_sel);
                     if (!step_sched)
                         goto dynamic_path;
-                    int& active_bk = (kv_sel == 0) ? ctx->lm_active_bucket_pos : ctx->lm_active_bucket_neg;
                     // Always reset+realloc — skipping this when active_bk==idx
                     // causes "illegal memory access" on CUDA (P100) because the
                     // gallocr's compute buffer state goes stale after ctx->sched
@@ -4689,8 +4754,9 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                 // Frame 0 = positive condition (text-conditioned)
                 // Frame 1 = negative condition (unconditional)
                 ggml_cgraph* gf = get_pred_head_graph(ctx, 2);
-                ggml_backend_sched_reset(ctx->sched);
-                if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
+                ggml_backend_sched_t psched = get_pred_head_sched(ctx);
+                ggml_backend_sched_reset(psched);
+                if (!ggml_backend_sched_alloc_graph(psched, gf))
                     return nullptr;
 
                 // Noisy input: same z for both conditions [vae_dim, 2]
@@ -4708,7 +4774,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                 ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pred_condition"), cond_pair.data(), 0,
                                         (size_t)d_lm * 2 * sizeof(float));
 
-                if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+                if (ggml_backend_sched_graph_compute(psched, gf) != GGML_STATUS_SUCCESS)
                     return nullptr;
 
                 // Read both predictions [vae_dim, 2]
