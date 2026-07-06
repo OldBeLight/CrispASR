@@ -32,6 +32,7 @@
 #include "core/sentencepiece.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -349,6 +350,10 @@ struct pocket_tts_context {
 };
 
 namespace { // reopen anonymous namespace for internal helpers
+
+static ggml_backend_t pocket_cpu_backend(pocket_tts_context* pctx) {
+    return pctx->backend_cpu;
+}
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -921,6 +926,47 @@ static void linear_f32(float* out, const float* x, ggml_tensor* W, ggml_tensor* 
         for (int o = 0; o < out_dim; o++)
             out[o] += b_data[o];
     }
+}
+
+// §224: CRISPASR_POCKET_MIMI_SCALAR=1 restores the eager per-timestep /
+// per-conv scalar mimi paths (A/B ground truth for the batched ggml ones).
+static bool pocket_mimi_scalar() {
+    static const bool v = [] {
+        const char* e = std::getenv("CRISPASR_POCKET_MIMI_SCALAR");
+        return e && *e && *e != '0';
+    }();
+    return v;
+}
+
+static ggml_backend_t pocket_cpu_backend(pocket_tts_context* pctx); // defined above
+
+// Batched linear: out[M, out_dim] = x[M, in_dim] @ W^T (+ bias), through one
+// ggml mul_mat on the native (F16) weight — replaces M scalar linear_f32
+// calls in the bulk mimi paths (weights read once, SIMD kernels, threads).
+static void linear_batch_ggml(pocket_tts_context* pctx, float* out, const float* x, ggml_tensor* W, ggml_tensor* bias,
+                              int M, int out_dim, int in_dim) {
+    ggml_backend_t be = pocket_cpu_backend(pctx);
+    size_t mem = ggml_tensor_overhead() * 10 + ggml_graph_overhead();
+    struct ggml_init_params gp = {mem, nullptr, true};
+    ggml_context* c0 = ggml_init(gp);
+    ggml_tensor* inp = ggml_new_tensor_2d(c0, GGML_TYPE_F32, in_dim, M);
+    ggml_set_input(inp);
+    ggml_tensor* cur = ggml_mul_mat(c0, W, inp); // (out_dim, M) — row-major (M, out_dim)
+    if (bias) {
+        ggml_tensor* b = bias->type == GGML_TYPE_F32 ? bias : ggml_cast(c0, bias, GGML_TYPE_F32);
+        cur = ggml_add(c0, cur, b);
+    }
+    ggml_set_output(cur);
+    ggml_cgraph* gf = ggml_new_graph(c0);
+    ggml_build_forward_expand(gf, cur);
+    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+    if (ggml_gallocr_alloc_graph(ga, gf)) {
+        ggml_backend_tensor_set(inp, x, 0, (size_t)M * in_dim * sizeof(float));
+        if (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS)
+            ggml_backend_tensor_get(cur, out, 0, (size_t)M * out_dim * sizeof(float));
+    }
+    ggml_gallocr_free(ga);
+    ggml_free(c0);
 }
 
 // RoPE: apply rotary embedding to a single vector (head_dim,) at position pos.
@@ -2025,8 +2071,8 @@ static void mimi_decode_ggml(pocket_tts_context* pctx, const float* latent_seq, 
 // approach since sequence lengths are modest (< 2000 frames).
 // Mimi transformer: shared between encoder and decoder (same architecture, different weights).
 // Processes seq in-place: (T, D) with causal attention, RoPE, LayerScale, GELU FFN.
-static void mimi_transformer_forward(const std::vector<pocket_tts_transformer_layer>& layers, float* seq, int T, int D,
-                                     int num_heads, int dim_feedforward, int context_size) {
+static void mimi_transformer_forward_scalar(const std::vector<pocket_tts_transformer_layer>& layers, float* seq, int T,
+                                            int D, int num_heads, int dim_feedforward, int context_size) {
     const int NH = num_heads;
     const int HD = D / NH;
     const int FF = dim_feedforward;
@@ -2129,6 +2175,102 @@ static void mimi_transformer_forward(const std::vector<pocket_tts_transformer_la
     }
 }
 
+// §224 batched twin of the scalar transformer: the four linear projections
+// (QKV, out-proj, FFN×2 — ~95% of the FLOPs) run as one ggml mul_mat over
+// the whole sequence each; the causal limited-context attention keeps the
+// scalar path's exact math. Valid because K/V at every position depend only
+// on the layer INPUT (never on same-layer outputs), so precomputing them for
+// all t is order-equivalent to the per-t loop.
+static void mimi_transformer_forward_batched(pocket_tts_context* pctx,
+                                             const std::vector<pocket_tts_transformer_layer>& layers, float* seq, int T,
+                                             int D, int num_heads, int dim_feedforward, int context_size) {
+    const int NH = num_heads;
+    const int HD = D / NH;
+    const int FF = dim_feedforward;
+    const int NL = (int)layers.size();
+
+    std::vector<float> normed_all((size_t)T * D), qkv_all((size_t)T * 3 * D);
+    std::vector<float> attn_all((size_t)T * D), proj_all((size_t)T * D);
+    std::vector<float> ffh_all((size_t)T * FF), ffo_all((size_t)T * D);
+    std::vector<float> k_layer((size_t)T * D), v_layer((size_t)T * D);
+
+    for (int l = 0; l < NL; l++) {
+        const auto& L = layers[l];
+
+        // 1. Pre-norm + QKV, batched over all positions
+        for (int t = 0; t < T; t++)
+            layer_norm(&normed_all[(size_t)t * D], &seq[(size_t)t * D], D, tensor_f32_data(L.attn_norm_w),
+                       tensor_f32_data(L.attn_norm_b));
+        linear_batch_ggml(pctx, qkv_all.data(), normed_all.data(), L.attn_in_proj, nullptr, T, 3 * D, D);
+
+        // 2. RoPE on Q/K + fill the K/V caches
+        for (int t = 0; t < T; t++) {
+            float* Q = &qkv_all[(size_t)t * 3 * D];
+            float* K = Q + D;
+            float* V = Q + 2 * D;
+            for (int h = 0; h < NH; h++) {
+                apply_rope_inplace(&Q[h * HD], HD, t, 10000.0f);
+                apply_rope_inplace(&K[h * HD], HD, t, 10000.0f);
+            }
+            vec_copy(&k_layer[(size_t)t * D], K, D);
+            vec_copy(&v_layer[(size_t)t * D], V, D);
+        }
+
+        // 3. Causal attention with limited context (identical to scalar path)
+        for (int t = 0; t < T; t++) {
+            const float* Q = &qkv_all[(size_t)t * 3 * D];
+            float* attn_out = &attn_all[(size_t)t * D];
+            vec_zero(attn_out, D);
+            int start_pos = std::max(0, t - context_size + 1);
+            int att_len = t - start_pos + 1;
+            for (int h = 0; h < NH; h++) {
+                std::vector<float> scores(att_len);
+                float scale = 1.0f / std::sqrt((float)HD);
+                for (int p = 0; p < att_len; p++)
+                    scores[p] = vec_dot(&Q[h * HD], &k_layer[(size_t)(start_pos + p) * D + h * HD], HD) * scale;
+                float max_s = *std::max_element(scores.begin(), scores.end());
+                float sum_exp = 0.0f;
+                for (int p = 0; p < att_len; p++) {
+                    scores[p] = std::exp(scores[p] - max_s);
+                    sum_exp += scores[p];
+                }
+                for (int p = 0; p < att_len; p++)
+                    scores[p] /= sum_exp;
+                for (int p = 0; p < att_len; p++)
+                    vec_fma(&attn_out[h * HD], &v_layer[(size_t)(start_pos + p) * D + h * HD], scores[p], HD);
+            }
+        }
+
+        // 4. Out-proj (batched) + LayerScale + residual
+        linear_batch_ggml(pctx, proj_all.data(), attn_all.data(), L.attn_out_proj, nullptr, T, D, D);
+        const float* ls1 = L.layer_scale_1 ? tensor_f32_data(L.layer_scale_1) : nullptr;
+        for (int t = 0; t < T; t++)
+            for (int i = 0; i < D; i++)
+                seq[(size_t)t * D + i] += ls1 ? proj_all[(size_t)t * D + i] * ls1[i] : proj_all[(size_t)t * D + i];
+
+        // 5. FFN, batched
+        for (int t = 0; t < T; t++)
+            layer_norm(&normed_all[(size_t)t * D], &seq[(size_t)t * D], D, tensor_f32_data(L.ffn_norm_w),
+                       tensor_f32_data(L.ffn_norm_b));
+        linear_batch_ggml(pctx, ffh_all.data(), normed_all.data(), L.ffn_linear1, nullptr, T, FF, D);
+        for (size_t i = 0; i < (size_t)T * FF; i++)
+            ffh_all[i] = gelu_f(ffh_all[i]);
+        linear_batch_ggml(pctx, ffo_all.data(), ffh_all.data(), L.ffn_linear2, nullptr, T, D, FF);
+        const float* ls2 = L.layer_scale_2 ? tensor_f32_data(L.layer_scale_2) : nullptr;
+        for (int t = 0; t < T; t++)
+            for (int i = 0; i < D; i++)
+                seq[(size_t)t * D + i] += ls2 ? ffo_all[(size_t)t * D + i] * ls2[i] : ffo_all[(size_t)t * D + i];
+    }
+}
+
+static void mimi_transformer_forward(pocket_tts_context* pctx, const std::vector<pocket_tts_transformer_layer>& layers,
+                                     float* seq, int T, int D, int num_heads, int dim_feedforward, int context_size) {
+    if (pocket_mimi_scalar())
+        mimi_transformer_forward_scalar(layers, seq, T, D, num_heads, dim_feedforward, context_size);
+    else
+        mimi_transformer_forward_batched(pctx, layers, seq, T, D, num_heads, dim_feedforward, context_size);
+}
+
 // ELU activation
 static inline float elu_f(float x, float alpha = 1.0f) {
     return x >= 0.0f ? x : alpha * (std::exp(x) - 1.0f);
@@ -2164,6 +2306,52 @@ static void conv1d_eager(float* out, const float* in, int Cin, int T_in, ggml_te
             out[co * T_out + t] = val;
         }
     }
+}
+
+// §224: ggml-graph twin of conv1d_eager — identical layout contract
+// (channels-first (Cin,T) flat = ggml ne (T, Cin); weight ne (K, Cin, Cout)
+// is exactly ggml_conv_1d's kernel layout). Threaded im2col+matmul instead
+// of scalar loops; the SEANet voice-conditioning encoder alone was 27 s of
+// scalar convs on a 16.5 s reference.
+static void conv1d_ggml(pocket_tts_context* pctx, float* out, const float* in, int Cin, int T_in, ggml_tensor* w_tensor,
+                        ggml_tensor* b_tensor, int stride, int pad_left, int pad_right) {
+    if (pocket_mimi_scalar()) {
+        conv1d_eager(out, in, Cin, T_in, w_tensor, b_tensor, stride, pad_left, pad_right);
+        return;
+    }
+    ggml_backend_t be = pocket_cpu_backend(pctx);
+    const int K = (int)w_tensor->ne[0];
+    const int Cout = (int)w_tensor->ne[2];
+    const int T_out = (T_in + pad_left + pad_right - K) / stride + 1;
+
+    size_t mem = ggml_tensor_overhead() * 14 + ggml_graph_overhead();
+    struct ggml_init_params gp = {mem, nullptr, true};
+    ggml_context* c0 = ggml_init(gp);
+    ggml_tensor* inp = ggml_new_tensor_2d(c0, GGML_TYPE_F32, T_in, Cin);
+    ggml_set_input(inp);
+    ggml_tensor* x = (pad_left || pad_right) ? ggml_pad_ext(c0, inp, pad_left, pad_right, 0, 0, 0, 0, 0, 0) : inp;
+    ggml_tensor* cur = ggml_conv_1d(c0, w_tensor, x, stride, 0, 1); // (T_out, Cout)
+    if (b_tensor) {
+        ggml_tensor* b = b_tensor->type == GGML_TYPE_F32 ? b_tensor : ggml_cast(c0, b_tensor, GGML_TYPE_F32);
+        cur = ggml_add(c0, cur, ggml_reshape_2d(c0, b, 1, Cout));
+    }
+    ggml_set_output(cur);
+    ggml_cgraph* gf = ggml_new_graph(c0);
+    ggml_build_forward_expand(gf, cur);
+    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+    bool ok = false;
+    if (ggml_gallocr_alloc_graph(ga, gf)) {
+        ggml_backend_tensor_set(inp, in, 0, (size_t)Cin * T_in * sizeof(float));
+        if (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS) {
+            // (T_out, Cout) flat == channels-first (Cout, T_out) — direct copy
+            ggml_backend_tensor_get(cur, out, 0, (size_t)Cout * T_out * sizeof(float));
+            ok = true;
+        }
+    }
+    ggml_gallocr_free(ga);
+    ggml_free(c0);
+    if (!ok)
+        conv1d_eager(out, in, Cin, T_in, w_tensor, b_tensor, stride, pad_left, pad_right);
 }
 
 // ConvTranspose1d (naive)
@@ -2336,7 +2524,7 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
         xfmr_seq = std::move(proj_seq);
     }
 
-    mimi_transformer_forward(m.dec_transformer_layers, xfmr_seq.data(), T_xfmr, OD, (int)mi.xfmr_num_heads,
+    mimi_transformer_forward(pctx, m.dec_transformer_layers, xfmr_seq.data(), T_xfmr, OD, (int)mi.xfmr_num_heads,
                              (int)mi.xfmr_dim_feedforward, (int)mi.xfmr_context);
 
     // Apply output projection if present
@@ -2393,8 +2581,8 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
     int pad_init_left = seanet_K - 1; // effective_kernel - stride, stride=1
     std::vector<float> seanet_buf(C_init * T_cur);
     if (sd.initial_conv_w) {
-        conv1d_eager(seanet_buf.data(), dec_in.data(), C_cur, T_cur, sd.initial_conv_w, sd.initial_conv_b, 1,
-                     pad_init_left, 0);
+        conv1d_ggml(pctx, seanet_buf.data(), dec_in.data(), C_cur, T_cur, sd.initial_conv_w, sd.initial_conv_b, 1,
+                    pad_init_left, 0);
         C_cur = C_init;
     } else {
         seanet_buf = dec_in;
@@ -2452,7 +2640,7 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
                 // Dilated conv — causal: pad_left = (K-1)*dilation, pad_right = 0
                 int eff_K = (res_K - 1) * dilation + 1; // effective kernel size
                 int pad_d_left = eff_K - 1;             // causal left padding
-                conv1d_eager(h.data(), act_buf.data(), C_cur, T_cur, rb.conv0_w, rb.conv0_b, 1, pad_d_left, 0);
+                conv1d_ggml(pctx, h.data(), act_buf.data(), C_cur, T_cur, rb.conv0_w, rb.conv0_b, 1, pad_d_left, 0);
                 int C_h = (int)rb.conv0_w->ne[2];
 
                 // ELU
@@ -2463,7 +2651,7 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
                 int K1 = (int)rb.conv1_w->ne[0];
                 int pad1_left = K1 - 1;
                 std::vector<float> h2(C_cur * T_cur);
-                conv1d_eager(h2.data(), h.data(), C_h, T_cur, rb.conv1_w, rb.conv1_b, 1, pad1_left, 0);
+                conv1d_ggml(pctx, h2.data(), h.data(), C_h, T_cur, rb.conv1_w, rb.conv1_b, 1, pad1_left, 0);
 
                 // Residual add
                 for (int i = 0; i < C_cur * T_cur; i++)
@@ -2481,8 +2669,8 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
     int n_out_samples = T_cur;      // causal pad preserves length
     std::vector<float> pcm_buf(n_out_samples);
     if (sd.final_conv_w) {
-        conv1d_eager(pcm_buf.data(), seanet_buf.data(), C_cur, T_cur, sd.final_conv_w, sd.final_conv_b, 1,
-                     pad_last_left, 0);
+        conv1d_ggml(pctx, pcm_buf.data(), seanet_buf.data(), C_cur, T_cur, sd.final_conv_w, sd.final_conv_b, 1,
+                    pad_last_left, 0);
     }
 
     // Allocate output
@@ -2516,6 +2704,18 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
     std::vector<float> pcm_padded(n_padded, 0.0f);
     memcpy(pcm_padded.data(), pcm, n_samples * sizeof(float));
 
+    const auto _t_enc0 = std::chrono::steady_clock::now();
+    auto bench_mark = [&](const char* what) {
+        if (!pocket_tts_bench_enabled())
+            return;
+        static thread_local std::chrono::steady_clock::time_point prev;
+        auto now = std::chrono::steady_clock::now();
+        auto from = (what[0] == 's') ? _t_enc0 : prev; // "seanet" measures from start
+        fprintf(stderr, "  pocket_tts_bench: mimi_enc_%-13s %.2f ms\n", what,
+                std::chrono::duration<double, std::milli>(now - from).count());
+        prev = now;
+    };
+
     // 2. SEANet encoder (all convolutions are causal)
     int T_cur = n_padded;
     int C_cur = 1; // mono PCM
@@ -2533,7 +2733,8 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
     std::vector<float> enc_buf(C_init * T_cur);
 
     // Input is single-channel: (1, T_cur)
-    conv1d_eager(enc_buf.data(), pcm_padded.data(), C_cur, T_cur, se.initial_conv_w, se.initial_conv_b, 1, pad_init, 0);
+    conv1d_ggml(pctx, enc_buf.data(), pcm_padded.data(), C_cur, T_cur, se.initial_conv_w, se.initial_conv_b, 1,
+                pad_init, 0);
     C_cur = C_init;
 
     // Encoder stages: {ResBlock → ELU → stride_conv} × n_stages
@@ -2559,7 +2760,7 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
                 int eff_K = (res_K - 1) * dilation + 1;
                 int pad_d = eff_K - 1; // causal
                 std::vector<float> h(C_hidden * T_cur);
-                conv1d_eager(h.data(), act_buf.data(), C_cur, T_cur, rb.conv0_w, rb.conv0_b, 1, pad_d, 0);
+                conv1d_ggml(pctx, h.data(), act_buf.data(), C_cur, T_cur, rb.conv0_w, rb.conv0_b, 1, pad_d, 0);
                 int C_h = (int)rb.conv0_w->ne[2];
 
                 for (int i = 0; i < C_h * T_cur; i++)
@@ -2568,7 +2769,7 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
                 int K1 = (int)rb.conv1_w->ne[0];
                 int pad1 = K1 - 1; // causal
                 std::vector<float> h2(C_cur * T_cur);
-                conv1d_eager(h2.data(), h.data(), C_h, T_cur, rb.conv1_w, rb.conv1_b, 1, pad1, 0);
+                conv1d_ggml(pctx, h2.data(), h.data(), C_h, T_cur, rb.conv1_w, rb.conv1_b, 1, pad1, 0);
 
                 // Residual add
                 for (int i = 0; i < C_cur * T_cur; i++)
@@ -2588,7 +2789,8 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
             int pad_s = K_s - ratio; // causal pad for strided conv: kernel - stride
             int T_new = (T_cur + pad_s - K_s) / ratio + 1;
             std::vector<float> down_buf(C_out * T_new);
-            conv1d_eager(down_buf.data(), enc_buf.data(), C_cur, T_cur, stage.conv_w, stage.conv_b, ratio, pad_s, 0);
+            conv1d_ggml(pctx, down_buf.data(), enc_buf.data(), C_cur, T_cur, stage.conv_w, stage.conv_b, ratio, pad_s,
+                        0);
             enc_buf = std::move(down_buf);
             T_cur = T_new;
             C_cur = C_out;
@@ -2603,13 +2805,15 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
     int pad_last = last_K - 1; // causal
     std::vector<float> enc_out(OD * T_cur);
     if (se.final_conv_w) {
-        conv1d_eager(enc_out.data(), enc_buf.data(), C_cur, T_cur, se.final_conv_w, se.final_conv_b, 1, pad_last, 0);
+        conv1d_ggml(pctx, enc_out.data(), enc_buf.data(), C_cur, T_cur, se.final_conv_w, se.final_conv_b, 1, pad_last,
+                    0);
     }
     int T_enc = T_cur; // encoder frame rate (200 Hz for 24kHz / 120 hop)
 
     if (pctx->verbosity >= 2)
         fprintf(stderr, "pocket_tts: seanet encode: %d samples → %d frames (C=%d)\n", n_samples, T_enc, OD);
 
+    bench_mark("seanet");
     // 3. Encoder transformer (2L, causal, RoPE, LayerScale)
     // Convert to seq-first: (T_enc, OD)
     std::vector<float> xfmr_seq(T_enc * OD);
@@ -2625,7 +2829,7 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
         xfmr_seq = std::move(proj);
     }
 
-    mimi_transformer_forward(m.enc_transformer_layers, xfmr_seq.data(), T_enc, OD, (int)mi.xfmr_num_heads,
+    mimi_transformer_forward(pctx, m.enc_transformer_layers, xfmr_seq.data(), T_enc, OD, (int)mi.xfmr_num_heads,
                              (int)mi.xfmr_dim_feedforward, (int)mi.xfmr_context);
 
     // Apply output projection if present
@@ -2642,6 +2846,7 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
         for (int c = 0; c < OD; c++)
             enc_cf[c * T_enc + t] = xfmr_seq[t * OD + c];
 
+    bench_mark("xfmr");
     // 4. Downsample: Conv1d(OD→LD, kernel=downsample_stride*2, stride=downsample_stride)
     // Causal: pad_left = kernel - stride, pad_right = 0
     if (m.downsample_conv_w) {
@@ -2650,8 +2855,8 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
         int pad_ds = K_ds - DS; // causal
         int T_down = (T_enc + pad_ds - K_ds) / DS + 1;
         std::vector<float> down_buf(LD * T_down);
-        conv1d_eager(down_buf.data(), enc_cf.data(), OD, T_enc, m.downsample_conv_w, m.downsample_conv_b, DS, pad_ds,
-                     0);
+        conv1d_ggml(pctx, down_buf.data(), enc_cf.data(), OD, T_enc, m.downsample_conv_w, m.downsample_conv_b, DS,
+                    pad_ds, 0);
 
         // Output: (T_down, LD) — allocate and return
         *n_frames_out = T_down;
@@ -2660,6 +2865,16 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
         for (int t = 0; t < T_down; t++)
             for (int d = 0; d < LD; d++)
                 (*latent_out)[t * LD + d] = down_buf[d * T_down + t];
+
+        // POCKET_MIMI_DUMP=<path>: dump the (deterministic) conditioning
+        // latents for scalar-vs-batched A/B — the sampler is stochastic, so
+        // WAV comparison cannot validate the encoder.
+        if (const char* dp = std::getenv("POCKET_MIMI_DUMP")) {
+            if (FILE* f = fopen(dp, "wb")) {
+                fwrite(*latent_out, sizeof(float), (size_t)T_down * LD, f);
+                fclose(f);
+            }
+        }
 
         if (pctx->verbosity >= 1)
             fprintf(stderr, "pocket_tts: mimi encode: %d samples → %d latent frames\n", n_samples, T_down);
