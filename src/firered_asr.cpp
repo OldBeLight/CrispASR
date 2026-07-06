@@ -210,6 +210,7 @@ struct firered_model {
     // Weight memory
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
+    ggml_backend_buffer_t buf_cpu = nullptr; // decoder partition when enc.* is split to GPU
 };
 
 struct firered_asr_context {
@@ -363,19 +364,36 @@ extern "C" struct firered_asr_context* firered_asr_init_from_file(const char* pa
     }
 
     // ---- pass 2: load tensor data ----
-    // Load to CPU: the decoder uses native Q4_K SIMD (60ms/step).
-    // The encoder scheduler auto-copies CPU weights to GPU per layer.
-    // TODO: single-graph encoder would eliminate per-layer copy overhead (~15s on T4).
+    // Decoder weights ALWAYS go to CPU: the AED decode loop uses native Q4_K
+    // SIMD vecmats on the CPU backend (60ms/step; per-token GPU launches
+    // were 20ms each). The encoder used to ride on the sched auto-copying
+    // CPU weights to GPU per layer — ggml removed that resolution
+    // (CPU-buffer weights now pin their ops to CPU), which silently made the
+    // whole encoder CPU-only (11.3s for 11s audio on M1). Split-loading
+    // enc.* onto the GPU backend restores encoder offload; the sched routes
+    // encoder ops to follow weight residency. Opt-in via
+    // CRISPASR_FIRERED_ENC_GPU=1 until verified on CUDA/Vulkan.
+    const bool enc_gpu = params.use_gpu && ctx->backend != ctx->backend_cpu && [] {
+        const char* e = std::getenv("CRISPASR_FIRERED_ENC_GPU");
+        return e && *e && *e != '0';
+    }();
     if (params.verbosity >= 1)
-        fprintf(stderr, "firered_asr: loading weights to CPU (Q4_K SIMD decoder)...\n");
+        fprintf(stderr, "firered_asr: loading weights to %s (Q4_K SIMD decoder)...\n",
+                enc_gpu ? "GPU(enc)+CPU(dec)" : "CPU");
     core_gguf::WeightLoad wl;
-    if (!core_gguf::load_weights(path_model, ctx->backend_cpu, "firered_asr", wl)) {
+    const bool loaded =
+        enc_gpu ? core_gguf::load_weights_split(
+                      path_model, ctx->backend, ctx->backend_cpu,
+                      [](const char* n, void*) { return strncmp(n, "enc.", 4) == 0; }, nullptr, "firered_asr", wl)
+                : core_gguf::load_weights(path_model, ctx->backend_cpu, "firered_asr", wl);
+    if (!loaded) {
         fprintf(stderr, "firered_asr: failed to load weights from '%s'\n", path_model);
         delete ctx;
         return nullptr;
     }
     m.ctx = wl.ctx;
     m.buf = wl.buf;
+    m.buf_cpu = wl.buf_cpu;
     auto& ts = wl.tensors;
 
     auto get = [&](const char* name) -> ggml_tensor* {
@@ -548,6 +566,8 @@ extern "C" void firered_asr_free(struct firered_asr_context* ctx) {
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
         ggml_backend_buffer_free(ctx->model.buf);
+    if (ctx->model.buf_cpu)
+        ggml_backend_buffer_free(ctx->model.buf_cpu);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)

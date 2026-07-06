@@ -429,7 +429,7 @@ Commit: `b9fd8eb`. **All 19 backends pass.**
 | Canary 1B | 1B | 672 | 0.0% | 6.2x | 1.8s | GPU enc+dec, 32+8 layers |
 | Cohere Transcribe | 2B | 1440 | 0.0% | 5.2x | 2.1s | GPU enc, AED dec |
 | Kyutai STT 1B | 1B | 636 | 4.5% | 1.4x | 7.7s | 24-layer Mimi decoder |
-| FireRed ASR2 AED | 900M | 918 | 0.0% | 0.6x | 19.0s | CPU Q4_K SIMD dec (60ms/step) |
+| FireRed ASR2 AED | 900M | 918 | 0.0% | 0.6x | 19.0s | CPU Q4_K SIMD dec (60ms/step); CRISPASR_FIRERED_ENC_GPU=1 splits enc.* to GPU (2.3x enc on M1/Metal + Vulkan, §224) |
 
 #### Encoder-LLM (autoregressive, language model decoder)
 
