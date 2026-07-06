@@ -5203,7 +5203,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->coopmat_support = false;
         }
 
-        device->integer_dot_product = device->integer_dot_product && shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated;
+        // CrispASR patch: GGML_VK_FORCE_INTEGER_DOT_PRODUCT=1 keeps the int-dot
+        // path enabled on devices that expose the extension without the
+        // "accelerated" property bit (e.g. MoltenVK) — diagnostics only.
+        device->integer_dot_product = device->integer_dot_product &&
+            (shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated ||
+             getenv("GGML_VK_FORCE_INTEGER_DOT_PRODUCT") != nullptr);
 
         device->min_imported_host_pointer_alignment = external_memory_host_props.minImportedHostPointerAlignment;
 
@@ -5856,8 +5861,10 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     const size_t subgroup_size = (default_subgroup_size != 0) ? default_subgroup_size : subgroup_props.subgroupSize;
     const bool uma = props2.properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
 
+    // CrispASR patch: see GGML_VK_FORCE_INTEGER_DOT_PRODUCT above (diagnostics only).
     integer_dot_product = integer_dot_product
-                       && shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated
+                       && (shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated ||
+                           getenv("GGML_VK_FORCE_INTEGER_DOT_PRODUCT") != nullptr)
                        && shader_integer_dot_product_features.shaderIntegerDotProduct;
 
     coopmat_support = coopmat_support
