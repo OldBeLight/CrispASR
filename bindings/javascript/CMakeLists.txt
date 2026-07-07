@@ -56,5 +56,8 @@ set_target_properties(${TARGET} PROPERTIES LINK_FLAGS " \
     -s USE_PTHREADS=1 \
     -s PTHREAD_POOL_SIZE=8 \
     -s ALLOW_MEMORY_GROWTH=1 \
+    -s STACK_SIZE=16MB \
+    -s INITIAL_MEMORY=512MB \
+    -s MAXIMUM_MEMORY=4GB \
     ${EXTRA_FLAGS} \
     ")

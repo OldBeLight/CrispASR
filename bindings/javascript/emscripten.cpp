@@ -481,6 +481,24 @@ EMSCRIPTEN_BINDINGS(whisper) {
                              return g_tts_session != nullptr;
                          }));
 
+    // Like ttsOpen but with an explicit backend name (e.g. "kokoro", "piper") — some TTS backends
+    // aren't auto-detectable from the GGUF and need it named, exactly as `--backend` does on the CLI.
+    emscripten::function("ttsOpenExplicit", emscripten::optional_override(
+                                                [](const std::string& model_path, const std::string& backend,
+                                                   int n_threads) {
+                                                    if (g_tts_session != nullptr) {
+                                                        crispasr_session_close(g_tts_session);
+                                                        g_tts_session = nullptr;
+                                                    }
+                                                    const int nt = n_threads <= 0 ? 1 : n_threads;
+                                                    g_tts_session =
+                                                        backend.empty()
+                                                            ? crispasr_session_open(model_path.c_str(), nt)
+                                                            : crispasr_session_open_explicit(model_path.c_str(),
+                                                                                             backend.c_str(), nt);
+                                                    return g_tts_session != nullptr;
+                                                }));
+
     emscripten::function("ttsClose", emscripten::optional_override([]() {
                              if (g_tts_session) {
                                  crispasr_session_close(g_tts_session);
