@@ -50,17 +50,26 @@ static bool firered_bench_enabled() {
     return v != 0;
 }
 
-// §229: run the conformer encoder rel-pos attention inside the ggml graph
-// (soft_max_ext path) instead of the hand-rolled CPU loops. Off by default —
-// the CPU path stays the reference; set CRISPASR_FIRERED_GGML_ATTN=1 to offload
-// the O(T²) encoder attention to the active backend (CUDA/Metal/Vulkan/CPU).
-static bool firered_ggml_attn_enabled() {
+// §229: encoder rel-pos attention in the ggml graph (soft_max_ext) vs the
+// hand-rolled CPU loops. The A/B (firered-asr2-aed) showed the in-graph path
+// faster on EVERY backend — pure CPU 3.6×, CUDA up to 20× — with byte-identical
+// decoded output, so it is the default. Returns the mode via
+// CRISPASR_FIRERED_GGML_ATTN:
+//   unset → 2 (auto: in-graph, but fall back to CPU for very large T)
+//   "0"   → 0 (force the CPU reference path)
+//   other → 1 (force in-graph, skip the large-T guard)
+static int firered_ggml_attn_mode() {
     static int v = -1;
     if (v < 0) {
         const char* e = std::getenv("CRISPASR_FIRERED_GGML_ATTN");
-        v = (e && *e && *e != '0') ? 1 : 0;
+        if (!e || !*e)
+            v = 2; // unset → auto
+        else if (*e == '0')
+            v = 0; // force CPU reference
+        else
+            v = 1; // force in-graph
     }
-    return v != 0;
+    return v;
 }
 
 struct firered_bench_stage {
@@ -1197,6 +1206,26 @@ static void hybrid_encoder(const float* subsampled, int T, int flat_dim, firered
     std::vector<float> pe_center(T_pe * d);
     memcpy(pe_center.data(), &pe_full[pe_start * d], T_pe * d * sizeof(float));
 
+    // §229: decide encoder attention path once for this call. Default is the
+    // in-graph (ggml) path. In "auto" mode it materializes the [T,T,nh] score
+    // matrix (O(T²) memory) vs the CPU path's O(T), so fall back to CPU for very
+    // large single chunks (e.g. no-VAD long audio) to avoid GPU/host OOM.
+    // CRISPASR_FIRERED_GGML_ATTN=1 forces in-graph regardless of size.
+    const int ggml_attn_mode = firered_ggml_attn_mode();
+    bool ggml_attn = (ggml_attn_mode != 0);
+    if (ggml_attn_mode == 2) {
+        const size_t score_elems = (size_t)T * T * nh;
+        const size_t kMaxScoreElems = 64ull * 1024 * 1024; // ~256 MB/tensor @ f32
+        if (score_elems > kMaxScoreElems) {
+            fprintf(stderr,
+                    "firered_asr: T=%d, nh=%d exceed the in-graph attention budget "
+                    "(%zu score elems) — using CPU attention "
+                    "(set CRISPASR_FIRERED_GGML_ATTN=1 to force in-graph)\n",
+                    T, nh, score_elems);
+            ggml_attn = false;
+        }
+    }
+
     // Read pos_bias_u/v for all layers (they're small — 20*64 each)
     struct layer_bias {
         std::vector<float> bu, bv;
@@ -1246,7 +1275,6 @@ static void hybrid_encoder(const float* subsampled, int T, int flat_dim, firered
         // Graph A: FFN1 + Q/K/V/P projections
         std::vector<float> Q_buf(T * d), K_buf(T * d), V_buf(T * d), P_buf(T_pe * d);
         std::vector<float> attn_out(T * d, 0.0f);
-        const bool ggml_attn = firered_ggml_attn_enabled();
         {
             size_t mem = ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(4096, false);
             std::vector<uint8_t> meta(mem);
@@ -1299,7 +1327,7 @@ static void hybrid_encoder(const float* subsampled, int T, int flat_dim, firered
             ggml_set_name(p, "P");
             ggml_set_output(p);
 
-            // Optional in-graph rel-pos attention (CRISPASR_FIRERED_GGML_ATTN=1).
+            // In-graph rel-pos attention (default; CRISPASR_FIRERED_GGML_ATTN=0 → CPU).
             // Mirrors the CPU path exactly:
             //   AC = (Q + bias_u)·Kᵀ            content term
             //   BD = rel_shift((Q + bias_v)·Pᵀ) relative-position term
