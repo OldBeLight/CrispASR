@@ -11,6 +11,8 @@
 #include "crispasr_model_registry.h"
 #include "whisper_params.h"
 
+#include "core/wav_reader.h"
+
 #include "irodori_tts.h"
 
 #include <cstdio>
@@ -101,9 +103,18 @@ public:
         return true;
     }
 
-    std::vector<float> synthesize(const std::string& text, const whisper_params& /*p*/) override {
+    std::vector<float> synthesize(const std::string& text, const whisper_params& p) override {
         if (!ctx_ || text.empty())
             return {};
+
+        // Per-call voice gating. The reference lives on the context (stateful
+        // set_reference), so we sync it to params.tts_voice on every call:
+        //   - voice set    → encode the reference for zero-shot cloning
+        //   - voice empty   → clear it, so the neutral-voice disclaimer synth
+        //                    (which passes tts_voice="") is NOT cloned
+        // The DAC-VAE encode is cached by path so chunked long text doesn't
+        // re-encode the reference for every chunk.
+        apply_reference(p);
 
         float* pcm = nullptr;
         int sr = 0;
@@ -126,7 +137,50 @@ public:
     }
 
 private:
+    // Sync the context's cloning reference to params.tts_voice. Caches the
+    // last-applied voice path so repeated calls (e.g. per chunk) don't
+    // re-load and re-encode the same reference audio.
+    void apply_reference(const whisper_params& p) {
+        if (p.tts_voice == ref_path_)
+            return; // already in the desired state (including both empty)
+        ref_path_ = p.tts_voice;
+
+        if (p.tts_voice.empty()) {
+            irodori_tts_clear_reference(ctx_);
+            return;
+        }
+
+        std::vector<float> pcm;
+        int sr = 0;
+        if (!crispasr::core::read_wav_mono_pcm16(p.tts_voice, pcm, sr) || pcm.empty() || sr <= 0) {
+            std::fprintf(stderr, "crispasr[irodori-tts]: failed to load reference audio '%s' (cloning disabled)\n",
+                         p.tts_voice.c_str());
+            irodori_tts_clear_reference(ctx_);
+            // Keep ref_path_ set so we don't re-warn for every chunk of the
+            // same request; a fixed voice path won't become readable mid-run.
+            return;
+        }
+        // irodori_tts_set_reference resamples to 48 kHz internally; pass the
+        // native rate through so it can do so. NOTE: the runtime currently
+        // ships only the DAC-VAE decoder — the encoder (audio → latent) is
+        // not ported yet, so set_reference returns -1 and cloning falls back
+        // to the default voice. This wiring is forward-compatible: it starts
+        // cloning automatically once the encoder lands.
+        if (irodori_tts_set_reference(ctx_, pcm.data(), (int)pcm.size(), sr) != 0) {
+            std::fprintf(stderr, "crispasr[irodori-tts]: voice cloning from reference audio is not yet supported "
+                                 "(DAC-VAE encoder not ported); using the default voice.\n");
+            irodori_tts_clear_reference(ctx_);
+            // Keep ref_path_ set: warn once per distinct voice, not per chunk.
+            return;
+        }
+        if (!p.no_prints) {
+            std::fprintf(stderr, "crispasr[irodori-tts]: reference voice '%s' (%d samples, %d Hz)\n",
+                         p.tts_voice.c_str(), (int)pcm.size(), sr);
+        }
+    }
+
     irodori_tts_context* ctx_ = nullptr;
+    std::string ref_path_; // last voice path applied to ctx_ ("" = cleared)
 };
 
 } // namespace
