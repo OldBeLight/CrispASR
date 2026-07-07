@@ -1412,8 +1412,33 @@ static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_
         return true;
     }
 
-    // Limit mel to ~5s reference for ggml_conv_2d stability
-    // No mel truncation needed — full reference audio is used for conditioning.
+    // Cap the reference length to the Conformer's positional-encoding table.
+    // The conditioning encoder subsamples mel by ~2 (Conv2dSubsampling k=3 s=2)
+    // → T_enc = (T_mel-3)/2 + 1, then views T_enc rows out of the fixed-length
+    // `pe` table. A long reference (e.g. a 164 s clip → 15408 mel frames →
+    // T_enc≈7703) overruns the 5000-row `pe` and aborts in ggml_view_2d
+    // ("data_size + view_offs <= ggml_nbytes" — reported on cstr/indextts-1.5-GGUF).
+    // Truncate to the longest reference the table supports (keeps refs that
+    // already worked unchanged; only over-long ones are clipped, from the
+    // start, which is representative for speaker conditioning).
+    if (ggml_tensor* pe = core_gguf::try_get(c->tensors, "cond_enc.embed.pos_enc.pe")) {
+        const int pe_len = (int)pe->ne[1];
+        if (pe_len > 1 && ((T_mel - 3) / 2 + 1) > pe_len) {
+            const int T2 = 2 * (pe_len - 1) + 3; // → T_enc == pe_len
+            std::vector<float> mel2((size_t)100 * T2);
+            for (int b = 0; b < 100; b++)
+                for (int t = 0; t < T2; t++)
+                    mel2[t + (size_t)b * T2] = mel[t + (size_t)b * T_mel]; // band-major
+            mel.swap(mel2);
+            if (c->params.verbosity >= 1) {
+                fprintf(stderr,
+                        "indextts: reference too long (%d mel frames, T_enc=%d > pe=%d); "
+                        "truncating to %d frames (~%.0fs) for conditioning\n",
+                        T_mel, (T_mel - 3) / 2 + 1, pe_len, T2, (double)T2 * 256 / 24000);
+            }
+            T_mel = T2;
+        }
+    }
 
     if (c->params.verbosity >= 1) {
         fprintf(stderr, "indextts: ref mel: %d frames x 100 bands\n", T_mel);
