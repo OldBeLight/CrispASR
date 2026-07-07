@@ -2190,30 +2190,48 @@ int irodori_tts_synthesize(struct irodori_tts_context* ctx, const char* text, fl
             }
         }
 
-        // CFG: independent text guidance
+        // CFG: independent guidance (matches Irodori rf.py cfg_guidance_mode
+        // "independent"):  v = v_cond
+        //                    + cfg_text    * (v_cond - v_text_uncond)      [text zeroed]
+        //                    + cfg_speaker * (v_cond - v_speaker_uncond)   [speaker masked]
         float cfg_text = ctx->cfg_scale_text;
         const char* cfg_env = std::getenv("CRISPASR_IRODORI_CFG_TEXT");
         if (cfg_env)
             cfg_text = (float)std::atof(cfg_env);
-        float cfg_min_t = 0.5f;
-        float cfg_max_t = 1.0f;
-        bool use_cfg = (cfg_text > 0.0f) && (t_val >= cfg_min_t) && (t_val <= cfg_max_t);
+        float cfg_speaker = ctx->cfg_scale_speaker;
+        const char* cfgsp_env = std::getenv("CRISPASR_IRODORI_CFG_SPEAKER");
+        if (cfgsp_env)
+            cfg_speaker = (float)std::atof(cfgsp_env);
+        const float cfg_min_t = 0.5f, cfg_max_t = 1.0f;
+        bool in_window = (t_val >= cfg_min_t) && (t_val <= cfg_max_t);
+        bool do_text_cfg = (cfg_text > 0.0f) && in_window;
+        // Speaker CFG only when a reference is actually attended. Gated to the
+        // same early-t window as text CFG: measured marginally better speaker
+        // fidelity than all-step guidance (0.649 vs 0.636 cos) at half the cost.
+        bool do_spk_cfg = attend_speaker && (cfg_speaker > 0.0f) && in_window;
 
-        if (use_cfg) {
-            // Unconditioned pass: zero text state
-            std::vector<float> text_uncond(T_text * hp.text_dim, 0.0f);
-            auto v_uncond =
-                run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_uncond.data(), T_text,
-                                spk_state.empty() ? nullptr : spk_state.data(), T_ref, attend_speaker);
-            if (!v_uncond.empty()) {
-                for (size_t i = 0; i < x_t.size(); i++) {
-                    float v = v_cond[i] + cfg_text * (v_cond[i] - v_uncond[i]);
-                    x_t[i] += v * dt;
-                }
-            } else {
-                // Fallback: no CFG
-                for (size_t i = 0; i < x_t.size(); i++)
-                    x_t[i] += v_cond[i] * dt;
+        if (do_text_cfg || do_spk_cfg) {
+            const float* spk_ptr = spk_state.empty() ? nullptr : spk_state.data();
+            // Text-unconditional pass: zero text state, keep speaker attended.
+            std::vector<float> v_text_uncond;
+            if (do_text_cfg) {
+                std::vector<float> text_uncond(T_text * hp.text_dim, 0.0f);
+                v_text_uncond = run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_uncond.data(),
+                                                T_text, spk_ptr, T_ref, attend_speaker);
+            }
+            // Speaker-unconditional pass: conditioned text, speaker masked out.
+            std::vector<float> v_spk_uncond;
+            if (do_spk_cfg) {
+                v_spk_uncond = run_dit_forward(ctx, x_t.data(), patched_steps, cond_embed.data(), text_state.data(),
+                                               T_text, spk_ptr, T_ref, /*attend_speaker=*/false);
+            }
+            for (size_t i = 0; i < x_t.size(); i++) {
+                float v = v_cond[i];
+                if (!v_text_uncond.empty())
+                    v += cfg_text * (v_cond[i] - v_text_uncond[i]);
+                if (!v_spk_uncond.empty())
+                    v += cfg_speaker * (v_cond[i] - v_spk_uncond[i]);
+                x_t[i] += v * dt;
             }
         } else {
             // No CFG for this timestep
