@@ -65,6 +65,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
 
       # Probe whether the trusted publisher is configured AND the package
@@ -108,6 +109,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
 
       # Fail fast (and clearly) if the token isn't set, instead of letting
@@ -156,6 +158,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
 
       # pub.dev's automated publishing requires the package to already

@@ -24,6 +24,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       - run: |
           cmake -S . -B /tmp/go_drift_build \
             --graphviz=/tmp/crispasr.dot \
@@ -42,6 +44,8 @@ jobs:
         with:
           go-version: '^1.23'
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       - run: |
           cd bindings/go
           make test

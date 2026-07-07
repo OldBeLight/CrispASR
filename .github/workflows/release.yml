@@ -23,6 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
       - name: Verify VERSION matches tag
         run: |
@@ -44,6 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
       - name: Verify in-tree glint matches upstream main
         run: |
@@ -1681,6 +1683,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          submodules: recursive
           fetch-depth: 1
 
       - uses: actions/download-artifact@v4

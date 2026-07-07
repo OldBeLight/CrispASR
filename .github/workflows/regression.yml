@@ -62,6 +62,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       - name: Run driver smoke test
         run: python tests/regression/test_driver_smoke.py
 
@@ -73,6 +75,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       - name: Run no-model Python unit tests
         run: |
           python -m pytest tests/test_backend_config.py -v || \
@@ -90,6 +94,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       - run: pip install huggingface_hub
       - run: python tests/regression/run_one.py --dry-run
         env:
@@ -176,6 +182,8 @@ jobs:
           # you add parakeet on top.
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Install build + runtime deps
         run: |

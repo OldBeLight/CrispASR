@@ -34,6 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          submodules: recursive
           ref: main
           token: ${{ secrets.GLINT_SYNC_PAT || github.token }}
 
