@@ -48,16 +48,22 @@ if (CRISPASR_WASM_SINGLE_FILE)
         )
 endif()
 
+# Multithreaded needs a big pre-reserved shared memory (growing shared memory mid-compute stalls in
+# a browser worker). Single-threaded uses a normal (growable) memory, so a small initial is fine.
+if (CRISPASR_WASM_SINGLE_THREAD)
+    set(WASM_THREAD_FLAGS "-s INITIAL_MEMORY=512MB")
+else()
+    set(WASM_THREAD_FLAGS "-s USE_PTHREADS=1 -s PTHREAD_POOL_SIZE=0 -s INITIAL_MEMORY=2GB")
+endif()
+
 set_target_properties(${TARGET} PROPERTIES LINK_FLAGS " \
     --bind \
     -s MODULARIZE=1 \
     -s EXPORT_NAME=\"'whisper_factory'\" \
     -s FORCE_FILESYSTEM=1 \
-    -s USE_PTHREADS=1 \
-    -s PTHREAD_POOL_SIZE=8 \
+    ${WASM_THREAD_FLAGS} \
     -s ALLOW_MEMORY_GROWTH=1 \
     -s STACK_SIZE=16MB \
-    -s INITIAL_MEMORY=512MB \
     -s MAXIMUM_MEMORY=4GB \
     ${EXTRA_FLAGS} \
     ")

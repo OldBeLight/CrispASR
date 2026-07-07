@@ -58,13 +58,19 @@ if (EMSCRIPTEN)
 
     option(CRISPASR_WASM            "crispasr: build WASM/JS target (Emscripten)"              ON)
     option(CRISPASR_WASM_SINGLE_FILE "crispasr: embed WASM inside the generated crispasr.js"   ON)
+    # Single-threaded WASM: no pthreads, so NO SharedArrayBuffer / COOP-COEP required, and no
+    # blocking-compute deadlock when driven from a Web Worker. Slower (1 thread), but it just runs
+    # anywhere. Multithreaded (-pthread) stays the default.
+    option(CRISPASR_WASM_SINGLE_THREAD "crispasr: single-threaded WASM (no pthreads, no COOP/COEP)" OFF)
 
     # Multithreaded WASM: -pthread enables SharedArrayBuffer-based threading
     # in the browser. The hosting page MUST set COOP/COEP headers:
     #   Cross-Origin-Opener-Policy: same-origin
     #   Cross-Origin-Embedder-Policy: require-corp
-    set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -pthread")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
+    if (NOT CRISPASR_WASM_SINGLE_THREAD)
+        set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -pthread")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
+    endif()
 
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s TOTAL_STACK=5242880")
     set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -s TOTAL_STACK=5242880")
