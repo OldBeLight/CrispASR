@@ -7260,3 +7260,65 @@ author-local ~/asr-bench install), so the columns could appear any time.
   vibevoice/chatterbox cache-A/B duds.
 - torch.compile-style encoder fusion: not byte-exact for them (fp32 upcast +
   BatchNorm amplification) — reinforces our decoded-output A/B mandate.
+
+
+## §228 Issue #221 irodori-tts follow-ups — cloning, emoji, caching, streaming (bakamomi)
+
+Follow-ups after the #221 base port. Reporter (bakamomi) is on an RTX 5070 Ti
+(CUDA) + AMD iGPU (Vulkan). See [[project_221_irodori_voice_cloning]].
+
+### DONE (2026-07-07, all on main)
+
+- **Emoji emotion control** — two fixes. (a) `core_spm::tokenize` collapsed to
+  BOS on any OOV multibyte codepoint (6029a51a); (b) the real one: OOV emoji
+  must use SentencePiece **byte_fallback** → `<0xHH>` tokens (the model's
+  learned controls), not `<unk>` noise (c5a69fc9). C++ tokens now byte-for-byte
+  == HF llm-jp-3.
+- **Zero-shot voice cloning** — ported the DAC-VAE encoder (audio→latent, BS.1770
+  −16 LUFS) + wired the two hardcoded "unconditional" defaults that ignored the
+  reference (6fec8338); speaker CFG (c1b9becf). Encoder-enabled codec uploaded to
+  cstr/irodori-tts-GGUF. spk-sim 0.08→0.65 (~91% of the repo's own sample).
+- **Duration predictor** — the `6.3 frames/token` heuristic truncated kanji-heavy
+  text; wired the model's token-sum duration predictor (05a7d0ad). Exact vs
+  reference given same text_state.
+- **Reference-conditioning cache** — generic `crispasr_tts_ref_cache.h` ("CRC1")
+  wired into irodori (`.iro32latent`), indextts (Conformer/Perceiver + ECAPA,
+  `.idxcond`), f5 (whisper transcript, `.f5reftext`); byte-identical reuse
+  (fba33a0c). indextts also caches across chunks in-session.
+- **Chunked codec decode** — overlap-save DAC-VAE decode bounds peak memory;
+  EXACT (cos=1.0, all seams 0), auto for long outputs (39ad4657).
+- **Streaming** — server already streamed per-sentence; added CLI `--tts-stream`
+  (s16le to stdout, 91f6d3f9) + C ABI `crispasr_session_synthesize_streaming`
+  (thin per-sentence wrapper, 1f6f0f60).
+
+### OPEN — pending follow-ups (priority order)
+
+- [ ] **Vulkan encode/decode for the DAC-VAE codec.** Codec runs on CPU under
+      Vulkan today (deliberate gallocr-safety fallback, cf. §192 TADA codec
+      corruption). bakamomi's AMD iGPU only accelerates the DiT/ODE; encode +
+      decode are CPU-bound. Port the codec graphs to Vulkan (or fix the gallocr
+      path that forced the CPU fallback). Largest item.
+- [ ] **Low-step first-segment streaming (single-utterance TTFB).** For a
+      diffusion model, per-sentence streaming (shipped) is the real win; the ODE
+      generates the whole utterance before decode, so intra-utterance
+      decode-streaming is ~free of TTFB benefit. The remaining lever is bakamomi's
+      "diffuse a short first segment at low ODE steps → emit → diffuse the rest at
+      full steps". Requires segmenting generation (sub-sentence) + exposing
+      first-chunk size/steps knobs; risk = first-chunk quality + prosody
+      discontinuity on a joint-attention DiT. Prototype + A/B before default.
+- [ ] **Irodori VoiceDesign backend** (Aratako/Irodori-TTS-600M-v3-VoiceDesign).
+      Natural-language voice *description* instead of a reference clip → a caption
+      encoder + a distinct model, so a new backend rather than a flag. Config
+      already exposes `caption_*` fields (use_caption_condition, caption_dim,
+      caption_tokenizer_repo, cfg_scale_caption) and the DiT has the caption
+      cross-attn path. Track as its own feature issue.
+- [ ] **C ABI intra-utterance streaming (optional).** The C ABI streaming wrapper
+      is per-sentence (reuses session_synthesize). True CAP_STREAMING-style
+      intra-utterance emission from the C ABI would need the session TTS path to
+      go through a common interface (it's ~20 inline per-backend `*_ctx` branches
+      today) + a TTS sample-rate accessor. Only worth it if an embedder needs
+      sub-sentence latency; low value for diffusion backends.
+- [ ] **Ref-cache for remaining cloning backends** (cheap ones deprioritized).
+      cosyvoice3 already has baked voice bundles; csm/melotts speaker embeds are
+      comparatively cheap. Wire on demand via the shared helper + a get/set
+      conditioning pair per backend.
