@@ -16,6 +16,7 @@
 
 #include "firered_asr.h"
 
+#include "core/cpu_attention.h" // cpu_dot + cpu_online_softmax_accumulate (shared)
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
@@ -740,28 +741,13 @@ static void read_f32_vec(ggml_tensor* t, std::vector<float>& out) {
     }
 }
 
+// cpu_dot + cpu_online_softmax_accumulate live in core/cpu_attention.h so
+// wav2vec2 (and future CPU-attention backends) share one implementation.
+using crispasr::cpu_attn::cpu_dot;
+using crispasr::cpu_attn::cpu_online_softmax_accumulate;
+
 // CPU matmul: C = A @ B^T where A is [M,K], B is [N,K] → C is [M,N]
 // (B stored as [N,K] row-major, like ggml weight [K,N] with ne[0]=K)
-// Dot product of two length-K float vectors using four independent
-// accumulator chains so the compiler can vectorize the reduction even under
-// strict FP (no -ffast-math / /fp:fast needed). Float accumulation over
-// K~1280 is well within tolerance for ASR logits; the old double-accumulate
-// form forced scalar, non-vectorized code and dominated the decoder.
-static inline float cpu_dot(const float* a, const float* b, int K) {
-    float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-    int k = 0;
-    for (; k + 4 <= K; k += 4) {
-        s0 += a[k + 0] * b[k + 0];
-        s1 += a[k + 1] * b[k + 1];
-        s2 += a[k + 2] * b[k + 2];
-        s3 += a[k + 3] * b[k + 3];
-    }
-    float s = (s0 + s1) + (s2 + s3);
-    for (; k < K; k++)
-        s += a[k] * b[k];
-    return s;
-}
-
 static void cpu_matmul_bt(const float* A, const float* B, float* C, int M, int K, int N) {
     if (M == 1) {
         // Single-vector × matrix: parallelize over output dimension N.
@@ -891,53 +877,6 @@ static void cpu_softmax_rows(float* x, int rows, int cols) {
         }
         for (int c = 0; c < cols; c++)
             x[r * cols + c] /= sum;
-    }
-}
-
-template <typename ScoreFn>
-static inline void cpu_online_softmax_accumulate(int T, int hd, const float* __restrict V, int stride_v,
-                                                 float* __restrict out, ScoreFn&& score_fn) {
-    // Online softmax update.
-    //
-    // Equivalent to:
-    //
-    //   softmax(score) * V
-    //
-    // but avoids storing the entire T-sized attention matrix.
-    //
-    // m tracks the maximum score seen so far.
-    // l tracks the normalized exponential sum.
-    float m = -INFINITY;
-    float l = 0.0f;
-    std::fill_n(out, hd, 0.0f);
-    for (int t = 0; t < T; t++) {
-        const float* __restrict v = V + t * stride_v;
-
-        float s = score_fn(t);
-        float m_new = (s > m) ? s : m;
-        float exp_scale = expf(m - m_new);
-        float e = expf(s - m_new);
-
-        // If a new maximum is found, previous accumulated values
-        // must be rescaled. Otherwise exp_scale == 1 and the
-        // multiplication can be skipped.
-        if (m_new > m) {
-            for (int dd = 0; dd < hd; dd++) {
-                out[dd] = out[dd] * exp_scale + e * v[dd];
-            }
-        } else {
-            for (int dd = 0; dd < hd; dd++) {
-                out[dd] += e * v[dd];
-            }
-        }
-
-        l = l * exp_scale + e;
-        m = m_new;
-    }
-
-    float inv_l = 1.0f / l;
-    for (int dd = 0; dd < hd; dd++) {
-        out[dd] *= inv_l;
     }
 }
 
