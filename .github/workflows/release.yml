@@ -97,6 +97,41 @@ jobs:
           files: release/crispasr-linux-x86_64.tar.gz
           fail_on_unmatched_files: false
 
+  # ── WebAssembly build (browser: ASR + TTS, all backends) ─────────────────────
+  build-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Setup emsdk
+        uses: mymindstorm/setup-emsdk@v14
+
+      - name: Build WASM (all backends)
+        run: ./build-wasm.sh --clean
+
+      - name: Package
+        run: |
+          mkdir -p release/crispasr-wasm
+          cp build-wasm/bin/libwhisper.js build-wasm/bin/libwhisper.wasm release/crispasr-wasm/
+          [ -f build-wasm/bin/libwhisper.worker.js ] && cp build-wasm/bin/libwhisper.worker.js release/crispasr-wasm/ || true
+          printf 'CrispASR WebAssembly: libwhisper.js (global whisper_factory) + libwhisper.wasm.\nMultithreaded -> host page must be cross-origin isolated (COOP/COEP).\nTTS: Module.ttsOpenExplicit(model,backend,threads) -> ttsSetVoice(voice,"") -> ttsSynthesize(text) => Float32Array @24kHz.\nLoad files via Module.FS_createDataFile("/models",name,bytes,true,true).\n' > release/crispasr-wasm/README.txt
+          cd release && tar czf crispasr-wasm.tar.gz crispasr-wasm/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-wasm
+          path: release/crispasr-wasm.tar.gz
+
+      - name: Attach crispasr-wasm.tar.gz to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: release/crispasr-wasm.tar.gz
+          fail_on_unmatched_files: false
+
   # ── Linux x86_64 CLI — AVX-512 + VNNI variant ────────────────────────────────
   # Default build-linux ships AVX-2 only. On CPUs with AVX-512 + VPDPBUSD
   # (Tiger Lake / Ice Lake / Sapphire Rapids client / Zen 4+) ggml's
