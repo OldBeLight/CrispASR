@@ -385,6 +385,12 @@ struct whisper_params {
     bool tts_play = false;
     int tts_play_device = -1;
 
+    // --tts-stream: stream synthesized audio to stdout as raw signed-16-bit
+    // little-endian mono PCM (at the backend's sample rate), emitting each
+    // sentence chunk as it is produced instead of writing one WAV at the end.
+    // For piping into a player, e.g. `… --tts-stream | ffplay -f s16le -ar 48000 -`.
+    bool tts_stream = false;
+
     // G2P phonemizer dictionary source:
     //   ""           → auto (OLaPh MIT preferred, then open-dict-data CC-BY-SA)
     //   "olaph"      → OLaPh MIT dicts from cstr/g2p-dicts HuggingFace

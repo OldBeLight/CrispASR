@@ -543,6 +543,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.tts_text = ARGV_NEXT;
     } else if (arg == "--tts-output") {
         params.tts_output = ARGV_NEXT;
+    } else if (arg == "--tts-stream") {
+        params.tts_stream = true;
     } else if (arg == "--voice") {
         params.tts_voice = ARGV_NEXT;
     } else if (arg == "--tts-steps") {
@@ -1144,6 +1146,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr,
             "             --tts-output FNAME      [%-7s] output path: .wav, .mp3, .aac (default: tts_output.wav)\n",
             params.tts_output.c_str());
+    fprintf(stderr, "             --tts-stream            stream s16le mono PCM to stdout per sentence (pipe to a "
+                    "player); logs stay on stderr\n");
     fprintf(stderr,
             "             --voice PATH            [%-7s] voice prompt: GGUF voice pack or reference WAV\n"
             "                                                 (.wav → 1.5B WAV cloning; .gguf → voice pack)\n",

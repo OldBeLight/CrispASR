@@ -2116,6 +2116,60 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // CLI `--tts` path to parity. Single-sentence input is a 1-element vector
         // (one std::vector move of overhead). The policy wrapper keeps VibeVoice
         // voice cloning single-shot (chunking breaks its continuous-prompt ICL).
+        // --tts-stream: emit each sentence chunk to stdout as raw s16le mono
+        // PCM as soon as it's synthesized (progressive playback), instead of
+        // concatenating into one WAV. Watermark is embedded per chunk; the
+        // spoken disclaimer (if voice-cloned) is emitted first. All logs stay
+        // on stderr so stdout is a clean PCM stream.
+        if (params.tts_stream) {
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr: streaming TTS as s16le mono @ %d Hz to stdout\n", sr_in);
+            auto emit = [&](std::vector<float>& pcm) {
+                if (pcm.empty())
+                    return;
+                crispasr_wm_dispatch::embed(pcm.data(), (int)pcm.size(), sr_in);
+                std::vector<int16_t> s16(pcm.size());
+                for (size_t i = 0; i < pcm.size(); i++) {
+                    float v = pcm[i] * 32767.0f;
+                    s16[i] = (int16_t)(v < -32768.0f ? -32768.0f : (v > 32767.0f ? 32767.0f : v));
+                }
+                fwrite(s16.data(), sizeof(int16_t), s16.size(), stdout);
+                fflush(stdout);
+            };
+            if (is_voice_clone && !params.tts_no_spoken_disclaimer) {
+                const auto& disc = crispasr_tts_get_disclaimer(backend.get(), params);
+                if (!disc.empty()) {
+                    std::vector<float> d(disc.begin(), disc.end());
+                    emit(d);
+                    std::vector<float> gap((size_t)sr_in / 5, 0.0f); // 200 ms
+                    emit(gap);
+                }
+            }
+            const std::vector<std::string> stream_chunks =
+                crispasr_tts_plan_chunks_for_backend(params.tts_text, backend->name());
+            bool any = false;
+            for (size_t ci = 0; ci < stream_chunks.size(); ci++) {
+                std::vector<float> c = backend->synthesize(stream_chunks[ci], params);
+                if (c.empty())
+                    continue;
+                if (any) {
+                    std::vector<float> gap((size_t)sr_in / 5, 0.0f); // 200 ms between chunks
+                    emit(gap);
+                }
+                emit(c);
+                any = true;
+            }
+            fflush(stdout);
+            crispasr_wm_dispatch::shutdown();
+            if (!any) {
+                fprintf(stderr, "crispasr: error: TTS synthesis failed\n");
+                return 15;
+            }
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr: TTS stream complete\n");
+            return 0;
+        }
+
         std::vector<float> audio;
         {
             const std::vector<std::string> chunks_txt =
