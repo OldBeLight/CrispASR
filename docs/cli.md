@@ -165,7 +165,20 @@ CrispASR writes outputs side-by-side with the input audio (e.g.
 ```
 
 Add `-ojf` (`--output-json-full`) to include per-word `words[]` and
-per-token `tokens[]` arrays when the backend populates them.
+per-token `tokens[]` arrays when the backend populates them:
+
+```json
+      "words": [
+        { "text": "And", "t0": 24, "t1": 52, "offsets": { "from": 240, "to": 520 } }
+      ]
+```
+
+**Time units.** Segment `offsets` (and each word/token `offsets`) are in
+**milliseconds**. The per-word / per-token `t0`/`t1` fields are in
+**centiseconds** — this is the library's internal timebase (see the C ABI's
+`t0_cs`/`t1_cs`) and is retained for backwards compatibility. Prefer the
+`offsets` object for a unit that is consistent across every level of the
+document (issue #228).
 
 ## Segmentation / chunking
 
