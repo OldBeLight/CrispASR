@@ -52,6 +52,9 @@ endif()
 # a browser worker). Single-threaded uses a normal (growable) memory, so a small initial is fine.
 if (CRISPASR_WASM_SINGLE_THREAD)
     set(WASM_THREAD_FLAGS "-s INITIAL_MEMORY=512MB")
+elseif (CRISPASR_WASM_PROXY_TO_PTHREAD)
+    # Experiment: run the runtime on a proxied pthread so the servicer thread stays free.
+    set(WASM_THREAD_FLAGS "-s USE_PTHREADS=1 -s PTHREAD_POOL_SIZE=8 -s PROXY_TO_PTHREAD=1 -s INITIAL_MEMORY=2GB")
 else()
     set(WASM_THREAD_FLAGS "-s USE_PTHREADS=1 -s PTHREAD_POOL_SIZE=0 -s INITIAL_MEMORY=2GB")
 endif()
