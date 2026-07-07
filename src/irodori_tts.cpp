@@ -264,6 +264,10 @@ struct irodori_tts_context {
     bool use_bpe = false; // true when merges are loaded (correct path)
     int bos_token_id = -1;
     int pad_token_id = -1;
+    // SentencePiece byte_fallback: byte value → "<0xHH>" token id (-1 if
+    // absent). Non-empty when the vocab has byte tokens; lets OOV emoji
+    // become byte sequences (Irodori emoji emotion controls) not <unk>.
+    std::vector<int32_t> byte_fallback;
 #ifdef IRODORI_HAVE_SENTENCEPIECE
     std::unique_ptr<sentencepiece::SentencePieceProcessor> sp_processor;
 #endif
@@ -973,6 +977,7 @@ static std::vector<int32_t> tokenize_text(const irodori_tts_context* ctx, const 
         IRODORI_DBG("[irodori] using override token IDs (%d tokens)\n", (int)tokens.size());
         return tokens;
     }
+    // (dump hook applied to the computed ids below)
 
     std::vector<int32_t> tokens;
 
@@ -1009,6 +1014,10 @@ static std::vector<int32_t> tokenize_text(const irodori_tts_context* ctx, const 
             cfg.unk_id = 0;
             cfg.utf8_aligned = true;
             cfg.merge_consecutive_unk = true;
+            // byte_fallback: OOV bytes → "<0xHH>" tokens (emoji emotion controls
+            // must reach the model as byte sequences, not <unk> noise, #221).
+            if (!ctx->byte_fallback.empty())
+                cfg.byte_fallback = &ctx->byte_fallback;
             auto sp_tokens = core_spm::tokenize(text, ctx->token_to_id, ctx->token_scores, cfg, true);
             tokens.insert(tokens.end(), sp_tokens.begin(), sp_tokens.end());
         } else {
@@ -1024,6 +1033,14 @@ static std::vector<int32_t> tokenize_text(const irodori_tts_context* ctx, const 
         }
     }
 
+    if (const char* dbg = std::getenv("CRISPASR_IRODORI_DUMP_TOKENS")) {
+        if (*dbg && *dbg != '0') {
+            std::fprintf(stderr, "[irodori] tokens (%d):", (int)tokens.size());
+            for (int32_t t : tokens)
+                std::fprintf(stderr, " %d", t);
+            std::fprintf(stderr, "\n");
+        }
+    }
     return tokens;
 }
 
@@ -1156,6 +1173,22 @@ struct irodori_tts_context* irodori_tts_init_from_file(const char* path_model, s
             for (size_t i = 0; i < vocab_strs.size(); i++) {
                 ctx->vocab[i] = vocab_strs[i];
                 ctx->token_to_id[vocab_strs[i]] = (int32_t)i;
+            }
+            // Build the SentencePiece byte_fallback table from "<0xHH>" tokens.
+            {
+                std::vector<int32_t> bf(256, -1);
+                char name[8];
+                int found = 0;
+                for (int b = 0; b < 256; b++) {
+                    std::snprintf(name, sizeof(name), "<0x%02X>", b);
+                    auto it = ctx->token_to_id.find(name);
+                    if (it != ctx->token_to_id.end()) {
+                        bf[b] = it->second;
+                        found++;
+                    }
+                }
+                if (found == 256)
+                    ctx->byte_fallback = std::move(bf);
             }
             // Load scores (used only by legacy SP Viterbi fallback)
             auto scores = core_gguf::kv_f32_array(meta, "tokenizer.ggml.scores");
