@@ -895,14 +895,8 @@ static void cpu_softmax_rows(float* x, int rows, int cols) {
 }
 
 template <typename ScoreFn>
-static inline void cpu_online_softmax_accumulate(
-    int T,
-    int hd,
-    const float* __restrict V,
-    int stride_v,
-    float* __restrict out,
-    ScoreFn&& score_fn)
-{
+static inline void cpu_online_softmax_accumulate(int T, int hd, const float* __restrict V, int stride_v,
+                                                 float* __restrict out, ScoreFn&& score_fn) {
     // Online softmax update.
     //
     // Equivalent to:
@@ -1390,15 +1384,19 @@ static void hybrid_encoder(const float* subsampled, int T, int flat_dim, firered
 
 #pragma omp parallel
             {
-                std::vector<float> acc(hd);
                 std::vector<float> qbu(hd);
                 std::vector<float> qbv(hd);
 
+                // NOTE: the two collapsed loops must be *perfectly* nested (no statements
+                // between the `h` and `tq` headers), otherwise GCC/Clang reject the
+                // `collapse(2)` clause. The per-head bias/query pointers are therefore
+                // derived inside the inner loop — they are pure pointer arithmetic and cost
+                // nothing.
 #pragma omp for collapse(2) schedule(static)
                 for (int h = 0; h < nh; h++) {
-                    const float* __restrict buh = biases[li].bu.data() + h * hd;
-                    const float* __restrict bvh = biases[li].bv.data() + h * hd;
                     for (int tq = 0; tq < T; tq++) {
+                        const float* __restrict buh = biases[li].bu.data() + h * hd;
+                        const float* __restrict bvh = biases[li].bv.data() + h * hd;
                         // Precompute query + biases once
                         // q is fixed for this query position tq.
                         // These are loop-invariant terms:
@@ -1413,15 +1411,9 @@ static void hybrid_encoder(const float* subsampled, int T, int flat_dim, firered
                             qbu[dd] = q[dd] + buh[dd];
                             qbv[dd] = q[dd] + bvh[dd];
                         }
-                        std::fill(acc.begin(), acc.end(), 0.0f);
 
                         cpu_online_softmax_accumulate(
-                            T,
-                            hd,
-                            V_buf.data() + h * hd,
-                            d,
-                            attn_out.data() + tq * d + h * hd,
-                            [&](int tk) -> float {
+                            T, hd, V_buf.data() + h * hd, d, attn_out.data() + tq * d + h * hd, [&](int tk) -> float {
                                 // Compute attention score:
                                 //
                                 // score = ((q+bu)K + (q+bv)P) / sqrt(head_dim)
@@ -1433,12 +1425,11 @@ static void hybrid_encoder(const float* subsampled, int T, int flat_dim, firered
                                 float position = 0.0f;
                                 int pos_idx = T - 1 - tq + tk;
                                 if ((unsigned)pos_idx < (unsigned)T_pe) {
-                                    position = cpu_dot(qbv.data(),P_buf.data() + h * hd + pos_idx * d , hd);
+                                    position = cpu_dot(qbv.data(), P_buf.data() + h * hd + pos_idx * d, hd);
                                 }
 
                                 return (content + position) * scale;
-                            }
-                        );
+                            });
                     }
                 }
             }
@@ -2450,19 +2441,13 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
 #pragma omp parallel for collapse(2) schedule(static)
                 for (int a = 0; a < n_active; ++a) {
                     for (int h = 0; h < nh_dec; ++h) {
-                        cpu_online_softmax_accumulate(
-                            T_sub,
-                            hd_dec,
-                            V_enc[li].data() + h * hd_dec,
-                            d,
-                            xattn_out_batch.data() + a * d + h * hd_dec,
-                            [&](int t) -> float {
-                                return cpu_dot(Qx_batch.data() + a * d + h * hd_dec, 
-                                               K_enc[li].data() + t * d + h * hd_dec, 
-                                               hd_dec) * 
-                                       inv_sqrt_hd_dec;
-                            }
-                        );
+                        cpu_online_softmax_accumulate(T_sub, hd_dec, V_enc[li].data() + h * hd_dec, d,
+                                                      xattn_out_batch.data() + a * d + h * hd_dec, [&](int t) -> float {
+                                                          return cpu_dot(Qx_batch.data() + a * d + h * hd_dec,
+                                                                         K_enc[li].data() + t * d + h * hd_dec,
+                                                                         hd_dec) *
+                                                                 inv_sqrt_hd_dec;
+                                                      });
                     }
                 }
 
