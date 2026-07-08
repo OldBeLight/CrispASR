@@ -7318,7 +7318,28 @@ Follow-ups after the #221 base port. Reporter (bakamomi) is on an RTX 5070 Ti
       go through a common interface (it's ~20 inline per-backend `*_ctx` branches
       today) + a TTS sample-rate accessor. Only worth it if an embedder needs
       sub-sentence latency; low value for diffusion backends.
+- [x] **Shared overlap-save decode driver** — DONE (573b7f82).
+      `core_dac::decode_overlap_save(T, hop, chunk, ctx, decode_window)` extracted;
+      irodori refactored onto it (re-verified cos=1.0/maxdiff=0), zonos wired
+      through it (descript-DAC codes; not runtime-validated locally — needs a
+      one-off chunked-vs-whole cos check with a zonos model; only long single
+      utterances trigger it). dia is unadopted (backend not working per memory);
+      parler adopts trivially if/when its decode is long.
+- [ ] **Parler T5 description disk-cache** (skips the T5 encode across runs).
+      set_description already caches enc_hidden IN-SESSION; only the cross-RUN
+      disk cache is missing. BLOCKED on structure: the shared ref-cache helper
+      lives in examples/cli (adapter layer) but the T5 encode is in the runtime
+      (src/parler_tts.cpp). Clean path = mirror indextts: add parler runtime
+      get/set-encoding API (borrow/restore enc_hidden + enc_T), cache in the CLI
+      adapter keyed on a hash of the description (+ a model discriminator to avoid
+      same-d_model collisions), voice_path="" (no mtime staleness). Unvalidatable
+      here (no parler model); default-off opt-in until validated.
 - [ ] **Ref-cache for remaining cloning backends** (cheap ones deprioritized).
       cosyvoice3 already has baked voice bundles; csm/melotts speaker embeds are
       comparatively cheap. Wire on demand via the shared helper + a get/set
       conditioning pair per backend.
+- [x] **Generalization audit** — DONE. Streaming (CLI/C ABI/server) is already
+      backend-agnostic → every TTS backend covered. byte_fallback (core_spm) helps
+      m2m100/indextts/parler/pocket_tts for free. Reference-cache + overlap-save
+      decode are opt-in per backend (helpers ready). Duration predictor is
+      irodori-specific (needs a model that ships an unused duration head).

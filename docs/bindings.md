@@ -263,8 +263,12 @@ Every binding above (Python, Rust, Dart/Flutter, Go, Java, JavaScript,
 Ruby) reaches all TTS backends through the same two unified-C-API calls,
 so there is nothing TTS-specific per wrapper:
 
-- `synthesize(text) -> float32 PCM @ 24 kHz mono`
-  (`crispasr_session_synthesize`)
+- `synthesize(text) -> float32 PCM (mono, backend-native rate — 24 kHz
+  for most, 48 kHz for irodori/voxcpm2)` (`crispasr_session_synthesize`)
+- `synthesize_streaming(text, cb, user)` — same, but fires `cb(pcm,
+  n_samples, is_final, user)` once per sentence chunk as it's produced, for
+  progressive playback (`crispasr_session_synthesize_streaming`). The PCM is
+  owned by the call; copy it in the callback if you need to keep it.
 - `set_voice(path, ref_text?)` — `path` is a preset/baked-voice name
   **or** a `*.wav` clone reference (`ref_text` required for a WAV);
   `set_instruct(...)` for qwen3-tts VoiceDesign.

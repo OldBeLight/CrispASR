@@ -4,6 +4,9 @@ CrispASR supports three streaming modes — pipe input, microphone
 capture, and continuous live mode — and per-token confidence output.
 All work with every supported backend.
 
+> **Streaming TTS output** (the reverse direction) is documented in its own
+> section at the bottom — [Streaming synthesized audio](#streaming-synthesized-audio-out).
+
 > Over HTTP, the server exposes the same streaming decoder as a WebSocket
 > endpoint — start it with `--ws-port` and send binary float32 PCM frames,
 > or connect to `ws-port + 1` for the JSON-based **vLLM Realtime API** endpoint.
@@ -310,3 +313,51 @@ Four context presets trade latency for accuracy:
 | 3      | 13 frames    | 14 frames  | ~1120 ms       | 6.93 %        |
 
 Set via `CRISPASR_NEMOTRON_CONTEXT_PRESET=N` (default: 0).
+
+## Streaming synthesized audio (out)
+
+TTS output can be streamed progressively — audio starts flowing before the
+whole clip is synthesized — from the CLI, the HTTP server, and the C ABI. All
+three split the input into sentence chunks and emit each chunk as soon as it is
+ready, so time-to-first-audio is one sentence, not the whole utterance.
+
+### CLI (`--tts-stream`)
+
+Emits raw **signed-16-bit little-endian mono PCM** to stdout at the backend's
+sample rate; all logs stay on stderr, so stdout is a clean stream to pipe into a
+player:
+
+```bash
+crispasr --backend irodori-tts -m model.gguf --codec-model dacvae-ja-32dim-f16.gguf \
+    --tts "こんにちは。今日はいい天気ですね。" --tts-stream \
+  | ffplay -f s16le -ar 48000 -nodisp -
+```
+
+The spoken AI-disclosure (voice-cloned output) is emitted first, each chunk is
+watermarked before emit, and a 200 ms gap separates chunks. Works with every TTS
+backend.
+
+### Server (`stream: true`)
+
+`POST /v1/audio/speech` with `"stream": true` and a PCM `response_format`
+(`pcm`, `wav`, or `f32`) streams each sentence as chunked transfer encoding:
+
+```bash
+curl -N http://localhost:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"irodori-tts","input":"…","stream":true,"response_format":"pcm"}' > out.pcm
+```
+
+### C ABI (`crispasr_session_synthesize_streaming`)
+
+For embedders/bindings — fires a callback per sentence chunk with that chunk's
+watermarked PCM (backend-native sample rate, owned by the call):
+
+```c
+void on_chunk(const float* pcm, int n, int is_final, void* user) { /* play/queue */ }
+crispasr_session_synthesize_streaming(session, "…", on_chunk, user);
+```
+
+Note: for diffusion backends (e.g. irodori) the per-*sentence* granularity above
+is the real latency win — a diffusion utterance is generated in full before it is
+decoded, so there is no sub-sentence audio to emit early.
