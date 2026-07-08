@@ -7339,11 +7339,15 @@ Follow-ups after the #221 base port. Reporter (bakamomi) is on an RTX 5070 Ti
       adapter keyed on a hash of the description (+ a model discriminator to avoid
       same-d_model collisions), voice_path="" (no mtime staleness). Unvalidatable
       here (no parler model); default-off opt-in until validated.
-- [ ] **Migrate indextts/f5 ref-cache into the runtime** (content-addressed) so
-      the C ABI + wrappers benefit, not just CLI+server. indextts: key on the
-      reference PCM in run_conditioning (already has get/set_reference_cache);
-      f5: key on the ref audio for the whisper transcript. Same 3-line pattern as
-      irodori (get_floats → encode → put_floats via core/tts_ref_cache.h).
+- [x] **indextts ref-cache → runtime** — DONE (b52c7af2). Content-addressed on
+      the reference PCM inside indextts_synthesize (skips Conformer/Perceiver +
+      ECAPA on a hit); adapter simplified to just pass the reference through.
+      Byte-identical on hit. Now benefits CLI, C ABI, server, wrappers.
+- [ ] **f5 ref-cache stays adapter-level (by design).** f5's expensive step is
+      the Whisper ref-transcription, which is orchestration in the CLI adapter's
+      init(), NOT the f5 runtime — so it can't move to the f5 runtime. Its
+      transcript cache (`.f5reftext`) covers CLI+server; the C ABI f5 path would
+      need its own transcription + cache to benefit. Low priority.
 - [ ] **Ref-cache for remaining cloning backends** (cheap ones deprioritized).
       cosyvoice3 already has baked voice bundles; csm/melotts speaker embeds are
       comparatively cheap. Wire on demand via the shared helper + a get/set
