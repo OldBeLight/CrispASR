@@ -234,12 +234,15 @@ pub struct SessionSegment {
     pub words: Vec<SessionWord>,
 }
 
-/// Raw per-frame CTC logits captured from the Omni CTC backend.
+/// Per-frame CTC logits captured from a CTC backend.
 ///
-/// `data` is frame-major and pre-softmax: `data[t * n_vocab + v]` is the
-/// logit for vocabulary entry `v` at encoder frame `t`, so its length is
-/// `n_vocab * n_frames`. Produced only by [`Session::transcribe_with_logits`]
-/// on a CTC model; other backends yield no grid.
+/// `data` is frame-major: `data[t * n_vocab + v]` is the score for vocabulary
+/// entry `v` at encoder frame `t`, so its length is `n_vocab * n_frames`.
+/// Produced only by [`Session::transcribe_with_logits`] on a backend with a
+/// dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec, or canary-ctc); other
+/// backends yield no grid. The Omni and wav2vec2 grids are raw logits
+/// (pre-softmax); the canary-ctc grid is log-probabilities. Log-softmax before
+/// use if you need normalized scores — it is idempotent on the canary grid.
 #[derive(Debug, Clone)]
 pub struct CtcLogits {
     pub n_vocab: usize,
@@ -394,11 +397,11 @@ impl Session {
         self.parse_session_result(res, "crispasr_session_transcribe")
     }
 
-    /// Opt in to capturing the raw per-frame CTC logits on subsequent
-    /// transcribe calls (Omni CTC backend only). Off by default: capture
-    /// copies `n_vocab × n_frames` floats per call, so leave it off unless a
-    /// consumer (e.g. forced alignment) needs the grid. Retrieve the logits
-    /// with [`Self::transcribe_with_logits`].
+    /// Opt in to capturing the per-frame CTC logits on subsequent transcribe
+    /// calls (backends with a dense CTC grid: Omni CTC, wav2vec2/hubert/data2vec,
+    /// canary-ctc). Off by default: capture copies `n_vocab × n_frames` floats
+    /// per call, so leave it off unless a consumer (e.g. forced alignment) needs
+    /// the grid. Retrieve the logits with [`Self::transcribe_with_logits`].
     pub fn set_return_logits(&self, on: bool) -> Result<(), String> {
         let rc = unsafe {
             crispasr_sys::crispasr_session_set_return_logits(self.handle, if on { 1 } else { 0 })
@@ -409,11 +412,11 @@ impl Session {
         Ok(())
     }
 
-    /// Transcribe and also return the raw CTC logits captured for this call.
+    /// Transcribe and also return the CTC logits captured for this call.
     /// Enables logit capture for the duration, so the caller need not call
     /// [`Self::set_return_logits`] first. The logits are `None` for backends
-    /// that don't produce a dense CTC grid (everything but Omni CTC) or when
-    /// the transcript is empty.
+    /// that don't produce a dense CTC grid (only Omni CTC, wav2vec2/hubert/
+    /// data2vec, and canary-ctc do) or when the transcript is empty.
     pub fn transcribe_with_logits(
         &self,
         pcm: &[f32],

@@ -1433,8 +1433,9 @@ struct crispasr_session {
     // Default 1 preserves greedy bit-identical output (no-regression contract).
     int beam_size = 1;
 
-    // Opt-in capture of the raw per-frame CTC logits on the Omni CTC backend
-    // (crispasr_session_set_return_logits). Off by default so the normal path
+    // Opt-in capture of the per-frame CTC logits on backends that produce a
+    // dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec, canary-ctc), via
+    // crispasr_session_set_return_logits. Off by default so the normal path
     // doesn't pay the [vocab × frames] copy; when on, the result carries the
     // logit grid for downstream forced alignment.
     bool return_logits = false;
@@ -1741,9 +1742,12 @@ struct crispasr_session_seg {
 struct crispasr_session_result {
     std::vector<crispasr_session_seg> segments;
     std::string backend;
-    // Raw per-frame CTC logits, populated only when the session opted in via
-    // crispasr_session_set_return_logits and the backend is Omni CTC.
-    // Frame-major: logits[t * n_logit_vocab + v], pre-softmax. Empty otherwise.
+    // Per-frame CTC logits, populated only when the session opted in via
+    // crispasr_session_set_return_logits and the backend produces a dense CTC
+    // grid (Omni CTC, wav2vec2/hubert/data2vec, canary-ctc). Frame-major:
+    // logits[t * n_logit_vocab + v]. Raw pre-softmax for Omni & wav2vec2;
+    // log-probabilities for canary-ctc (log-softmax is idempotent on it, so a
+    // consumer can log-softmax uniformly). Empty otherwise.
     std::vector<float> logits;
     int n_logit_vocab = 0;
     int n_logit_frames = 0;
@@ -4916,6 +4920,14 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         }
         const int V = (int)s->wav2vec2_ctx->hparams.vocab_size;
         const int T = (int)(logits.size() / (size_t)V);
+        // Opt-in raw-logits capture for forced alignment (see
+        // crispasr_session_set_return_logits). Raw pre-softmax grid, frame-major
+        // [n_frames × n_vocab]; copy so the decode below still consumes `logits`.
+        if (s->return_logits) {
+            r->logits.assign(logits.begin(), logits.end());
+            r->n_logit_vocab = V;
+            r->n_logit_frames = T;
+        }
         auto emits = (s->beam_size > 1)
                          ? wav2vec2_beam_decode_with_probs(*s->wav2vec2_ctx, logits.data(), T, s->beam_size, 2.3f)
                          : wav2vec2_greedy_decode_with_probs(*s->wav2vec2_ctx, logits.data(), T);
@@ -5023,6 +5035,15 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             return nullptr;
         }
         canary_ctc_decode_result* dr = canary_ctc_greedy_decode_with_probs(s->ctc_ctx, logits, T_enc, V);
+        // Opt-in logits capture for forced alignment (see
+        // crispasr_session_set_return_logits). canary_ctc_compute_logits returns
+        // per-frame log-probabilities (already log-softmaxed), frame-major
+        // [n_frames × n_vocab]; copy before the buffer is freed below.
+        if (s->return_logits) {
+            r->logits.assign(logits, logits + (size_t)T_enc * V);
+            r->n_logit_vocab = V;
+            r->n_logit_frames = T_enc;
+        }
         std::free(logits);
         if (!dr || !dr->text) {
             if (dr)
@@ -6081,12 +6102,13 @@ CA_EXPORT float crispasr_session_result_word_p(crispasr_session_result* r, int i
     return (i_word >= 0 && i_word < (int)ws.size()) ? ws[i_word].p : -1.0f;
 }
 
-// Raw per-frame CTC logits (Omni CTC backend, opted in via
-// crispasr_session_set_return_logits). Shape is n_logit_vocab × n_logit_frames;
+// Per-frame CTC logits (opted in via crispasr_session_set_return_logits) for
+// backends that produce a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,
+// canary-ctc). Shape is n_logit_vocab × n_logit_frames;
 // crispasr_session_result_logits returns a frame-major buffer
-// (logits[t * n_logit_vocab + v], pre-softmax) valid for that many floats, or
-// NULL when none were captured. Owned by `r`; freed with
-// crispasr_session_result_free.
+// (logits[t * n_logit_vocab + v]) valid for that many floats, or NULL when none
+// were captured. Raw pre-softmax for Omni & wav2vec2; log-probabilities for
+// canary-ctc. Owned by `r`; freed with crispasr_session_result_free.
 CA_EXPORT int crispasr_session_result_n_logit_frames(crispasr_session_result* r) {
     return r ? r->n_logit_frames : 0;
 }

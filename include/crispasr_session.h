@@ -257,9 +257,11 @@ CRISPASR_SESSION_API const char* crispasr_session_result_word_text(crispasr_sess
 CRISPASR_SESSION_API int64_t crispasr_session_result_word_t0(crispasr_session_result* r, int i_seg, int i_word);
 CRISPASR_SESSION_API int64_t crispasr_session_result_word_t1(crispasr_session_result* r, int i_seg, int i_word);
 CRISPASR_SESSION_API float crispasr_session_result_word_p(crispasr_session_result* r, int i_seg, int i_word);
-// Raw per-frame CTC logits (Omni CTC backend, opted in via
-// crispasr_session_set_return_logits). frame-major, pre-softmax:
-// logits[t * n_logit_vocab + v]; _logits returns NULL when none captured.
+// Per-frame CTC logits (opted in via crispasr_session_set_return_logits) for
+// backends that produce a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,
+// canary-ctc). Frame-major: logits[t * n_logit_vocab + v]. Raw pre-softmax for
+// Omni & wav2vec2; log-probabilities for canary-ctc. _logits returns NULL when
+// none captured.
 CRISPASR_SESSION_API int crispasr_session_result_n_logit_frames(crispasr_session_result* r);
 CRISPASR_SESSION_API int crispasr_session_result_n_logit_vocab(crispasr_session_result* r);
 CRISPASR_SESSION_API const float* crispasr_session_result_logits(crispasr_session_result* r);
