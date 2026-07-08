@@ -7361,3 +7361,154 @@ Follow-ups after the #221 base port. Reporter (bakamomi) is on an RTX 5070 Ti
       m2m100/indextts/parler/pocket_tts for free. Reference-cache + overlap-save
       decode are opt-in per backend (helpers ready). Duration predictor is
       irodori-specific (needs a model that ships an unused duration head).
+
+
+## §229 transcribe.cpp perf audit — vs handy-computer/transcribe.cpp (ANALYSIS / OPEN)
+
+Context: `handy-computer/transcribe.cpp` (github, cloned + read 2026-07-08) is a
+direct ASR peer — ggml-based C/C++ STT, Metal/Vulkan/CUDA, 16 model families /
+60+ variants, HF org `handy-computer`. Heavy roster overlap with us (Parakeet,
+Canary, Canary-Qwen, Whisper, cohere-transcribe, SenseVoice, FunASR, Nemotron
+streaming, Granite-Speech, Voxtral, Moonshine, Qwen3-ASR, GigaAM, MedASR).
+
+**Design contrast.** They: 92k LOC, ASR-only, SHARED components — one
+`src/conformer/`, `src/causal_lm/`, `src/transcribe-flash-policy`,
+`src/transcribe-batch-util`, `src/transcribe-kaldi-fbank`, reused by every
+family via thin `src/arch/<model>/` drivers. Us: 318k LOC, ASR **and** a large
+TTS suite, per-model self-contained files (though core/ IS increasingly shared:
+`core_conformer`=`core/fastconformer.h`, `core_sanm`, `core_dac`, `core_spm`,
+`core_beam_decode`, `core/mel.cpp`). Their shared-infra design concentrates perf
+work; our per-model design buys reach + flexibility at the cost of perf-hygiene
+drift. **Caveat: this is a static code read, not wall-clock benchmarks** — treat
+"more performant" as hot-path engineering, and gate any port on a decoded-output
+A/B like every prior perf item (§176/§210/§227).
+
+### Scoreboard (overlapping ASR paths only; TTS + breadth out of scope, ours)
+
+| Subsystem | Winner | Basis |
+|---|---|---|
+| CPU compute + threading | **transcribe.cpp** (clear) | tinyBLAS forced ON (+29% enc); native ggml pool; SIGILL-safe fat-binary SIMD |
+| Flash attention | **transcribe.cpp** (clear) | unified per-family×per-backend policy + head-dim padding |
+| AR decoder (KV/beam/batch/sampling) | **transcribe.cpp** (clear) | in-graph argmax, build-once decode graph, batched multi-utterance decode |
+| Conformer encoder | **transcribe.cpp** overall (nuanced) | our block is leaner single-stream BUT no batching + NORM_AFFINE breaks on Metal/Vulkan |
+| Feature extraction | **transcribe.cpp** (modest) | centralized non-pow2 FFT + vDSP fp64; ours = per-backend "cargo-cult" pow2 radix-2 |
+| Long-form / streaming | **split** | them: streaming latency (ring KV, sliding window). us: VAD-gated long-form (4 VAD engines; they have none) |
+| Quantization | **CrispASR** (clear) | imatrix pipeline + low-bit/IQ types; they explicitly refuse imatrix |
+
+**Bottom line:** they have the more performant core ASR *engine* (CPU, flash,
+decoder, on-target encoder, features, streaming latency) via uniform shared-infra
+optimization. We win quantization QUALITY (imatrix is a real, unmatched
+differentiator), VAD-gated long-form robustness, and — off this axis — vastly
+broader model/format/TTS coverage.
+
+### VERIFIED near-free wins for us (both confirmed in-tree, not just agent claims)
+
+- [ ] **Force `GGML_LLAMAFILE ON`** (tinyBLAS / llamafile_sgemm). CONFIRMED we
+      ship it OFF: we never set it (except `-DGGML_LLAMAFILE=OFF` for WASM),
+      ggml defaults `GGML_LLAMAFILE_DEFAULT OFF` (`ggml/CMakeLists.txt:113`), and
+      `COHERE_MKL` (our only fast-GEMM path) defaults OFF (`CMakeLists.txt:137`).
+      So a default CPU build runs the conformer/whisper encoder matmuls — the
+      dominant ASR CPU cost — on stock ggml kernels. They force it ON
+      (`CMakeLists.txt:283`, "~29% faster encoder"). One-line CMake change; A/B
+      an encoder RTF before/after to confirm on our fleet. Biggest single CPU win.
+- [ ] **Metal + Vulkan kernel for `GGML_OP_NORM_AFFINE`** (or stop emitting it on
+      those backends). CONFIRMED: our fork's fused norm op (`ggml.h:500`,
+      `ggml.c:3162`), used throughout `core/fastconformer.h` (7×/block: ff1/attn/
+      conv/conv_ln/ff2/out) and `core/sanm.h:115,182`, has **zero** Metal refs
+      (`ggml/src/ggml-metal/` — none) and **zero** Vulkan refs; the Metal
+      `supports_op` switch handles only `GGML_OP_NORM`/`RMS_NORM`
+      (`ggml-metal-device.m:1392-1393`) → NORM_AFFINE falls to `default:false`.
+      Only CPU + CUDA implement it. So on M1 Metal AND Vulkan every layernorm in
+      the canary/funasr/sanm encoders is offloaded to CPU with GPU↔CPU copies in
+      the hot loop (~7×48 = ~336 per canary encode) — a regression on our two
+      primary GPU targets, masked as a "leaner fused graph" that only pays off on
+      CPU/CUDA. Fix: add the Metal (and Vulkan) NORM_AFFINE kernel + `supports_op`
+      case, OR gate `core_conformer`/`core_sanm` to plain `ggml_norm`+mul+add on
+      Metal/Vulkan. Gate on an M1 canary encode A/B.
+
+### Deeper findings (file:line, ranked by leverage)
+
+- **Decoder (cohere head-to-head, both greedy by default).** Theirs:
+  `ggml_argmax` in-graph + 1-int32 readback (`arch/cohere/model.cpp:1211-1213`);
+  build-once static GPU decode graph reused every token (`:1145-1199`); TRUE
+  B-utterances-in-one-graph batched decode (`transcribe-batch-util.cpp:197-362`).
+  Ours (`src/cohere.cpp`): full-vocab logits device→host every token +
+  host `std::max_element` + host softmax (`:2606,2614`); rebuilds graph META per
+  token (`:1521-1528`) though gallocr is pre-reserved so no realloc (`:2523-2534`);
+  no batched decode anywhere. Transducer/TDT is a genuine tie (both persist LSTM
+  state, hoist enc-proj, skip-on-blank; our parakeet joint is CPU/BLAS `cblas_sgemv`
+  which is fine at n=1). **Our beam search is the slow form**: N sequential
+  single-token forwards (`core/beam_decode.h:412-441`) each preceded by a
+  `kv_snapshot_pool` deep-copy of the ENTIRE preallocated `dec_max_ctx` K+V (all
+  layers), regardless of `n_past` (`core/attention.h:230-284`) — the #161 driver;
+  copy traffic O(full-KV)×beams×tokens. Fixes: in-graph argmax; snapshot only the
+  used `n_past` prefix (or use position-indexed cache without snapshot).
+- **Flash policy.** Theirs: `transcribe-flash-policy` (thin env-override module) +
+  per-family defaults honored at 17 sites, typed `BackendKind`, Metal
+  simdgroup-mm capability probe, and **head-dim padding** (`pad_head_dim`,
+  `arch/moonshine_streaming/decoder.cpp:37`) so odd head dims still ride the fused
+  kernel. Ours: ~40 scattered per-model `p.flash_attn=bool` + per-model `getenv`
+  guards added reactively per crashing backend (moss Vulkan `moss_transcribe.cpp:
+  1556`; chatterbox PREC_F32 Metal route `chatterbox.cpp:1530`); NO head-dim
+  padding; the Turing sm_75 −9-10% fusion regression (memory
+  [[project_flash_attn_turing_regression]]) is unhandled at the model layer.
+- **Conformer glue (single-stream, where WE are actually tighter).** Our block:
+  fused `ggml_norm_affine` (1 op vs their 3-op LN), fused `ggml_siglu_swapped`
+  GLU (1 vs 4), load-time BN fold (0 in-graph), zero-copy strided-view rel_shift
+  `fastconformer.h:43-47` (1 op vs their fill+concat+cont = 2 copies of the
+  O(2T×T×H) score-bias, `conformer.cpp:82-113`). So on CUDA/CPU single-stream our
+  core is leaner — but we give it back via (a) no utterance batching (they carry a
+  B axis end-to-end: 2-8× offline throughput we can't reach), (b) the NORM_AFFINE
+  Metal/Vulkan cliff above, (c) 3 redundant flash `ggml_cont(Q/K/V)` per block
+  (`fastconformer.h:327,330`) they avoid with strided flash inputs. THEIR
+  single-stream weak spot = that copy-heavy rel_shift; the single-view trick is
+  the first thing to port INTO them / keep in us.
+- **Feature extraction.** Theirs: 2 centralized thread-safe frontends
+  (`transcribe-mel.cpp`, `transcribe-kaldi-fbank.cpp`) — native mixed-radix FFT for
+  non-pow2 `n_fft=400` (no pad-to-512 loss), Apple vDSP fp64 for pow2, cblas mel
+  matmul, ~3e-7 vs ONNX. Ours: `core/mel.cpp` shares only the mel POST-processing
+  (BLAS matmul + OMP over frames) but the FFT is per-backend and pow2-only
+  (`core/mel.h:33`); backends ship near-identical hand-rolled copies
+  (`voxtral.cpp:446` literally comments "cargo-cult from qwen3_asr.cpp";
+  `core/fft.h:6-8` admits kokoro/mimo duplicate it). Consolidation target: one
+  shared non-pow2 FFT frontend. Our only edge: we actually resample many
+  containers (miniaudio) — but with basic `ma_resample_algorithm_linear`
+  (`crispasr_audio.cpp:406`); switch to windowed-sinc if fidelity ever matters.
+- **Long-form / streaming.** Theirs: first-class streaming (persistent
+  `MoonshineStreamingKvCache` ring buffer, causal sliding-window = no overlap
+  re-encode, LocalAgreement committed-prefix in the session core; bounded memory).
+  Ours: chunked overlap-and-merge with LCS boundary dedup (`canary.cpp:1524-1665`)
+  — better boundary TEXT but ~40% overlap re-encode (`parakeet.cpp:872`) + O(len)
+  concat host buffer. We uniquely have 4 real VAD engines (silero/whisper,
+  MarbleNet, FireRed, encdec) that skip silence — they have NONE (reject silero
+  `.bin` at load, punt segmentation to caller). Confirms memory
+  [[project_parakeet_208_session_longaudio]]: **§176 encoder-graph cache is a dud**
+  — opt-in-OFF (`CRISPASR_PARAKEET_ENC_CACHE`), saves ~0.13% of window time,
+  corrupts the 2nd same-`T_mel` encode under the shared sched (enc std 0.020→0.008
+  → empty transcript). The one WORKING graph cache is the dimension-keyed,
+  state-carrying `nemotron.cpp:1260-1317` (streaming FastConformer).
+- **Quantization (WE win).** imatrix producer (`crispasr_imatrix.cpp`, eval-callback
+  per MUL_MAT) + consumer (`examples/crispasr-quantize`, feeds `ggml_quantize_chunk`
+  imatrix) + CER-gated A/B (`tools/imatrix_ab.py`) + CC0 corpus, plus the low-bit/IQ
+  types (Q2_K/Q3_K/IQ4_NL/IQ4_XS) + `--tensor-type regex=type`. They refuse imatrix
+  (`tools/transcribe-quantize/main.cpp:432`), cap at Q6_K. THEIR one edge worth
+  stealing: a clean generalized bucket-table tensor classifier
+  (`tools/transcribe-quantize/policy.cpp:50-278`) vs our per-arch `if`-ladder
+  (`examples/crispasr-quantize/main.cpp:559-684`) — a refactor, not a perf change.
+
+### Actions (ranked)
+
+0. **GATE on measurement** (same discipline as §227.0). Before porting anything:
+   one M1 + one T4/CPU run of an encoder RTF A/B for wins 1-2. If GGML_LLAMAFILE
+   ON and a Metal NORM_AFFINE kernel each move the encoder ≥5%, do them.
+1. [ ] Force GGML_LLAMAFILE ON (win #1). Cheapest, biggest CPU lever.
+2. [ ] Metal (+Vulkan) NORM_AFFINE kernel or Metal/Vulkan fallback (win #2).
+3. [ ] In-graph argmax + used-prefix-only KV snapshot for cohere/AR decode (kills
+      the #161 copy storm; also drop per-token full-vocab readback).
+4. [ ] Flash head-dim padding helper + a real per-backend flash-capability gate
+      (fold in the Turing sm_75 opt-out from [[project_flash_attn_turing_regression]]).
+5. [ ] Consolidate the per-backend pow2 FFT into one shared non-pow2 frontend.
+6. [ ] (stretch) utterance-batched encoder + batched multi-utterance decode for
+      offline throughput — large, and exactly the cached-graph minefield of
+      #171/#184/§227.2; do not start before 0.
+7. [ ] (cleanup) bucket-table quant tensor classifier to replace the per-arch ladder.
