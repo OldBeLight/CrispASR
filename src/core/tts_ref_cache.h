@@ -1,8 +1,18 @@
-// crispasr_tts_ref_cache.h — on-disk cache for expensive TTS reference
+// core/tts_ref_cache.h — on-disk cache for expensive TTS reference
 // conditioning (voice cloning). Encoding a reference — a codec encoder, a
 // Conformer/Perceiver, or an ASR pass over the clip — is slow and produces a
-// small, reusable blob. Cache it next to the voice file so repeated runs skip
-// the encode entirely (#221).
+// small, reusable blob. Cache it so repeated runs skip the encode entirely
+// (#221). Lives in core/ so BOTH the runtime backends and every consumer
+// (CLI adapters, C ABI, server, wrappers) can share it.
+//
+// Two keying modes:
+//   1. Path-keyed (path_for + load*/save*): cache next to a voice file,
+//      invalidated by that file's mtime. Convenient for the CLI (`<voice>.iro32latent`).
+//   2. Content-addressed (content_* + get_floats/put_floats over a key buffer):
+//      key = hash of the raw reference (e.g. the PCM), stored in a cache dir.
+//      No file path needed, so a backend can cache in its RUNTIME set_reference
+//      and EVERY caller — including the C ABI and wrappers that only pass raw
+//      PCM — benefits, and any runtime adopts it in a few lines.
 //
 // Format (little-endian):
 //   magic "CRC1" | u32 version | u32 tag_len | tag bytes |
@@ -10,9 +20,8 @@
 //
 // The tag identifies the backend + representation (e.g. "irodori-latent",
 // "indextts-cond", "f5-reftext"); a mismatching tag rejects the cache so two
-// backends never read each other's blob. The cache is invalidated when the
-// voice file is newer than it. Payload is opaque bytes — callers interpret it
-// as float32 latents, UTF-8 text, etc.
+// backends never read each other's blob. Payload is opaque bytes — callers
+// interpret it as float32 latents, UTF-8 text, etc.
 //
 // Header-only; no backend dependencies.
 
@@ -121,6 +130,56 @@ inline bool load_floats(const std::string& cache_path, const std::string& voice_
 inline void save_floats(const std::string& cache_path, const char* tag, const std::vector<uint32_t>& shape,
                         const float* data, size_t count) {
     save(cache_path, tag, shape, data, count * sizeof(float));
+}
+
+// ── content-addressed cache (runtime; benefits every consumer) ──
+// FNV-1a 64-bit over a byte range.
+inline uint64_t fnv1a(const void* data, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    const unsigned char* p = (const unsigned char*)data;
+    for (size_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+// Cache directory: CRISPASR_TTS_REF_CACHE_DIR, else <TMPDIR>/crispasr-tts-refcache.
+inline std::string cache_dir() {
+    if (const char* d = std::getenv("CRISPASR_TTS_REF_CACHE_DIR"))
+        if (*d)
+            return d;
+    const char* tmp = std::getenv("TMPDIR");
+    std::string base = (tmp && *tmp) ? tmp : "/tmp";
+    if (!base.empty() && base.back() == '/')
+        base.pop_back();
+    std::string dir = base + "/crispasr-tts-refcache";
+    ::mkdir(dir.c_str(), 0700); // best-effort; ignored if it exists
+    return dir;
+}
+
+// Content path for a (tag, key-bytes) pair: <cache_dir>/<tag>-<hash>.ref
+inline std::string content_path(const char* tag, const void* key, size_t key_len) {
+    uint64_t h = fnv1a(tag, std::strlen(tag)) ^ fnv1a(key, key_len);
+    char name[80];
+    std::snprintf(name, sizeof(name), "/%s-%016llx.ref", tag, (unsigned long long)h);
+    return cache_dir() + name;
+}
+
+// Content-addressed float-blob get/put keyed on `key` bytes (e.g. the raw
+// reference PCM). Returns true on a cache hit. Disabled by CRISPASR_TTS_REF_CACHE=0.
+inline bool get_floats(const char* tag, const void* key, size_t key_len, std::vector<uint32_t>& shape,
+                       std::vector<float>& out) {
+    if (disabled())
+        return false;
+    return load_floats(content_path(tag, key, key_len), /*voice_path=*/"", tag, shape, out);
+}
+
+inline void put_floats(const char* tag, const void* key, size_t key_len, const std::vector<uint32_t>& shape,
+                       const float* data, size_t count) {
+    if (disabled())
+        return;
+    save_floats(content_path(tag, key, key_len), tag, shape, data, count);
 }
 
 } // namespace crispasr_ref_cache
