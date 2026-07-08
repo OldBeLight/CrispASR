@@ -957,58 +957,36 @@ static std::string canary_qwen_decode_tokens(canary_qwen_context* ctx, const int
 // Full transcription pipeline
 // ===========================================================================
 
-// Build the Qwen-style prompt:
-//   <|im_start|>user\nTranscribe the following: <|audioplaceholder|><|im_end|>\n
+// Build the Qwen-style prompt with audio_start/pad/end framing:
+//   <|im_start|>user\nTranscribe the following:
+//   <|audio_start|><|audio_pad|>×N<|audio_end|><|im_end|>\n
 //   <|im_start|>assistant\n
 //
-// The <|audioplaceholder|> is a single token that gets replaced with audio
-// embeddings. However, canary-qwen expects the audio to be injected as N
-// encoder frames, so we need to handle this differently from a single token.
-//
-// Strategy: build the prompt text, tokenize it, find the placeholder token,
-// then splice in the audio embeddings.
+// The <|audio_pad|> tokens (id 151676) are placeholders — their text
+// embeddings are replaced with the projected encoder output frames.
 
 static std::vector<float> canary_qwen_build_prompt_embeds(canary_qwen_context* ctx, const float* audio_embeds,
                                                           int T_enc, int* out_total_tokens) {
     const int d = (int)ctx->model.hparams.llm_d_model;
+    const int32_t audio_pad_id = 151676; // <|audio_pad|>
 
-    // Build prompt string with placeholder
-    // Note: canary-qwen uses a simpler prompt than full chat template.
-    // The model card shows: "Transcribe the following: <|audioplaceholder|>"
-    std::string prompt_text = "<|im_start|>user\nTranscribe the following: <|audioplaceholder|><|im_end|>\n"
-                              "<|im_start|>assistant\n";
+    // Build the prompt with N audio_pad tokens that we'll replace
+    std::string prompt_text = "<|im_start|>user\nTranscribe the following: <|audio_start|>";
+    for (int i = 0; i < T_enc; i++)
+        prompt_text += "<|audio_pad|>";
+    prompt_text += "<|audio_end|><|im_end|>\n<|im_start|>assistant\n";
 
     // Tokenize
     auto prompt_ids = canary_qwen_tokenize(ctx, prompt_text.c_str());
 
     if (cq_debug_enabled()) {
-        fprintf(stderr, "canary_qwen: prompt tokens (%d):", (int)prompt_ids.size());
-        for (auto id : prompt_ids)
-            fprintf(stderr, " %d", id);
-        fprintf(stderr, "\n");
-    }
-
-    // Find the <|audioplaceholder|> token position(s).
-    // NeMo SALM uses audio_locator_tag = "<|audioplaceholder|>". This may be
-    // a single special token added to the Qwen3 vocab, or it may not exist
-    // in the standard vocab. If it doesn't exist as a single token, we
-    // need to handle it differently.
-    //
-    // For canary-qwen, the actual injection is: place the audio frames where
-    // the placeholder would be. We look for token id matching
-    // "<|audioplaceholder|>" in the vocab; if not found, we just prepend
-    // audio frames before the user text.
-    int placeholder_idx = -1;
-    auto it = ctx->vocab.token_to_id.find("<|audioplaceholder|>");
-    int placeholder_id = -1;
-    if (it != ctx->vocab.token_to_id.end()) {
-        placeholder_id = it->second;
-        for (int i = 0; i < (int)prompt_ids.size(); i++) {
-            if (prompt_ids[i] == placeholder_id) {
-                placeholder_idx = i;
-                break;
-            }
-        }
+        fprintf(stderr, "canary_qwen: prompt tokens (%d), T_enc=%d\n", (int)prompt_ids.size(), T_enc);
+        // Print first and last few tokens
+        int show = std::min(10, (int)prompt_ids.size());
+        fprintf(stderr, "  first %d:", show);
+        for (int i = 0; i < show; i++)
+            fprintf(stderr, " %d", prompt_ids[i]);
+        fprintf(stderr, " ...\n");
     }
 
     // Embed all text tokens
@@ -1016,38 +994,20 @@ static std::vector<float> canary_qwen_build_prompt_embeds(canary_qwen_context* c
     if (text_embeds.empty())
         return {};
 
-    // Splice audio embeddings in place of the placeholder
-    int total_tokens;
-    std::vector<float> combined;
-
-    if (placeholder_idx >= 0) {
-        // Replace the single placeholder token with T_enc audio frames
-        int n_text_before = placeholder_idx;
-        int n_text_after = (int)prompt_ids.size() - placeholder_idx - 1;
-        total_tokens = n_text_before + T_enc + n_text_after;
-        combined.resize((size_t)total_tokens * d);
-
-        // Copy text before placeholder
-        if (n_text_before > 0)
-            memcpy(combined.data(), text_embeds.data(), (size_t)n_text_before * d * sizeof(float));
-        // Copy audio embeddings
-        memcpy(combined.data() + (size_t)n_text_before * d, audio_embeds, (size_t)T_enc * d * sizeof(float));
-        // Copy text after placeholder
-        if (n_text_after > 0)
-            memcpy(combined.data() + (size_t)(n_text_before + T_enc) * d,
-                   text_embeds.data() + (size_t)(placeholder_idx + 1) * d, (size_t)n_text_after * d * sizeof(float));
-    } else {
-        // No placeholder found — use the audio_start/audio_end framing pattern
-        // like qwen3_asr: <|im_start|>user\n <|audio_start|> [audio] <|audio_end|> Transcribe...<|im_end|>\n<|im_start|>assistant\n
-        // Fall back: prepend audio before text
-        total_tokens = (int)prompt_ids.size() + T_enc;
-        combined.resize((size_t)total_tokens * d);
-        memcpy(combined.data(), audio_embeds, (size_t)T_enc * d * sizeof(float));
-        memcpy(combined.data() + (size_t)T_enc * d, text_embeds.data(), text_embeds.size() * sizeof(float));
+    // Replace audio_pad positions with audio encoder embeddings
+    int audio_idx = 0;
+    for (int i = 0; i < (int)prompt_ids.size() && audio_idx < T_enc; i++) {
+        if (prompt_ids[i] == audio_pad_id) {
+            memcpy(text_embeds.data() + (size_t)i * d, audio_embeds + (size_t)audio_idx * d, (size_t)d * sizeof(float));
+            audio_idx++;
+        }
     }
 
-    *out_total_tokens = total_tokens;
-    return combined;
+    if (cq_debug_enabled() && audio_idx != T_enc)
+        fprintf(stderr, "canary_qwen: WARNING: only %d/%d audio_pad positions found\n", audio_idx, T_enc);
+
+    *out_total_tokens = (int)prompt_ids.size();
+    return text_embeds;
 }
 
 static canary_qwen_result* canary_qwen_transcribe_impl(canary_qwen_context* ctx, const float* samples, int n_samples) {
