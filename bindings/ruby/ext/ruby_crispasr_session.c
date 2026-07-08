@@ -71,6 +71,7 @@ extern int                     crispasr_session_set_max_speech_tokens(struct Cri
 extern int                     crispasr_session_set_length_scale(struct CrispasrSession* s, float scale);
 extern int                     crispasr_session_set_best_of(struct CrispasrSession* s, int n);
 extern int                     crispasr_session_set_beam_size(struct CrispasrSession* s, int n);
+extern int                     crispasr_session_set_return_logits(struct CrispasrSession* s, int enable);
 extern int                     crispasr_session_set_grammar_text(struct CrispasrSession* s, const char* gbnf_text,
                                                                   const char* root_rule, float penalty);
 extern int                     crispasr_session_set_fallback_thresholds(struct CrispasrSession* s,
@@ -108,6 +109,12 @@ extern const char*  crispasr_session_result_word_text(struct crispasr_session_re
 extern int64_t      crispasr_session_result_word_t0(struct crispasr_session_result* r, int i_seg, int i_word);
 extern int64_t      crispasr_session_result_word_t1(struct crispasr_session_result* r, int i_seg, int i_word);
 extern float        crispasr_session_result_word_p(struct crispasr_session_result* r, int i_seg, int i_word);
+// Raw per-frame CTC logits (Omni CTC backend, opted in via set_return_logits);
+// frame-major, pre-softmax: logits[t * n_logit_vocab + v]. _logits is NULL when
+// none captured. Owned by the result, freed with crispasr_session_result_free.
+extern int          crispasr_session_result_n_logit_frames(struct crispasr_session_result* r);
+extern int          crispasr_session_result_n_logit_vocab(struct crispasr_session_result* r);
+extern const float* crispasr_session_result_logits(struct crispasr_session_result* r);
 extern void         crispasr_session_result_free(struct crispasr_session_result* r);
 // issue #208: chunked-encode transcribe + long-form progress poll.
 extern struct crispasr_session_result* crispasr_session_transcribe_chunked_lang(struct CrispasrSession* s,
@@ -504,6 +511,16 @@ static VALUE rb_session_set_beam_size(VALUE self, VALUE handle, VALUE n) {
     return Qnil;
 }
 
+// Opt in to capturing the raw per-frame CTC logits (Omni CTC backend only).
+// Off by default so the normal path pays no copy; read them back with
+// transcribe_with_logits.
+static VALUE rb_session_set_return_logits(VALUE self, VALUE handle, VALUE enable) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_return_logits(s, RTEST(enable) ? 1 : 0);
+    if (rc != 0) rb_raise(rb_eRuntimeError, "set_return_logits failed (rc=%d)", rc);
+    return Qnil;
+}
+
 // set_grammar_text(handle, gbnf_text, root_rule, penalty)
 // Pass nil or "" for gbnf_text to clear the grammar.
 static VALUE rb_session_set_grammar_text(VALUE self, VALUE handle, VALUE gbnf, VALUE root, VALUE penalty) {
@@ -703,6 +720,73 @@ static VALUE rb_session_transcribe(VALUE self, VALUE handle, VALUE pcm_arr) {
     }
     crispasr_session_result_free(r);
     return segments;
+}
+
+// CrispASR::Session.transcribe_with_logits(handle, pcm_array)
+//   -> [segments, logits]. segments matches transcribe(); logits is nil for
+//   non-CTC backends (or an empty grid) or a hash
+//   { n_frames:, n_vocab:, data: [Float, ...] } holding the frame-major,
+//   pre-softmax grid (data[t * n_vocab + v]). Opts the session into logit
+//   capture for this call (mirrors set_return_logits(true)).
+static VALUE rb_session_transcribe_with_logits(VALUE self, VALUE handle, VALUE pcm_arr) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    crispasr_session_set_return_logits(s, 1);
+    long n = RARRAY_LEN(pcm_arr);
+    float* pcm = (float*)malloc(sizeof(float) * (size_t)n);
+    if (!pcm) rb_raise(rb_eNoMemError, "alloc failed");
+    for (long i = 0; i < n; i++)
+        pcm[i] = (float)NUM2DBL(rb_ary_entry(pcm_arr, i));
+
+    struct crispasr_session_result* r = crispasr_session_transcribe(s, pcm, (int)n);
+    free(pcm);
+    if (!r) rb_raise(rb_eRuntimeError, "transcription failed");
+
+    int n_segs = crispasr_session_result_n_segments(r);
+    VALUE segments = rb_ary_new_capa(n_segs);
+    for (int i = 0; i < n_segs; i++) {
+        VALUE seg = rb_hash_new();
+        const char* text = crispasr_session_result_segment_text(r, i);
+        rb_hash_aset(seg, ID2SYM(rb_intern("text")), rb_utf8_str_new_cstr(text ? text : ""));
+        rb_hash_aset(seg, ID2SYM(rb_intern("t0")), LL2NUM(crispasr_session_result_segment_t0(r, i)));
+        rb_hash_aset(seg, ID2SYM(rb_intern("t1")), LL2NUM(crispasr_session_result_segment_t1(r, i)));
+
+        int n_words = crispasr_session_result_n_words(r, i);
+        VALUE words = rb_ary_new_capa(n_words);
+        for (int j = 0; j < n_words; j++) {
+            VALUE w = rb_hash_new();
+            const char* wt = crispasr_session_result_word_text(r, i, j);
+            rb_hash_aset(w, ID2SYM(rb_intern("text")), rb_utf8_str_new_cstr(wt ? wt : ""));
+            rb_hash_aset(w, ID2SYM(rb_intern("t0")), LL2NUM(crispasr_session_result_word_t0(r, i, j)));
+            rb_hash_aset(w, ID2SYM(rb_intern("t1")), LL2NUM(crispasr_session_result_word_t1(r, i, j)));
+            rb_hash_aset(w, ID2SYM(rb_intern("p")), DBL2NUM((double)crispasr_session_result_word_p(r, i, j)));
+            rb_ary_push(words, w);
+        }
+        rb_hash_aset(seg, ID2SYM(rb_intern("words")), words);
+        rb_ary_push(segments, seg);
+    }
+
+    // Lift the raw CTC logits (Omni CTC only) into a Ruby array before the
+    // result — which owns the float buffer — is freed. Mirrors the synthesize
+    // PCM marshalling.
+    VALUE logits = Qnil;
+    int n_frames = crispasr_session_result_n_logit_frames(r);
+    int n_vocab = crispasr_session_result_n_logit_vocab(r);
+    const float* lg = crispasr_session_result_logits(r);
+    if (n_frames > 0 && n_vocab > 0 && lg) {
+        long total = (long)n_frames * (long)n_vocab;
+        VALUE data = rb_ary_new_capa(total);
+        for (long i = 0; i < total; i++) rb_ary_push(data, DBL2NUM((double)lg[i]));
+        logits = rb_hash_new();
+        rb_hash_aset(logits, ID2SYM(rb_intern("n_frames")), INT2NUM(n_frames));
+        rb_hash_aset(logits, ID2SYM(rb_intern("n_vocab")), INT2NUM(n_vocab));
+        rb_hash_aset(logits, ID2SYM(rb_intern("data")), data);
+    }
+    crispasr_session_result_free(r);
+
+    VALUE out = rb_ary_new_capa(2);
+    rb_ary_push(out, segments);
+    rb_ary_push(out, logits);
+    return out;
 }
 
 // CrispASR::Session.transcribe_chunked(handle, pcm, chunk_seconds, overlap_seconds, language)
@@ -1414,6 +1498,7 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "is_voice_design",      rb_session_is_voice_design,  1);
     rb_define_singleton_method(mSession, "synthesize",           rb_session_synthesize,       2);
     rb_define_singleton_method(mSession, "transcribe",           rb_session_transcribe,       2);
+    rb_define_singleton_method(mSession, "transcribe_with_logits", rb_session_transcribe_with_logits, 2);
     rb_define_singleton_method(mSession, "transcribe_chunked",   rb_session_transcribe_chunked, 5);
     rb_define_singleton_method(mSession, "get_progress",         rb_session_get_progress,     0);
     rb_define_singleton_method(mSession, "vad_segments",         rb_session_vad_segments,    -1);
@@ -1441,6 +1526,7 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "set_length_scale",          rb_session_set_length_scale,          2);
     rb_define_singleton_method(mSession, "set_best_of",               rb_session_set_best_of,               2);
     rb_define_singleton_method(mSession, "set_beam_size",             rb_session_set_beam_size,             2);
+    rb_define_singleton_method(mSession, "set_return_logits",         rb_session_set_return_logits,         2);
     rb_define_singleton_method(mSession, "set_grammar_text",          rb_session_set_grammar_text,          4);
     rb_define_singleton_method(mSession, "set_fallback_thresholds",   rb_session_set_fallback_thresholds,   5);
     rb_define_singleton_method(mSession, "set_alt_n",                 rb_session_set_alt_n,                 2);
