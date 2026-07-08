@@ -772,6 +772,31 @@ class SessionSegment {
       '[${start.toStringAsFixed(1)}-${end.toStringAsFixed(1)}s] $text';
 }
 
+/// Raw per-frame CTC logits captured from the Omni CTC backend by
+/// [CrispasrSession.transcribeWithLogits].
+///
+/// [data] is frame-major and **pre-softmax**: `data[t * nVocab + v]` is the
+/// logit for vocabulary entry `v` at encoder frame `t`, so its length is
+/// `nFrames * nVocab`. Only the Omni CTC backend produces a dense grid; other
+/// backends yield none.
+class CtcLogits {
+  /// Vocabulary size — the number of CTC output classes scored per frame.
+  final int nVocab;
+
+  /// Number of encoder frames (the time axis).
+  final int nFrames;
+
+  /// Frame-major, pre-softmax logits of length `nFrames * nVocab`;
+  /// `data[t * nVocab + v]` is the score for class `v` at frame `t`.
+  final Float32List data;
+
+  const CtcLogits({
+    required this.nVocab,
+    required this.nFrames,
+    required this.data,
+  });
+}
+
 /// One "commit" from a streaming session — the latest concatenated text
 /// that whisper produced for the current rolling window, plus its absolute
 /// start/end time in the live audio stream.
@@ -2154,6 +2179,73 @@ class CrispasrSession {
     }
   }
 
+  /// Transcribe and also return the raw per-frame CTC logits captured for
+  /// this call (Omni CTC backend only).
+  ///
+  /// Enables logit capture for the duration of the call — the caller need
+  /// not call [setReturnLogits] first — then returns `(segments, logits)`.
+  /// The [CtcLogits] grid is frame-major and pre-softmax
+  /// (`data[t * nVocab + v]`); see [CtcLogits]. It is `null` for backends
+  /// that don't produce a dense CTC grid (everything but Omni CTC), when the
+  /// transcript is empty, or on a dylib predating the accessor (which falls
+  /// back to a plain [transcribe]).
+  ///
+  /// [language] behaves exactly as in [transcribe].
+  (List<SessionSegment>, CtcLogits?) transcribeWithLogits(
+    Float32List pcm, {
+    String? language,
+  }) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (pcm.isEmpty) return (const <SessionSegment>[], null);
+    if (!_lib.providesSymbol('crispasr_session_result_logits')) {
+      return (transcribe(pcm, language: language), null); // old dylib
+    }
+
+    setReturnLogits(true);
+
+    final samples = calloc<Float>(pcm.length);
+    for (var i = 0; i < pcm.length; i++) {
+      samples[i] = pcm[i];
+    }
+
+    Pointer<Void> res;
+    Pointer<Utf8>? langPtr;
+    if (language != null && language.isNotEmpty) {
+      langPtr = language.toNativeUtf8();
+      final fn = _lib.lookupFunction<
+          Pointer<Void> Function(Pointer<Void>, Pointer<Float>, Int32, Pointer<Utf8>),
+          Pointer<Void> Function(Pointer<Void>, Pointer<Float>, int, Pointer<Utf8>)>(
+        'crispasr_session_transcribe_lang',
+      );
+      res = fn(_handle, samples, pcm.length, langPtr);
+    } else {
+      final fn = _lib.lookupFunction<
+          Pointer<Void> Function(Pointer<Void>, Pointer<Float>, Int32),
+          Pointer<Void> Function(Pointer<Void>, Pointer<Float>, int)>(
+        'crispasr_session_transcribe',
+      );
+      res = fn(_handle, samples, pcm.length);
+    }
+    calloc.free(samples);
+    if (langPtr != null) calloc.free(langPtr);
+    if (res == nullptr) {
+      throw Exception('crispasr_session_transcribe returned null');
+    }
+
+    try {
+      // Read both segments and logits before the result handle is freed.
+      final segs = _readSegments(res);
+      final logits = _readLogits(res);
+      return (segs, logits);
+    } finally {
+      final freeFn =
+          _lib.lookupFunction<Void Function(Pointer<Void>), void Function(Pointer<Void>)>(
+        'crispasr_session_result_free',
+      );
+      freeFn(res);
+    }
+  }
+
   /// Chunked-encode transcribe (issue #208).
   ///
   /// Forces the Parakeet backend through its bounded overlapping-window
@@ -2393,6 +2485,33 @@ class CrispasrSession {
     return out;
   }
 
+  /// Lift out the raw per-frame CTC logits attached to [res], if any, into a
+  /// Dart-owned [CtcLogits] before the result handle is freed. Returns `null`
+  /// unless the session opted in via [setReturnLogits] and the backend
+  /// produced a dense CTC grid (Omni CTC only).
+  CtcLogits? _readLogits(Pointer<Void> res) {
+    final nFramesFn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_result_n_logit_frames');
+    final nVocabFn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_result_n_logit_vocab');
+    final logitsFn = _lib.lookupFunction<Pointer<Float> Function(Pointer<Void>),
+        Pointer<Float> Function(Pointer<Void>)>('crispasr_session_result_logits');
+    final nFrames = nFramesFn(res);
+    final nVocab = nVocabFn(res);
+    final ptr = logitsFn(res);
+    if (nFrames <= 0 || nVocab <= 0 || ptr == nullptr) return null;
+    // The buffer is owned by the result — `asTypedList` views the native
+    // float* without copying, then `Float32List.fromList(...)` copies it into
+    // Dart-owned memory before the caller frees the result (same view-then-copy
+    // pattern as [synthesize] / [decodeAudioFile]).
+    final view = ptr.asTypedList(nFrames * nVocab);
+    return CtcLogits(
+      nVocab: nVocab,
+      nFrames: nFrames,
+      data: Float32List.fromList(view),
+    );
+  }
+
   // ---------------------------------------------------------------------------
   // TTS synthesis (vibevoice, qwen3-tts, kokoro, orpheus, chatterbox, zonos-tts, lfm2-audio, dots-tts, and others)
   // ---------------------------------------------------------------------------
@@ -2613,6 +2732,25 @@ class CrispasrSession {
         int Function(Pointer<Void>, int)>('crispasr_session_set_beam_size');
     final rc = fn(_handle, n);
     if (rc != 0) throw Exception('setBeamSize failed (rc=$rc)');
+  }
+
+  /// Opt in to capturing the raw per-frame CTC logits (Omni CTC backend
+  /// only) so a following transcribe attaches the dense
+  /// `[nVocab × nFrames]` grid read back via [transcribeWithLogits].
+  /// Off by default so the normal path pays no `[vocab × frames]` copy.
+  ///
+  /// Only available when built with the logits accessor (symbol presence
+  /// is checked at runtime; throws on older native builds).
+  void setReturnLogits(bool enable) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_return_logits')) {
+      throw UnsupportedError(
+          'crispasr_session_set_return_logits not present in this libcrispasr build');
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
+        int Function(Pointer<Void>, int)>('crispasr_session_set_return_logits');
+    final rc = fn(_handle, enable ? 1 : 0);
+    if (rc != 0) throw Exception('setReturnLogits failed (rc=$rc)');
   }
 
   /// GBNF grammar-constrained sampling (whisper only — other backends
