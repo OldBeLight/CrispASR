@@ -18,6 +18,22 @@ on:
 jobs:
   build-wasm:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Multithreaded (SharedArrayBuffer). Works in Node; DEADLOCKS in a browser
+          # worker (pthread_join on the servicer thread) — kept for Node/parity.
+          - name: default
+            flag: ''
+          # Single-threaded: no pthreads, no COOP/COEP needed. Slower but always works.
+          - name: single-thread
+            flag: '--single-thread'
+          # PROXY_TO_PTHREAD: multithreaded AND browser-safe (compute runs on the
+          # proxied pthread; the servicer worker never blocks). The one to host.
+          - name: proxy-to-pthread
+            flag: '--proxy-to-pthread'
+    name: build-wasm (${{ matrix.name }})
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,21 +43,26 @@ jobs:
       - name: Setup emsdk
         uses: mymindstorm/setup-emsdk@v14
 
-      - name: Build WASM (all backends)
-        run: ./build-wasm.sh --clean
+      - name: Build WASM (${{ matrix.name }})
+        run: ./build-wasm.sh --clean ${{ matrix.flag }}
 
       - name: Verify output
         run: |
           ls -lh build-wasm/bin/libwhisper.js build-wasm/bin/libwhisper.wasm
-          echo "JS size: $(wc -c < build-wasm/bin/libwhisper.js) bytes"
+          echo "JS size:   $(wc -c < build-wasm/bin/libwhisper.js) bytes"
           echo "WASM size: $(wc -c < build-wasm/bin/libwhisper.wasm) bytes"
-          # Sanity: WASM should be < 10 MB (all backends), JS < 200 KB
-          [ $(wc -c < build-wasm/bin/libwhisper.wasm) -lt 10485760 ] || (echo "WASM too large" && exit 1)
+          # Sanity: WASM binary should be < 10 MB (all backends), JS < 200 KB
+          [ "$(wc -c < build-wasm/bin/libwhisper.wasm)" -lt 10485760 ] || (echo "WASM too large" && exit 1)
+          # The proxy build must export the async, deadlock-free synth entry.
+          if [ "${{ matrix.name }}" = "proxy-to-pthread" ]; then
+            grep -q "ttsSynthesizeAsync" build-wasm/bin/libwhisper.wasm || \
+              (echo "proxy build missing ttsSynthesizeAsync export" && exit 1)
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: crispasr-wasm
+          name: crispasr-wasm-${{ matrix.name }}
           path: |
             build-wasm/bin/libwhisper.js
             build-wasm/bin/libwhisper.wasm

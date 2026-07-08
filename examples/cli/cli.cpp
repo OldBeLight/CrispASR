@@ -412,6 +412,8 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
             return false;
         }
         params.lcs_min_length = v;
+    } else if (arg == "--context") {
+        params.context = ARGV_NEXT;
     } else if (arg == "--hotwords") {
         params.hotwords = ARGV_NEXT;
     } else if (arg == "--hotwords-file") {
@@ -541,6 +543,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.tts_text = ARGV_NEXT;
     } else if (arg == "--tts-output") {
         params.tts_output = ARGV_NEXT;
+    } else if (arg == "--tts-stream") {
+        params.tts_stream = true;
     } else if (arg == "--voice") {
         params.tts_voice = ARGV_NEXT;
     } else if (arg == "--tts-steps") {
@@ -552,6 +556,12 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         // Also drive the native-knob path (f5 ode_steps, chatterbox cfm_steps),
         // which reads tts_num_steps; previously only vibevoice honoured this.
         params.tts_num_steps = params.tts_steps;
+    } else if (arg == "--tts-cfg-scale") {
+        params.tts_cfg_scale = std::stof(ARGV_NEXT);
+        if (params.tts_cfg_scale < 0.0f)
+            params.tts_cfg_scale = 0.0f;
+        if (params.tts_cfg_scale > 10.0f)
+            params.tts_cfg_scale = 10.0f;
     } else if (arg == "--codec-model") {
         params.tts_codec_model = ARGV_NEXT;
         std::string auto_base;
@@ -833,6 +843,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "             --hotwords LIST       [%-7s] comma-separated keyword list to bias recognition "
             "(granite: KWB prompt)\n",
             params.hotwords.empty() ? "" : params.hotwords.c_str());
+    fprintf(stderr,
+            "             --context TEXT        [%-7s] hotword/context text injected into the prompt "
+            "(vibevoice-asr only)\n",
+            params.context.empty() ? "" : "set");
     fprintf(stderr,
             "             --prefix-text TEXT    [%-7s] granite incremental decoding: seed the transcript so "
             "the model continues from it\n",
@@ -1122,14 +1136,18 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr, "\nSpeech-to-speech (S2S) options:\n");
     fprintf(stderr, "             --s2s                   [%-7s] speech-to-speech mode: audio input → audio output\n",
             params.s2s ? "true" : "false");
-    fprintf(stderr, "             --s2s-output FNAME      [%-7s] output WAV path (default: s2s_output.wav)\n",
+    fprintf(stderr,
+            "             --s2s-output FNAME      [%-7s] output path: .wav, .mp3, .aac (default: s2s_output.wav)\n",
             params.s2s_output.c_str());
 
     fprintf(stderr, "\nText-to-speech (TTS) options:\n");
     fprintf(stderr,
-            "             --tts \"TEXT\"            synthesise TEXT and write WAV to --tts-output (24 kHz mono)\n");
-    fprintf(stderr, "             --tts-output FNAME      [%-7s] output WAV path (default: tts_output.wav)\n",
+            "             --tts \"TEXT\"            synthesise TEXT and write audio to --tts-output (24 kHz mono)\n");
+    fprintf(stderr,
+            "             --tts-output FNAME      [%-7s] output path: .wav, .mp3, .aac (default: tts_output.wav)\n",
             params.tts_output.c_str());
+    fprintf(stderr, "             --tts-stream            stream s16le mono PCM to stdout per sentence (pipe to a "
+                    "player); logs stay on stderr\n");
     fprintf(stderr,
             "             --voice PATH            [%-7s] voice prompt: GGUF voice pack or reference WAV\n"
             "                                                 (.wav → 1.5B WAV cloning; .gguf → voice pack)\n",
@@ -1196,6 +1214,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.chat_n_gpu_layers);
     fprintf(stderr, "             --tts-steps N            [%-7d] DPM-Solver++ steps (10-20, vibevoice only)\n",
             params.tts_steps);
+    fprintf(stderr,
+            "             --tts-cfg-scale X        [%-7s] TTS CFG guidance scale (vibevoice/chatterbox/f5/tada; "
+            "vibevoice: 0 = model default, try 1.5 or a new --seed to re-roll BGM onsets)\n",
+            "default");
     fprintf(stderr, "             --tts-trim-silence       [%-7s] trim leading silence from TTS output\n",
             params.tts_trim_silence ? "true" : "false");
     fprintf(stderr, "             --tts-play               [%-7s] play synthesised audio on the local speaker\n",

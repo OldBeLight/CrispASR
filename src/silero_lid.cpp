@@ -109,6 +109,7 @@ struct lid_model {
 
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
+    ggml_backend_buffer_t buf_cpu = nullptr; // frontend weights (split load)
     std::map<std::string, ggml_tensor*> tensors;
 };
 
@@ -133,12 +134,27 @@ static ggml_tensor* lid_get(lid_model& m, const std::string& name) {
     return it != m.tensors.end() ? it->second : nullptr;
 }
 
-static bool lid_load(lid_model& m, const char* path, ggml_backend_t backend) {
+// The frontend conv + adaptive-norm filter must live in a host buffer: the
+// ggml path computes them on CPU for precision (see silero_lid_frontend_cpu).
+static bool silero_lid_is_gpu_tensor(const char* name, void*) {
+    return strcmp(name, "lid.frontend.weight") != 0 && strcmp(name, "lid.adaptive_norm.filter") != 0;
+}
+
+// backend_cpu == backend → plain single-buffer load (legacy path);
+// otherwise split: frontend weights on CPU, the rest on `backend`.
+static bool lid_load(lid_model& m, const char* path, ggml_backend_t backend, ggml_backend_t backend_cpu) {
     core_gguf::WeightLoad wl;
-    if (!core_gguf::load_weights(path, backend, "silero_lid", wl))
-        return false;
+    if (backend == backend_cpu) {
+        if (!core_gguf::load_weights(path, backend, "silero_lid", wl))
+            return false;
+    } else {
+        if (!core_gguf::load_weights_split(path, backend, backend_cpu, silero_lid_is_gpu_tensor, nullptr, "silero_lid",
+                                           wl))
+            return false;
+    }
     m.ctx = wl.ctx;
     m.buf = wl.buf;
+    m.buf_cpu = wl.buf_cpu;
     m.tensors = std::move(wl.tensors);
 
     // Bind top-level
@@ -216,7 +232,33 @@ static bool lid_load(lid_model& m, const char* path, ggml_backend_t backend) {
 // Forward pass (manual F32, CPU-only for the small 17 MB model)
 // ===========================================================================
 
-// The whole forward is hand-rolled CPU scalar. The pointwise convs (96×) +
+// Two forward paths, selected at init time:
+//   1. ggml graph (default) — threaded SIMD matmuls on every CPU, GPU offload
+//      via the backend sched. See silero_lid_forward_ggml().
+//   2. Legacy hand-rolled CPU (CRISPASR_SILERO_LID_LEGACY=1) — scalar loops +
+//      optional Accelerate GEMM. Kept as the A/B ground truth; the ggml path
+//      is validated logit-for-logit against it.
+static bool silero_use_legacy() {
+    static const bool v = [] {
+        const char* e = std::getenv("CRISPASR_SILERO_LID_LEGACY");
+        return e && *e && *e != '0';
+    }();
+    return v;
+}
+
+// Cap the audio fed to LID. The stage-0 self-attention is O(T^2) in time and
+// memory (T = samples/160): an unbounded slice on a 10-minute file tries to
+// allocate a ~19 GB score matrix. 30 s matches the whisper-LID slice.
+// CRISPASR_SILERO_LID_MAX_S overrides (0 = unlimited).
+static int silero_lid_max_samples() {
+    static const int v = [] {
+        const char* e = std::getenv("CRISPASR_SILERO_LID_MAX_S");
+        return (e && *e) ? atoi(e) : 30;
+    }();
+    return v > 0 ? v * 16000 : 0;
+}
+
+// The legacy forward is hand-rolled CPU scalar. The pointwise convs (96×) +
 // transformer QKV/out-proj/FFN + stage projections are matmuls; cblas_sgemm
 // (Accelerate) is the bulk of the win. Set SILERO_FORCE_SCALAR=1 to validate
 // scalar == GEMM or run on non-Apple.
@@ -404,27 +446,390 @@ static void ffn_residual(float* x, int D, int T, const float* ff1_w, const float
 
 
 // ===========================================================================
+// ggml graph forward (default path — CPU SIMD + GPU offload via sched)
+// ===========================================================================
+//
+// Same math as the legacy path below, expressed as one ggml graph. Layouts as
+// loaded from the GGUF (numpy shape → ggml ne is reversed):
+//   frontend_w (322,1,320) → ne (K=320, Cin=1,  OC=322)   — ggml_conv_1d direct
+//   dw_w       (C,1,5)     → ne (K=5,   1,      C)        — ggml_conv_1d_dw direct
+//   pw/proj/1x1 (Co,Ci,1)  → ne (1,     Ci,     Co)       — ggml_conv_1d k=1 direct
+//   qkv/out/ff (Din,Dout)  → ne (Dout,  Din)              — transposed in-graph
+//   lang_w     (95,192)    → ne (192,   95)               — ggml_mul_mat direct
+// Activations run time-fastest (T, C) through the conv encoder and
+// channel-fastest (D, T) inside the transformer (norms/matmuls want ne[0]=D).
+// SILERO_LID_TRACE=1: print per-checkpoint stats on both paths to localize a
+// divergence (layouts are flat-identical between the two implementations).
+static bool silero_lid_trace_enabled() {
+    static const bool v = std::getenv("SILERO_LID_TRACE") != nullptr;
+    return v;
+}
+
+static void silero_lid_trace(const char* path, const char* name, const float* d, size_t n) {
+    if (!silero_lid_trace_enabled() || !n)
+        return;
+    double sum = 0, sq = 0;
+    for (size_t i = 0; i < n; i++) {
+        sum += d[i];
+        sq += (double)d[i] * d[i];
+    }
+    double mean = sum / n;
+    double var = sq / n - mean * mean;
+    const char* oe = std::getenv("SILERO_LID_TRACE_OFF");
+    size_t off = oe ? (size_t)atoll(oe) : 0;
+    if (off + 3 >= n)
+        off = 0;
+    fprintf(stderr, "silero_trace[%s] %-14s n=%-8zu mean=%+.6f std=%.6f  @%zu=[%.6f %.6f %.6f %.6f]\n", path, name, n,
+            mean, sqrt(var > 0 ? var : 0), off, d[off], d[off + 1], d[off + 2], d[off + 3]);
+}
+
+// Part A — front-end + log-magnitude normalization. ALWAYS on the CPU
+// backend: log(2^20*|z| + 1) amplifies matmul rounding error by ~1/|z| at
+// quiet frames, so GPU fp16/fastmath noise in the frontend conv (harmless
+// elsewhere) corrupts individual features by whole log-units. Requires
+// frontend weights resident in a host buffer (split-loaded at init).
+static bool silero_lid_frontend_cpu(silero_lid_context* ctx, const float* samples, int n_samples,
+                                    std::vector<float>& feats, int64_t& T_out) {
+    silero_lid_bench_stage _bs("frontend_cpu");
+    const auto& m = ctx->model;
+
+    const size_t A_NODES = 64;
+    ggml_init_params ip = {A_NODES * ggml_tensor_overhead() + ggml_graph_overhead_custom(A_NODES, false), nullptr,
+                           true};
+    ggml_context* ctx0 = ggml_init(ip);
+    if (!ctx0)
+        return false;
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, A_NODES, false);
+
+    ggml_tensor* audio = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_samples, 1);
+    ggml_set_input(audio);
+
+    // Front-end: Conv1d(1→322, k=320, s=160), zero-pad 160 each side
+    ggml_tensor* x = ggml_conv_1d(ctx0, m.frontend_w, audio, m.frontend_stride, m.frontend_stride, 1); // (T, 322)
+    const int64_t T0 = x->ne[0];
+
+    // Magnitude + log + adaptive normalization. Channels 0..160 = real,
+    // 161..321 = imag; see the legacy path for the ONNX trace.
+    const int64_t c_half = m.frontend_channels / 2; // 161
+    ggml_tensor* re = ggml_cont(ctx0, ggml_view_2d(ctx0, x, T0, c_half, x->nb[1], 0));
+    ggml_tensor* im = ggml_cont(ctx0, ggml_view_2d(ctx0, x, T0, c_half, x->nb[1], (size_t)c_half * x->nb[1]));
+    ggml_tensor* mag = ggml_sqrt(ctx0, ggml_add(ctx0, ggml_sqr(ctx0, re), ggml_sqr(ctx0, im)));
+    ggml_tensor* logmag = ggml_log(ctx0, ggml_scale_bias(ctx0, mag, 1048576.0f, 1.0f)); // (T, 161)
+
+    ggml_tensor* fmean = ggml_mean(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, logmag))); // (1, T)
+    fmean = ggml_reshape_2d(ctx0, fmean, T0, 1);
+    ggml_tensor* fpad = ggml_pad_reflect_1d(ctx0, fmean, 8, 8);                      // (T+16, 1)
+    ggml_tensor* smooth = ggml_conv_1d(ctx0, m.adaptive_norm_filter, fpad, 1, 0, 1); // (T, 1)
+    ggml_tensor* gmean = ggml_mean(ctx0, ggml_reshape_2d(ctx0, smooth, T0, 1));      // (1, 1)
+    ggml_tensor* out = ggml_sub(ctx0, logmag, gmean);                                // broadcast → (T, 161)
+    ggml_set_output(out);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend_cpu));
+    if (!ggml_gallocr_alloc_graph(ga, gf)) {
+        ggml_gallocr_free(ga);
+        ggml_free(ctx0);
+        return false;
+    }
+    ggml_backend_tensor_set(audio, samples, 0, (size_t)n_samples * sizeof(float));
+    if (ggml_backend_graph_compute(ctx->backend_cpu, gf) != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(ga);
+        ggml_free(ctx0);
+        return false;
+    }
+    feats.resize((size_t)T0 * c_half);
+    ggml_backend_tensor_get(out, feats.data(), 0, feats.size() * sizeof(float));
+    T_out = T0;
+    ggml_gallocr_free(ga);
+    ggml_free(ctx0);
+    return true;
+}
+
+// Part B — conv/transformer encoder + attention pooling + classifier, on the
+// backend sched (GPU when available).
+static bool silero_lid_forward_ggml(silero_lid_context* ctx, const float* samples, int n_samples,
+                                    std::vector<float>& logits) {
+    const auto& m = ctx->model;
+    if (!m.frontend_w || !m.adaptive_norm_filter)
+        return false;
+
+    const int n_langs = (int)m.lang_w->ne[1];
+
+    std::vector<float> feats;
+    int64_t T0 = 0;
+    if (!silero_lid_frontend_cpu(ctx, samples, n_samples, feats, T0))
+        return false;
+    const int64_t c_half = m.frontend_channels / 2; // 161
+
+    const size_t GRAPH_NODES = 8192;
+    ggml_init_params ip = {GRAPH_NODES * ggml_tensor_overhead() + ggml_graph_overhead_custom(GRAPH_NODES, false),
+                           nullptr, true};
+    ggml_context* ctx0 = ggml_init(ip);
+    if (!ctx0)
+        return false;
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, GRAPH_NODES, false);
+
+    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T0, c_half); // (T, 161)
+    ggml_tensor* feats_in = x;
+    ggml_set_name(x, "feats");
+    ggml_set_input(x);
+
+    // ---- 8 stages: 12 dw-sep conv blocks + transformer + boundary 1×1 ----
+    for (int si = 0; si < (int)m.stages.size(); si++) {
+        const auto& st = m.stages[si];
+
+        for (int bi = 0; bi < (int)st.conv_blocks.size(); bi++) {
+            const auto& cb = st.conv_blocks[bi];
+            if (!cb.dw_w || !cb.pw_w)
+                continue;
+            const int64_t c_in = x->ne[1];
+            const int64_t c_out = cb.pw_w->ne[2];
+
+            ggml_tensor* blk_in = x;
+            // dw conv k=5, same padding, + bias + ReLU
+            ggml_tensor* h = ggml_conv_1d_dw(ctx0, cb.dw_w, x, 1, 2, 1); // (T, C_in)
+            h = ggml_reshape_2d(ctx0, h, x->ne[0], c_in);
+            h = ggml_add(ctx0, h, ggml_reshape_2d(ctx0, cb.dw_b, 1, c_in));
+            h = ggml_relu(ctx0, h);
+            // pw conv (k=1) + bias
+            h = ggml_conv_1d(ctx0, cb.pw_w, h, 1, 0, 1); // (T, C_out)
+            h = ggml_add(ctx0, h, ggml_reshape_2d(ctx0, cb.pw_b, 1, c_out));
+            // residual: identity when shapes match, else the block's 1×1 proj
+            if (cb.proj_w) {
+                ggml_tensor* p = ggml_conv_1d(ctx0, cb.proj_w, blk_in, 1, 0, 1);
+                if (cb.proj_b)
+                    p = ggml_add(ctx0, p, ggml_reshape_2d(ctx0, cb.proj_b, 1, cb.proj_w->ne[2]));
+                h = ggml_add(ctx0, h, p);
+            } else if (c_in == c_out) {
+                h = ggml_add(ctx0, h, blk_in);
+            }
+            x = ggml_relu(ctx0, h);
+            if (si == 0 && bi == 0)
+                ggml_set_name(x, "trc_s0_b0");
+        }
+        if (si == 0)
+            ggml_set_name(x, "trc_s0_conv");
+
+        // Transformer (POST-norm, full bidirectional attention — the ONNX
+        // model has no attention mask, so mask=nullptr is the correct mask).
+        const auto& tx = st.tx;
+        if (tx.qkv_w) {
+            const int64_t T = x->ne[0];
+            const int64_t D = x->ne[1];
+            const int nh = 2;
+            const int64_t hd = D / nh;
+
+            ggml_tensor* xt = ggml_cont(ctx0, ggml_transpose(ctx0, x));                  // (D, T)
+            ggml_tensor* qkv_wt = ggml_cont(ctx0, ggml_transpose(ctx0, tx.qkv_w));       // (D, 3D)
+            ggml_tensor* qkv = ggml_add(ctx0, ggml_mul_mat(ctx0, qkv_wt, xt), tx.qkv_b); // (3D, T)
+            if (si == 0)
+                ggml_set_name(qkv, "trc_tx_qkv");
+
+            // ONNX slice order: K [0:D], Q [D:2D], V [2D:3D]
+            auto slice_heads = [&](int idx) { // → (hd, T, nh)
+                ggml_tensor* t =
+                    ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, D, T, qkv->nb[1], (size_t)idx * D * qkv->nb[0]));
+                t = ggml_reshape_3d(ctx0, t, hd, nh, T);
+                return ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3));
+            };
+            ggml_tensor* K = slice_heads(0);
+            ggml_tensor* Q = slice_heads(1);
+            ggml_tensor* V = slice_heads(2);
+
+            ggml_tensor* scores = ggml_mul_mat(ctx0, K, Q); // (T_k, T_q, nh)
+            scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f / sqrtf((float)hd), 0.0f);
+            if (si == 0)
+                ggml_set_name(scores, "trc_tx_scores");
+            ggml_tensor* vt = ggml_cont(ctx0, ggml_permute(ctx0, V, 1, 0, 2, 3)); // (T, hd, nh)
+            ggml_tensor* attn = ggml_mul_mat(ctx0, vt, scores);                   // (hd, T_q, nh)
+            attn = ggml_cont(ctx0, ggml_permute(ctx0, attn, 0, 2, 1, 3));         // (hd, nh, T)
+            attn = ggml_reshape_2d(ctx0, attn, D, T);
+            if (si == 0)
+                ggml_set_name(attn, "trc_tx_attn");
+
+            ggml_tensor* out_wt = ggml_cont(ctx0, ggml_transpose(ctx0, tx.out_w));
+            ggml_tensor* proj = ggml_add(ctx0, ggml_mul_mat(ctx0, out_wt, attn), tx.out_b);
+            xt = ggml_add(ctx0, xt, proj); // attention residual
+
+            if (si == 0)
+                ggml_set_name(xt, "trc_tx_res1");
+            if (tx.norm1_w)
+                xt = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, xt, 1e-5f), tx.norm1_w), tx.norm1_b);
+            if (si == 0)
+                ggml_set_name(xt, "trc_tx_n1");
+
+            ggml_tensor* ff1_wt = ggml_cont(ctx0, ggml_transpose(ctx0, tx.ff1_w));
+            ggml_tensor* ff2_wt = ggml_cont(ctx0, ggml_transpose(ctx0, tx.ff2_w));
+            ggml_tensor* mid = ggml_relu(ctx0, ggml_add(ctx0, ggml_mul_mat(ctx0, ff1_wt, xt), tx.ff1_b));
+            if (si == 0)
+                ggml_set_name(mid, "trc_tx_mid");
+            ggml_tensor* ff2mm = ggml_mul_mat(ctx0, ff2_wt, mid);
+            if (si == 0)
+                ggml_set_name(ff2mm, "trc_tx_ff2mm");
+            ggml_tensor* ff = ggml_add(ctx0, ff2mm, tx.ff2_b);
+            if (si == 0)
+                ggml_set_name(ff, "trc_tx_ff");
+            xt = ggml_add(ctx0, xt, ff); // FFN residual
+            if (si == 0)
+                ggml_set_name(xt, "trc_tx_res2");
+
+            if (tx.norm2_w)
+                xt = ggml_add(ctx0, ggml_mul(ctx0, ggml_norm(ctx0, xt, 1e-5f), tx.norm2_w), tx.norm2_b);
+            if (si == 0)
+                ggml_set_name(xt, "trc_tx_n2");
+
+            x = ggml_cont(ctx0, ggml_transpose(ctx0, xt)); // back to (T, D)
+            if (si == 0)
+                ggml_set_name(x, "trc_s0_tx");
+        }
+
+        // Stage-boundary 1×1 conv: stride 2 (first 4 stages) or stride 1, +ReLU
+        if (tx.conv1x1_w) {
+            const int stride = (si < m.n_downsample_stages) ? 2 : 1;
+            x = ggml_conv_1d(ctx0, tx.conv1x1_w, x, stride, 0, 1);
+            if (tx.conv1x1_b)
+                x = ggml_add(ctx0, x, ggml_reshape_2d(ctx0, tx.conv1x1_b, 1, tx.conv1x1_w->ne[2]));
+            x = ggml_relu(ctx0, x);
+        }
+        char trc_nm[32];
+        snprintf(trc_nm, sizeof(trc_nm), "trc_stage%d", si);
+        ggml_set_name(x, trc_nm);
+    }
+
+    // ---- Attention-weighted pooling + language classifier ----
+    const int64_t T = x->ne[0];
+    const int64_t D = x->ne[1];
+    ggml_tensor* xt = ggml_cont(ctx0, ggml_transpose(ctx0, x));                          // (D, T)
+    ggml_tensor* s = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, m.pool_weight, D, 1), xt); // (1, T)
+    s = ggml_soft_max(ctx0, ggml_reshape_2d(ctx0, ggml_tanh(ctx0, s), T, 1));            // (T, 1)
+    ggml_tensor* pooled = ggml_mul_mat(ctx0, x, s);                                      // (D, 1)
+
+    ggml_tensor* lang = ggml_add(ctx0, ggml_mul_mat(ctx0, m.lang_w, pooled), m.lang_b); // (95, 1)
+    ggml_set_name(lang, "lid_logits");
+    ggml_set_output(lang);
+    ggml_build_forward_expand(gf, lang);
+
+    // SILERO_LID_TRUNC=<trc_name>: replace the graph with one that ENDS at
+    // the named checkpoint (genuine truncated output — appended set_output
+    // snapshots can read already-reused buffers and lie).
+    std::vector<std::pair<std::string, ggml_tensor*>> trace_pts;
+    if (const char* trunc = std::getenv("SILERO_LID_TRUNC")) {
+        ggml_tensor* t = ggml_get_tensor(ctx0, trunc);
+        if (!t && strcmp(trunc, "pooled") == 0)
+            t = pooled;
+        if (t) {
+            ggml_tensor* c = ggml_cont(ctx0, t);
+            ggml_set_output(c);
+            gf = ggml_new_graph_custom(ctx0, GRAPH_NODES, false);
+            ggml_build_forward_expand(gf, c);
+            trace_pts.emplace_back(trunc, c);
+        } else {
+            fprintf(stderr, "silero_lid: TRUNC tensor '%s' not found\n", trunc);
+        }
+    }
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "silero_lid: failed to allocate ggml graph (T=%lld)\n", (long long)T0);
+        ggml_free(ctx0);
+        return false;
+    }
+    ggml_backend_tensor_set(feats_in, feats.data(), 0, feats.size() * sizeof(float));
+
+    {
+        silero_lid_bench_stage _bs("graph_compute");
+        if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "silero_lid: ggml graph compute failed\n");
+            ggml_free(ctx0);
+            return false;
+        }
+    }
+
+    for (auto& [name, t] : trace_pts) {
+        std::vector<float> buf(ggml_nelements(t));
+        ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(float));
+        silero_lid_trace("ggml", name.c_str(), buf.data(), buf.size());
+        if (const char* dir = std::getenv("SILERO_LID_DUMP")) {
+            std::string p = std::string(dir) + "/" + name + ".bin";
+            if (FILE* f = fopen(p.c_str(), "wb")) {
+                fwrite(buf.data(), sizeof(float), buf.size(), f);
+                fclose(f);
+            }
+        }
+    }
+    if (!trace_pts.empty()) { // truncated run — no logits in this graph
+        ggml_free(ctx0);
+        return false;
+    }
+
+    logits.resize(n_langs);
+    ggml_backend_tensor_get(lang, logits.data(), 0, (size_t)n_langs * sizeof(float));
+    ggml_free(ctx0);
+    return true;
+}
+
+// ===========================================================================
 // Public API
 // ===========================================================================
 
 extern "C" struct silero_lid_context* silero_lid_init(const char* gguf_path, int n_threads) {
     auto* ctx = new silero_lid_context();
     ctx->n_threads = n_threads > 0 ? n_threads : 4;
-    ctx->backend = crispasr_init_gpu_backend();
-    if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    if (!ctx->backend) {
+
+    ctx->backend_cpu = ggml_backend_cpu_init();
+    if (!ctx->backend_cpu) {
         delete ctx;
         return nullptr;
     }
-    // crispasr_init_gpu_backend() returns the best available backend (Metal on
-    // Apple Silicon, CUDA on NVIDIA, …). ggml_backend_cpu_set_n_threads asserts
-    // the backend is CPU, so only call it on the CPU backend — otherwise this
-    // aborted on every silero-LID load on a GPU build (#165).
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
-    if (!lid_load(ctx->model, gguf_path, ctx->backend)) {
+    if (silero_use_legacy()) {
+        // The legacy forward dereferences tensor->data directly, so weights
+        // MUST live in host memory (same constraint as pyannote_seg). Loading
+        // them on a discrete-GPU backend makes tensor->data a device address
+        // and the first weight read segfaults (#222).
+        ctx->backend = ctx->backend_cpu;
+    } else {
+        ctx->backend = crispasr_init_gpu_backend();
+        if (ctx->backend && ggml_backend_is_cpu(ctx->backend)) {
+            // CPU-only build: drop the duplicate instance so the sched uses
+            // the one with n_threads configured.
+            ggml_backend_free(ctx->backend);
+            ctx->backend = nullptr;
+        }
+        if (ctx->backend && !std::getenv("CRISPASR_SILERO_LID_VULKAN")) {
+            // ggml-vulkan miscomputes one of the transformer FFN MUL_MATs in
+            // this graph (per-op GGML_VULKAN_CHECK_RESULTS pinpoints it;
+            // allocation-layout dependent, same class as TADA #192) → wrong
+            // language logits. Until fixed upstream, run the LID graph on
+            // CPU when the GPU backend is Vulkan — still ~6× faster than the
+            // legacy scalar path. CRISPASR_SILERO_LID_VULKAN=1 opts back in.
+            ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            if (reg && strcmp(ggml_backend_reg_name(reg), "Vulkan") == 0) {
+                ggml_backend_free(ctx->backend);
+                ctx->backend = nullptr;
+            }
+        }
+        if (!ctx->backend)
+            ctx->backend = ctx->backend_cpu;
+        // Issue #68 mirror: sched requires the CPU backend last for host-side
+        // fallbacks (e.g. PAD_REFLECT_1D on backends without a kernel).
+        ggml_backend_t backends[2] = {ctx->backend, nullptr};
+        int n_backends = 1;
+        if (ctx->backend != ctx->backend_cpu)
+            backends[n_backends++] = ctx->backend_cpu;
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_backends, 8192, false, false);
+        if (!ctx->sched) {
+            if (ctx->backend != ctx->backend_cpu)
+                ggml_backend_free(ctx->backend);
+            ggml_backend_free(ctx->backend_cpu);
+            delete ctx;
+            return nullptr;
+        }
+    }
+
+    if (!lid_load(ctx->model, gguf_path, ctx->backend, ctx->backend_cpu)) {
         delete ctx;
         return nullptr;
     }
@@ -460,12 +865,18 @@ extern "C" struct silero_lid_context* silero_lid_init(const char* gguf_path, int
 extern "C" void silero_lid_free(struct silero_lid_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->sched)
+        ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
         ggml_backend_buffer_free(ctx->model.buf);
+    if (ctx->model.buf_cpu)
+        ggml_backend_buffer_free(ctx->model.buf_cpu);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
-    if (ctx->backend)
+    if (ctx->backend && ctx->backend != ctx->backend_cpu)
         ggml_backend_free(ctx->backend);
+    if (ctx->backend_cpu)
+        ggml_backend_free(ctx->backend_cpu);
     delete ctx;
 }
 
@@ -473,11 +884,8 @@ extern "C" int silero_lid_n_langs(struct silero_lid_context* ctx) {
     return ctx ? (int)ctx->lang_strs.size() : 0;
 }
 
-extern "C" const char* silero_lid_detect(struct silero_lid_context* ctx, const float* samples, int n_samples,
-                                         float* out_confidence) {
-    if (!ctx || !samples || n_samples <= 0)
-        return nullptr;
-    silero_lid_bench_stage _bs_total("detect_total");
+static bool silero_lid_forward_legacy(silero_lid_context* ctx, const float* samples, int n_samples,
+                                      std::vector<float>& logits) {
     const auto& m = ctx->model;
 
     // ---- Front-end: learned Conv1d(1→322, k=320, stride=160) ----
@@ -519,6 +927,7 @@ extern "C" const char* silero_lid_detect(struct silero_lid_context* ctx, const f
         C = 1;
         cur.assign(samples, samples + n_samples);
     }
+    silero_lid_trace("legacy", "frontend", cur.data(), cur.size());
 
     // ---- Magnitude + log + adaptive normalization ----
     //
@@ -604,6 +1013,7 @@ extern "C" const char* silero_lid_detect(struct silero_lid_context* ctx, const f
         cur = std::move(log_mag);
         C = C_half; // 161
     }
+    silero_lid_trace("legacy", "logmag_norm", cur.data(), cur.size());
 
     for (int si = 0; si < (int)m.stages.size(); si++) {
         const auto& st = m.stages[si];
@@ -734,6 +1144,11 @@ extern "C" const char* silero_lid_detect(struct silero_lid_context* ctx, const f
             cur = std::move(proj);
             C = C_out;
         }
+        if (silero_lid_trace_enabled()) {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "stage%d_out", si);
+            silero_lid_trace("legacy", nm, cur.data(), cur.size());
+        }
     }
 
     // ---- Attention-weighted pooling over time ----
@@ -762,10 +1177,11 @@ extern "C" const char* silero_lid_detect(struct silero_lid_context* ctx, const f
     for (int t = 0; t < T; t++)
         for (int d = 0; d < D; d++)
             pooled[d] += frame_scores[t] * cur[d * T + t];
+    silero_lid_trace("legacy", "pooled", pooled.data(), pooled.size());
 
     // ---- Language classifier: linear(D → 95) ----
-    int n_langs = (int)ctx->lang_strs.size();
-    std::vector<float> logits(n_langs);
+    int n_langs = (int)m.lang_w->ne[1];
+    logits.resize(n_langs);
     const float* lw = (const float*)m.lang_w->data;
     const float* lb = (const float*)m.lang_b->data;
     for (int i = 0; i < n_langs; i++) {
@@ -774,12 +1190,43 @@ extern "C" const char* silero_lid_detect(struct silero_lid_context* ctx, const f
             s += lw[i * D + d] * pooled[d];
         logits[i] = s;
     }
+    return true;
+}
 
-    // Argmax
+extern "C" const char* silero_lid_detect(struct silero_lid_context* ctx, const float* samples, int n_samples,
+                                         float* out_confidence) {
+    if (!ctx || !samples || n_samples <= 0)
+        return nullptr;
+    silero_lid_bench_stage _bs_total("detect_total");
+
+    const int max_samples = silero_lid_max_samples();
+    if (max_samples > 0 && n_samples > max_samples)
+        n_samples = max_samples;
+
+    std::vector<float> logits;
+    const bool ok = ctx->sched ? silero_lid_forward_ggml(ctx, samples, n_samples, logits)
+                               : silero_lid_forward_legacy(ctx, samples, n_samples, logits);
+    if (!ok || logits.empty())
+        return nullptr;
+
     int best = 0;
-    for (int i = 1; i < n_langs; i++)
+    for (int i = 1; i < (int)logits.size(); i++)
         if (logits[i] > logits[best])
             best = i;
+
+    if (std::getenv("SILERO_LID_DEBUG")) {
+        std::vector<int> order(logits.size());
+        for (int i = 0; i < (int)order.size(); i++)
+            order[i] = i;
+        std::partial_sort(order.begin(), order.begin() + std::min<size_t>(5, order.size()), order.end(),
+                          [&](int a, int b) { return logits[a] > logits[b]; });
+        fprintf(stderr, "silero_lid[%s]: top-5:", ctx->sched ? "ggml" : "legacy");
+        for (int r = 0; r < (int)std::min<size_t>(5, order.size()); r++) {
+            int i = order[r];
+            fprintf(stderr, " %s=%.4f", i < (int)ctx->lang_strs.size() ? ctx->lang_strs[i].c_str() : "?", logits[i]);
+        }
+        fprintf(stderr, "\n");
+    }
 
     if (out_confidence)
         *out_confidence = logits[best];

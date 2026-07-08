@@ -210,6 +210,10 @@
 #include "f5_tts.h"
 #define CA_HAVE_F5TTS 1
 #endif
+#if __has_include("irodori_tts.h")
+#include "irodori_tts.h"
+#define CA_HAVE_IRODORI_TTS 1
+#endif
 #if __has_include("m2m100.h")
 #include "m2m100.h"
 #define CA_HAVE_M2M100 1
@@ -1292,6 +1296,8 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "indextts";
     else if (strcmp(arch, "f5-tts") == 0 || strcmp(arch, "f5tts") == 0)
         backend = "f5-tts";
+    else if (strcmp(arch, "irodori-tts") == 0 || strcmp(arch, "irodori_tts") == 0)
+        backend = "irodori-tts";
     else if (strcmp(arch, "m2m100") == 0)
         backend = "m2m100";
     else if (strcmp(arch, "parler-tts") == 0 || strcmp(arch, "parler_tts") == 0 || strcmp(arch, "parlertts") == 0)
@@ -1680,6 +1686,9 @@ struct crispasr_session {
 #endif
 #ifdef CA_HAVE_F5TTS
     f5_tts_context* f5tts_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_IRODORI_TTS
+    irodori_tts_context* irodori_ctx = nullptr;
 #endif
 #ifdef CA_HAVE_PIPER
     piper_tts_context* piper_ctx = nullptr;
@@ -2801,6 +2810,21 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_IRODORI_TTS
+    if (s->backend == "irodori-tts" || s->backend == "irodori_tts" || s->backend == "irodori") {
+        s->backend = "irodori-tts";
+        irodori_tts_params p = irodori_tts_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->irodori_ctx = irodori_tts_init_from_file(model_path, p);
+        if (!s->irodori_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_PIPER
     if (s->backend == "piper" || s->backend == "piper-tts") {
         s->backend = "piper";
@@ -3233,6 +3257,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_F5TTS
     list += ",f5-tts";
+#endif
+#ifdef CA_HAVE_IRODORI_TTS
+    list += ",irodori-tts";
 #endif
 #ifdef CA_HAVE_PIPER
     list += ",piper";
@@ -4946,7 +4973,12 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         };
 
         const std::vector<float> pcm24 = resample_16k_to_24k(pcm, n_samples);
-        vibevoice_result* vr = vibevoice_transcribe_with_probs(s->vibevoice_ctx, pcm24.data(), (int)pcm24.size());
+        // Session hotwords double as vibevoice's free-form context injection
+        // (CLI: --context; here the comma-separated hotword list is spliced
+        // into the prompt's "with extra info:" slot, PR #223 / issue #224).
+        const char* vv_context = s->hotwords.empty() ? nullptr : s->hotwords.c_str();
+        vibevoice_result* vr =
+            vibevoice_transcribe_with_probs_and_context(s->vibevoice_ctx, pcm24.data(), (int)pcm24.size(), vv_context);
         if (!vr || !vr->text) {
             if (vr)
                 vibevoice_result_free(vr);
@@ -6173,6 +6205,10 @@ CA_EXPORT int crispasr_session_set_codec_path(crispasr_session* s, const char* p
         return 0;
     }
 #endif
+#ifdef CA_HAVE_IRODORI_TTS
+    if (s->irodori_ctx)
+        return irodori_tts_set_codec_path(s->irodori_ctx, path);
+#endif
 #ifdef CA_HAVE_INDEXTTS
     // indextts routes its BigVGAN vocoder companion (indextts-bigvgan)
     // through the shared codec-path setter, same as qwen3-tts/orpheus.
@@ -6892,6 +6928,18 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
         return pcm;
     }
 #endif
+#ifdef CA_HAVE_IRODORI_TTS
+    if (s->irodori_ctx) {
+        // Irodori-TTS outputs 48 kHz mono. DAC-VAE decode pending (outputs silence placeholder).
+        float* pcm = nullptr;
+        int sr = 0;
+        int n = irodori_tts_synthesize(s->irodori_ctx, text, &pcm, &sr);
+        if (n <= 0 || !pcm)
+            return nullptr;
+        *out_n_samples = n;
+        return pcm;
+    }
+#endif
 #ifdef CA_HAVE_PARLER_TTS
     if (s->parler_tts_ctx) {
         // Parler outputs 44.1 kHz mono. Resample to 24 kHz for the session
@@ -7022,6 +7070,60 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
 
 CA_EXPORT void crispasr_pcm_free(float* pcm) {
     free(pcm);
+}
+
+// Streaming synthesis: split `text` into sentence chunks and fire `cb` with the
+// watermarked PCM of each chunk as it is produced — progressive delivery for
+// embedders, without buffering the whole clip. Sample rate is the same as
+// crispasr_session_synthesize (backend-native; caller-known). The PCM passed to
+// `cb` is owned by this call (freed after `cb` returns); copy it if needed.
+// `is_final` is 1 on the last chunk. Returns 0 on success, -1 on bad args.
+CA_EXPORT int crispasr_session_synthesize_streaming(crispasr_session* s, const char* text, crispasr_pcm_stream_cb cb,
+                                                    void* user_data) {
+    if (!s || !text || !cb)
+        return -1;
+
+    // Sentence split on ASCII (. ! ? newline) and CJK (。！？) terminators; the
+    // terminator stays with its sentence; whitespace-only pieces are dropped.
+    const std::string t = text;
+    std::vector<std::string> chunks;
+    std::string cur;
+    auto flush = [&]() {
+        size_t a = cur.find_first_not_of(" \t\r\n");
+        size_t b = cur.find_last_not_of(" \t\r\n");
+        if (a != std::string::npos)
+            chunks.push_back(cur.substr(a, b - a + 1));
+        cur.clear();
+    };
+    for (size_t i = 0; i < t.size();) {
+        unsigned char c = (unsigned char)t[i];
+        size_t adv = 1;
+        bool term = (c == '.' || c == '!' || c == '?' || c == '\n');
+        if (!term && i + 2 < t.size()) {
+            unsigned char b1 = (unsigned char)t[i + 1], b2 = (unsigned char)t[i + 2];
+            if ((c == 0xE3 && b1 == 0x80 && b2 == 0x82) ||                 // 。
+                (c == 0xEF && b1 == 0xBC && (b2 == 0x81 || b2 == 0x9F))) { // ！ ？
+                term = true;
+                adv = 3;
+            }
+        }
+        cur.append(t, i, adv);
+        i += adv;
+        if (term)
+            flush();
+    }
+    flush();
+    if (chunks.empty())
+        return 0;
+
+    for (size_t i = 0; i < chunks.size(); i++) {
+        int n = 0;
+        float* pcm = crispasr_session_synthesize(s, chunks[i].c_str(), &n);
+        const int is_final = (i + 1 == chunks.size()) ? 1 : 0;
+        cb(pcm && n > 0 ? pcm : nullptr, pcm ? n : 0, is_final, user_data);
+        free(pcm);
+    }
+    return 0;
 }
 
 // =========================================================================
@@ -7450,6 +7552,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_F5TTS
     if (s->f5tts_ctx)
         f5_tts_free(s->f5tts_ctx);
+#endif
+#ifdef CA_HAVE_IRODORI_TTS
+    if (s->irodori_ctx)
+        irodori_tts_free(s->irodori_ctx);
 #endif
 #ifdef CA_HAVE_PIPER
     if (s->piper_ctx)
@@ -8051,6 +8157,12 @@ CA_EXPORT int crispasr_session_set_tts_seed(crispasr_session* s, uint64_t seed) 
         touched++;
     }
 #endif
+#ifdef CA_HAVE_IRODORI_TTS
+    if (s->irodori_ctx) {
+        irodori_tts_set_seed(s->irodori_ctx, seed);
+        touched++;
+    }
+#endif
 #ifdef CA_HAVE_MELOTTS
     if (s->melotts_ctx) {
         melotts_set_seed(s->melotts_ctx, (uint32_t)seed);
@@ -8113,6 +8225,24 @@ CA_EXPORT int crispasr_session_set_tts_steps(crispasr_session* s, int steps) {
         // reporter's "quick and dirty" vs "slow and accurate" lever (#197) —
         // more steps trade speed for acoustic fidelity. Read per synthesize().
         tada_set_num_fm_steps(s->tada_ctx, steps);
+        touched++;
+    }
+#endif
+    return touched > 0 ? 0 : -2;
+}
+
+// TTS CFG guidance scale. Honoured by vibevoice (0 = model default:
+// 1.3 base / 3.0 realtime; upstream's realtime demo uses 1.5).
+// Spontaneous BGM onsets are documented VibeVoice model behavior —
+// lowering cfg or changing the seed re-rolls them. Other TTS
+// backends no-op (rc=-2).
+CA_EXPORT int crispasr_session_set_tts_cfg_scale(crispasr_session* s, float scale) {
+    if (!s)
+        return -1;
+    int touched = 0;
+#ifdef CA_HAVE_VIBEVOICE
+    if (s->vibevoice_ctx) {
+        vibevoice_set_cfg_scale((vibevoice_context*)s->vibevoice_ctx, scale);
         touched++;
     }
 #endif

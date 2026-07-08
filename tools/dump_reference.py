@@ -290,6 +290,11 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # repo with lit_model.pth + small.pt + model_config.yaml. Needs the
     # litgpt package on sys.path (set MINI_OMNI2_REPO or put it in model_dir).
     "mini-omni2": "reference_backends.mini_omni2",
+    # Irodori-TTS (Aratako/Irodori-TTS-500M-v3): RF-DiT flow matching TTS.
+    # model_dir = HF id or local .safetensors. Audio arg is unused (TTS).
+    # Text from IRODORI_TEST_TEXT env (default "こんにちは、世界。").
+    # Captures text_state, cond_embed, dit_block_0, v_pred_step0.
+    "irodori-tts": "reference_backends.irodori_tts",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import

@@ -37,7 +37,9 @@ while [[ $# -gt 0 ]]; do
         --simd)        SIMD=ON; shift ;;
         --no-simd)     SIMD=OFF; shift ;;
         --single-file) SINGLE_FILE=ON; shift ;;
-        --)            shift; CMAKE_EXTRA=("$@"); break ;;
+        --single-thread) CMAKE_EXTRA+=("-DCRISPASR_WASM_SINGLE_THREAD=ON"); shift ;;
+        --proxy-to-pthread) CMAKE_EXTRA+=("-DCRISPASR_WASM_PROXY_TO_PTHREAD=ON"); shift ;;
+        --)            shift; CMAKE_EXTRA+=("$@"); break ;;
         *)             CMAKE_EXTRA+=("$1"); shift ;;
     esac
 done

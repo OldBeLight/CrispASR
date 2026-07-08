@@ -8,6 +8,7 @@
 #include "crispasr_backend_utils.h"
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
+#include "crispasr_tts_ref_cache.h"
 #include "whisper_params.h"
 
 #include "core/audio_resample.h"
@@ -28,6 +29,10 @@ static bool file_exists(const std::string& path) {
     struct stat st;
     return stat(path.c_str(), &st) == 0;
 }
+
+// Reference-conditioning cache tag (see crispasr_tts_ref_cache.h). Blob layout:
+// [cond_dim conditioning floats][512 ECAPA floats?]; shape = {cond_dim, spk_n}.
+static constexpr const char* kIndexttsCacheTag = "indextts-cond";
 
 // Look for a sibling BigVGAN vocoder file next to the GPT model.
 static std::string discover_vocoder(const std::string& model_path) {
@@ -123,15 +128,42 @@ public:
         indextts_set_temperature(ctx_, params.temperature);
         indextts_set_seed(ctx_, params.seed);
 
-        // Load reference audio if specified
+        // Reference conditioning (Conformer/Perceiver + ECAPA) is expensive and
+        // scales with reference length. Set it up once per session and reuse it
+        // across text chunks; cache it on disk (keyed on the voice file) so
+        // later runs skip the encode too. Disable via CRISPASR_TTS_REF_CACHE=0.
+        const bool cache_enabled = !crispasr_ref_cache::disabled();
+        const std::string cache_path = crispasr_ref_cache::path_for(voice_path_, ".idxcond");
+
+        if (!voice_path_.empty() && !ref_ready_) {
+            // 1) Try the on-disk cache.
+            if (cache_enabled) {
+                std::vector<uint32_t> shape;
+                std::vector<float> blob;
+                const int cond_dim = indextts_conditioning_dim(ctx_);
+                if (crispasr_ref_cache::load_floats(cache_path, voice_path_, kIndexttsCacheTag, shape, blob) &&
+                    shape.size() == 2 && (int)shape[0] == cond_dim && (shape[1] == 0 || shape[1] == 512) &&
+                    blob.size() == (size_t)shape[0] + shape[1]) {
+                    const float* spk = shape[1] == 512 ? blob.data() + cond_dim : nullptr;
+                    indextts_set_reference_cache(ctx_, blob.data(), cond_dim, spk, (int)shape[1]);
+                    ref_ready_ = true;
+                    if (!params.no_prints)
+                        fprintf(stderr, "crispasr[indextts]: using cached reference conditioning '%s'\n",
+                                cache_path.c_str());
+                }
+            }
+        }
+
+        // 2) Cache miss (and a voice is set) → load + resample the reference so
+        // this synthesize computes the conditioning; we freeze + save it after.
         const float* ref_pcm = nullptr;
         int ref_n_samples = 0;
         std::vector<float> ref_audio;
-
-        if (!voice_path_.empty()) {
+        const bool need_encode = !voice_path_.empty() && !ref_ready_;
+        if (need_encode) {
+            indextts_clear_reference_cache(ctx_); // force a fresh encode this call
             int sr = 0;
             if (crispasr::core::read_wav_mono_pcm16(voice_path_, ref_audio, sr)) {
-                // IndexTTS API expects 24kHz mono float32 PCM. Resample if needed.
                 if (sr != 24000 && sr > 0) {
                     ref_audio = core_audio::resample_polyphase(ref_audio.data(), (int)ref_audio.size(), sr, 24000);
                     if (!params.no_prints) {
@@ -152,6 +184,25 @@ public:
 
         int n = 0;
         float* pcm = indextts_synthesize(ctx_, text.c_str(), ref_pcm, ref_n_samples, &n);
+
+        // 3) After a fresh encode: freeze the conditioning for later chunks and
+        // write the disk cache.
+        if (need_encode && pcm && n > 0) {
+            indextts_mark_reference_cached(ctx_);
+            ref_ready_ = true;
+            const float* cond = nullptr;
+            const float* spk = nullptr;
+            int cond_n = 0, spk_n = 0;
+            if (cache_enabled && indextts_get_reference_cache(ctx_, &cond, &cond_n, &spk, &spk_n) == 0 && cond_n > 0) {
+                std::vector<float> blob(cond, cond + cond_n);
+                if (spk && spk_n == 512)
+                    blob.insert(blob.end(), spk, spk + 512);
+                crispasr_ref_cache::save_floats(cache_path, kIndexttsCacheTag, {(uint32_t)cond_n, (uint32_t)spk_n},
+                                                blob.data(), blob.size());
+                if (!params.no_prints)
+                    fprintf(stderr, "crispasr[indextts]: cached reference conditioning → '%s'\n", cache_path.c_str());
+            }
+        }
         if (!pcm || n <= 0) {
             fprintf(stderr, "crispasr[indextts]: synthesis failed\n");
             return {};
@@ -171,6 +222,7 @@ public:
 private:
     indextts_context* ctx_ = nullptr;
     std::string voice_path_;
+    bool ref_ready_ = false; // conditioning set on ctx_ (from cache or a prior encode)
 };
 
 } // namespace

@@ -21,6 +21,7 @@
  */
 
 #include "wav2vec2-ggml.h"
+#include "core/cpu_attention.h" // cpu_dot + cpu_online_softmax_accumulate (shared, #229)
 #include "core/ctc.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
@@ -313,18 +314,6 @@ static void layer_norm(const float* x, float* y, const float* w, const float* b,
 // GELU (exact tanh approximation)
 static inline float gelu(float x) {
     return 0.5f * x * (1.f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-}
-
-// Softmax in-place over n elements
-static void softmax(float* x, int n) {
-    float mx = *std::max_element(x, x + n);
-    float s = 0.f;
-    for (int i = 0; i < n; i++) {
-        x[i] = expf(x[i] - mx);
-        s += x[i];
-    }
-    for (int i = 0; i < n; i++)
-        x[i] /= s;
 }
 
 // InstanceNorm (GroupNorm with num_groups=C) on channel-first data [C, L].
@@ -1864,7 +1853,6 @@ std::vector<float> wav2vec2_compute_logits(const wav2vec2_model& m, const float*
     std::vector<float> attn_out(T * H);
     std::vector<float> ffn_mid(T * I);
     std::vector<float> ffn_out(T * H);
-    std::vector<float> scores(T);
 
     for (uint32_t li = 0; li < hp.num_hidden_layers; li++) {
         const auto& e = m.enc[li];
@@ -1879,27 +1867,21 @@ std::vector<float> wav2vec2_compute_logits(const wav2vec2_model& m, const float*
         ggml_linear_f32(scratch, e.v_w, tensor_data_f32(e.v_b), normed.data(), V_buf.data(), H, H, T, n_threads,
                         m.backend);
 
+        // Encoder self-attention, hand-rolled CPU path (O(T²) — the alignment
+        // bottleneck on long audio). Vectorized dot + flash-style online softmax,
+        // parallel over (head, query). Shared helpers in core/cpu_attention.h,
+        // same treatment as firered_asr (#229). Q/K/V are [T, H] row-major; for
+        // head h the values live at column offset h*head_dim with row stride H.
         std::fill(attn_out.begin(), attn_out.end(), 0.f);
+#pragma omp parallel for collapse(2) schedule(static)
         for (int h = 0; h < n_heads; h++) {
-            int off = h * head_dim;
             for (int tq = 0; tq < T; tq++) {
-                for (int tk = 0; tk < T; tk++) {
-                    float dot = 0.f;
-                    const float* q = Q_buf.data() + tq * H + off;
-                    const float* k = K_buf.data() + tk * H + off;
-                    for (int d = 0; d < head_dim; d++)
-                        dot += q[d] * k[d];
-                    scores[tk] = dot * scale;
-                }
-                softmax(scores.data(), T);
-
-                float* ao = attn_out.data() + tq * H + off;
-                for (int tv = 0; tv < T; tv++) {
-                    const float* v = V_buf.data() + tv * H + off;
-                    float s = scores[tv];
-                    for (int d = 0; d < head_dim; d++)
-                        ao[d] += s * v[d];
-                }
+                const int off = h * head_dim;
+                const float* q = Q_buf.data() + tq * H + off;
+                crispasr::cpu_attn::cpu_online_softmax_accumulate(
+                    T, head_dim, V_buf.data() + off, H, attn_out.data() + tq * H + off, [&](int tk) {
+                        return crispasr::cpu_attn::cpu_dot(q, K_buf.data() + tk * H + off, head_dim) * scale;
+                    });
             }
         }
 

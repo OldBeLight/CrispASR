@@ -57,6 +57,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_outetts_backend();
 #endif
 std::unique_ptr<CrispasrBackend> crispasr_make_zonos_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_f5_tts_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_irodori_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_bark_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_pocket_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_speecht5_backend();
@@ -158,6 +159,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
 #endif
     if (name == "f5-tts" || name == "f5_tts" || name == "f5tts" || name == "f5")
         return crispasr_make_f5_tts_backend();
+    if (name == "irodori-tts" || name == "irodori_tts" || name == "irodori")
+        return crispasr_make_irodori_tts_backend();
     if (name == "pocket-tts" || name == "pocket_tts" || name == "pockettts" || name == "pocket")
         return crispasr_make_pocket_tts_backend();
     if (name == "fastpitch" || name == "fastpitch-tts" || name == "fastpitch_tts")
@@ -683,6 +686,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "melotts";
             else if (a == "f5-tts" || a == "f5_tts" || a == "f5tts")
                 result = "f5-tts";
+            else if (a == "irodori-tts" || a == "irodori_tts" || a == "irodori")
+                result = "irodori-tts";
             else if (a == "chatterbox" || a == "chatterbox_turbo" || a == "kartoffelbox")
                 result = "chatterbox";
             else if (a == "tada" || a == "tada-tts" || a == "tada-1b" || a == "tada-tts-1b" || a == "tada-3b-ml")

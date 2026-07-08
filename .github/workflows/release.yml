@@ -23,6 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
       - name: Verify VERSION matches tag
         run: |
@@ -34,6 +35,32 @@ jobs:
             echo "::error::VERSION file ($file_version) does not match tag ($tag_version)"
             exit 1
           fi
+
+  # Releases must ship the current glint encoder: fail if the in-tree
+  # glint/ sync marker is behind github.com/CrispStrobe/glint main.
+  # Fix: run the "Sync glint" workflow (or tools/sync-glint.sh) and
+  # re-tag.
+  validate-glint-fresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Verify in-tree glint matches upstream main
+        run: |
+          synced="$(sed -n 's/.*Synced at upstream commit: `\([0-9a-f]*\)`.*/\1/p' glint/README.md)"
+          upstream="$(git ls-remote https://github.com/CrispStrobe/glint refs/heads/main | cut -f1)"
+          echo "in-tree: $synced  upstream main: $upstream"
+          if [ -z "$synced" ] || [ -z "$upstream" ]; then
+            echo "::error::could not read glint sync marker or upstream HEAD"
+            exit 1
+          fi
+          case "$upstream" in
+            "$synced"*) echo "glint is current" ;;
+            *) echo "::error::in-tree glint ($synced) is behind upstream main ($upstream); run the 'Sync glint' workflow and re-tag"
+               exit 1 ;;
+          esac
 
   build-linux:
     runs-on: ubuntu-22.04
@@ -70,6 +97,41 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-linux-x86_64.tar.gz
+          fail_on_unmatched_files: false
+
+  # ── WebAssembly build (browser: ASR + TTS, all backends) ─────────────────────
+  build-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Setup emsdk
+        uses: mymindstorm/setup-emsdk@v14
+
+      - name: Build WASM (all backends)
+        run: ./build-wasm.sh --clean
+
+      - name: Package
+        run: |
+          mkdir -p release/crispasr-wasm
+          cp build-wasm/bin/libwhisper.js build-wasm/bin/libwhisper.wasm release/crispasr-wasm/
+          [ -f build-wasm/bin/libwhisper.worker.js ] && cp build-wasm/bin/libwhisper.worker.js release/crispasr-wasm/ || true
+          printf 'CrispASR WebAssembly: libwhisper.js (global whisper_factory) + libwhisper.wasm.\nMultithreaded -> host page must be cross-origin isolated (COOP/COEP).\nTTS: Module.ttsOpenExplicit(model,backend,threads) -> ttsSetVoice(voice,"") -> ttsSynthesize(text) => Float32Array @24kHz.\nLoad files via Module.FS_createDataFile("/models",name,bytes,true,true).\n' > release/crispasr-wasm/README.txt
+          cd release && tar czf crispasr-wasm.tar.gz crispasr-wasm/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-wasm
+          path: release/crispasr-wasm.tar.gz
+
+      - name: Attach crispasr-wasm.tar.gz to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: release/crispasr-wasm.tar.gz
           fail_on_unmatched_files: false
 
   # ── Linux x86_64 CLI — AVX-512 + VNNI variant ────────────────────────────────
@@ -1621,6 +1683,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          submodules: recursive
           fetch-depth: 1
 
       - uses: actions/download-artifact@v4

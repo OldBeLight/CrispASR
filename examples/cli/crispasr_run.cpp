@@ -51,7 +51,9 @@
 #include "crispasr_watermark.h"
 #include "crispasr_watermark_dispatch.h"
 #include "crispasr_wav_writer.h"
-#include "common-crispasr.h" // read_audio_data
+#include "crispasr_mp3_writer.h" // MP3 output via in-tree glint encoder
+#include "crispasr_aac_writer.h" // AAC-LC (ADTS) output via in-tree glint encoder
+#include "common-crispasr.h"     // read_audio_data
 
 #include <algorithm>
 #include <atomic>
@@ -72,6 +74,46 @@
 #include <vector>
 
 namespace {
+
+// Serialize synthesized (TTS/S2S) float32 PCM to `out_path` — WAV by
+// default, MP3 or AAC-LC/ADTS (in-tree glint encoder) when the path
+// ends in .mp3 / .aac. All carry AI-provenance metadata (WAV LIST/INFO
+// chunk, MP3/AAC ID3v2 TXXX tag). C2PA Content Credentials signing is
+// WAV-only; requesting it with a lossy output warns instead of
+// silently dropping the manifest. Returns 0 on success, 16 on failure
+// (caller's exit code).
+static int crispasr_write_synth_audio(const std::string& out_path, const float* pcm, int n_samples, int sample_rate,
+                                      const std::string& c2pa_cert, const std::string& c2pa_key) {
+    auto has_ext = [&](const char* lo, const char* up) {
+        return out_path.size() >= 4 &&
+               (out_path.compare(out_path.size() - 4, 4, lo) == 0 || out_path.compare(out_path.size() - 4, 4, up) == 0);
+    };
+    const bool is_mp3 = has_ext(".mp3", ".MP3");
+    const bool is_aac = has_ext(".aac", ".AAC");
+    std::string blob;
+    if (is_mp3 || is_aac) {
+        blob = is_mp3 ? crispasr_make_mp3(pcm, n_samples, sample_rate) : crispasr_make_aac(pcm, n_samples, sample_rate);
+        if (blob.empty()) {
+            fprintf(stderr, "crispasr: error: %s encoding failed for '%s'\n", is_mp3 ? "MP3" : "AAC", out_path.c_str());
+            return 16;
+        }
+        if (!c2pa_cert.empty() || !c2pa_key.empty())
+            fprintf(stderr, "crispasr: warning: C2PA signing is WAV-only; '%s' is written unsigned\n",
+                    out_path.c_str());
+    } else {
+        blob = crispasr_make_wav_int16(pcm, n_samples, sample_rate);
+        // C2PA Content Credentials signing (when available + configured)
+        crispasr_c2pa_sign_wav(blob, c2pa_cert, c2pa_key);
+    }
+    FILE* fout = fopen(out_path.c_str(), "wb");
+    if (!fout) {
+        fprintf(stderr, "crispasr: error: cannot write '%s'\n", out_path.c_str());
+        return 16;
+    }
+    fwrite(blob.data(), 1, blob.size(), fout);
+    fclose(fout);
+    return 0;
+}
 
 // Apply FireRedPunc punctuation restoration to all segments.
 static void apply_punc_model(fireredpunc_context* punc_ctx, std::vector<crispasr_segment>& segs) {
@@ -2074,6 +2116,60 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // CLI `--tts` path to parity. Single-sentence input is a 1-element vector
         // (one std::vector move of overhead). The policy wrapper keeps VibeVoice
         // voice cloning single-shot (chunking breaks its continuous-prompt ICL).
+        // --tts-stream: emit each sentence chunk to stdout as raw s16le mono
+        // PCM as soon as it's synthesized (progressive playback), instead of
+        // concatenating into one WAV. Watermark is embedded per chunk; the
+        // spoken disclaimer (if voice-cloned) is emitted first. All logs stay
+        // on stderr so stdout is a clean PCM stream.
+        if (params.tts_stream) {
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr: streaming TTS as s16le mono @ %d Hz to stdout\n", sr_in);
+            auto emit = [&](std::vector<float>& pcm) {
+                if (pcm.empty())
+                    return;
+                crispasr_wm_dispatch::embed(pcm.data(), (int)pcm.size(), sr_in);
+                std::vector<int16_t> s16(pcm.size());
+                for (size_t i = 0; i < pcm.size(); i++) {
+                    float v = pcm[i] * 32767.0f;
+                    s16[i] = (int16_t)(v < -32768.0f ? -32768.0f : (v > 32767.0f ? 32767.0f : v));
+                }
+                fwrite(s16.data(), sizeof(int16_t), s16.size(), stdout);
+                fflush(stdout);
+            };
+            if (is_voice_clone && !params.tts_no_spoken_disclaimer) {
+                const auto& disc = crispasr_tts_get_disclaimer(backend.get(), params);
+                if (!disc.empty()) {
+                    std::vector<float> d(disc.begin(), disc.end());
+                    emit(d);
+                    std::vector<float> gap((size_t)sr_in / 5, 0.0f); // 200 ms
+                    emit(gap);
+                }
+            }
+            const std::vector<std::string> stream_chunks =
+                crispasr_tts_plan_chunks_for_backend(params.tts_text, backend->name());
+            bool any = false;
+            for (size_t ci = 0; ci < stream_chunks.size(); ci++) {
+                std::vector<float> c = backend->synthesize(stream_chunks[ci], params);
+                if (c.empty())
+                    continue;
+                if (any) {
+                    std::vector<float> gap((size_t)sr_in / 5, 0.0f); // 200 ms between chunks
+                    emit(gap);
+                }
+                emit(c);
+                any = true;
+            }
+            fflush(stdout);
+            crispasr_wm_dispatch::shutdown();
+            if (!any) {
+                fprintf(stderr, "crispasr: error: TTS synthesis failed\n");
+                return 15;
+            }
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr: TTS stream complete\n");
+            return 0;
+        }
+
         std::vector<float> audio;
         {
             const std::vector<std::string> chunks_txt =
@@ -2132,20 +2228,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // Embed watermark (AudioSeal if loaded, otherwise spread-spectrum)
         crispasr_wm_dispatch::embed(audio.data(), (int)audio.size(), sr_in);
 
-        // Write output WAV (backend-native sample rate, mono).
-        // crispasr_make_wav_int16 includes a LIST/INFO chunk with
-        // AI-provenance metadata (ISFT, ICMT).
+        // Write output audio (backend-native sample rate, mono) — WAV by
+        // default, MP3/AAC when --tts-output ends in .mp3/.aac.
         std::string out_path = params.tts_output.empty() ? "tts_output.wav" : params.tts_output;
-        std::string wav = crispasr_make_wav_int16(audio.data(), (int)audio.size(), sr_in);
-        // C2PA Content Credentials signing (when available + configured)
-        crispasr_c2pa_sign_wav(wav, params.c2pa_cert, params.c2pa_key);
-        FILE* fout = fopen(out_path.c_str(), "wb");
-        if (!fout) {
-            fprintf(stderr, "crispasr: error: cannot write '%s'\n", out_path.c_str());
-            return 16;
-        }
-        fwrite(wav.data(), 1, wav.size(), fout);
-        fclose(fout);
+        if (int rc = crispasr_write_synth_audio(out_path, audio.data(), (int)audio.size(), sr_in, params.c2pa_cert,
+                                                params.c2pa_key))
+            return rc;
 
         // Post-embed watermark verification: re-detect on the in-memory
         // PCM (which has already been watermarked) and warn if confidence
@@ -2225,17 +2313,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // Embed watermark
         crispasr_wm_dispatch::embed(audio.data(), (int)audio.size(), sr_out);
 
-        // Write output WAV
+        // Write output audio — WAV by default, MP3/AAC when --s2s-output
+        // ends in .mp3/.aac.
         std::string out_path = params.s2s_output.empty() ? "s2s_output.wav" : params.s2s_output;
-        std::string wav = crispasr_make_wav_int16(audio.data(), (int)audio.size(), sr_out);
-        crispasr_c2pa_sign_wav(wav, params.c2pa_cert, params.c2pa_key);
-        FILE* fout = fopen(out_path.c_str(), "wb");
-        if (!fout) {
-            fprintf(stderr, "crispasr: error: cannot write '%s'\n", out_path.c_str());
-            return 16;
-        }
-        fwrite(wav.data(), 1, wav.size(), fout);
-        fclose(fout);
+        if (int rc = crispasr_write_synth_audio(out_path, audio.data(), (int)audio.size(), sr_out, params.c2pa_cert,
+                                                params.c2pa_key))
+            return rc;
 
         if (!params.no_prints)
             fprintf(stderr, "crispasr: S2S output written to '%s' (%zu samples @ %d Hz, %.2f sec)\n", out_path.c_str(),

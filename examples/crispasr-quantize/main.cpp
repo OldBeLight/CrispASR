@@ -566,7 +566,12 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                          (sname.size() >= 2 && sname.substr(sname.size() - 2) == ".w") ||
                          (sname.find("_proj") != std::string::npos) || (sname.find(".gate") != std::string::npos) ||
                          (sname.find(".up") != std::string::npos) || (sname.find(".wo") != std::string::npos) ||
-                         (sname.find(".heads.") != std::string::npos);
+                         (sname.find(".heads.") != std::string::npos) ||
+                         // SwiGLU MLP (.w1/.w2/.w3) and attention QKV (.wq/.wk/.wv) — irodori-tts, f5-tts
+                         (sname.size() >= 3 && sname[sname.size() - 3] == '.' && sname[sname.size() - 2] == 'w' &&
+                          sname[sname.size() - 1] >= '1' && sname[sname.size() - 1] <= '9') ||
+                         (sname.find(".wq") != std::string::npos) || (sname.find(".wk") != std::string::npos) ||
+                         (sname.find(".wv") != std::string::npos);
         const bool ok_dims = (ggml_n_dims(t) == 2) || ((is_firered || is_ecapa) && ggml_n_dims(t) >= 2);
         const int64_t ncols = t->ne[0];
 

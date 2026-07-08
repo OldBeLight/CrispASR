@@ -809,37 +809,44 @@ Not candidates: `crispasr_strip_ascii_punctuation` / `crispasr_lowercase_ascii`
 
 ---
 
-## §177 VibeVoice #171 — remaining layers after the chunking fix (OPEN)
+## §177 VibeVoice #171 — remaining layer: RDNA4/RADV quantized-matmul path (OPEN)
 
-The server/CLI chunking divergence is fixed (§176, `crispasr_tts_chunking.cpp`
-prefix guard). Two layers from GH #171 remain, both needing the reporter's
-RDNA4 box (AMD RX 9070 XT, gfx1201) — we get clean audio on Metal +
-Vulkan/MoltenVK and cannot reproduce locally.
+Fixed so far: server/CLI chunking divergence (§176 prefix guard), the
+voice-prompt KV stride leak (server multi-request degradation — reporter
+confirmed gone at 71f0639), and the quant recipe (pred./at_conn./tts_eos.
+protected, b36248c1+5c8add40, all three HF repos regenerated). The reporter
+retested the regenerated q8_0 (sha256 confirmed = current HF file):
+**still broken, "identical result"** — the recipe was a real hardening but not
+his root cause. Superseded theory: item 1's "coopmat2 flash-attn" — his device
+line says `matrix cores: KHR_coopmat`, i.e. NV_coopmat2 is absent on RADV, so
+`GGML_VK_DISABLE_COOPMAT2=1` was always a no-op there (his earlier "COOPMAT2=1
+fixes it" observations were confounded by the then-unfixed server state leak).
 
-1. **RDNA4 coopmat2 flash-attn garbage.** Confirmed by the reporter:
-   `GGML_VK_DISABLE_COOPMAT2=1` fixes every broken sample. This is the
-   upstream ggml coopmat2 shader on RDNA4 (already filed upstream — see
-   `docs/prompts`/upstream-PR notes #19). **Action:** once upstream lands, or
-   as a stopgap, auto-disable coopmat2 flash-attn for the vibevoice TTS graph
-   on gfx12xx (the `VIBEVOICE_TTS_FLASH_ATTN=0` knob already bisects LM
-   attention; `VIBEVOICE_VAE_BACKEND=cpu` isolates the decoder). Set a safe
-   RDNA4 default rather than relying on the user-set env var.
+Current evidence (2026-07-06):
+- Failure signature: q8_0 breaks, f16 clean, same GPU (RX 9070 XT, RADV
+  GFX1201, `int dot: 1`); Metal + MoltenVK clean on the exact same q8_0 file
+  (fr voice, seed 42, all repro texts, ASR-roundtrip verbatim).
+- The only GPU code paths a q8_0 model takes that an f16 model never touches
+  are the quantized-matmul paths: int-dot MMQ / MMVQ (activations quantized to
+  q8_1) and the KHR_coopmat/scalar dequant matmul variants.
+- Disproof of "q8_1 activation-quant noise" as inherent cause: shipped
+  `GGML_VK_FORCE_INTEGER_DOT_PRODUCT=1` (e2da0d6e, CrispASR patch in vendored
+  ggml-vulkan) which enables int-dot on MoltenVK (extension present, only the
+  "accelerated" bit missing). Forced int-dot + `GGML_VK_FORCE_MMVQ=1` on M1:
+  clean, roundtrips verbatim. So the shader *logic* is fine; suspicion is a
+  RADV GFX1201 shader miscompile (his log: "radv is not a conformant Vulkan
+  implementation, testing use only" — early RDNA4 Mesa support). Vendored ggml
+  base 2026-05-05; no matching upstream correctness fix found since.
 
-2. **Cross-request statefulness** ("1st request correct; after N different
-   sentences the same input gives garbage" — server only, CLI is one
-   synthesize per process). The §176 chunking fix only *de-amplifies* this
-   (removes the 2-calls-per-request multiplier); it is not the root cause.
-   Suspect a scratch / cached voice-prompt KV buffer reused across
-   `vibevoice_synthesize()` calls that a numerically-bad request (RDNA4
-   coopmat2) poisons for subsequent ones — the logs show pos resets to 309
-   and "pre-filled KV from voice prompt" every request, so the leak is likely
-   in a *shared buffer behind* that refill, not the position counter.
-   **Action:** audit `vibevoice_synthesize` for state that survives between
-   calls (voice-KV cache tensors, compute scratch); add a session-level
-   "synthesize is idempotent across calls" test (synthesize A, then B×5, then
-   A again → byte-identical to the first A) on a reproducible backend. Ask the
-   reporter to re-test multi-request after §176 + `GGML_VK_DISABLE_COOPMAT2=1`
-   to see whether a residual leak remains once the numerics are clean.
+**Action:** reporter runs the knob matrix one-at-a-time on a broken sample
+(all env-only, no rebuild): `GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1`,
+`GGML_VK_DISABLE_MMVQ=1`, `GGML_VK_DISABLE_COOPMAT=1`, `GGML_VK_DISABLE_F16=1`,
+anchor `CRISPASR_N_GPU_LAYERS=0` (TTS LM layers → CPU). Also: Mesa upgrade /
+AMDVLK cross-check. Once one knob is confirmed → device-targeted safe default
+(RADV GFX12xx) in vendored ggml-vulkan + upstream report to ggml-org/llama.cpp
+with the minimal repro. Side note for the thread: his old
+`vibevoice-1.5b-bf16.gguf` predates `--include-decoder`; the current f16 on
+cstr/vibevoice-1.5b-GGUF has the decoder tensors.
 
 ---
 
@@ -7032,3 +7039,286 @@ right after `CUDA Graph id N reused`. CPU works.
   extra aggravator. Fix confirmed on hardware. Both Metal + forced-CUDA branches
   also compile clean. (Nice-to-have: an sm_80+ run to also exercise the
   capture-replay path, but the fix is already proven end-to-end.)
+
+## §224 Issue #222 follow-ups — silero LID ggml graph (DONE) + diarize/firered CPU perf (OPEN)
+
+Issue #222 (silero LID Vulkan segfault) fixed in `222b6781` (weights were
+GPU-loaded but the forward dereferenced `tensor->data`). Follow-up shipped in
+`a5b780f8`: the silero LID forward is now a ggml graph — CPU frontend
+(log-magnitude precision) + sched encoder (GPU on Metal/CUDA), 30 s slice cap
+(O(T²) attention; uncapped 10-min file = ~19 GB score alloc). Legacy scalar
+path gated `CRISPASR_SILERO_LID_LEGACY=1`. M1: 103 ms Metal / 183 ms CPU-ggml
+vs 241 ms Accelerate / 1014 ms scalar. A/B logit-matched on en/zh/multispeaker.
+
+**Vulkan (OPEN):** ggml-vulkan miscomputes one FFN MUL_MAT (f32 128×128×1101)
+in this graph on MoltenVK — allocation-layout dependent, identical-shape
+matmuls pass and fail in the same graph (TADA #192 class). Found with
+`-DGGML_VULKAN_CHECK_RESULTS=ON` (vendored CMakeLists now links ggml-cpu for
+that option). LID graph auto-routes to CPU on Vulkan;
+`CRISPASR_SILERO_LID_VULKAN=1` opts back in. TODO: verify on conformant RADV
+(reporter has RX 9070 XT) — may be MoltenVK-only; if it reproduces, minimal
+upstream repro.
+
+**Diarization CPU perf (DONE, 3340054f):** both models ported to ggml graphs,
+legacy paths gated as A/B ground truth. pyannote_seg 4.38 s → 0.55 s (31.5 s
+audio, M1), frame-identical (CRISPASR_PYANNOTE_LEGACY=1). TitaNet embeddings
+cos=1.000000; inverse-default: without Accelerate the scalar path measured
+**106–131 s per embedding** (the actual #222 "extremely slow" cause on Linux)
+→ 3.4 s ggml (~35×); with Accelerate the legacy AMX path (0.7 s) stays default
+(CRISPASR_TITANET_GGML=1 / CRISPASR_TITANET_LEGACY=1). OPEN: batch segments;
+F16 weights to close the ggml-vs-AMX gap on Apple.
+
+**FireRed ASR perf (PARTLY DONE, d6e2ad85):** measured split on 11 s jfk (M1):
+fbank 0.08 s + subsample 0.16 s + **encoder 11.3 s** + decoder ~0.5 s/step
+(beam=3, ~16 s) = 0.3× RT. Root cause of the CPU-only encoder: it relied on
+the sched auto-copying CPU weights to GPU, which ggml removed → silent
+regression. Fix: CRISPASR_FIRERED_ENC_GPU=1 split-loads enc.* to GPU —
+transcript-identical, encoder 2.3× on Metal, 2.1× on Vulkan/MoltenVK. CUDA A/B
+PASSED on Kaggle P100 (transcript-identical, enc 12.93→5.88 s, 2.2×) —
+default FLIPPED (ffa4afa0); CRISPASR_FIRERED_ENC_CPU=1 opts out. Decoder beam path DONE (bc8a599a):
+the beam loop was dequantizing all decoder weights to F32 and running
+scalar dots (8× the bytes of greedy's Q4_K kernels); now batched through
+ggml_matmat on the quantized weights — beam=3 16.8 s → 3.1 s (~70 ms/step,
+≈1.5× greedy as expected), transcript-identical en+zh; F32 fallback gated
+CRISPASR_FIRERED_BEAM_F32=1. Full 11 s-jfk pipeline: 36 s → ~8.5 s (M1).
+
+**§224e disease sweep (2026-07-06)** — audited all runtimes for the three
+disease classes cured this week (scalar forward / F32-dequant matmul / silent
+CPU-pinning after ggml removed sched auto-copy of CPU weights):
+- **ecapa_lid — CURED (e20599ee):** ASP+FC head was scalar on non-Apple
+  (~3.0 s of a 4.5 s detect; ecapa is the recommended --lid-backend). Head now
+  in-graph (titanet ASP recipe), inverse-default (Accelerate GEMM head, 57 ms,
+  stays default on Apple). Verified en/zh identical on Metal + Vulkan.
+  Remaining: trunk graph ~1.3 s on M1 — profile Metal residency.
+- **mimo_tokenizer — CURED (4027f37c):** weights now load on the compute
+  backend (all reads are tensor_get / host-cached RVQ codebooks → full GPU
+  residency safe). Smoke 22.4 s/71.7 s-user → 15.9 s/1.5 s-user; full
+  mimo-asr pipeline 10.3 → 7.6 s, transcripts char-identical en+zh.
+  CRISPASR_MIMO_TOK_CPU=1 restores CPU weights.
+- **pocket_tts — CURED differently (63ae5a43):** the actual hotspot was NOT
+  the backbone graphs but the eager mimi ENCODER re-run per invocation for
+  voice conditioning: SEANet scalar convs 27.5 s + per-timestep transformer
+  12.1 s. conv1d_ggml drop-in (identical layout contract) + batched
+  transformer linears via mul_mat on the F16 weights (attention math
+  untouched) → synthesis 43 → 5.6 s. Conditioning latents cos=0.99999994 vs
+  scalar; TTS→ASR roundtrip verbatim. CRISPASR_POCKET_MIMI_SCALAR=1 =
+  ground truth; POCKET_MIMI_DUMP=<path> dumps latents. The GPU-residency
+  split for the backbone remains possible but is no longer the bottleneck.
+  OPEN idea: cache conditioning latents keyed by voice-file hash (17 KB) to
+  skip re-encoding entirely on repeat runs.
+- **openvoice2 — OPEN (disease 1):** WaveNet (16 layers, bulk of voice
+  conversion) is hand-rolled conv, Accelerate on Apple / scalar elsewhere
+  (§176d note). Titanet-class cure; opt-in feature, measure first.
+- **firered_vad — OPEN (disease 1, low):** 8 DFSMN blocks scalar; small
+  model, opt-in --vad backend.
+- **chatterbox_campplus — OPEN (disease 1, low):** x-vector embed scalar;
+  once per voice-clone synthesis.
+- Healthy: mimo_asr (proper split-load with embed carve-out), fireredpunc,
+  ecapa trunk, firered_vad/titanet weight READS (tensor_get, device-safe),
+  lid_cld3/lid_fasttext (tiny text models).
+
+## §225 glint encoder in-tree — TTS/S2S MP3 + AAC output everywhere (DONE)
+
+Integrated our clean-room MP3 + AAC-LC encoder (sibling `glint` repo) as an
+in-tree copy at `glint/` (encoder core only, ~25 files; same
+develop-there/sync-here relationship as `ggml/`). Static lib, linked into `crispasr-cli`; SIMD
+kernels compile-time guarded + runtime dispatched, so no special flags.
+
+- `examples/cli/crispasr_mp3_writer.h` — header-only `crispasr_make_mp3()`:
+  mono CBR 128 kbps, `GLINT_QUALITY_NORMAL`, ID3v2 AI-provenance tag
+  prepended (`crispasr_make_id3v2_ai_tag`), non-MP3 rates linearly
+  resampled to nearest native rate (all TTS backends emit native rates).
+- Server `response_format=mp3` no longer needs libmp3lame — the 400
+  `codec_not_available` path is gone; both /v1/audio/speech and S2S routes
+  use the shared helper.
+- CLI: `--tts-output out.mp3` / `--s2s-output out.mp3` dispatch on
+  extension (`crispasr_write_synth_audio`); C2PA signing stays WAV-only
+  (warns on .mp3 instead of silently dropping the manifest).
+- libmp3lame kept as optional fallback: auto-used if glint fails, forced
+  via `CRISPASR_MP3_ENCODER=lame` (A/B); forced-lame failure falls back to
+  glint.
+- Verified: unit tests (`test_tts_provenance` `[mp3]` — ID3 prefix, frame
+  sync, CBR size, resample, invalid input), ffmpeg decode roundtrip of a
+  440 Hz sine (peak 440.0 Hz, RMS/duration exact), live pocket-tts →
+  `.mp3` → moonshine ASR roundtrip returns the input text verbatim, and
+  forced-lame path.
+- **AAC-LC (experimental)** also in: upstream's phase-1 AAC encoder
+  (long blocks, CBR-average, ADTS) shipped while this landed, so the
+  in-tree copy carries it — `response_format=aac` (audio/aac) and
+  `--tts-output out.aac` via `crispasr_aac_writer.h` (mono, 96 kbps
+  default, ID3v2 provenance tag prefixed — decoders skip it). Verified:
+  ADTS syncword unit tests, ffmpeg decode (LC profile, 440 Hz exact),
+  live pocket-tts → .aac → ffmpeg-decode → moonshine ASR verbatim.
+  Note: crispasr's *reader* can't ingest .aac without the libav
+  transcode build (pre-existing; plain ffmpeg .aac fails identically).
+- Streaming TTS still rejects mp3/aac (full-file encoding); glint has a
+  callback streaming API — chunked `audio/mpeg` streaming is a natural
+  follow-up if wanted.
+- **Auto-sync (§225b):** `tools/sync-glint.sh` + `sync-glint` workflow
+  (repository_dispatch `glint-push` from glint's notify-crispasr
+  workflow, daily cron fallback, manual dispatch) keep `glint/` at
+  upstream main's committed state — regenerates GLINT_SOURCES, bumps
+  the README sync marker, gates on `test_tts_provenance "[mp3],[aac]"`
+  before pushing. `validate-glint-fresh` in release.yml fails a release
+  whose marker is behind glint main, so releases always ship current
+  glint. Instant dispatch needs a `CRISPASR_SYNC_PAT` secret in the
+  glint repo (Contents r/w on CrispASR); without it the daily cron
+  covers it. First sync pulled the AAC psy-shaping upstream commit
+  (30fb4fcd, aac_psy.cpp auto-added to the source list).
+
+## §226 irodori-tts GPU + codec GGUF fix (DONE 864ebe2e / HF refresh)
+
+User-requested GPU enablement for the Irodori-TTS RF-DiT backend (all stages
+were already single-backend gallocr ggml graphs, but the backend hardcoded
+CPU). Now honors use_gpu (CLI adapter wired; session ABI already passed it);
+codec follows the compute backend except on Vulkan (CPU per TADA #192);
+CRISPASR_IRODORI_CPU / _CODEC_GPU / _CODEC_CPU override.
+
+Blocking baseline bug found+fixed on the way: the published
+dacvae-ja-32dim-f16.gguf predated the converter's wm_model final-conv export
+— missing pre.1.{weight,bias} (Conv 96→1) made the C++ decoder skip the
+final conv and die at GGML_ASSERT(nelements==ne0) on the 1-D reshape.
+Re-converted (converter on main was already correct) and re-uploaded to
+cstr/irodori-tts-GGUF, so `-m auto` users get the fix without a rebuild.
+
+M1 verify (seed 42, JA): CPU↔Metal waveform cos=0.999389, same RMS/ASR
+reading; 73.4 s → 31.4 s per 2 s synthesis (2.3×; CPU idle on GPU run).
+
+OPEN (upstream/parallel session): baseline generation QUALITY is still WIP —
+both CPU and GPU produce the same garbled JA speech (parity holds; the
+divergence is upstream of the backend split, likely DiT/ODE math vs the
+Python reference). Perf follow-up: ~120 DiT graph evals (40 ODE steps ×
+CFG) rebuild graph+gallocr per eval — cacheable, but mind the #215 cached-
+cgraph UAF pattern.
+
+## §227 starling comparison — CUDA decode-loop optimization options (ANALYSIS / OPEN)
+
+Context: sims1253/starling (CUDA-graph inference for ASR, RTX 5090, bf16)
+benchmarks CrispASR as an external engine and overlaps our model fleet
+(granite-speech, parakeet-tdt-v3, MOSS-Transcribe, qwen3-asr, ARK-ASR-3B,
+higgs-audio-v3-stt, cohere-transcribe — several via OUR cstr/* GGUF
+conversions). Repo cloned to ~/code/starling; read 2026-07-06. Their claim:
+stock transformers decode is launch-bound (GPU ~10% busy) → capturing decode
+steps + multi-step token loops into CUDA graphs gives 27–1180× vs 3–66×
+stock, byte-identical output, WER-verified on Open ASR Leaderboard repro.
+
+### Benchmark-fairness action (cheap, reputational)
+
+Their CrispASR adapter (benchmarks/engines.py:722, scripts/
+bench_qwen3_crispasr.py) times ONE FULL CLI SUBPROCESS PER CLIP — including
+process start + multi-GB F16 GGUF disk load + CUDA weight upload on EVERY
+rep — while starling/stock numbers exclude model load and use warm reps.
+Cold-start seconds get labeled as engine speed on short clips. No crispasr
+numbers are published in their repo yet (engine silently skipped without the
+author-local ~/asr-bench install), so the columns could appear any time.
+- [ ] Contact author: benchmark `crispasr-server` (resident model — matches
+      their own server mode) or parse our stderr phase timings; offer setup
+      help. Alternatively contribute a resident-mode adapter PR to starling.
+- [ ] Consider a documented "benchmarking CrispASR" recipe in docs/ (server
+      mode, warm reps, phase-timing flags) so third-party benchers measure
+      transcribe time, not cold start.
+
+### Optimization options extracted (ordered by evidence)
+
+0. **GATE EVERYTHING on a decode-utilization profile.** One Kaggle T4/P100
+   run: GPU-busy% during granite/qwen3-asr AR decode (nvidia-smi dmon or
+   nsys). If ggml decode is already 60%+ busy, options 2–4 are duds like the
+   CPU/Metal analogs (§210 Metal ICB ceiling 1.8%; vibevoice CPU cache A/B
+   0%, byte-identical). If ~10–20% busy (starling's stock baseline), proceed.
+1. **Keep per-step graphs capture-friendly (mostly done, free).** ggml-cuda
+   already captures stable per-step graphs into CUDA graphs. Capture keys on
+   the split graph — alternating different graphs on one sched (and shape
+   churn like the "graph has different number of nodes → reserving" respam)
+   defeats both the gallocr AND capture. The #171 per-purpose dedicated
+   scheds (pred head, per-KV-path LM steps) already improved this; audit
+   other AR backends for the same pattern where a decode loop shares a sched
+   with helper graphs (EOS classifiers, connectors).
+2. **Multi-step token-loop unroll (the real starling edge; CUDA-only).**
+   Unroll K greedy decode steps into ONE graph: in-graph GGML_OP_ARGMAX →
+   get_rows embedding feedback → static per-step KV positions; host sync
+   drops from per-token to per-K-tokens; EOS checked per block (≤K−1 wasted
+   steps); byte-exact for greedy. Topology is stable per (n_past bucket, K)
+   → single capture replay per block. Substantial engineering and EXACTLY
+   the cached-graph minefield of #171/#184/#220 — invariant applies: one
+   graph per sched, or last-allocated-only. Do not start before option 0
+   numbers exist.
+3. **Self-speculative draft from CTC head (granite only).** starling drafts
+   from granite's encoder CTC head and verifies with the LLM — no extra
+   model. We already have granite CTC infrastructure. Their caveat: batched
+   spec at B≥16 LOSES (0.76×, lock-step rewind waste); B=1 spec is the win.
+4. **Fused RMSNorm/SwiGLU steps** — ggml-cuda already fuses some of this;
+   only worth auditing if option 0 shows launch-bound decode with capture ON.
+
+### Anti-options (their negative results transfer or confirm ours)
+
+- INT8 weight-only quant on CUDA decode: SLOWER for them (launch-bound, not
+  bandwidth-bound) — matches our ONNX-int8-10×-slower-on-CUDA-EP datapoint.
+  Quant remains a CPU/Metal bandwidth win, not a CUDA decode win.
+- Graph caching per shape without eviction: their parakeet/ark RTFx is
+  DEPRESSED by per-clip capture cost at high shape diversity (their own
+  footnote) — shape-bucketed graph caches hurt there too; mirrors our
+  vibevoice/chatterbox cache-A/B duds.
+- torch.compile-style encoder fusion: not byte-exact for them (fp32 upcast +
+  BatchNorm amplification) — reinforces our decoded-output A/B mandate.
+
+
+## §228 Issue #221 irodori-tts follow-ups — cloning, emoji, caching, streaming (bakamomi)
+
+Follow-ups after the #221 base port. Reporter (bakamomi) is on an RTX 5070 Ti
+(CUDA) + AMD iGPU (Vulkan). See [[project_221_irodori_voice_cloning]].
+
+### DONE (2026-07-07, all on main)
+
+- **Emoji emotion control** — two fixes. (a) `core_spm::tokenize` collapsed to
+  BOS on any OOV multibyte codepoint (6029a51a); (b) the real one: OOV emoji
+  must use SentencePiece **byte_fallback** → `<0xHH>` tokens (the model's
+  learned controls), not `<unk>` noise (c5a69fc9). C++ tokens now byte-for-byte
+  == HF llm-jp-3.
+- **Zero-shot voice cloning** — ported the DAC-VAE encoder (audio→latent, BS.1770
+  −16 LUFS) + wired the two hardcoded "unconditional" defaults that ignored the
+  reference (6fec8338); speaker CFG (c1b9becf). Encoder-enabled codec uploaded to
+  cstr/irodori-tts-GGUF. spk-sim 0.08→0.65 (~91% of the repo's own sample).
+- **Duration predictor** — the `6.3 frames/token` heuristic truncated kanji-heavy
+  text; wired the model's token-sum duration predictor (05a7d0ad). Exact vs
+  reference given same text_state.
+- **Reference-conditioning cache** — generic `crispasr_tts_ref_cache.h` ("CRC1")
+  wired into irodori (`.iro32latent`), indextts (Conformer/Perceiver + ECAPA,
+  `.idxcond`), f5 (whisper transcript, `.f5reftext`); byte-identical reuse
+  (fba33a0c). indextts also caches across chunks in-session.
+- **Chunked codec decode** — overlap-save DAC-VAE decode bounds peak memory;
+  EXACT (cos=1.0, all seams 0), auto for long outputs (39ad4657).
+- **Streaming** — server already streamed per-sentence; added CLI `--tts-stream`
+  (s16le to stdout, 91f6d3f9) + C ABI `crispasr_session_synthesize_streaming`
+  (thin per-sentence wrapper, 1f6f0f60).
+
+### OPEN — pending follow-ups (priority order)
+
+- [ ] **Vulkan encode/decode for the DAC-VAE codec.** Codec runs on CPU under
+      Vulkan today (deliberate gallocr-safety fallback, cf. §192 TADA codec
+      corruption). bakamomi's AMD iGPU only accelerates the DiT/ODE; encode +
+      decode are CPU-bound. Port the codec graphs to Vulkan (or fix the gallocr
+      path that forced the CPU fallback). Largest item.
+- [ ] **Low-step first-segment streaming (single-utterance TTFB).** For a
+      diffusion model, per-sentence streaming (shipped) is the real win; the ODE
+      generates the whole utterance before decode, so intra-utterance
+      decode-streaming is ~free of TTFB benefit. The remaining lever is bakamomi's
+      "diffuse a short first segment at low ODE steps → emit → diffuse the rest at
+      full steps". Requires segmenting generation (sub-sentence) + exposing
+      first-chunk size/steps knobs; risk = first-chunk quality + prosody
+      discontinuity on a joint-attention DiT. Prototype + A/B before default.
+- [ ] **Irodori VoiceDesign backend** (Aratako/Irodori-TTS-600M-v3-VoiceDesign).
+      Natural-language voice *description* instead of a reference clip → a caption
+      encoder + a distinct model, so a new backend rather than a flag. Config
+      already exposes `caption_*` fields (use_caption_condition, caption_dim,
+      caption_tokenizer_repo, cfg_scale_caption) and the DiT has the caption
+      cross-attn path. Track as its own feature issue.
+- [ ] **C ABI intra-utterance streaming (optional).** The C ABI streaming wrapper
+      is per-sentence (reuses session_synthesize). True CAP_STREAMING-style
+      intra-utterance emission from the C ABI would need the session TTS path to
+      go through a common interface (it's ~20 inline per-backend `*_ctx` branches
+      today) + a TTS sample-rate accessor. Only worth it if an embedder needs
+      sub-sentence latency; low value for diffusion backends.
+- [ ] **Ref-cache for remaining cloning backends** (cheap ones deprioritized).
+      cosyvoice3 already has baked voice bundles; csm/melotts speaker embeds are
+      comparatively cheap. Wire on demand via the shared helper + a get/set
+      conditioning pair per backend.

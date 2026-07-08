@@ -146,6 +146,15 @@ struct vibevoice_context {
     ggml_cgraph* pred_graph = nullptr;
     int pred_graph_n_frames = 0;
     std::vector<uint8_t> pred_graph_meta;
+    // Dedicated scheduler for the cached pred-head graph. A cached graph's
+    // tensors keep the buffer pointers assigned by the LAST alloc on its
+    // scheduler; if any OTHER graph on the same scheduler forces the
+    // gallocr to grow (free + realloc its compute buffer), those pointers
+    // dangle and the next sched_alloc_graph of the cached graph reads a
+    // freed ggml_backend_buffer in split_graph (issue #171 CPU segfault,
+    // ASan heap-use-after-free). A private sched only ever sees this one
+    // fixed-topology graph, so its gallocr never reallocates under it.
+    ggml_backend_sched_t pred_sched = nullptr;
     // §201 Lk-bucketed TTS LM step graphs (positive + negative KV paths)
     struct LmBucket {
         int lk = 0;
@@ -157,7 +166,16 @@ struct vibevoice_context {
     static constexpr int kLmBucketLks[kLmNBuckets] = {128, 256, 512, 1024};
     std::array<LmBucket, kLmNBuckets> lm_buckets_pos{};
     std::array<LmBucket, kLmNBuckets> lm_buckets_neg{};
-    ggml_backend_sched_t lm_step_sched = nullptr;
+    // One scheduler per KV path (0=positive, 1=negative). The CFG loop
+    // alternates positive/negative LM steps every frame; if both cached
+    // bucket graphs shared one scheduler, each alternation with different
+    // bucket sizes would realloc the gallocr and dangle the other graph's
+    // buffer pointers (same use-after-free class as pred_sched above —
+    // this is what "CUDA illegal memory access" in issue #184 was).
+    ggml_backend_sched_t lm_step_sched[2] = {nullptr, nullptr};
+    // Bucket index of the graph most recently allocated on each scheduler.
+    // Only that graph's buffer pointers are valid; switching buckets must
+    // rebuild the incoming graph (see run_lm_step).
     int lm_active_bucket_pos = -1;
     int lm_active_bucket_neg = -1;
 };
@@ -174,6 +192,7 @@ extern "C" struct vibevoice_context_params vibevoice_context_default_params(void
     p.use_gpu = true;
     p.tts_steps = 20;
     p.seed = 0;
+    p.cfg_scale = 0.0f;
     p.flash_attn = true;
     return p;
 }
@@ -376,6 +395,11 @@ extern "C" void vibevoice_set_seed(struct vibevoice_context* ctx, uint32_t seed)
         ctx->params.seed = seed;
 }
 
+extern "C" void vibevoice_set_cfg_scale(struct vibevoice_context* ctx, float scale) {
+    if (ctx)
+        ctx->params.cfg_scale = scale > 0.0f ? scale : 0.0f;
+}
+
 extern "C" void vibevoice_free(struct vibevoice_context* ctx) {
     if (!ctx)
         return;
@@ -387,8 +411,11 @@ extern "C" void vibevoice_free(struct vibevoice_context* ctx) {
     for (auto& bk : ctx->lm_buckets_neg)
         if (bk.ctx)
             ggml_free(bk.ctx);
-    if (ctx->lm_step_sched)
-        ggml_backend_sched_free(ctx->lm_step_sched);
+    for (int i = 0; i < 2; i++)
+        if (ctx->lm_step_sched[i])
+            ggml_backend_sched_free(ctx->lm_step_sched[i]);
+    if (ctx->pred_sched)
+        ggml_backend_sched_free(ctx->pred_sched);
     if (ctx->kv_neg_buf)
         ggml_backend_buffer_free(ctx->kv_neg_buf);
     if (ctx->kv_neg_ctx)
@@ -642,9 +669,50 @@ static ggml_cgraph* build_tokenizer_encoder_graph(vibevoice_context* ctx, const 
 // Stage helpers (shared by public stage API and vibevoice_transcribe)
 // ===========================================================================
 
-// Run one tokenizer encoder. Returns [vae_dim * T] row-major, frame-first.
-static std::vector<float> run_encoder_stage(vibevoice_context* ctx, const char* prefix, const float* samples,
-                                            int n_samples, int* out_T, int* out_vae_dim) {
+// Cap per-chunk raw audio length fed to the encoder in one graph-build-
+// and-compute call. ggml's CUDA unary-op kernels (e.g. GELU,
+// ggml/src/ggml-cuda/unary.cu) take the element count as a 32-bit `int`.
+// The encoder's stage-0 FFN GELU runs on a [C_ffn=128, T] tensor with
+// stride 1 (T = n_samples, not yet downsampled), so INT32_MAX/128 ≈ 698.9s
+// @ 24kHz overflows the CUDA kernel launch ("invalid argument"). 300s is
+// comfortably under that, with ~2.3x margin for any other similarly-shaped
+// op, and needs only ~12 chunks for a full 60-minute recording.
+// Override: CRISPASR_VIBEVOICE_ENCODER_CHUNK_SECONDS (default 300).
+static constexpr int VIBEVOICE_ENCODER_MAX_CHUNK_SAMPLES_DEFAULT = 300 * 24000;
+
+// Left-context audio prepended to every chunk after the first, in samples.
+// The encoder is causal-only (build_causal_conv1d/build_causal_dw_conv1d
+// both left-pad only), so a hard cut at a chunk boundary would otherwise
+// feed the first several output frames zero history instead of real
+// preceding audio. 10s is a generous bound on the encoder's true receptive
+// field summed across all 7 ConvNeXt stages.
+// Override: CRISPASR_VIBEVOICE_ENCODER_CONTEXT_SECONDS (default 10).
+static constexpr int VIBEVOICE_ENCODER_LEFT_CONTEXT_SAMPLES_DEFAULT = 10 * 24000;
+
+static int vibevoice_encoder_max_chunk_samples() {
+    const char* v = getenv("CRISPASR_VIBEVOICE_ENCODER_CHUNK_SECONDS");
+    if (v && v[0]) {
+        int s = atoi(v);
+        if (s > 0)
+            return s * 24000;
+    }
+    return VIBEVOICE_ENCODER_MAX_CHUNK_SAMPLES_DEFAULT;
+}
+
+static int vibevoice_encoder_left_context_samples() {
+    const char* v = getenv("CRISPASR_VIBEVOICE_ENCODER_CONTEXT_SECONDS");
+    if (v && v[0]) {
+        int s = atoi(v);
+        if (s > 0)
+            return s * 24000;
+    }
+    return VIBEVOICE_ENCODER_LEFT_CONTEXT_SAMPLES_DEFAULT;
+}
+
+// Run one tokenizer encoder call: a single graph build + compute, no
+// chunking. Returns [vae_dim * T] row-major, frame-first.
+static std::vector<float> run_encoder_stage_one_call(vibevoice_context* ctx, const char* prefix, const float* samples,
+                                                     int n_samples, int* out_T, int* out_vae_dim) {
     ggml_cgraph* gf = build_tokenizer_encoder_graph(ctx, prefix, n_samples);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
@@ -660,13 +728,91 @@ static std::vector<float> run_encoder_stage(vibevoice_context* ctx, const char* 
     ggml_tensor* out = ggml_graph_get_tensor(gf, "encoder_out");
     int vae_dim = (int)out->ne[0];
     int T = (int)out->ne[1];
-    std::vector<float> mean(vae_dim * T);
-    ggml_backend_tensor_get(out, mean.data(), 0, vae_dim * T * sizeof(float));
+    std::vector<float> mean((size_t)vae_dim * T);
+    ggml_backend_tensor_get(out, mean.data(), 0, (size_t)vae_dim * T * sizeof(float));
     if (out_T)
         *out_T = T;
     if (out_vae_dim)
         *out_vae_dim = vae_dim;
     return mean;
+}
+
+// Run one tokenizer encoder ("at_enc" acoustic or "st_enc" semantic) over
+// arbitrarily long raw audio. Returns [vae_dim * T] row-major, frame-first
+// — same contract as before chunking was added, so every caller (the
+// exported vibevoice_run_acoustic_encoder/vibevoice_run_semantic_encoder/
+// vibevoice_encode_speech stage API, vibevoice_transcribe_impl, and the TTS
+// voice-cloning reference-encode path) gets the fix for free.
+//
+// Splits audio longer than VIBEVOICE_ENCODER_MAX_CHUNK_SAMPLES into chunks
+// to avoid the CUDA int32 overflow above, using overlap-and-discard: each
+// chunk after the first is extended with VIBEVOICE_ENCODER_LEFT_CONTEXT_SAMPLES
+// of real preceding audio so the causal convs see true history, then the
+// frames covering that extension are discarded before stitching. The
+// discard count is measured empirically — by running the encoder on the
+// left-context prefix alone and counting its output frames — rather than
+// computed analytically, since build_causal_conv1d's stride-alignment
+// right-padding makes an exact closed-form frame count fragile to derive
+// across all 7 stages.
+static std::vector<float> run_encoder_stage(vibevoice_context* ctx, const char* prefix, const float* samples,
+                                            int n_samples, int* out_T, int* out_vae_dim) {
+    const int max_chunk = vibevoice_encoder_max_chunk_samples();
+    const int left_ctx = vibevoice_encoder_left_context_samples();
+    const int n_chunks = (n_samples + max_chunk - 1) / max_chunk;
+    if (n_chunks <= 1)
+        return run_encoder_stage_one_call(ctx, prefix, samples, n_samples, out_T, out_vae_dim);
+
+    if (ctx->params.verbosity >= 1)
+        fprintf(stderr, "vibevoice: %s: audio %.1fs exceeds %ds encoder chunk limit, splitting into %d chunks\n",
+                prefix, n_samples / 24000.0f, max_chunk / 24000, n_chunks);
+
+    // Measure discard_T once: the left-context length is constant for all
+    // chunks after the first, so encoding the prefix once gives us the
+    // frame count to discard for every subsequent chunk — no need to
+    // re-run the encoder on the prefix per chunk.
+    int discard_T = 0;
+    if (left_ctx > 0) {
+        // Use the actual context length that chunk 1 will see (may be
+        // clamped if chunk_start < left_ctx, but for chunk 1 with
+        // chunk_start = max_chunk that's always the full left_ctx).
+        const int ctx_len = std::min(left_ctx, max_chunk);
+        int prefix_vae_dim = 0;
+        auto prefix_mean = run_encoder_stage_one_call(ctx, prefix, samples, ctx_len, &discard_T, &prefix_vae_dim);
+        if (prefix_mean.empty()) {
+            fprintf(stderr, "vibevoice: %s: left-context measurement failed\n", prefix);
+            return {};
+        }
+        if (ctx->params.verbosity >= 1)
+            fprintf(stderr, "vibevoice: %s: left-context %ds → %d encoder frames to discard per chunk\n", prefix,
+                    ctx_len / 24000, discard_T);
+    }
+
+    std::vector<float> out_mean;
+    int total_T = 0;
+    int vae_dim = 0;
+    for (int c = 0; c < n_chunks; c++) {
+        const int chunk_start = c * max_chunk;
+        const int chunk_end = std::min(n_samples, chunk_start + max_chunk);
+        const int raw_start = (c == 0) ? 0 : std::max(0, chunk_start - left_ctx);
+        const int cur_discard = (c == 0) ? 0 : discard_T;
+
+        int chunk_T = 0, chunk_vae_dim = 0;
+        auto chunk_mean = run_encoder_stage_one_call(ctx, prefix, samples + raw_start, chunk_end - raw_start, &chunk_T,
+                                                     &chunk_vae_dim);
+        if (chunk_mean.empty()) {
+            fprintf(stderr, "vibevoice: %s: encoder failed on chunk %d/%d\n", prefix, c + 1, n_chunks);
+            return {};
+        }
+        vae_dim = chunk_vae_dim;
+        const int skip = std::min(cur_discard, chunk_T); // defensive clamp
+        out_mean.insert(out_mean.end(), chunk_mean.begin() + (size_t)skip * chunk_vae_dim, chunk_mean.end());
+        total_T += chunk_T - skip;
+    }
+    if (out_T)
+        *out_T = total_T;
+    if (out_vae_dim)
+        *out_vae_dim = vae_dim;
+    return out_mean;
 }
 
 // Run one SpeechConnector (FC1 → RMSNorm → FC2) via ggml graph.
@@ -920,12 +1066,19 @@ extern "C" float* vibevoice_encode_speech(struct vibevoice_context* ctx, const f
 // Transcribe
 // ===========================================================================
 
+// Defined later in this file (Qwen2 tokenizer encode section); forward
+// declared so vibevoice_transcribe_impl can use it for --context injection.
+static std::vector<int32_t> tokenize_text_bpe_vocab_rank(const vibevoice_model& m, const std::string& text);
+
 // Internal: shared implementation for `vibevoice_transcribe` and
 // `vibevoice_transcribe_with_probs`. When `out_token_ids` and
 // `out_token_probs` are non-null, both are populated in lock-step with the
-// emitted (non-stop) tokens. Returns malloc'd UTF-8 transcript.
+// emitted (non-stop) tokens. `context` is optional hotword/metadata text
+// (NULL/empty/whitespace-only falls back to the default prompt). Returns
+// malloc'd UTF-8 transcript.
 static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const float* samples, int n_samples,
-                                       std::vector<int32_t>* out_token_ids, std::vector<float>* out_token_probs) {
+                                       std::vector<int32_t>* out_token_ids, std::vector<float>* out_token_probs,
+                                       const char* context) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
 
@@ -970,78 +1123,30 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "vibevoice: %d samples (%.2fs at 24kHz)\n", n_samples, n_samples / 24000.0f);
 
-    // 1. Run acoustic tokenizer encoder
-    if (ctx->params.verbosity >= 1)
-        fprintf(stderr, "vibevoice: running acoustic encoder...\n");
-
-    ggml_cgraph* gf_at = build_tokenizer_encoder_graph(ctx, "at_enc", n_samples);
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf_at)) {
-        fprintf(stderr, "vibevoice: acoustic encoder graph alloc failed\n");
-        return nullptr;
+    // 1-4. Encode raw audio into combined acoustic+semantic speech features
+    // via the shared vibevoice_encode_speech() stage API (encoder+encoder+
+    // connector+connector+sum). Its encoder calls internally chunk long
+    // audio to avoid a CUDA int32 overflow (see run_encoder_stage above)
+    // while the LLM decode below still runs as a single pass over the
+    // whole feature sequence, so global context / diarization consistency
+    // across the recording is unaffected.
+    std::vector<float> speech_features;
+    int T_audio = 0;
+    {
+        int n_frames = 0, d_lm_out = 0;
+        float* feat = vibevoice_encode_speech(ctx, samples, n_samples, &n_frames, &d_lm_out);
+        if (!feat) {
+            fprintf(stderr, "vibevoice: encoder/connector failed\n");
+            return nullptr;
+        }
+        speech_features.assign(feat, feat + (size_t)n_frames * d_lm_out);
+        free(feat);
+        T_audio = n_frames;
     }
 
-    ggml_tensor* inp_t = ggml_graph_get_tensor(gf_at, "audio_in");
-    // Input is [C=1, T=n_samples] → ne[0]=1, ne[1]=n_samples
-    // The flat data is [sample_0, sample_1, ...] which maps to ne[1] varying fastest
-    // In ggml column-major: data[c * T + t] = data[0 * T + t] = data[t]
-    // So just write the samples directly
-    ggml_backend_tensor_set(inp_t, samples, 0, n_samples * sizeof(float));
-
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf_at) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "vibevoice: acoustic encoder compute failed\n");
-        return nullptr;
-    }
-
-    ggml_tensor* at_out = ggml_graph_get_tensor(gf_at, "encoder_out");
-    int vae_dim_at = (int)at_out->ne[0];
-    int T_audio = (int)at_out->ne[1];
-    std::vector<float> acoustic_mean(vae_dim_at * T_audio);
-    ggml_backend_tensor_get(at_out, acoustic_mean.data(), 0, vae_dim_at * T_audio * sizeof(float));
-
-    if (ctx->params.verbosity >= 1)
-        fprintf(stderr, "vibevoice: acoustic encoder: [%d, %d] (vae_dim=%d, frames=%d)\n", vae_dim_at, T_audio,
-                vae_dim_at, T_audio);
-
-    // 2. Run semantic tokenizer encoder
-    if (ctx->params.verbosity >= 1)
-        fprintf(stderr, "vibevoice: running semantic encoder...\n");
-
-    ggml_cgraph* gf_st = build_tokenizer_encoder_graph(ctx, "st_enc", n_samples);
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf_st)) {
-        fprintf(stderr, "vibevoice: semantic encoder graph alloc failed\n");
-        return nullptr;
-    }
-    ggml_tensor* inp_st = ggml_graph_get_tensor(gf_st, "audio_in");
-    ggml_backend_tensor_set(inp_st, samples, 0, n_samples * sizeof(float));
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf_st) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "vibevoice: semantic encoder compute failed\n");
-        return nullptr;
-    }
-    ggml_tensor* st_out = ggml_graph_get_tensor(gf_st, "encoder_out");
-    int vae_dim_st = (int)st_out->ne[0];
-    int T_sem = (int)st_out->ne[1];
-    std::vector<float> semantic_mean(vae_dim_st * T_sem);
-    ggml_backend_tensor_get(st_out, semantic_mean.data(), 0, vae_dim_st * T_sem * sizeof(float));
-
-    if (ctx->params.verbosity >= 1)
-        fprintf(stderr, "vibevoice: semantic encoder: [%d, %d]\n", vae_dim_st, T_sem);
-
-    // 3. Run connectors via ggml graph (handles Q4_K and any quantized weight type)
-    auto acoustic_features = run_connector_stage(ctx, "at_conn", acoustic_mean.data(), T_audio, vae_dim_at);
-    auto semantic_features = run_connector_stage(ctx, "se_conn", semantic_mean.data(), T_sem, vae_dim_st);
-    if (acoustic_features.empty() || semantic_features.empty()) {
-        fprintf(stderr, "vibevoice: connector failed\n");
-        return nullptr;
-    }
-
-    if (ctx->params.verbosity >= 1)
-        fprintf(stderr, "vibevoice: connectors done: acoustic=[%d,%d] semantic=[%d,%d]\n", T_audio, hp.d_lm, T_sem,
-                hp.d_lm);
-
-    // 4. Combine acoustic + semantic features (element-wise sum)
-    // Debug: optionally inject Python reference features
+    // Debug: optionally inject Python reference features (whole-buffer
+    // override of the features computed above; only used for short
+    // single-chunk reference clips in stage-diff testing).
     const char* ref_features_path = getenv("VIBEVOICE_REF_FEATURES");
     if (ref_features_path && ref_features_path[0]) {
         FILE* f = fopen(ref_features_path, "rb");
@@ -1050,28 +1155,28 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
             int n = (int)(ftell(f) / sizeof(float));
             fseek(f, 0, SEEK_SET);
             // Reference is [T, d_lm] = [83, 1536]
-            int T_ref = n / hp.d_lm;
-            std::vector<float> ref_features(n);
-            size_t rd = fread(ref_features.data(), sizeof(float), n, f);
-            fclose(f);
-            (void)rd;
-            fprintf(stderr, "vibevoice: INJECTING reference features [%d, %d] from %s\n", T_ref, hp.d_lm,
-                    ref_features_path);
-            // Replace features with reference
-            T_audio = T_ref;
-            T_sem = T_ref;
-            acoustic_features.resize(T_ref * hp.d_lm);
-            semantic_features.assign(T_ref * hp.d_lm, 0.0f); // zero semantic — ref already combined
-            memcpy(acoustic_features.data(), ref_features.data(), T_ref * hp.d_lm * sizeof(float));
+            if (n <= 0 || n % hp.d_lm != 0) {
+                fprintf(stderr,
+                        "vibevoice: VIBEVOICE_REF_FEATURES '%s' has %d floats, not a positive multiple of "
+                        "d_lm=%d -- ignoring\n",
+                        ref_features_path, n, hp.d_lm);
+                fclose(f);
+            } else {
+                int T_ref = n / hp.d_lm;
+                speech_features.assign((size_t)T_ref * hp.d_lm, 0.0f);
+                size_t rd = fread(speech_features.data(), sizeof(float), speech_features.size(), f);
+                fclose(f);
+                if (rd != speech_features.size()) {
+                    fprintf(stderr, "vibevoice: VIBEVOICE_REF_FEATURES '%s' short read (%zu of %zu floats)\n",
+                            ref_features_path, rd, speech_features.size());
+                    return nullptr;
+                }
+                fprintf(stderr, "vibevoice: INJECTING reference features [%d, %d] from %s\n", T_ref, hp.d_lm,
+                        ref_features_path);
+                T_audio = T_ref;
+            }
         }
     }
-    if (T_audio != T_sem) {
-        fprintf(stderr, "vibevoice: frame mismatch: acoustic=%d, semantic=%d\n", T_audio, T_sem);
-        return nullptr;
-    }
-    std::vector<float> speech_features(T_audio * hp.d_lm);
-    for (int i = 0; i < T_audio * hp.d_lm; i++)
-        speech_features[i] = acoustic_features[i] + semantic_features[i];
 
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "vibevoice: speech features combined: [%d, %d]\n", T_audio, hp.d_lm);
@@ -1097,30 +1202,95 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
         7699,     1946,   1119, 1467,     2550,  304, 4718, 3561,  13, // audio input into text output in JSON format.
         198,      IM_END, 198,  IM_START, 872,   198                   // \n<|im_end|>\n<|im_start|>user\n
     };
-    // After audio placeholder tokens:
+    // After audio placeholder tokens, no --context:
     // "\nThis is a XX.XX seconds audio, please transcribe it with these keys: Start time, End time, Speaker ID, Content<|im_end|>\n"
+    // With --context (matches microsoft/VibeVoice's `context_info` handling in
+    // vibevoice_asr_processor.py):
+    // "\nThis is a XX.XX seconds audio, with extra info: {context}\n\nPlease transcribe it with these keys: ...<|im_end|>\n"
     float dur = n_samples / 24000.0f;
     // Duration is inserted as plain text before tokenization by the HF
     // processor. For Qwen2.5 digits and '.' map to stable single-char ids.
     char dur_str[16];
     snprintf(dur_str, sizeof(dur_str), "%.2f", dur);
-    std::vector<int> dur_tokens;
-    for (const char* p = dur_str; *p; p++) {
-        if (*p >= '0' && *p <= '9')
-            dur_tokens.push_back(15 + (*p - '0'));
-        else if (*p == '.')
-            dur_tokens.push_back(13);
+
+    // Match Python's `context_info and context_info.strip()` truthiness check.
+    std::string context_trimmed;
+    if (context) {
+        const char* b = context;
+        const char* e = context + strlen(context);
+        auto is_ws = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+        while (b < e && is_ws(*b))
+            b++;
+        while (e > b && is_ws(*(e - 1)))
+            e--;
+        context_trimmed.assign(b, e);
     }
-    std::vector<int> suffix_tokens = {
-        198,                 // \n
-        1986, 374, 264, 220, // This is a<space>
-    };
-    suffix_tokens.insert(suffix_tokens.end(), dur_tokens.begin(), dur_tokens.end());
+
+    std::vector<int> suffix_tokens;
+    if (!context_trimmed.empty()) {
+        // No hardcoded token array for arbitrary context text — tokenize at
+        // runtime with the same dual-path (real BPE merges if the GGUF has
+        // `tokenizer.ggml.merges`, else the vocab-rank approximation) already
+        // used for VibeVoice TTS text (see vibevoice_synthesize()).
+        //
+        // The two text lines are tokenized separately (rather than one string
+        // with embedded "\n"/"\n\n") because tokenize_simple()/
+        // tokenize_text_bpe_vocab_rank() treat space/tab/newline runs purely
+        // as word separators and never emit a newline token — feeding it the
+        // whole string with embedded newlines silently drops the leading \n
+        // (matching the no-context path's token 198) and the blank line
+        // before "Please transcribe" (PR #223 review). The structural
+        // newlines are inserted explicitly below instead.
+        auto tokenize_line = [&](const std::string& s) {
+            return !m.merge_rank.empty() ? core_bpe::tokenize_simple(m.token_to_id, m.merge_rank, s)
+                                         : tokenize_text_bpe_vocab_rank(m, s);
+        };
+        std::string line1 = "This is a " + std::string(dur_str) + " seconds audio, with extra info: " + context_trimmed;
+        std::string line2 = "Please transcribe it with these keys: Start time, End time, Speaker ID, Content";
+
+        suffix_tokens.push_back(198); // \n
+        auto line1_tokens = tokenize_line(line1);
+        suffix_tokens.insert(suffix_tokens.end(), line1_tokens.begin(), line1_tokens.end());
+
+        // Blank line ("\n\n"): use the vocab's single merged double-newline
+        // token if present (real BPE would likely merge it), else two \n.
+        std::string double_nl = core_bpe::bytes_to_unicode("\n\n", 2);
+        auto dnl_it = m.token_to_id.find(double_nl);
+        if (dnl_it != m.token_to_id.end())
+            suffix_tokens.push_back(dnl_it->second);
+        else {
+            suffix_tokens.push_back(198);
+            suffix_tokens.push_back(198);
+        }
+
+        auto line2_tokens = tokenize_line(line2);
+        suffix_tokens.insert(suffix_tokens.end(), line2_tokens.begin(), line2_tokens.end());
+
+        if (ctx->params.verbosity >= 1)
+            fprintf(stderr, "vibevoice: context injected: %zu tokens for %zu-char context string\n",
+                    suffix_tokens.size(), context_trimmed.size());
+    } else {
+        std::vector<int> dur_tokens;
+        for (const char* p = dur_str; *p; p++) {
+            if (*p >= '0' && *p <= '9')
+                dur_tokens.push_back(15 + (*p - '0'));
+            else if (*p == '.')
+                dur_tokens.push_back(13);
+        }
+        suffix_tokens = {
+            198,                 // \n
+            1986, 374, 264, 220, // This is a<space>
+        };
+        suffix_tokens.insert(suffix_tokens.end(), dur_tokens.begin(), dur_tokens.end());
+        std::vector<int> suffix_mid = {
+            6546, 7699, 11, 4587, 38840, 432, 449,   1493,           // seconds audio, please transcribe it with these
+            6894, 25,                                                // keys:
+            5145, 882,  11, 3972, 882,   11,  29073, 3034, 11, 8883, // Start time, End time, Speaker ID, Content
+        };
+        suffix_tokens.insert(suffix_tokens.end(), suffix_mid.begin(), suffix_mid.end());
+    }
     std::vector<int> suffix_tail = {
-        6546,     7699,  11, 4587, 38840, 432, 449,   1493,           // seconds audio, please transcribe it with these
-        6894,     25,                                                 // keys:
-        5145,     882,   11, 3972, 882,   11,  29073, 3034, 11, 8883, // Start time, End time, Speaker ID, Content
-        IM_END,   198,                                                // <|im_end|>\n
+        IM_END, 198,         // <|im_end|>\n
         IM_START, 77091, 198 // <|im_start|>assistant\n (add_generation_prompt=True)
     };
     suffix_tokens.insert(suffix_tokens.end(), suffix_tail.begin(), suffix_tail.end());
@@ -2075,6 +2245,11 @@ static bool backend_needs_fresh_pred_graph(ggml_backend_t b) {
     const char* override_str = std::getenv("CRISPASR_VIBEVOICE_REUSE_PRED_GRAPH");
     if (override_str && (override_str[0] == '1' || override_str[0] == 't' || override_str[0] == 'T'))
         return false;
+    // =0 forces rebuild-each-call even on CPU — the other half of the A/B:
+    // measures what the pred-graph cache is actually worth on a backend
+    // where it is on by default.
+    if (override_str && (override_str[0] == '0' || override_str[0] == 'f' || override_str[0] == 'F'))
+        return true;
     const char* name = ggml_backend_name(b);
     if (!name)
         return false;
@@ -2128,6 +2303,30 @@ static ggml_cgraph* get_pred_head_graph(vibevoice_context* ctx, int n_frames) {
     ctx->pred_graph = build_pred_head_graph_impl(ctx, n_frames, *meta);
     ctx->pred_graph_n_frames = n_frames;
     return ctx->pred_graph;
+}
+
+// Scheduler the pred-head graph must run on. When the graph is CACHED
+// across DPM steps (reuse_ok — CPU today), it needs a private scheduler:
+// on a shared one, any other graph that grows the gallocr (e.g. a text
+// window's LM step at a deeper n_past) frees the compute buffer the cached
+// graph's tensors still point into, and the next sched_alloc_graph reads
+// the freed ggml_backend_buffer inside split_graph — the issue #171 CPU
+// segfault (ASan: heap-use-after-free in sched_backend_from_buffer).
+// When the graph is rebuilt each call (Metal/Vulkan/CUDA bypass), the
+// shared ctx->sched is safe and keeps the historical behavior.
+// CRISPASR_VIBEVOICE_PRED_SCHED=0 forces the old shared-sched behavior
+// (regression-bisection escape hatch; reintroduces the UAF when cached).
+static ggml_backend_sched_t get_pred_head_sched(vibevoice_context* ctx) {
+    const bool reuse_ok = !backend_needs_fresh_pred_graph(ctx->backend);
+    const char* env = std::getenv("CRISPASR_VIBEVOICE_PRED_SCHED");
+    if (!reuse_ok || (env && env[0] == '0'))
+        return ctx->sched;
+    if (!ctx->pred_sched) {
+        ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+        int n_be = (ctx->backend && ctx->backend != ctx->backend_cpu) ? 2 : 1;
+        ctx->pred_sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+    }
+    return ctx->pred_sched ? ctx->pred_sched : ctx->sched;
 }
 
 static ggml_cgraph* build_pred_head_graph_impl(vibevoice_context* ctx, int n_frames, std::vector<uint8_t>& meta_buf) {
@@ -3268,8 +3467,9 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                     compute_sinusoidal_embed(t, t_sin.data(), 256);
 
                     ggml_cgraph* gf = get_pred_head_graph(ctx, 2);
-                    ggml_backend_sched_reset(ctx->sched);
-                    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
+                    ggml_backend_sched_t psched = get_pred_head_sched(ctx);
+                    ggml_backend_sched_reset(psched);
+                    if (!ggml_backend_sched_alloc_graph(psched, gf))
                         break;
                     std::vector<float> z_pair(vae_dim * 2);
                     memcpy(z_pair.data(), z.data(), vae_dim * sizeof(float));
@@ -3285,7 +3485,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pred_condition"), cond_pair.data(), 0,
                                             (size_t)d_lm * 2 * sizeof(float));
 
-                    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+                    if (ggml_backend_sched_graph_compute(psched, gf) != GGML_STATUS_SUCCESS)
                         break;
                     std::vector<float> v_both(vae_dim * 2);
                     ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "pred_output"), v_both.data(), 0,
@@ -3922,13 +4122,16 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     // §201: lazy-init a dedicated scheduler for LM step bucket graphs.
     // The main ctx->sched is used by pred head / DPM between LM steps, which
     // would reset allocs; a separate sched keeps bucket allocations stable.
-    auto lm_step_sched_lazy = [&]() -> ggml_backend_sched_t {
-        if (ctx->lm_step_sched)
-            return ctx->lm_step_sched;
+    // One sched PER KV PATH (pos/neg): the CFG loop alternates the two every
+    // frame, and two cached graphs on one sched dangle each other's buffer
+    // pointers whenever the gallocr reallocs (see lm_step_sched declaration).
+    auto lm_step_sched_lazy = [&](int kv_sel) -> ggml_backend_sched_t {
+        if (ctx->lm_step_sched[kv_sel])
+            return ctx->lm_step_sched[kv_sel];
         ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
         int n_be = (ctx->backend && ctx->backend != ctx->backend_cpu) ? 2 : 1;
-        ctx->lm_step_sched = ggml_backend_sched_new(backends, nullptr, n_be, 65536, false, false);
-        return ctx->lm_step_sched;
+        ctx->lm_step_sched[kv_sel] = ggml_backend_sched_new(backends, nullptr, n_be, 65536, false, false);
+        return ctx->lm_step_sched[kv_sel];
     };
 
     // §201: pick smallest bucket whose Lk >= needed_lk.
@@ -4097,12 +4300,28 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         if (use_buckets && n_tokens == 1 && (!dump_dir || !dump_dir[0])) {
             const int idx = lm_pick_bucket(n_past + 1);
             if (idx >= 0) {
+                int& active_bk = (kv_sel == 0) ? ctx->lm_active_bucket_pos : ctx->lm_active_bucket_neg;
+                // Only the graph most recently allocated on this sched has
+                // valid buffer pointers — allocating a DIFFERENT bucket
+                // reallocs the gallocr and frees the buffer the previously
+                // cached graph points into. When switching buckets, rebuild
+                // the incoming graph fresh so sched_split_graph never reads
+                // a freed buffer (issue #171 use-after-free class). Bucket
+                // switches are rare (KV growth crossing a bucket boundary,
+                // or a new shorter request), so the rebuild cost is noise.
+                if (active_bk != idx) {
+                    auto& bk = (kv_sel == 0) ? ctx->lm_buckets_pos[idx] : ctx->lm_buckets_neg[idx];
+                    if (bk.ctx) {
+                        ggml_free(bk.ctx);
+                        bk.ctx = nullptr;
+                    }
+                    bk.gf = nullptr;
+                }
                 ggml_cgraph* gf = lm_get_or_build_bucket(kv_sel, idx);
                 if (gf) {
-                    ggml_backend_sched_t step_sched = lm_step_sched_lazy();
+                    ggml_backend_sched_t step_sched = lm_step_sched_lazy(kv_sel);
                     if (!step_sched)
                         goto dynamic_path;
-                    int& active_bk = (kv_sel == 0) ? ctx->lm_active_bucket_pos : ctx->lm_active_bucket_neg;
                     // Always reset+realloc — skipping this when active_bk==idx
                     // causes "illegal memory access" on CUDA (P100) because the
                     // gallocr's compute buffer state goes stale after ctx->sched
@@ -4447,8 +4666,19 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         }
     }
 
-    // Use 1.3 for Base models (prevents static drift), 3.0 for Realtime models
+    // Use 1.3 for Base models (prevents static drift), 3.0 for Realtime models.
+    // Overridable via --tts-cfg-scale / vibevoice_set_cfg_scale() /
+    // VIBEVOICE_TTS_CFG_SCALE (params win over env). Upstream's realtime demo
+    // defaults to 1.5; spontaneous BGM onsets (documented VibeVoice behavior,
+    // issue #171) can often be re-rolled away with a different cfg or --seed.
     float cfg_scale = is_base_model ? 1.3f : 3.0f;
+    if (ctx->params.cfg_scale > 0.0f) {
+        cfg_scale = ctx->params.cfg_scale;
+    } else if (const char* ce = getenv("VIBEVOICE_TTS_CFG_SCALE")) {
+        float v = (float)atof(ce);
+        if (v > 0.0f)
+            cfg_scale = v;
+    }
 
     std::vector<float> all_latents;
     mt19937_state rng;
@@ -4546,8 +4776,9 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                 // Frame 0 = positive condition (text-conditioned)
                 // Frame 1 = negative condition (unconditional)
                 ggml_cgraph* gf = get_pred_head_graph(ctx, 2);
-                ggml_backend_sched_reset(ctx->sched);
-                if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
+                ggml_backend_sched_t psched = get_pred_head_sched(ctx);
+                ggml_backend_sched_reset(psched);
+                if (!ggml_backend_sched_alloc_graph(psched, gf))
                     return nullptr;
 
                 // Noisy input: same z for both conditions [vae_dim, 2]
@@ -4565,7 +4796,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                 ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pred_condition"), cond_pair.data(), 0,
                                         (size_t)d_lm * 2 * sizeof(float));
 
-                if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+                if (ggml_backend_sched_graph_compute(psched, gf) != GGML_STATUS_SUCCESS)
                     return nullptr;
 
                 // Read both predictions [vae_dim, 2]
@@ -4975,14 +5206,20 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
 }
 
 extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float* samples, int n_samples) {
-    return vibevoice_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr);
+    return vibevoice_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr, nullptr);
 }
 
-extern "C" struct vibevoice_result* vibevoice_transcribe_with_probs(struct vibevoice_context* ctx, const float* samples,
-                                                                    int n_samples) {
+extern "C" char* vibevoice_transcribe_with_context(struct vibevoice_context* ctx, const float* samples, int n_samples,
+                                                   const char* context) {
+    return vibevoice_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr, context);
+}
+
+static struct vibevoice_result* vibevoice_transcribe_with_probs_impl(struct vibevoice_context* ctx,
+                                                                     const float* samples, int n_samples,
+                                                                     const char* context) {
     std::vector<int32_t> ids;
     std::vector<float> probs;
-    char* text = vibevoice_transcribe_impl(ctx, samples, n_samples, &ids, &probs);
+    char* text = vibevoice_transcribe_impl(ctx, samples, n_samples, &ids, &probs, context);
     if (!text)
         return nullptr;
     auto* r = (vibevoice_result*)calloc(1, sizeof(vibevoice_result));
@@ -4997,6 +5234,17 @@ extern "C" struct vibevoice_result* vibevoice_transcribe_with_probs(struct vibev
         }
     }
     return r;
+}
+
+extern "C" struct vibevoice_result* vibevoice_transcribe_with_probs(struct vibevoice_context* ctx, const float* samples,
+                                                                    int n_samples) {
+    return vibevoice_transcribe_with_probs_impl(ctx, samples, n_samples, nullptr);
+}
+
+extern "C" struct vibevoice_result* vibevoice_transcribe_with_probs_and_context(struct vibevoice_context* ctx,
+                                                                                const float* samples, int n_samples,
+                                                                                const char* context) {
+    return vibevoice_transcribe_with_probs_impl(ctx, samples, n_samples, context);
 }
 
 extern "C" void vibevoice_result_free(struct vibevoice_result* r) {

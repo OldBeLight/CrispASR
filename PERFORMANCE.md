@@ -429,7 +429,7 @@ Commit: `b9fd8eb`. **All 19 backends pass.**
 | Canary 1B | 1B | 672 | 0.0% | 6.2x | 1.8s | GPU enc+dec, 32+8 layers |
 | Cohere Transcribe | 2B | 1440 | 0.0% | 5.2x | 2.1s | GPU enc, AED dec |
 | Kyutai STT 1B | 1B | 636 | 4.5% | 1.4x | 7.7s | 24-layer Mimi decoder |
-| FireRed ASR2 AED | 900M | 918 | 0.0% | 0.6x | 19.0s | CPU Q4_K SIMD dec (60ms/step) |
+| FireRed ASR2 AED | 900M | 918 | 0.0% | 0.6x | 19.0s | CPU Q4_K SIMD dec (60ms/step greedy; beam batched through Q4_K mul_mat, 16.8s→3.1s at beam=3, §224); enc.* split-loaded to GPU by DEFAULT with use_gpu (transcript-identical, enc 2.2-2.3x on Metal/Vulkan/CUDA-P100, §224; CRISPASR_FIRERED_ENC_CPU=1 opts out) |
 
 #### Encoder-LLM (autoregressive, language model decoder)
 
@@ -2932,20 +2932,31 @@ core infrastructure.
   mel filterbank recomputed per call
 
 **Pyannote** (`pyannote_seg.cpp`):
-- Has: direct tensor pointer access (correct for tiny model), CPU-forced
-- Gap: forward/backward LSTM serial (could parallel), SincNet conv scalar,
-  no context caching
+- Has: ggml-graph forward (§224, default): SincNet + classifier as CPU-backend
+  graphs, LSTM input projections batched per layer/dir as one mul_mat, the
+  sequential recurrence dual-threaded (one thread per direction). 4.38 s →
+  0.55 s on 31.5 s audio (M1), output frame-identical.
+  `CRISPASR_PYANNOTE_LEGACY=1` restores the scalar path (A/B ground truth).
+- Gap: no context caching; recurrence R@h still plain (autovec) loops
 
 #### LID
 
 **ECAPA-TDNN LID** (`ecapa_lid.cpp`):
-- Has: GPU for Conv1d trunk, mel filterbank in GGUF, 15s audio cap
-- Gap: ASP + FC layers scalar CPU (9216×T dominant), BN not pre-folded
+- Has: GPU for Conv1d trunk, mel filterbank in GGUF, 15s audio cap; ASP + FC
+  head in-graph (§224, titanet-style). Inverse-default: in-graph WITHOUT
+  Accelerate (scalar head was ~3.0 s of a 4.5 s detect → in-graph removes it);
+  WITH Accelerate the GEMM head (57 ms) stays default.
+  CRISPASR_ECAPA_ASP_GGML=1 / CRISPASR_ECAPA_ASP_CPU=1 force either way.
+- Gap: trunk graph ~1.3 s dominates on M1 (profile Metal residency); BN not
+  pre-folded
 
 **Silero LID** (`silero_lid.cpp`):
-- Has: GPU weight loading, learned STFT front-end
-- Gap: **entire forward pass is scalar CPU** despite GPU init — 8 stages
-  × O(T²) attention loops
+- Has: ggml-graph forward (§224, default): CPU frontend (log-mag precision) +
+  sched encoder (GPU on Metal/CUDA; auto-routed to CPU on Vulkan pending an
+  upstream mul_mat fix), 30 s slice cap. 103 ms Metal / 183 ms CPU-ggml vs
+  241 ms Accelerate / 1014 ms scalar legacy (11 s audio, M1).
+  `CRISPASR_SILERO_LID_LEGACY=1` restores the scalar path.
+- Gap: Vulkan GPU blocked on the ggml-vulkan FFN MUL_MAT miscompute
 
 **FireRed LID** (`firered_lid.cpp`):
 - Has: reuses full firered_asr runtime
@@ -2954,9 +2965,14 @@ core infrastructure.
 #### Speaker
 
 **TitaNet** (`titanet.cpp`):
-- Has: BN pre-folding at init, pre-emphasis, L2 normalization
-- Gap: **all inference is scalar CPU loops** (depthwise conv, pointwise
-  conv, SE, ASP TDNN 9216×T — no ggml graph, no GPU despite init_best)
+- Has: BN pre-folding at init, pre-emphasis, L2 normalization; ggml-graph
+  forward (§224): full encoder + ASP as one CPU-backend graph, embeddings
+  cos=1.000000 vs legacy. Inverse-default: ggml is default WITHOUT Accelerate
+  (scalar was 106–131 s/embed on M1 → 3.4 s ggml, ~35×); WITH Accelerate the
+  legacy AMX GEMM path stays default (0.7 s vs 3.4 s ggml).
+  `CRISPASR_TITANET_GGML=1` / `CRISPASR_TITANET_LEGACY=1` force either way.
+- Gap: ggml F32 matmul ≪ AMX on Apple (F16 weights would halve bandwidth);
+  segments not batched
 
 #### Translation
 

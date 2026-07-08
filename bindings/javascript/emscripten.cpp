@@ -15,6 +15,22 @@
 #include <thread>
 #include <vector>
 
+// PROXY_TO_PTHREAD path: the browser deadlock is that a thread which owns the
+// event loop (the "servicer") may not block in pthread_join — but ggml's compute
+// threads do exactly that. The fix (we own the code, so we can): run the heavy
+// synth on a NON-servicer thread. Under -sPROXY_TO_PTHREAD, main() runs on a
+// dedicated pthread; we keep it alive and use it as the compute thread, driving
+// it from the servicer via a proxying queue. The servicer never blocks, so ggml's
+// pthread_create/join for compute workers is serviced normally. No deadlock.
+#ifdef __EMSCRIPTEN_PTHREADS__
+#include <emscripten/proxying.h>
+#include <emscripten/threading.h>
+#include <pthread.h>
+static emscripten::ProxyingQueue g_proxy_queue;
+static pthread_t                 g_compute_thread;        // pthread-0 under PROXY_TO_PTHREAD
+static bool                      g_compute_thread_set = false;
+#endif
+
 // The unified Session C-ABI is declared in crispasr.h (included above)
 // as `struct crispasr_session`. Legacy name alias for the Embind wrappers:
 extern "C" {
@@ -254,6 +270,20 @@ static CrispasrSession* g_asr_session = nullptr;
 
 struct whisper_context* g_context;
 
+#ifdef __EMSCRIPTEN_PTHREADS__
+// Present only in threaded builds. Under -sPROXY_TO_PTHREAD this runs on pthread-0
+// (NOT the servicer); we record it as the compute thread and keep the runtime live
+// so it can process the proxying queue. In a non-proxy threaded build this runs on
+// the servicer itself, so ttsSynthesizeAsync would still block there — the async
+// path is only correct with PROXY_TO_PTHREAD (that's the whole point).
+int main() {
+    g_compute_thread     = pthread_self();
+    g_compute_thread_set = true;
+    emscripten_exit_with_live_runtime();
+    return 0;
+}
+#endif
+
 EMSCRIPTEN_BINDINGS(whisper) {
     emscripten::function("init", emscripten::optional_override([](const std::string& path_model) {
                              if (g_context == nullptr) {
@@ -485,6 +515,24 @@ EMSCRIPTEN_BINDINGS(whisper) {
                              return g_tts_session != nullptr;
                          }));
 
+    // Like ttsOpen but with an explicit backend name (e.g. "kokoro", "piper") — some TTS backends
+    // aren't auto-detectable from the GGUF and need it named, exactly as `--backend` does on the CLI.
+    emscripten::function("ttsOpenExplicit", emscripten::optional_override(
+                                                [](const std::string& model_path, const std::string& backend,
+                                                   int n_threads) {
+                                                    if (g_tts_session != nullptr) {
+                                                        crispasr_session_close(g_tts_session);
+                                                        g_tts_session = nullptr;
+                                                    }
+                                                    const int nt = n_threads <= 0 ? 1 : n_threads;
+                                                    g_tts_session =
+                                                        backend.empty()
+                                                            ? crispasr_session_open(model_path.c_str(), nt)
+                                                            : crispasr_session_open_explicit(model_path.c_str(),
+                                                                                             backend.c_str(), nt);
+                                                    return g_tts_session != nullptr;
+                                                }));
+
     emscripten::function("ttsClose", emscripten::optional_override([]() {
                              if (g_tts_session) {
                                  crispasr_session_close(g_tts_session);
@@ -567,6 +615,56 @@ EMSCRIPTEN_BINDINGS(whisper) {
                              crispasr_pcm_free(pcm);
                              return out;
                          }));
+
+#ifdef __EMSCRIPTEN_PTHREADS__
+    // Multithreaded, deadlock-free synth for the browser. Delivers a Float32Array
+    // (24 kHz mono PCM, empty on failure) to `cb`. The servicer only enqueues work
+    // and returns immediately; the blocking compute happens on the proxied pthread.
+    emscripten::function("ttsSynthesizeAsync",
+                         emscripten::optional_override([](const std::string& text, emscripten::val cb) {
+                             auto* text_copy = new std::string(text);
+                             auto* cbp       = new emscripten::val(cb);
+                             if (!g_compute_thread_set) {
+                                 // No proxied runtime thread (shouldn't happen once
+                                 // the factory has resolved) — run inline as fallback.
+                                 int    n   = 0;
+                                 float* pcm = g_tts_session
+                                     ? crispasr_session_synthesize(g_tts_session, text_copy->c_str(), &n)
+                                     : nullptr;
+                                 emscripten::val out = emscripten::val::array();
+                                 if (pcm && n > 0) {
+                                     out = emscripten::val::global("Float32Array").new_(n);
+                                     out.call<void>("set", emscripten::val(emscripten::typed_memory_view(n, pcm)));
+                                 }
+                                 if (pcm) crispasr_pcm_free(pcm);
+                                 (*cbp)(out);
+                                 delete text_copy;
+                                 delete cbp;
+                                 return;
+                             }
+                             pthread_t servicer = pthread_self();
+                             // Enqueue the blocking synth onto the compute thread (pthread-0).
+                             g_proxy_queue.proxyAsync(g_compute_thread, [text_copy, cbp, servicer]() {
+                                 int    n   = 0;
+                                 float* pcm = g_tts_session
+                                     ? crispasr_session_synthesize(g_tts_session, text_copy->c_str(), &n)
+                                     : nullptr;
+                                 delete text_copy;
+                                 // Hand the result (shared WASM heap) back to the servicer; only
+                                 // touch the JS callback `val` on the thread that created it.
+                                 g_proxy_queue.proxyAsync(servicer, [pcm, n, cbp]() {
+                                     emscripten::val out = emscripten::val::array();
+                                     if (pcm && n > 0) {
+                                         out = emscripten::val::global("Float32Array").new_(n);
+                                         out.call<void>("set", emscripten::val(emscripten::typed_memory_view(n, pcm)));
+                                     }
+                                     if (pcm) crispasr_pcm_free(pcm);
+                                     (*cbp)(out);
+                                     delete cbp;
+                                 });
+                             });
+                         }));
+#endif
 
     // Mirrors python crispasr.kokoro_resolve_for_lang() — returns
     // {modelPath, voicePath, voiceName, backboneSwapped}.

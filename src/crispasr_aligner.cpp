@@ -157,6 +157,51 @@ bool is_wav2vec2_aligner_model(const std::string& model_path, const std::string&
            arch == "data2vec-audio" || arch == "data2vec_audio";
 }
 
+// Maximum audio chunk duration in samples for the Qwen3-FA encoder.
+// The Whisper-style conv front-end produces tensors whose element count
+// is proportional to (audio_seconds * conv_channels * mel_bins).  At
+// ~1400 s the first conv output exceeds INT32_MAX elements, causing a
+// CUDA kernel launch failure ("invalid configuration argument") because
+// ggml's unary CUDA kernels pass the element count as `int`.  We cap at
+// 120 s per chunk to stay well within limits and keep VRAM reasonable.
+// Issue #217.
+static constexpr int QWEN3_FA_MAX_CHUNK_SAMPLES = 120 * 16000; // 120 s @ 16 kHz
+
+// Align a single chunk — factored out so the chunking loop and the
+// short-audio fast path share the same code.
+static std::vector<CrispasrAlignedWord> align_qwen3_fa_one_chunk(qwen3_asr_context* ctx,
+                                                                 const std::vector<std::string>& words,
+                                                                 const float* samples, int n_samples,
+                                                                 int64_t t_offset_cs) {
+    std::vector<CrispasrAlignedWord> out;
+    if (words.empty())
+        return out;
+
+    std::vector<const char*> word_ptrs(words.size());
+    for (size_t i = 0; i < words.size(); i++)
+        word_ptrs[i] = words[i].c_str();
+
+    std::vector<int64_t> start_ms(words.size(), 0);
+    std::vector<int64_t> end_ms(words.size(), 0);
+    int rc = qwen3_asr_align_words(ctx, samples, n_samples, word_ptrs.data(), (int)words.size(), start_ms.data(),
+                                   end_ms.data());
+    if (rc != 0) {
+        fprintf(stderr, "crispasr[aligner-qwen3]: align_words rc=%d (chunk at %.1fs)\n", rc,
+                (double)t_offset_cs / 100.0);
+        return out;
+    }
+
+    out.reserve(words.size());
+    for (size_t i = 0; i < words.size(); i++) {
+        CrispasrAlignedWord cw;
+        cw.text = words[i];
+        cw.t0_cs = t_offset_cs + start_ms[i] / 10;
+        cw.t1_cs = t_offset_cs + end_ms[i] / 10;
+        out.push_back(std::move(cw));
+    }
+    return out;
+}
+
 std::vector<CrispasrAlignedWord> align_qwen3_fa(const std::string& model_path, const std::vector<std::string>& words,
                                                 const float* samples, int n_samples, int64_t t_offset_cs,
                                                 int n_threads) {
@@ -191,30 +236,72 @@ std::vector<CrispasrAlignedWord> align_qwen3_fa(const std::string& model_path, c
         return out;
     }
 
-    std::vector<const char*> word_ptrs(words.size());
-    for (size_t i = 0; i < words.size(); i++)
-        word_ptrs[i] = words[i].c_str();
-
-    std::vector<int64_t> start_ms(words.size(), 0);
-    std::vector<int64_t> end_ms(words.size(), 0);
-    int rc = qwen3_asr_align_words(ctx, samples, n_samples, word_ptrs.data(), (int)words.size(), start_ms.data(),
-                                   end_ms.data());
-    // Do NOT free ctx — it's cached (§176e).
-    if (rc != 0) {
-        fprintf(stderr, "crispasr[aligner-qwen3]: align_words rc=%d\n", rc);
-        return out;
+    // ── Short audio fast path: fits in one chunk ────────────────────────
+    if (n_samples <= QWEN3_FA_MAX_CHUNK_SAMPLES) {
+        return align_qwen3_fa_one_chunk(ctx, words, samples, n_samples, t_offset_cs);
     }
+
+    // ── Long audio: split into chunks of QWEN3_FA_MAX_CHUNK_SAMPLES ────
+    // Words are assigned proportionally to audio chunks by their index
+    // position. This assumes roughly uniform speech density, which is
+    // imperfect but sufficient for forced alignment — the model corrects
+    // any drift within each chunk.
+    const int n_chunks = (n_samples + QWEN3_FA_MAX_CHUNK_SAMPLES - 1) / QWEN3_FA_MAX_CHUNK_SAMPLES;
+    const int n_words_total = (int)words.size();
+
+    fprintf(stderr, "crispasr[aligner-qwen3]: audio %.1fs exceeds %ds limit, splitting into %d chunks\n",
+            (double)n_samples / 16000.0, QWEN3_FA_MAX_CHUNK_SAMPLES / 16000, n_chunks);
 
     out.reserve(words.size());
-    for (size_t i = 0; i < words.size(); i++) {
-        CrispasrAlignedWord cw;
-        cw.text = words[i];
-        // ms → centiseconds; add slice offset so words are absolute
-        // against the original audio.
-        cw.t0_cs = t_offset_cs + start_ms[i] / 10;
-        cw.t1_cs = t_offset_cs + end_ms[i] / 10;
-        out.push_back(std::move(cw));
+    int word_cursor = 0;
+
+    for (int c = 0; c < n_chunks; c++) {
+        const int chunk_start = c * QWEN3_FA_MAX_CHUNK_SAMPLES;
+        const int chunk_samples = std::min(QWEN3_FA_MAX_CHUNK_SAMPLES, n_samples - chunk_start);
+        const int64_t chunk_offset_cs = t_offset_cs + (int64_t)chunk_start * 100 / 16000;
+
+        // Assign words: proportional split by audio position.
+        // Word range for chunk c: [word_cursor, word_end)
+        int word_end;
+        if (c == n_chunks - 1) {
+            word_end = n_words_total; // last chunk gets all remaining words
+        } else {
+            // Proportional: fraction of total audio covered after this chunk
+            double frac = (double)(chunk_start + chunk_samples) / (double)n_samples;
+            word_end = std::min(n_words_total, std::max(word_cursor + 1, (int)std::round(frac * n_words_total)));
+        }
+        if (word_cursor >= n_words_total)
+            break; // no more words to align
+
+        const int chunk_n_words = word_end - word_cursor;
+        std::vector<std::string> chunk_words(words.begin() + word_cursor, words.begin() + word_end);
+
+        auto chunk_aligned =
+            align_qwen3_fa_one_chunk(ctx, chunk_words, samples + chunk_start, chunk_samples, chunk_offset_cs);
+
+        if (chunk_aligned.empty()) {
+            fprintf(stderr, "crispasr[aligner-qwen3]: chunk %d/%d failed (%d words, %.1fs audio)\n", c + 1, n_chunks,
+                    chunk_n_words, (double)chunk_samples / 16000.0);
+            // Continue with remaining chunks — partial alignment is better
+            // than no alignment. The missing words will leave a gap.
+        }
+
+        for (auto& w : chunk_aligned)
+            out.push_back(std::move(w));
+
+        word_cursor = word_end;
     }
+
+    // Ensure monotonicity across chunk boundaries — the last word of
+    // chunk N may have a later timestamp than the first word of chunk
+    // N+1 due to proportional word assignment imprecision.
+    for (size_t i = 1; i < out.size(); i++) {
+        if (out[i].t0_cs < out[i - 1].t1_cs)
+            out[i].t0_cs = out[i - 1].t1_cs;
+        if (out[i].t1_cs < out[i].t0_cs)
+            out[i].t1_cs = out[i].t0_cs;
+    }
+
     return out;
 }
 

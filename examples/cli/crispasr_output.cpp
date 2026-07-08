@@ -666,12 +666,19 @@ bool crispasr_write_json(const std::string& path, const std::vector<crispasr_seg
             f << ",\n      \"emotion\":    \"" << json_escape(s.emotion) << "\"";
         if (!s.itn_flag.empty())
             f << ",\n      \"itn_flag\":   \"" << json_escape(s.itn_flag) << "\"";
+        // NOTE ON UNITS (issue #228): segment `offsets` above are in milliseconds
+        // (t0/t1 are the internal centisecond timebase * 10). For back-compat the
+        // per-word / per-token `t0`/`t1` fields are kept in their original
+        // centisecond units, and each entry additionally carries an `offsets`
+        // object in milliseconds so every timed object in this document exposes a
+        // consistent ms field matching the segment shape.
         if (full && !s.words.empty()) {
             f << ",\n      \"words\": [\n";
             for (size_t j = 0; j < s.words.size(); j++) {
                 const auto& w = s.words[j];
                 f << "        { \"text\": \"" << json_escape(w.text) << "\", \"t0\": " << w.t0 << ", \"t1\": " << w.t1
-                  << " }" << (j + 1 < s.words.size() ? "," : "") << "\n";
+                  << ", \"offsets\": { \"from\": " << (w.t0 * 10) << ", \"to\": " << (w.t1 * 10) << " } }"
+                  << (j + 1 < s.words.size() ? "," : "") << "\n";
             }
             f << "      ]";
         }
@@ -680,8 +687,8 @@ bool crispasr_write_json(const std::string& path, const std::vector<crispasr_seg
             for (size_t j = 0; j < s.tokens.size(); j++) {
                 const auto& t = s.tokens[j];
                 f << "        { \"text\": \"" << json_escape(t.text) << "\", \"p\": " << t.confidence
-                  << ", \"t0\": " << t.t0 << ", \"t1\": " << t.t1 << " }" << (j + 1 < s.tokens.size() ? "," : "")
-                  << "\n";
+                  << ", \"t0\": " << t.t0 << ", \"t1\": " << t.t1 << ", \"offsets\": { \"from\": " << (t.t0 * 10)
+                  << ", \"to\": " << (t.t1 * 10) << " } }" << (j + 1 < s.tokens.size() ? "," : "") << "\n";
             }
             f << "      ]";
         }

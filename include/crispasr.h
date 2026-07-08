@@ -569,13 +569,12 @@ CRISPASR_API struct whisper_full_params whisper_full_default_params(enum whisper
 // Pointer-arg wrappers for FFI bindings (Dart, etc.) — see crispasr.cpp.
 // Use these instead of the by-value variants when the binding cannot
 // reliably marshal a large struct across the C ABI on every target.
-CRISPASR_API struct whisper_context* whisper_init_from_file_with_params_by_ref(
-    const char* path_model, struct whisper_context_params* params);
+CRISPASR_API struct whisper_context* whisper_init_from_file_with_params_by_ref(const char* path_model,
+                                                                               struct whisper_context_params* params);
 CRISPASR_API struct whisper_context* whisper_init_from_file_with_params_no_state_by_ref(
     const char* path_model, struct whisper_context_params* params);
-CRISPASR_API int whisper_full_by_ref(struct whisper_context* ctx,
-                                      struct whisper_full_params* params,
-                                      const float* samples, int n_samples);
+CRISPASR_API int whisper_full_by_ref(struct whisper_context* ctx, struct whisper_full_params* params,
+                                     const float* samples, int n_samples);
 CRISPASR_API void crispasr_params_set_max_tokens(struct whisper_full_params* p, int n);
 CRISPASR_API void crispasr_params_set_temperature(struct whisper_full_params* p, float t);
 
@@ -586,6 +585,7 @@ CRISPASR_API void crispasr_params_set_temperature(struct whisper_full_params* p,
 CRISPASR_API int crispasr_session_set_temperature(struct crispasr_session* s, float temperature, uint64_t seed);
 CRISPASR_API int crispasr_session_set_tts_seed(struct crispasr_session* s, uint64_t seed);
 CRISPASR_API int crispasr_session_set_tts_steps(struct crispasr_session* s, int steps);
+CRISPASR_API int crispasr_session_set_tts_cfg_scale(struct crispasr_session* s, float scale);
 CRISPASR_API int crispasr_session_set_max_new_tokens(struct crispasr_session* s, int n);
 CRISPASR_API int crispasr_session_set_frequency_penalty(struct crispasr_session* s, float penalty);
 CRISPASR_API int crispasr_session_set_top_p(struct crispasr_session* s, float top_p);
@@ -604,14 +604,13 @@ CRISPASR_API int crispasr_session_set_g2p_dict(struct crispasr_session* s, const
 CRISPASR_API int crispasr_session_set_best_of(struct crispasr_session* s, int n);
 CRISPASR_API int crispasr_session_set_beam_size(struct crispasr_session* s, int n);
 CRISPASR_API int crispasr_session_set_grammar_text(struct crispasr_session* s, const char* gbnf_text,
-                                                    const char* root_rule, float penalty);
+                                                   const char* root_rule, float penalty);
 CRISPASR_API int crispasr_session_set_fallback_thresholds(struct crispasr_session* s, float entropy_thold,
-                                                           float logprob_thold, float no_speech_thold,
-                                                           float temperature_inc);
+                                                          float logprob_thold, float no_speech_thold,
+                                                          float temperature_inc);
 CRISPASR_API int crispasr_session_set_alt_n(struct crispasr_session* s, int n);
 CRISPASR_API int crispasr_session_set_whisper_decode_extras(struct crispasr_session* s, int suppress_nst,
-                                                             const char* suppress_regex,
-                                                             int carry_initial_prompt);
+                                                            const char* suppress_regex, int carry_initial_prompt);
 CRISPASR_API int crispasr_session_set_ask(struct crispasr_session* s, const char* prompt);
 
 // TTS synthesis — returns malloc'd float32 PCM at 24 kHz mono.
@@ -626,17 +625,15 @@ CRISPASR_API void crispasr_pcm_free(float* pcm);
 // out_text (optional): if non-null, receives the intermediate transcript
 // (malloc'd, caller frees with free()). Returns nullptr on failure or
 // if the backend doesn't support S2S.
-CRISPASR_API float* crispasr_session_speech_to_speech(struct crispasr_session* s,
-                                                       const float* in_samples, int n_in_samples,
-                                                       char** out_text, int* out_n_samples);
+CRISPASR_API float* crispasr_session_speech_to_speech(struct crispasr_session* s, const float* in_samples,
+                                                      int n_in_samples, char** out_text, int* out_n_samples);
 
 // Set hotwords for contextual biasing. Comma-separated list of words or
 // phrases. For CTC/TDT backends (parakeet), configures the Aho-Corasick
 // trie with the given boost factor. For LLM backends, the hotwords are
 // prepended to the ask prompt on the next transcribe call.
 // Pass NULL or empty string to clear. Returns 0 on success.
-CRISPASR_API int crispasr_session_set_hotwords(struct crispasr_session* s,
-                                                const char* hotwords, float boost);
+CRISPASR_API int crispasr_session_set_hotwords(struct crispasr_session* s, const char* hotwords, float boost);
 
 // Human-readable error from the last failed synthesize call. Empty string
 // when the last call succeeded. Pointer owned by the session.
@@ -852,7 +849,7 @@ CRISPASR_API int crispasr_watermark_load_model(const char* gguf_path);
 // Dart cannot use C function pointers as callbacks; instead it polls
 // the module-level atomic via crispasr_get_progress(). Returns 0-100
 // during transcription, -1 when idle.
-CRISPASR_API int  crispasr_get_progress(void);
+CRISPASR_API int crispasr_get_progress(void);
 CRISPASR_API void crispasr_reset_progress(void);
 
 // ─── Stereo audio decode ─────────────────────────────────────────────
@@ -860,42 +857,23 @@ CRISPASR_API void crispasr_reset_progress(void);
 // Like crispasr_audio_load but returns stereo (2-channel) PCM.
 // If the source is mono, both left and right receive the same data
 // and *out_channels is 1. Always resamples to 16 kHz.
-CRISPASR_API int crispasr_audio_load_stereo(
-    const char* path,
-    float** out_left,
-    float** out_right,
-    int* out_samples,
-    int* out_sample_rate,
-    int* out_channels
-);
+CRISPASR_API int crispasr_audio_load_stereo(const char* path, float** out_left, float** out_right, int* out_samples,
+                                            int* out_sample_rate, int* out_channels);
 
 // ─── Parallel transcription ─────────────────────────────────────────
 //
 // Thin wrapper around whisper_full_parallel with g_progress tracking.
-CRISPASR_API int crispasr_transcribe_parallel(
-    struct whisper_context* ctx,
-    struct whisper_full_params params,
-    const float* samples,
-    int n_samples,
-    int n_processors
-);
+CRISPASR_API int crispasr_transcribe_parallel(struct whisper_context* ctx, struct whisper_full_params params,
+                                              const float* samples, int n_samples, int n_processors);
 
 // ─── DTW timestamp helpers ──────────────────────────────────────────
 //
 // crispasr_ctx_params_set_dtw: configure DTW token-level timestamps
 // on a whisper_context_params before context init.
 // crispasr_token_dtw_t: retrieve the DTW timestamp for a given token.
-CRISPASR_API void crispasr_ctx_params_set_dtw(
-    struct whisper_context_params* p,
-    bool enable,
-    int aheads_preset,
-    int n_top
-);
-CRISPASR_API int64_t crispasr_token_dtw_t(
-    struct whisper_context* ctx,
-    int i_segment,
-    int i_token
-);
+CRISPASR_API void crispasr_ctx_params_set_dtw(struct whisper_context_params* p, bool enable, int aheads_preset,
+                                              int n_top);
+CRISPASR_API int64_t crispasr_token_dtw_t(struct whisper_context* ctx, int i_segment, int i_token);
 
 ////////////////////////////////////////////////////////////////////////////
 

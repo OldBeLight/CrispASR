@@ -10,6 +10,17 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## Flow-matching DiT with JointAttention REQUIRES attention masking even for unconditional generation — skipping masked KV tokens silently corrupts output (2026-07)
+
+Porting Irodori-TTS (RF-DiT flow-matching TTS with JointAttention over self + text + speaker context), the text encoder reached cos=0.9995 parity and single-step DiT v_pred reached cos=0.9984, yet the 40-step ODE produced garbage audio (random language hallucinations on ASR roundtrip). The root cause: **the Python model always includes speaker KV in the JointAttention, even when unconditional (no speaker reference), with an attention mask that has -inf for speaker positions**. The C++ initially skipped speaker KV entirely (no speaker state → don't concat), which changed the KV sequence length and thus the softmax distribution. Even though masked tokens get zero attention weight in Python, their presence in the denominator affects all other weights.
+
+**Fix:** pass `mask` to `ggml_flash_attn_ext` (F16 tensor with 0.0 for attend, -inf for masked positions). Must be `GGML_TYPE_F16` — F32 asserts. Shape `(n_kv, n_batch)` matching the KV sequence length including masked positions.
+
+**Lesson:** when porting a model that uses attention masking, you CANNOT skip masked tokens as an optimization — you must include them with proper masking. `ggml_flash_attn_ext(q, k, v, nullptr, ...)` does NOT mean "no masking needed" — it means "full bidirectional attention over all KV positions". If the upstream model uses `attn_mask` to selectively ignore positions, the C++ must replicate this exactly.
+
+**Corollary:** single-step parity (cos≈0.999) is NECESSARY but NOT SUFFICIENT for flow-matching models. The ODE trajectory is exponentially sensitive to attention distribution differences. A per-step cos of 0.9984 sounds high but accumulates to cos≈0.94 over 40 steps, which is fatal for flow-matching TTS. The ASR roundtrip is the true test, not the per-step cosine.
+
+
 ## The Mimi codec transformer must be causal — non-causal silently truncates long audio; the >250-frame WER A/B settled it (2026-07)
 
 Sweeping CrispASR for the CrispEmbed `deepseek_ocr2` bug class (a masked attention replaced by
@@ -11905,3 +11916,107 @@ keeps the alloc-once reuse; old path stays available for A/B via
 that is allocated once and reused across steps is unsafe on CUDA (and Vulkan) —
 reset+alloc per step; granite_speech is the reference implementation.**
 
+
+## A cached cgraph is invalidated by ANY other graph on its scheduler — reset+alloc per step is NOT enough (#171, 2026-07-06)
+
+The #171 "TTS regression" saga (RDNA4 driver theories, quant-recipe
+hardening, knob matrices — none of it moved the symptom) ended as an
+ASan-proven **heap-use-after-free** reproducible on the first try with a
+CPU-only Debug+ASan build: vibevoice's cached diffusion pred-head graph
+kept `tensor->buffer` pointers into `ctx->sched`'s gallocr compute buffer;
+a mid-generation text-window LM graph on the *same* scheduler grew the
+gallocr (`reallocating CPU buffer from 0.36 MiB to 0.37 MiB` — free + new
+alloc); the next DPM step's `ggml_backend_sched_alloc_graph` of the cached
+graph then read the freed `ggml_backend_buffer` inside
+`ggml_backend_sched_split_graph` (before realloc could have fixed anything).
+Debug builds segfault; **Release builds often survive the stale read and
+silently corrupt activations instead** — same bug, presenting as "broken
+audio", which is why it masqueraded as a model/driver problem for weeks.
+The #184 CUDA "illegal memory access" was the same class via the LM bucket
+graphs (pos/neg CFG steps alternating two cached graphs of different Lk on
+one shared `lm_step_sched`).
+
+**The invariant: only the graph most recently allocated on a scheduler has
+valid buffer pointers.** This *sharpens* the #220 rule ("reset+alloc the
+sched every step"): per-step reset+alloc of the *same* graph is fine, but
+it does NOT protect a cached graph from *other* graphs allocated on the
+same scheduler in between — the UAF read happens during split_graph inside
+the very alloc that would re-set the pointers. Fixes that satisfy the
+invariant (c96c4997): give each cached graph a **dedicated scheduler**
+(fixed topology → its gallocr never reallocs under it), and when several
+cached graphs must share one sched, rebuild the incoming graph whenever it
+was not the last one allocated there.
+
+**But measure before keeping any graph cache at all.** A same-seed 4-way
+A/B (CPU Release, short + 58-token synthesis) showed the vibevoice pred +
+bucket caches were worth **0% end-to-end** (diffusion compute dominates
+graph build ~100×) and all four on/off combinations produced
+**byte-identical WAVs** — the entire bug class (#171 segfault, #184 CUDA,
+#47 Metal/Vulkan asserts) guarded an optimization worth nothing, exactly
+like the chatterbox CFM graph cache (§208 dud). Deleting the caches
+outright is the recorded follow-up; until then, `CRISPASR_VIBEVOICE_
+REUSE_PRED_GRAPH=0/1` and `CRISPASR_VIBEVOICE_LM_BUCKETS=0/1` A/B them.
+
+## ASR roundtrip does not validate audio ONSETS; reproduce with the original pipeline before debugging your runtime (#171, 2026-07-06)
+
+The residual #171 complaint ("music plays before the voice") survived every
+runtime theory because our acceptance tests could not see it: the vibevoice
+output opened with ~1 s of BGM, yet **whisper roundtripped the full text
+perfectly** (ASR skips non-speech prefixes) and spectral heuristics
+(RMS/centroid/syllabic modulation) also read as speech. Only a human
+listening caught it — on outputs we had repeatedly declared "clean".
+When a report says "noise/music at the start or end", roundtrip is
+necessary but proves nothing about prefixes/suffixes: have a human listen,
+or ASR/classify the first second in isolation. (This is also how the
+at_dec quant-protection call (5c8add40) was mis-validated: "roundtrips
+perfectly" hid the same artifact.)
+
+What actually closed the case, in one evening, was the blueprint rule
+applied to *behavior* instead of tensors: run **the original pipeline**
+(`microsoft/VibeVoice` `demo/realtime_model_inference_from_file.py`, their
+`fr-Spk1_woman.pt`, same text, MPS) — it produced the **same music**,
+proving the runtime faithful and the artifact inherent model behavior
+(documented by the maintainers: spontaneous BGM from short inputs, small
+models, intro-style text, BGM-carrying voice prompts; BGM in training data
+is intentional per the paper). Two supporting checks worth reusing:
+(a) verify reporter "regression" claims with FIXED files — a v0.7.1 binary
+on today's files produced the same audio as main (corr 0.84 at the trim
+lag), so "worked before v0.7.2" was a different-files effect; (b) when the
+official pipeline needs to run locally: `USE_TF=0` (miniconda TF import is
+broken), `HF_HOME` override (`~/.cache/huggingface` is a dangling SSD
+symlink on the M1), venv at `~/code/VibeVoice/.venv`. Mitigation shipped as
+knobs, not fixes: `--tts-cfg-scale` (5f3046a7) + existing `--seed`; the
+dominant lever is the voice prompt itself (official fr prompts are
+BGM-prone; emma was clean).
+
+
+## SentencePiece `byte_fallback` is not optional decoration — OOV emoji/symbols must become `<0xHH>` byte tokens, and a `utf8_aligned` Viterbi dead-ends at a multi-byte lead without it (#221, 2026-07-07)
+
+Irodori-TTS (#221) used emoji as **emotion controls** (👂=whisper, 😮‍💨=breath). Two bugs, both in `core/sentencepiece.h`'s unigram Viterbi:
+
+1. **Collapse to BOS.** In `utf8_aligned` mode the single-byte unk fallback edge `i→i+1` is illegal at a multi-byte codepoint's lead byte: `i+1` is a UTF-8 continuation byte that the alignment guard skips, so **no edge leaves `i`**, every later position is unreachable, the backtrack returns empty, and the whole utterance tokenizes to just the BOS. Any OOV multi-byte char (an emoji outside the vocab) triggered it. Minimum fix: a codepoint-level fallback that advances the full 1–4 byte codepoint.
+
+2. **The real fix — byte_fallback.** Mapping OOV chars to a single `<unk>` is *wrong* for models trained with SentencePiece `byte_fallback` (llm-jp-3 here). Those tokenizers emit OOV bytes as `<0xHH>` tokens (👂 → `<0xF0><0x9F><0x91><0x82>`; a ZWJ sequence like 😮‍💨 = 😮-bytes + ZWJ(**in-vocab**) + 💨-bytes), and the model **learned those byte sequences as the controls**. `<unk>` played them as noise. Fix: a 256-entry byte→`<0xHH>`-token-id table (`Config::byte_fallback`), built from the vocab at load; the OOV fallback emits the byte token (scored by `scores[]`) instead of `<unk>`.
+
+**Validation that actually proves it:** dump the C++ token ids and assert **byte-for-byte equality with the reference HF tokenizer** on the exact strings in the bug report — not "does it sound right". C++ matched HF to all 47 ids incl. the byte-fallback + ZWJ runs, which *is* the proof the model gets identical input. **Lesson:** for any tokenizer port, check whether the source uses `byte_fallback` before assuming `<unk>`; the tell is that OOV input tokenizes to `unk=0` in HF. Emoji that ARE in-vocab (😭, 🥺) are red herrings — they were never the failing case.
+
+
+## Porting the missing sub-model is necessary but not sufficient — hunt the hardcoded "unconditional" defaults that ignore it (#221 voice cloning, 2026-07-07)
+
+Irodori-TTS voice cloning was a stub. Porting the DAC-VAE **encoder** (reference audio → 32-dim latent: 30-conv stack + Snake + `in_proj` mean, preceded by BS.1770 −16 LUFS normalization) got the latent right (cos 0.99996 vs PyTorch GT) — and cloning **still did nothing**, because the synthesize path had two hardcoded unconditional defaults that silently discarded the reference:
+- speaker state hardwired to a zero vector (the speaker encoder was never run), and
+- the DiT attention mask **always** `-inf`'d the speaker KV positions (the same JointAttention "unconditional" default from the entry near the top of this file — here it defeated a *real* reference).
+
+The fix was 3 lines of graph plumbing (`attend_speaker` toggle) on top of the whole encoder port. **Lesson:** when a feature is "stubbed", grep the *consumer* for the zeros / always-masked / `TODO` defaults before declaring the port done — the missing model is usually the visible half; the invisible half is the conditioning path that was wired to ignore it. Diagnostic that pinpointed it fast: A/B the output **with vs without** the reference and measure a speaker-similarity proxy (time-averaged DAC-VAE latent cos) — identical outputs (cos 1.0) said "reference not reaching the model", not "encoder wrong". After the fix: 0.08 → 0.65 (vs 0.70 for the repo's own cloned sample).
+
+
+## Any T-sized `ggml_view` into a fixed-length weight table must be bounded by the tensor's real length — long inputs overflow it and abort (indextts, 2026-07-07)
+
+IndexTTS voice cloning aborted in `ggml_view_2d` for a long reference (a 164 s clip). The Conformer conditioning encoder subsamples mel by ~2 (`T_enc = (T_mel-3)/2 + 1`) then views `T_enc` rows out of the fixed 5000-row relative-position table `pe`; a 164 s ref → ~15.4k mel frames → `T_enc≈7700 > 5000`, so the view ran past the tensor and hit `GGML_ASSERT(data_size + view_offs <= ggml_nbytes)`. It had been *introduced* by deleting an earlier length clamp under a "no truncation needed — full reference is used" comment. Fix: read `pe->ne[1]` at runtime and, only when `T_enc` would exceed it, truncate the conditioning mel to the longest length the table supports (`T2 = 2*(pe_len-1)+3` → `T_enc == pe_len`). **Lesson:** a positional/embedding table is a hard cap on sequence length; any view sized by a runtime `T` must clamp to `ne[1]` (or the model's documented max) rather than trusting the input. Short refs stay under the cap, so this class of bug only surfaces on the largest inputs a user throws at it — and a stale "we removed the limit, it's fine now" comment is a reliable place to find one.
+
+
+## A `frames/token` (or chars/sec) length heuristic silently truncates diffusion TTS — run the duration predictor the model already ships (#221, 2026-07-07)
+
+Irodori-TTS dropped tail clauses on kanji-heavy text: output length was `latent_steps = T_text * 6.3 frames/token`, but kanji unpack to a variable number of mora, so a 14-token line got 88 frames (3.52 s) when it needed ~196 (7.85 s), and the flow-matching diffusion — which *fills the allocated duration* — simply ran out of room and cut the end. The model ships a **duration predictor** (`token_sum_adarn_zero`: per-token RMSNorm → AdaLN-Zero from `silu(speaker_vec)` → SwiGLU → `tanh(gate)` residual → out_proj → `softplus` per token, **summed**; returns `log1p(total)` so frames = the raw sum) whose weights were loaded and never run. Wiring it (`latent_steps = round(total_frames·scale/speed)`) fixed the truncation; the ASR roundtrip went from cut-off to complete.
+
+Two lessons: (1) **a heuristic in the hot path is a red flag that a real model component is sitting unused** — grep the loader for weights that never appear in a forward. (2) **The duration predictor is sensitive to text-encoder drift**: isolating with the F32 reference gave the exact frame count (196.35) from the reference `text_state`, but the q8 model's `text_state` (cos≈0.9995) gave 163 — the per-token `softplus` sum amplifies small logit errors across tokens. 163 vs 196 didn't truncate (the roundtrip was complete, just ~17 % faster), so it shipped, but it's a reminder that a downstream scalar-regression head is a magnifying glass on upstream cos drift — validate it on the *end metric* (does all the text get spoken?), not just the per-tensor cosine.

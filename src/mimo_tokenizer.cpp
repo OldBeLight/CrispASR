@@ -420,9 +420,18 @@ extern "C" struct mimo_tokenizer_context* mimo_tokenizer_init_from_file(const ch
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
 
-    // ---- Pass 2: weights (load to CPU; encoder forward graph picks per-op) ----
+    // ---- Pass 2: weights ----
+    // Load onto the COMPUTE backend. This used to load to CPU and rely on
+    // the sched auto-copying weights to the GPU per op — ggml removed that
+    // resolution (CPU-buffer weights now pin their ops to CPU), which made
+    // the whole encoder silently CPU-only on GPU builds (§224e). All weight
+    // reads here go through ggml_backend_tensor_get (device-safe), so full
+    // GPU residency is fine. CRISPASR_MIMO_TOK_CPU=1 forces CPU weights.
+    ggml_backend_t weights_be = ctx->backend;
+    if (const char* e = std::getenv("CRISPASR_MIMO_TOK_CPU"); e && *e && *e != '0')
+        weights_be = ctx->backend_cpu;
     core_gguf::WeightLoad wl;
-    if (!core_gguf::load_weights(path_model, ctx->backend_cpu, "mimo_tokenizer", wl)) {
+    if (!core_gguf::load_weights(path_model, weights_be, "mimo_tokenizer", wl)) {
         delete ctx;
         return nullptr;
     }
