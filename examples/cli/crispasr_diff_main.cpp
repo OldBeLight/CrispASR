@@ -3687,8 +3687,12 @@ int main(int argc, char** argv) {
         {
             auto mel_pair = ref.get_f32("mel_spectrogram");
             auto mel_shp = ref.shape("mel_spectrogram");
-            int staged_n_mels = mel_shp.size() >= 1 ? (int)mel_shp[0] : 128;
-            int staged_T_mel = mel_shp.size() >= 2 ? (int)mel_shp[1] : 0;
+            // dump_reference stores cohere mel as (T, n_mels) row-major, which is
+            // exactly the [n_mels, T] ggml layout the staged encoder expects.
+            // shp[0]=T, shp[1]=n_mels (these were previously swapped, which made
+            // cohere_run_encoder_staged reject the mel with a feature mismatch).
+            int staged_T_mel = mel_shp.size() >= 1 ? (int)mel_shp[0] : 0;
+            int staged_n_mels = mel_shp.size() >= 2 ? (int)mel_shp[1] : 128;
             const float* staged_mel = mel_pair.first;
 
             struct CohereStageCap {

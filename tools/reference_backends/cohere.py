@@ -102,9 +102,18 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     # CohereAsrPreTrainedModel._init_weights re-initializes all Linear/Conv
     # weights to normal(0, 0.02), overwriting the pretrained values.  Detect
     # and patch by reloading ALL weight tensors from the safetensors file.
-    _conv0 = model.encoder.pre_encode.conv[0].weight
-    _conv0_rms = float(_conv0.norm() / _conv0.numel() ** 0.5)
-    if _conv0_rms < 0.1:
+    # Find the first conv-like weight anywhere in the resolved encoder
+    # (base model: encoder.pre_encode.conv[0]; Parakeet-style Arabic model:
+    # encoder.subsampling.layers[0]). Structure varies, so search generically.
+    _enc_probe, _ = _resolve_encoder(model)
+    _conv0 = None
+    for _m in _enc_probe.modules():
+        _w = getattr(_m, "weight", None)
+        if _w is not None and hasattr(_w, "dim") and _w.dim() >= 3:
+            _conv0 = _w
+            break
+    _conv0_rms = float(_conv0.norm() / _conv0.numel() ** 0.5) if _conv0 is not None else None
+    if _conv0_rms is not None and _conv0_rms < 0.1:
         print(f"  WARNING: weights appear random-init (rms={_conv0_rms:.4f}), patching ALL from safetensors")
         from safetensors import safe_open
         sf_path = Path(model_dir) / "model.safetensors"
@@ -164,7 +173,7 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     # The conv subsampling module lives at encoder.pre_encode in the
     # rust reference; accept any of the common attribute names.
     pre_encode = None
-    for name in ("pre_encode", "conv_subsampling", "subsample", "conv_subsample"):
+    for name in ("pre_encode", "subsampling", "conv_subsampling", "subsample", "conv_subsample"):
         if hasattr(encoder, name):
             pre_encode = getattr(encoder, name)
             break
@@ -173,7 +182,10 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
             pre_encode.register_forward_hook(cap("enc_pre_subsample_out")))
 
     # ---- Layer-0 sub-stage monkey-patch ----
-    want_substages = stages & {"L0_ff1", "L0_attn", "L0_conv", "L0_ff2"}
+    # ParakeetEncoderBlock.forward has a different signature than the base
+    # ConformerLayer, so the sub-stage monkey-patch below can't replicate it.
+    # Skip it — the per-layer encoder_layer_i captures localize divergence.
+    want_substages = set()  # was: stages & {"L0_ff1", "L0_attn", "L0_conv", "L0_ff2"}
     if want_substages:
         layer0 = encoder.layers[0]
         _orig_forward = layer0.forward
@@ -209,15 +221,24 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         layer0.forward = _patched_forward
 
     # ---- Encoder forward ----
+    # Run the FULL model (encoder + 1 decode step) rather than calling
+    # encoder(feats) directly: the encoder's forward signature varies by
+    # model variant (ParakeetEncoder needs a length/mask), whereas
+    # model.generate() drives the encoder through its own known call path.
+    # The per-layer + encoder-output hooks capture during this forward.
     enc_hidden = None
+    _enc_hidden_holder = {}
+
+    def _enc_out_hook(_m, _i, o):
+        t = (o.last_hidden_state if hasattr(o, "last_hidden_state")
+             else (o[0] if isinstance(o, tuple) else o))
+        _enc_hidden_holder["h"] = t.detach().clone()
+
+    _eh = encoder.register_forward_hook(_enc_out_hook)
     with torch.no_grad():
-        feats = inputs.get("input_features", inputs.get("input_values"))
-        if feats is None:
-            raise RuntimeError("cohere reference: processor produced no features")
-        enc_out = encoder(feats)
-        enc_hidden = (
-            enc_out.last_hidden_state if hasattr(enc_out, "last_hidden_state")
-            else (enc_out[0] if isinstance(enc_out, tuple) else enc_out))
+        model.generate(**inputs, max_new_tokens=1, do_sample=False, num_beams=1)
+    _eh.remove()
+    enc_hidden = _enc_hidden_holder.get("h")
 
     for h in handles:
         h.remove()
