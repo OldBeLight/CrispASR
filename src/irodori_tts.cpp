@@ -27,6 +27,7 @@
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/sentencepiece.h"
+#include "core/tts_ref_cache.h"
 
 #ifdef IRODORI_HAVE_SENTENCEPIECE
 #include <sentencepiece_processor.h>
@@ -1099,9 +1100,14 @@ struct irodori_tts_context* irodori_tts_init_from_file(const char* path_model, s
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
 
-    // Codec backend: GPU except on Vulkan (conv-heavy codec graphs have a
-    // history of gallocr corruption there — TADA #192); CRISPASR_IRODORI_
-    // CODEC_GPU=1 / CRISPASR_IRODORI_CODEC_CPU=1 force either way.
+    // Codec backend: GPU except on Vulkan, where conv-heavy codec graphs once
+    // corrupted via gallocr on native drivers (TADA #192). That corruption no
+    // longer reproduces on MoltenVK/M1 with current ggml — the DAC-VAE encoder
+    // (cos 0.99996 vs CPU) and decoder (cos 0.99999) run clean on Vulkan there
+    // — so the CPU fallback is likely over-conservative on modern Vulkan. Kept
+    // as the default pending confirmation on native AMD/RADV (the driver family
+    // that originally corrupted); CRISPASR_IRODORI_CODEC_GPU=1 opts into the
+    // (validated) GPU codec, CRISPASR_IRODORI_CODEC_CPU=1 forces CPU.
     ctx->codec_backend = ctx->backend;
     if (ctx->backend != ctx->backend_cpu) {
         ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend);
@@ -1669,6 +1675,31 @@ int irodori_tts_set_reference(struct irodori_tts_context* ctx, const float* ref_
 
     const int SR = ctx->hparams.sample_rate;       // 48000
     const int hop = ctx->hparams.codec_hop_length; // 1920
+    const int latent_pd = ctx->hparams.latent_dim * ctx->hparams.latent_patch_size; // 32
+
+    // Debug: feed an already-normalized waveform straight through (isolates
+    // the encoder graph from resample/LUFS for parity testing).
+    const char* dbg = std::getenv("CRISPASR_IRODORI_ENC_PRENORM");
+
+    // Content-addressed reference cache (runtime, so every caller benefits —
+    // CLI, C ABI, server, wrappers). Key = hash of (ref_pcm, sample_rate); skip
+    // resample + −16 LUFS + DAC-VAE encode on a hit. Skipped for the debug
+    // pre-norm path (its latent is not the normal-pipeline latent).
+    const uint64_t cache_key = crispasr_ref_cache::fnv1a(ref_pcm, (size_t)n_samples * sizeof(float)) ^
+                               crispasr_ref_cache::fnv1a(&sample_rate, sizeof(sample_rate));
+    if (!dbg) {
+        std::vector<uint32_t> shape;
+        std::vector<float> lat;
+        if (crispasr_ref_cache::get_floats("irodori-latent", &cache_key, sizeof(cache_key), shape, lat) &&
+            shape.size() == 2 && shape[1] == (uint32_t)latent_pd && shape[0] > 0 &&
+            lat.size() == (size_t)shape[0] * shape[1]) {
+            ctx->ref_latent = std::move(lat);
+            ctx->ref_latent_frames = (int)shape[0];
+            if (ctx->verbosity >= 1)
+                std::fprintf(stderr, "[irodori] reference from cache (%d latent frames)\n", ctx->ref_latent_frames);
+            return 0;
+        }
+    }
 
     // 1) Resample to the codec rate.
     std::vector<float> wav;
@@ -1677,10 +1708,6 @@ int irodori_tts_set_reference(struct irodori_tts_context* ctx, const float* ref_
     } else {
         wav.assign(ref_pcm, ref_pcm + n_samples);
     }
-
-    // Debug: feed an already-normalized waveform straight through (isolates
-    // the encoder graph from resample/LUFS for parity testing).
-    const char* dbg = std::getenv("CRISPASR_IRODORI_ENC_PRENORM");
 
     if (!dbg) {
         // 2) Loudness-normalize to -16 LUFS (codec default), then peak-limit.
@@ -1722,6 +1749,12 @@ int irodori_tts_set_reference(struct irodori_tts_context* ctx, const float* ref_
     }
     ctx->ref_latent = std::move(latent);
     ctx->ref_latent_frames = frames;
+
+    // Save to the content-addressed cache for next time (any caller).
+    if (!dbg)
+        crispasr_ref_cache::put_floats("irodori-latent", &cache_key, sizeof(cache_key),
+                                       {(uint32_t)frames, (uint32_t)latent_pd}, ctx->ref_latent.data(),
+                                       ctx->ref_latent.size());
 
     // Optional: dump the latent for parity checks.
     if (const char* out = std::getenv("CRISPASR_IRODORI_ENC_DUMP")) {
