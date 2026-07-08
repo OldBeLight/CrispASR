@@ -438,6 +438,13 @@ extern "C" {
         i_word: c_int,
     ) -> f32;
 
+    // Raw per-frame CTC logits (Omni CTC backend, opted in via
+    // `crispasr_session_set_return_logits`). Frame-major, pre-softmax:
+    // `logits[t * n_logit_vocab + v]`; the pointer is NULL when none captured.
+    pub fn crispasr_session_result_n_logit_frames(r: *mut CrispasrSessionResult) -> c_int;
+    pub fn crispasr_session_result_n_logit_vocab(r: *mut CrispasrSessionResult) -> c_int;
+    pub fn crispasr_session_result_logits(r: *mut CrispasrSessionResult) -> *const c_float;
+
     pub fn crispasr_session_result_free(r: *mut CrispasrSessionResult);
     pub fn crispasr_session_close(s: *mut CrispasrSession);
 
@@ -552,6 +559,7 @@ extern "C" {
     pub fn crispasr_session_set_length_scale(s: *mut CrispasrSession, scale: c_float) -> c_int;
     pub fn crispasr_session_set_best_of(s: *mut CrispasrSession, n: c_int) -> c_int;
     pub fn crispasr_session_set_beam_size(s: *mut CrispasrSession, n: c_int) -> c_int;
+    pub fn crispasr_session_set_return_logits(s: *mut CrispasrSession, enable: c_int) -> c_int;
     pub fn crispasr_session_set_grammar_text(
         s: *mut CrispasrSession,
         gbnf_text: *const c_char,

@@ -38,6 +38,16 @@ void omniasr_free(struct omniasr_context* ctx);
 // Returns malloc'd UTF-8 string, caller frees with free().
 char* omniasr_transcribe(struct omniasr_context* ctx, const float* samples, int n_samples);
 
+// Like omniasr_transcribe, but for the CTC model_type also hands back the raw
+// per-frame logits from the CTC head. On return, if out_logits != NULL and the
+// model is CTC, *out_logits is a malloc'd [n_vocab * n_frames] buffer
+// (frame-major: logits[t*n_vocab + v], pre-softmax) that the caller frees with
+// free(); *out_n_vocab / *out_n_frames give the shape. For the LLM model_type
+// (no dense grid) the out params are left 0/NULL and this behaves exactly like
+// omniasr_transcribe. Text return + free contract identical to omniasr_transcribe.
+char* omniasr_transcribe_with_logits(struct omniasr_context* ctx, const float* samples, int n_samples,
+                                     float** out_logits, int* out_n_vocab, int* out_n_frames);
+
 // Variant for the LLM model variant: returns text plus per-token ids and
 // softmax probabilities (CPU-side argmax + softmax). Returns nullptr for the
 // CTC variant — use omniasr_transcribe instead. Free with omniasr_result_free.

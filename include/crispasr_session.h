@@ -260,6 +260,12 @@ CRISPASR_SESSION_API const char* crispasr_session_result_word_text(crispasr_sess
 CRISPASR_SESSION_API int64_t crispasr_session_result_word_t0(crispasr_session_result* r, int i_seg, int i_word);
 CRISPASR_SESSION_API int64_t crispasr_session_result_word_t1(crispasr_session_result* r, int i_seg, int i_word);
 CRISPASR_SESSION_API float crispasr_session_result_word_p(crispasr_session_result* r, int i_seg, int i_word);
+// Raw per-frame CTC logits (Omni CTC backend, opted in via
+// crispasr_session_set_return_logits). frame-major, pre-softmax:
+// logits[t * n_logit_vocab + v]; _logits returns NULL when none captured.
+CRISPASR_SESSION_API int crispasr_session_result_n_logit_frames(crispasr_session_result* r);
+CRISPASR_SESSION_API int crispasr_session_result_n_logit_vocab(crispasr_session_result* r);
+CRISPASR_SESSION_API const float* crispasr_session_result_logits(crispasr_session_result* r);
 CRISPASR_SESSION_API int crispasr_session_result_word_n_alts(crispasr_session_result* r, int i_seg, int i_word);
 CRISPASR_SESSION_API const char* crispasr_session_result_word_alt_text(crispasr_session_result* r, int i_seg,
                                                                        int i_word, int i_alt);
@@ -364,6 +370,7 @@ CRISPASR_SESSION_API int crispasr_session_set_best_of(crispasr_session* s, int n
 CRISPASR_SESSION_API int crispasr_session_set_max_new_tokens(crispasr_session* s, int n);
 CRISPASR_SESSION_API int crispasr_session_set_frequency_penalty(crispasr_session* s, float penalty);
 CRISPASR_SESSION_API int crispasr_session_set_beam_size(crispasr_session* s, int n);
+CRISPASR_SESSION_API int crispasr_session_set_return_logits(crispasr_session* s, int enable);
 CRISPASR_SESSION_API int crispasr_session_set_grammar_text(crispasr_session* s, const char* gbnf_text,
                                                            const char* root_rule, float penalty);
 CRISPASR_SESSION_API int crispasr_session_set_fallback_thresholds(crispasr_session* s, float entropy_thold,

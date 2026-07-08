@@ -37,6 +37,17 @@ fn parakeet_model() -> Option<String> {
     }
 }
 
+fn omni_ctc_model() -> Option<String> {
+    let p = std::env::var("OMNI_CTC_MODEL").unwrap_or_else(|_| {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../models/omniasr-ctc.gguf").to_string()
+    });
+    if Path::new(&p).exists() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
 // ---- CrispASR (whisper-only) tests ----
 
 #[test]
@@ -165,6 +176,73 @@ fn session_parakeet_word_timestamps() {
         );
         prev_end = w.end;
     }
+}
+
+#[test]
+fn session_omni_ctc_logits() {
+    let model_path = match omni_ctc_model() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: omni CTC model not found (set OMNI_CTC_MODEL)");
+            return;
+        }
+    };
+    // Auto-detect doesn't recognise every Omni GGUF on this pinned release;
+    // the generic "omniasr" backend routes all CTC/LLM variants.
+    let sess = crispasr::Session::open_with_backend(&model_path, "omniasr", 4)
+        .expect("session open omniasr");
+
+    // The 300M CTC model has a ~5 s positional-encoding limit (per its HF
+    // card), so decode only the first ~4 s of the ~11 s clip.
+    let pcm: Vec<f32> = jfk_pcm().into_iter().take(16_000 * 4).collect();
+
+    let (segs, logits) = sess
+        .transcribe_with_logits(&pcm)
+        .expect("transcribe_with_logits");
+    let text = segs
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(!text.trim().is_empty(), "expected a transcript");
+
+    // Accessor contract: a dense [n_vocab × n_frames] grid, correctly shaped
+    // and finite.
+    let lg = logits.expect("CTC backend should return Some(CtcLogits)");
+    assert!(lg.n_vocab > 0 && lg.n_frames > 0);
+    assert_eq!(lg.data.len(), lg.n_vocab * lg.n_frames);
+    assert!(lg.data.iter().all(|x| x.is_finite()), "logits must be finite");
+
+    // Greedy CTC over the exposed logits (argmax per frame, collapse repeats,
+    // drop blank id 0) must yield a non-degenerate token stream — evidence the
+    // grid is the real decode input, not zeros/garbage.
+    let v = lg.n_vocab;
+    let mut prev: i32 = -1;
+    let mut n_tokens = 0usize;
+    for t in 0..lg.n_frames {
+        let frame = &lg.data[t * v..(t + 1) * v];
+        let best = (0..v)
+            .max_by(|&a, &b| frame[a].partial_cmp(&frame[b]).unwrap())
+            .unwrap() as i32;
+        if best != 0 && best != prev {
+            n_tokens += 1;
+        }
+        prev = best;
+    }
+    assert!(
+        n_tokens > 0 && n_tokens < lg.n_frames,
+        "degenerate greedy decode: {n_tokens} tokens over {} frames",
+        lg.n_frames
+    );
+
+    // Capturing logits must not perturb the transcript.
+    let plain = sess.transcribe(&pcm).expect("transcribe");
+    let ptext = plain
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(ptext, text, "logits capture changed the transcript");
 }
 
 // ---- Registry + cache ----

@@ -1427,6 +1427,12 @@ struct crispasr_session {
     // Default 1 preserves greedy bit-identical output (no-regression contract).
     int beam_size = 1;
 
+    // Opt-in capture of the raw per-frame CTC logits on the Omni CTC backend
+    // (crispasr_session_set_return_logits). Off by default so the normal path
+    // doesn't pay the [vocab × frames] copy; when on, the result carries the
+    // logit grid for downstream forced alignment.
+    bool return_logits = false;
+
     // Whisper text-suppression + prompt-carry extras (whisper-only).
     // Map 1-to-1 onto wparams.suppress_nst / suppress_regex /
     // carry_initial_prompt on every transcribe dispatch.
@@ -1726,6 +1732,12 @@ struct crispasr_session_seg {
 struct crispasr_session_result {
     std::vector<crispasr_session_seg> segments;
     std::string backend;
+    // Raw per-frame CTC logits, populated only when the session opted in via
+    // crispasr_session_set_return_logits and the backend is Omni CTC.
+    // Frame-major: logits[t * n_logit_vocab + v], pre-softmax. Empty otherwise.
+    std::vector<float> logits;
+    int n_logit_vocab = 0;
+    int n_logit_frames = 0;
 };
 
 // ── Streamed-segment polling buffer (Dart FFI path) ─────────────────────
@@ -5258,7 +5270,21 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         }
         if (oar)
             omniasr_result_free(oar);
-        // CTC variant: text only.
+        // CTC variant: text only (+ optional raw logits for forced alignment).
+        if (s->return_logits) {
+            float* lg = nullptr;
+            int lv = 0, lf = 0;
+            char* text =
+                omniasr_transcribe_with_logits((omniasr_context*)s->omniasr_ctx, pcm, n_samples, &lg, &lv, &lf);
+            crispasr_session_result* res = package_text_only(text, true);
+            if (res && lg) {
+                res->logits.assign(lg, lg + (size_t)lv * lf);
+                res->n_logit_vocab = lv;
+                res->n_logit_frames = lf;
+            }
+            free(lg);
+            return res;
+        }
         return package_text_only(omniasr_transcribe((omniasr_context*)s->omniasr_ctx, pcm, n_samples), true);
     }
 #endif
@@ -6021,6 +6047,22 @@ CA_EXPORT float crispasr_session_result_word_p(crispasr_session_result* r, int i
         return -1.0f;
     auto& ws = r->segments[i_seg].words;
     return (i_word >= 0 && i_word < (int)ws.size()) ? ws[i_word].p : -1.0f;
+}
+
+// Raw per-frame CTC logits (Omni CTC backend, opted in via
+// crispasr_session_set_return_logits). Shape is n_logit_vocab × n_logit_frames;
+// crispasr_session_result_logits returns a frame-major buffer
+// (logits[t * n_logit_vocab + v], pre-softmax) valid for that many floats, or
+// NULL when none were captured. Owned by `r`; freed with
+// crispasr_session_result_free.
+CA_EXPORT int crispasr_session_result_n_logit_frames(crispasr_session_result* r) {
+    return r ? r->n_logit_frames : 0;
+}
+CA_EXPORT int crispasr_session_result_n_logit_vocab(crispasr_session_result* r) {
+    return r ? r->n_logit_vocab : 0;
+}
+CA_EXPORT const float* crispasr_session_result_logits(crispasr_session_result* r) {
+    return (r && !r->logits.empty()) ? r->logits.data() : nullptr;
 }
 
 // Top-N alternative candidates for the word's first content token.
@@ -8323,6 +8365,13 @@ CA_EXPORT int crispasr_session_set_beam_size(crispasr_session* s, int n) {
     if (!s)
         return -1;
     s->beam_size = n > 0 ? n : 1;
+    return 0;
+}
+
+CA_EXPORT int crispasr_session_set_return_logits(crispasr_session* s, int enable) {
+    if (!s)
+        return -1;
+    s->return_logits = enable != 0;
     return 0;
 }
 
