@@ -7298,11 +7298,15 @@ Follow-ups after the #221 base port. Reporter (bakamomi) is on an RTX 5070 Ti
 
 ### OPEN — pending follow-ups (priority order)
 
-- [ ] **Vulkan encode/decode for the DAC-VAE codec.** Codec runs on CPU under
-      Vulkan today (deliberate gallocr-safety fallback, cf. §192 TADA codec
-      corruption). bakamomi's AMD iGPU only accelerates the DiT/ODE; encode +
-      decode are CPU-bound. Port the codec graphs to Vulkan (or fix the gallocr
-      path that forced the CPU fallback). Largest item.
+- [~] **Vulkan encode/decode for the DAC-VAE codec** — codec-GPU VALIDATED on
+      MoltenVK (a0b3835f). The TADA #192 gallocr corruption no longer reproduces:
+      built with -DGGML_VULKAN=ON, `CRISPASR_IRODORI_CODEC_GPU=1` runs encoder
+      (cos 0.99996 vs CPU) + decoder (cos 0.99999) clean on Vulkan/M1, no NaN.
+      The flag already exists; the CPU default is kept pending bakamomi confirming
+      on native AMD/RADV (MoltenVK ≠ RADV; asked in the issue). ON AMD-OK: flip
+      the default (keep CRISPASR_IRODORI_CODEC_CPU=1 escape hatch). Local Vulkan
+      test recipe: VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json,
+      build-vk dir, --gpu-backend vulkan.
 - [ ] **Low-step first-segment streaming (single-utterance TTFB).** For a
       diffusion model, per-sentence streaming (shipped) is the real win; the ODE
       generates the whole utterance before decode, so intra-utterance
