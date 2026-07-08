@@ -608,8 +608,12 @@ constexpr Entry k_registry[] = {
     // OmniVoice: k2-fsa/OmniVoice — Qwen3-0.6B backbone with masked
     // iterative multi-codebook TTS (8 codebooks × 1025 vocab, 600+
     // languages). Uses HiggsAudioV2 audio tokenizer for encode/decode.
-    // Converter: models/convert-omnivoice-to-gguf.py — user-supplied
-    // model; no pre-converted GGUF published yet.
+    {"omnivoice", "omnivoice-f16.gguf",
+     "https://huggingface.co/cstr/omnivoice-GGUF/resolve/main/omnivoice-f16.gguf",
+     "~1.2 GB",
+     "omnivoice-tokenizer-f16.gguf",
+     "https://huggingface.co/cstr/omnivoice-GGUF/resolve/main/omnivoice-tokenizer-f16.gguf",
+     "~400 MB"},
     //
     // Orpheus-3B (canopylabs/orpheus-3b-0.1-ft is gated; we convert
     // from the non-gated mirror unsloth/orpheus-3b-0.1-ft, llama3.2 —

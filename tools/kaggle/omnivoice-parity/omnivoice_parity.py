@@ -233,8 +233,11 @@ try:
         cmake_flags = kh.cuda_build_flags(cuda_arch)
         cache_flags = kh.cache_and_link_flags()
         n_jobs = kh.safe_build_jobs(gpu=True)
+        # cuda_build_flags / cache_and_link_flags return lists
+        cf = " ".join(cmake_flags) if isinstance(cmake_flags, list) else str(cmake_flags)
+        cc = " ".join(cache_flags) if isinstance(cache_flags, list) else str(cache_flags)
         build_cmd = (
-            f"cmake -G Ninja -B build {cmake_flags} {cache_flags} "
+            f"cmake -G Ninja -B build {cf} {cc} "
             f"-DCMAKE_BUILD_TYPE=Release && "
             f"cmake --build build --target crispasr-cli -j{n_jobs}"
         )

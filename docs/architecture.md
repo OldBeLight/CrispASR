@@ -601,6 +601,20 @@ Qwen3 talker LM + 12 Hz RVQ speech tokenizer. Three variants:
 - `qwen3-tts-1.7b-base` — 1.7B talker, higher quality
 - `qwen3-tts-1.7b-voicedesign` — natural-language voice description via `--instruct`
 
+### omnivoice
+
+k2-fsa/OmniVoice (Apache-2.0) — masked iterative multi-codebook TTS.
+Qwen3-0.6B LLM backbone with:
+- `audio_embeddings`: Embedding(8×1025, 1024) with per-codebook offsets
+- `audio_heads`: Linear(1024, 8×1025) — projects to 8 codebooks × 1025 vocab
+- Generation: SoundStorm-style masked iterative (not autoregressive). 32
+  steps, each unmasking top-k highest-confidence positions via Gumbel sampling.
+- Audio tokenizer: HiggsAudioV2 (HuBERT semantic + DAC acoustic, 24 kHz, 75 Hz
+  frame rate). Separate GGUF (`--codec-model`).
+- 600+ languages, zero-shot voice cloning from reference audio.
+
+Supports finetunes: `ModelsLab/omnivoice-singing` (same architecture).
+
 ### csm
 
 Sesame CSM-1B (`sesame/csm-1b`, Apache-2.0), one GGUF, 24 kHz. Three

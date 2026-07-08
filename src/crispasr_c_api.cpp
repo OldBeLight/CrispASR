@@ -3213,6 +3213,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #ifdef CA_HAVE_QWEN3_TTS
     list += ",qwen3-tts";
 #endif
+#ifdef CA_HAVE_OMNIVOICE
+    list += ",omnivoice";
+#endif
 #ifdef CA_HAVE_GLMASR
     list += ",glm-asr";
 #endif
