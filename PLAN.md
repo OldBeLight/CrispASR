@@ -7281,10 +7281,15 @@ Follow-ups after the #221 base port. Reporter (bakamomi) is on an RTX 5070 Ti
 - **Duration predictor** — the `6.3 frames/token` heuristic truncated kanji-heavy
   text; wired the model's token-sum duration predictor (05a7d0ad). Exact vs
   reference given same text_state.
-- **Reference-conditioning cache** — generic `crispasr_tts_ref_cache.h` ("CRC1")
-  wired into irodori (`.iro32latent`), indextts (Conformer/Perceiver + ECAPA,
-  `.idxcond`), f5 (whisper transcript, `.f5reftext`); byte-identical reuse
-  (fba33a0c). indextts also caches across chunks in-session.
+- **Reference-conditioning cache** — `core/tts_ref_cache.h` ("CRC1", moved from
+  examples/cli so runtime + all consumers share it, 5c68b0b7/f0ed6d56). Two modes:
+  path-keyed (`<voice>.suffix`, mtime) + **content-addressed** (hash of the raw
+  reference → cache dir; no path needed). **irodori caches in the RUNTIME**
+  (`irodori_tts_set_reference`), so CLI, C ABI, server, and wrappers all skip the
+  encode — byte-identical reuse (maxdiff 0). indextts (Conformer/Perceiver + ECAPA)
+  + f5 (whisper transcript) cache at the ADAPTER level (fba33a0c) — CLI+server
+  only; migrating them to the runtime content-addressed pattern (3 lines:
+  get_floats→encode→put_floats) for C-ABI/wrapper coverage is a follow-up below.
 - **Chunked codec decode** — overlap-save DAC-VAE decode bounds peak memory;
   EXACT (cos=1.0, all seams 0), auto for long outputs (39ad4657).
 - **Streaming** — server already streamed per-sentence; added CLI `--tts-stream`
@@ -7334,6 +7339,11 @@ Follow-ups after the #221 base port. Reporter (bakamomi) is on an RTX 5070 Ti
       adapter keyed on a hash of the description (+ a model discriminator to avoid
       same-d_model collisions), voice_path="" (no mtime staleness). Unvalidatable
       here (no parler model); default-off opt-in until validated.
+- [ ] **Migrate indextts/f5 ref-cache into the runtime** (content-addressed) so
+      the C ABI + wrappers benefit, not just CLI+server. indextts: key on the
+      reference PCM in run_conditioning (already has get/set_reference_cache);
+      f5: key on the ref audio for the whisper transcript. Same 3-line pattern as
+      irodori (get_floats → encode → put_floats via core/tts_ref_cache.h).
 - [ ] **Ref-cache for remaining cloning backends** (cheap ones deprioritized).
       cosyvoice3 already has baked voice bundles; csm/melotts speaker embeds are
       comparatively cheap. Wire on demand via the shared helper + a get/set
