@@ -1,34 +1,34 @@
 name: CI
 
+# This is the upstream llama.cpp/ggml CI matrix, carried in-tree because ggml
+# is de-vendored into the `ggml/` submodule (CrispStrobe/ggml) — which already
+# runs this same matrix in its OWN repo. In CrispASR we only want it to fire
+# when the ggml submodule itself moves, so we DON'T:
+#   * re-run the whole 40-leg matrix on every `src/**` C++ edit — the upstream
+#     `**/*.cpp` / `**/*.h` globs matched our entire tree, so a one-line format
+#     fix spun up the full ggml CI (issue #231 triage surfaced this);
+#   * fire on our release `v*` tags — release.yml owns tags, and build.yml's own
+#     `release:` job (`if: startsWith(github.ref, 'refs/tags/v')`) would race it
+#     and attach ggml artifacts to our GitHub release.
+# CrispASR's own cross-platform build lives in ci.yml; this matrix is a safety
+# net for ggml-submodule bumps only. Use `workflow_dispatch` to run it manually.
 on:
   push:
     branches:
       - main
-    tags:
-      - 'v*'
-    paths: ['.github/workflows/build.yml',
-            '**/CMakeLists.txt',
-            '**/Makefile',
-            '**/*.mk',
-            '**/*.cmake',
-            '**/*.in',
-            '**/*.h',
-            '**/*.hpp',
-            '**/*.c',
-            '**/*.cpp',
-            '**/*.cu',
-            '**/*.cuh',
-            '**/*.cl',
-            '**/*.swift',
-            '**/*.m',
-            '**/*.mm',
-            '**/*.metal',
-            '**/*.comp',
-            '**/*.java',
-            '**/*.xcscheme']
+    paths:
+      - 'ggml'          # the submodule gitlink itself (a bump changes this path)
+      - 'ggml/**'
+      - '.gitmodules'
+      - '.github/workflows/build.yml'
 
   pull_request:
     types: [opened, synchronize, reopened]
+    paths:
+      - 'ggml'
+      - 'ggml/**'
+      - '.gitmodules'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
     inputs:
       create_release:
