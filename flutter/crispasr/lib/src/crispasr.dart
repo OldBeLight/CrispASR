@@ -772,13 +772,13 @@ class SessionSegment {
       '[${start.toStringAsFixed(1)}-${end.toStringAsFixed(1)}s] $text';
 }
 
-/// Raw per-frame CTC logits captured from the Omni CTC backend by
-/// [CrispasrSession.transcribeWithLogits].
+/// Per-frame CTC logits captured from a CTC backend (Omni CTC, wav2vec2/hubert/
+/// data2vec, or canary-ctc) by [CrispasrSession.transcribeWithLogits].
 ///
-/// [data] is frame-major and **pre-softmax**: `data[t * nVocab + v]` is the
-/// logit for vocabulary entry `v` at encoder frame `t`, so its length is
-/// `nFrames * nVocab`. Only the Omni CTC backend produces a dense grid; other
-/// backends yield none.
+/// [data] is frame-major: `data[t * nVocab + v]` is the score for vocabulary
+/// entry `v` at encoder frame `t`, so its length is `nFrames * nVocab`. The
+/// Omni and wav2vec2 grids are raw logits (pre-softmax); the canary-ctc grid is
+/// log-probabilities. Backends without a dense CTC grid yield none.
 class CtcLogits {
   /// Vocabulary size — the number of CTC output classes scored per frame.
   final int nVocab;
@@ -786,7 +786,8 @@ class CtcLogits {
   /// Number of encoder frames (the time axis).
   final int nFrames;
 
-  /// Frame-major, pre-softmax logits of length `nFrames * nVocab`;
+  /// Frame-major CTC grid of length `nFrames * nVocab` (raw logits for Omni &
+  /// wav2vec2, log-probabilities for canary-ctc);
   /// `data[t * nVocab + v]` is the score for class `v` at frame `t`.
   final Float32List data;
 
@@ -2179,16 +2180,16 @@ class CrispasrSession {
     }
   }
 
-  /// Transcribe and also return the raw per-frame CTC logits captured for
-  /// this call (Omni CTC backend only).
+  /// Transcribe and also return the per-frame CTC logits captured for
+  /// this call (backends with a dense CTC grid: Omni CTC, wav2vec2/hubert/
+  /// data2vec, canary-ctc).
   ///
   /// Enables logit capture for the duration of the call — the caller need
   /// not call [setReturnLogits] first — then returns `(segments, logits)`.
-  /// The [CtcLogits] grid is frame-major and pre-softmax
-  /// (`data[t * nVocab + v]`); see [CtcLogits]. It is `null` for backends
-  /// that don't produce a dense CTC grid (everything but Omni CTC), when the
-  /// transcript is empty, or on a dylib predating the accessor (which falls
-  /// back to a plain [transcribe]).
+  /// The [CtcLogits] grid is frame-major (`data[t * nVocab + v]`); see
+  /// [CtcLogits]. It is `null` for backends that don't produce a dense CTC
+  /// grid, when the transcript is empty, or on a dylib predating the accessor
+  /// (which falls back to a plain [transcribe]).
   ///
   /// [language] behaves exactly as in [transcribe].
   (List<SessionSegment>, CtcLogits?) transcribeWithLogits(
@@ -2485,10 +2486,10 @@ class CrispasrSession {
     return out;
   }
 
-  /// Lift out the raw per-frame CTC logits attached to [res], if any, into a
+  /// Lift out the per-frame CTC logits attached to [res], if any, into a
   /// Dart-owned [CtcLogits] before the result handle is freed. Returns `null`
   /// unless the session opted in via [setReturnLogits] and the backend
-  /// produced a dense CTC grid (Omni CTC only).
+  /// produced a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec, canary-ctc).
   CtcLogits? _readLogits(Pointer<Void> res) {
     final nFramesFn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
         int Function(Pointer<Void>)>('crispasr_session_result_n_logit_frames');
@@ -2734,8 +2735,9 @@ class CrispasrSession {
     if (rc != 0) throw Exception('setBeamSize failed (rc=$rc)');
   }
 
-  /// Opt in to capturing the raw per-frame CTC logits (Omni CTC backend
-  /// only) so a following transcribe attaches the dense
+  /// Opt in to capturing the per-frame CTC logits (backends with a dense CTC
+  /// grid: Omni CTC, wav2vec2/hubert/data2vec, canary-ctc) so a following
+  /// transcribe attaches the dense
   /// `[nVocab × nFrames]` grid read back via [transcribeWithLogits].
   /// Off by default so the normal path pays no `[vocab × frames]` copy.
   ///

@@ -1209,8 +1209,10 @@ class Session:
         if hasattr(lib, "crispasr_session_result_word_alt_p"):
             lib.crispasr_session_result_word_alt_p.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
             lib.crispasr_session_result_word_alt_p.restype = ctypes.c_float
-        # 2026-07-07: raw per-frame CTC logits (Omni CTC backend only), opted in
-        # via crispasr_session_set_return_logits. Frame-major, pre-softmax;
+        # 2026-07-07: per-frame CTC logits for backends with a dense CTC grid
+        # (Omni CTC, wav2vec2/hubert/data2vec, canary-ctc), opted in via
+        # crispasr_session_set_return_logits. Frame-major (raw pre-softmax for
+        # Omni & wav2vec2, log-probabilities for canary-ctc);
         # crispasr_session_result_logits returns NULL when none were captured.
         # hasattr-guarded so a binding loaded against an older dylib still works.
         if hasattr(lib, "crispasr_session_result_logits"):
@@ -1509,14 +1511,15 @@ class Session:
         *,
         language: Optional[str] = None,
     ) -> Tuple[List[SessionSegment], Optional[np.ndarray]]:
-        """Transcribe and also return the raw per-frame CTC logits.
+        """Transcribe and also return the per-frame CTC logits.
 
         Enables logit capture for this call (no prior :meth:`set_return_logits`
         needed), then returns ``(segments, logits)``. ``logits`` is a 2D
-        float32 numpy array of shape ``(n_frames, n_vocab)`` — frame-major and
-        **pre-softmax**, i.e. ``logits[t, v]`` is the raw score for vocabulary
-        entry ``v`` at encoder frame ``t``. It is ``None`` for backends that
-        don't produce a dense CTC grid (everything but Omni CTC), when the
+        float32 numpy array of shape ``(n_frames, n_vocab)`` — frame-major, i.e.
+        ``logits[t, v]`` is the score for vocabulary entry ``v`` at encoder
+        frame ``t``. The Omni CTC and wav2vec2/hubert/data2vec grids are raw
+        logits (pre-softmax); the canary-ctc grid is log-probabilities. It is
+        ``None`` for backends that don't produce a dense CTC grid, when the
         transcript is empty, or on dylibs predating the accessor.
 
         ``sample_rate`` / ``language`` behave exactly as in :meth:`transcribe`.
@@ -1565,7 +1568,7 @@ class Session:
                     ))
                 segs.append(SessionSegment(text=text.strip(), start=t0, end=t1, words=words))
 
-            # Lift out the raw CTC logits (if any) before the handle is freed.
+            # Lift out the CTC logits (if any) before the handle is freed.
             n_frames = self._lib.crispasr_session_result_n_logit_frames(res)
             n_vocab = self._lib.crispasr_session_result_n_logit_vocab(res)
             lp = self._lib.crispasr_session_result_logits(res)
@@ -2011,7 +2014,8 @@ class Session:
             raise RuntimeError(f"set_beam_size failed (rc={rc})")
 
     def set_return_logits(self, on: bool) -> None:
-        """Opt in to capturing raw per-frame CTC logits (Omni CTC backend only).
+        """Opt in to capturing per-frame CTC logits (backends with a dense CTC
+        grid: Omni CTC, wav2vec2/hubert/data2vec, canary-ctc).
 
         Off by default: capture copies an ``n_frames × n_vocab`` float grid per
         transcribe, so leave it off unless a consumer (e.g. forced alignment)

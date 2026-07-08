@@ -236,9 +236,11 @@ namespace CrispASR
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern float crispasr_session_result_word_p(IntPtr result, int iSeg, int iWord);
 
-        // Raw per-frame CTC logits (Omni CTC backend, opted in via
-        // crispasr_session_set_return_logits). _logits returns a const float*
-        // (frame-major, pre-softmax; logits[t * nVocab + v]) or NULL when none.
+        // Per-frame CTC logits (opted in via crispasr_session_set_return_logits)
+        // for backends with a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,
+        // canary-ctc). _logits returns a const float* (frame-major;
+        // logits[t * nVocab + v]) or NULL when none. Raw pre-softmax for Omni &
+        // wav2vec2; log-probabilities for canary-ctc.
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_result_n_logit_frames(IntPtr result);
 

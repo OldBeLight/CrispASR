@@ -234,8 +234,9 @@ namespace CrispASR
             => Check(NativeMethods.crispasr_session_set_beam_size(Handle, n), "set_beam_size");
 
         /// <summary>
-        /// Opt in to capturing the raw per-frame CTC logits (Omni CTC backend
-        /// only) so a following transcribe attaches the dense grid read back
+        /// Opt in to capturing the per-frame CTC logits (backends with a dense
+        /// CTC grid: Omni CTC, wav2vec2/hubert/data2vec, canary-ctc) so a
+        /// following transcribe attaches the dense grid read back
         /// via <see cref="TranscribeWithLogits"/>. Off by default so the normal
         /// path pays no <c>[vocab × frames]</c> copy.
         /// </summary>
@@ -315,12 +316,12 @@ namespace CrispASR
         }
 
         /// <summary>
-        /// Transcribe and also return the raw per-frame CTC logits captured for
-        /// this call (Omni CTC backend only). Opts in for the duration of the
-        /// call — no need to call <see cref="SetReturnLogits"/> first — then
-        /// returns the segments plus a <see cref="CtcLogits"/> grid, or
-        /// <c>null</c> for backends that produce no dense CTC grid (everything
-        /// but Omni CTC).
+        /// Transcribe and also return the per-frame CTC logits captured for
+        /// this call (backends with a dense CTC grid: Omni CTC, wav2vec2/hubert/
+        /// data2vec, canary-ctc). Opts in for the duration of the call — no need
+        /// to call <see cref="SetReturnLogits"/> first — then returns the
+        /// segments plus a <see cref="CtcLogits"/> grid, or <c>null</c> for
+        /// backends that produce no dense CTC grid.
         /// </summary>
         public (Segment[] Segments, CtcLogits? Logits) TranscribeWithLogits(float[] pcm, string? language = null)
         {
@@ -630,11 +631,13 @@ namespace CrispASR
     }
 
     /// <summary>
-    /// Raw per-frame CTC logits from the Omni CTC backend, captured by
+    /// Per-frame CTC logits from a CTC backend (Omni CTC, wav2vec2/hubert/
+    /// data2vec, or canary-ctc), captured by
     /// <see cref="Session.TranscribeWithLogits"/>. <see cref="Data"/> is
-    /// frame-major and pre-softmax: <c>Data[t * NVocab + v]</c> is the logit
-    /// for vocabulary entry <c>v</c> at encoder frame <c>t</c>, so its length
-    /// is <c>NFrames * NVocab</c>. Only the Omni CTC backend produces a grid.
+    /// frame-major: <c>Data[t * NVocab + v]</c> is the score for vocabulary
+    /// entry <c>v</c> at encoder frame <c>t</c>, so its length is
+    /// <c>NFrames * NVocab</c>. The Omni and wav2vec2 grids are raw logits
+    /// (pre-softmax); the canary-ctc grid is log-probabilities.
     /// </summary>
     public readonly struct CtcLogits
     {
@@ -644,7 +647,7 @@ namespace CrispASR
         /// <summary>Number of encoder frames (the time axis).</summary>
         public int NFrames { get; }
 
-        /// <summary>Frame-major, pre-softmax logits of length <c>NFrames * NVocab</c>.</summary>
+        /// <summary>Frame-major CTC grid of length <c>NFrames * NVocab</c> (raw logits for Omni &amp; wav2vec2, log-probabilities for canary-ctc).</summary>
         public float[] Data { get; }
 
         public CtcLogits(int nVocab, int nFrames, float[] data)

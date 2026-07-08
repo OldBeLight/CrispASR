@@ -106,9 +106,11 @@ public final class CrispasrSession implements AutoCloseable {
         long         crispasr_session_result_word_t0(Pointer result, int iSeg, int iWord);
         long         crispasr_session_result_word_t1(Pointer result, int iSeg, int iWord);
         float        crispasr_session_result_word_p(Pointer result, int iSeg, int iWord);
-        // Raw per-frame CTC logits (Omni CTC backend, opted in via
-        // crispasr_session_set_return_logits). _logits returns a const float*
-        // (frame-major, pre-softmax; logits[t * nVocab + v]) or NULL when none.
+        // Per-frame CTC logits (opted in via crispasr_session_set_return_logits)
+        // for backends with a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,
+        // canary-ctc). _logits returns a const float* (frame-major;
+        // logits[t * nVocab + v]) or NULL when none. Raw pre-softmax for Omni &
+        // wav2vec2; log-probabilities for canary-ctc.
         int          crispasr_session_result_n_logit_frames(Pointer result);
         int          crispasr_session_result_n_logit_vocab(Pointer result);
         Pointer      crispasr_session_result_logits(Pointer result);
@@ -484,8 +486,9 @@ public final class CrispasrSession implements AutoCloseable {
     }
 
     /**
-     * Opt in to capturing the raw per-frame CTC logits (Omni CTC backend only)
-     * so a following transcribe attaches the dense grid read back via
+     * Opt in to capturing the per-frame CTC logits (backends with a dense CTC
+     * grid: Omni CTC, wav2vec2/hubert/data2vec, canary-ctc) so a following
+     * transcribe attaches the dense grid read back via
      * {@link #transcribeWithLogits(float[], String)}. Off by default so the
      * normal path pays no {@code [vocab × frames]} copy.
      */
@@ -810,18 +813,20 @@ public final class CrispasrSession implements AutoCloseable {
     }
 
     /**
-     * Raw per-frame CTC logits from the Omni CTC backend, captured by
+     * Per-frame CTC logits from a CTC backend (Omni CTC, wav2vec2/hubert/
+     * data2vec, or canary-ctc), captured by
      * {@link #transcribeWithLogits(float[], String)}. {@code data} is
-     * frame-major and pre-softmax: {@code data[t * nVocab + v]} is the logit
-     * for vocabulary entry {@code v} at encoder frame {@code t}, so its length
-     * is {@code nFrames * nVocab}. Only the Omni CTC backend produces a grid.
+     * frame-major: {@code data[t * nVocab + v]} is the score for vocabulary
+     * entry {@code v} at encoder frame {@code t}, so its length is
+     * {@code nFrames * nVocab}. The Omni and wav2vec2 grids are raw logits
+     * (pre-softmax); the canary-ctc grid is log-probabilities.
      */
     public static final class CtcLogits {
         /** Vocabulary size — the number of CTC output classes scored per frame. */
         public final int nVocab;
         /** Number of encoder frames (the time axis). */
         public final int nFrames;
-        /** Frame-major, pre-softmax logits of length {@code nFrames * nVocab}. */
+        /** Frame-major CTC grid of length {@code nFrames * nVocab} (raw logits for Omni &amp; wav2vec2, log-probabilities for canary-ctc). */
         public final float[] data;
         CtcLogits(int nVocab, int nFrames, float[] data) {
             this.nVocab = nVocab; this.nFrames = nFrames; this.data = data;
@@ -831,8 +836,7 @@ public final class CrispasrSession implements AutoCloseable {
     /**
      * Segments plus the optional CTC logit grid from
      * {@link #transcribeWithLogits(float[], String)}. {@code logits} is
-     * {@code null} for backends that produce no dense CTC grid (everything but
-     * Omni CTC).
+     * {@code null} for backends that produce no dense CTC grid.
      */
     public static final class TranscriptionWithLogits {
         public final Segment[] segments;
@@ -855,12 +859,12 @@ public final class CrispasrSession implements AutoCloseable {
     }
 
     /**
-     * Transcribe and also return the raw per-frame CTC logits captured for this
-     * call (Omni CTC backend only). Opts in for the duration of the call — no
-     * need to call {@link #setReturnLogits(boolean)} first — then returns the
-     * segments plus a {@link CtcLogits} grid, or a {@code null} {@code logits}
-     * field for backends that produce no dense CTC grid (everything but Omni
-     * CTC).
+     * Transcribe and also return the per-frame CTC logits captured for this
+     * call (backends with a dense CTC grid: Omni CTC, wav2vec2/hubert/data2vec,
+     * canary-ctc). Opts in for the duration of the call — no need to call
+     * {@link #setReturnLogits(boolean)} first — then returns the segments plus a
+     * {@link CtcLogits} grid, or a {@code null} {@code logits} field for
+     * backends that produce no dense CTC grid.
      */
     public TranscriptionWithLogits transcribeWithLogits(float[] pcm, String lang) {
         setReturnLogits(true);

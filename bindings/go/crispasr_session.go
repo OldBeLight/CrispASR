@@ -106,9 +106,11 @@ const char*  crispasr_session_result_word_text(crispasr_session_result* r, int i
 long long    crispasr_session_result_word_t0(crispasr_session_result* r, int i_seg, int i_word);
 long long    crispasr_session_result_word_t1(crispasr_session_result* r, int i_seg, int i_word);
 float        crispasr_session_result_word_p(crispasr_session_result* r, int i_seg, int i_word);
-// Raw per-frame CTC logits (Omni CTC backend, opted in via
-// crispasr_session_set_return_logits). frame-major, pre-softmax:
-// logits[t * n_logit_vocab + v]; _logits returns NULL when none captured.
+// Per-frame CTC logits (opted in via crispasr_session_set_return_logits) for
+// backends that produce a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,
+// canary-ctc). Frame-major: logits[t * n_logit_vocab + v]. Raw pre-softmax for
+// Omni & wav2vec2; log-probabilities for canary-ctc. _logits returns NULL when
+// none captured.
 int          crispasr_session_result_n_logit_frames(crispasr_session_result* r);
 int          crispasr_session_result_n_logit_vocab(crispasr_session_result* r);
 const float* crispasr_session_result_logits(crispasr_session_result* r);
@@ -642,8 +644,9 @@ func (s *CrispasrSession) SetBeamSize(n int) error {
 	return nil
 }
 
-// SetReturnLogits opts in to capturing the raw per-frame CTC logits on
-// subsequent transcribe calls (Omni CTC backend only). Off by default: capture
+// SetReturnLogits opts in to capturing the per-frame CTC logits on
+// subsequent transcribe calls (backends with a dense CTC grid: Omni CTC,
+// wav2vec2/hubert/data2vec, canary-ctc). Off by default: capture
 // copies an NFrames × NVocab float grid per call, so leave it off unless a
 // consumer (e.g. forced alignment) needs the logits. Retrieve them with
 // TranscribeWithLogits.
@@ -1056,11 +1059,12 @@ type TranscribeWord struct {
 	P    float32 // confidence
 }
 
-// CtcLogits holds the raw per-frame CTC logits captured from the Omni CTC
-// backend. Data is frame-major and pre-softmax: Data[t*NVocab + v] is the logit
-// for vocabulary entry v at encoder frame t, so len(Data) == NFrames*NVocab.
-// Produced only by TranscribeWithLogits on a CTC model; other backends yield no
-// grid.
+// CtcLogits holds the per-frame CTC logits captured from a CTC backend (Omni
+// CTC, wav2vec2/hubert/data2vec, or canary-ctc). Data is frame-major:
+// Data[t*NVocab + v] is the score for vocabulary entry v at encoder frame t, so
+// len(Data) == NFrames*NVocab. The Omni and wav2vec2 grids are raw logits
+// (pre-softmax); the canary-ctc grid is log-probabilities. Produced only by
+// TranscribeWithLogits; other backends yield no grid.
 type CtcLogits struct {
 	NVocab  int
 	NFrames int
@@ -1096,10 +1100,10 @@ func (s *CrispasrSession) TranscribeLang(pcm []float32, lang string) (*Transcrib
 }
 
 // TranscribeWithLogits transcribes 16 kHz mono float32 PCM and also returns the
-// raw per-frame CTC logits captured for this call. It opts logit capture in for
+// per-frame CTC logits captured for this call. It opts logit capture in for
 // the duration (no prior SetReturnLogits needed). The returned *CtcLogits is
-// nil for backends that don't produce a dense CTC grid (everything but Omni
-// CTC) or when the transcript is empty.
+// nil for backends that don't produce a dense CTC grid or when the transcript
+// is empty.
 func (s *CrispasrSession) TranscribeWithLogits(pcm []float32) (*TranscribeResult, *CtcLogits, error) {
 	if s.handle == nil {
 		return nil, nil, errors.New("session is closed")
@@ -1195,7 +1199,7 @@ func extractResult(r *C.crispasr_session_result) *TranscribeResult {
 	return result
 }
 
-// extractLogits lifts out the raw CTC logits attached to a result (see
+// extractLogits lifts out the CTC logits attached to a result (see
 // CtcLogits) into a Go-owned slice before the result is freed. The C buffer is
 // owned by the result, so the data is copied out here. Returns nil unless the
 // session opted in via SetReturnLogits and the backend produced a grid.

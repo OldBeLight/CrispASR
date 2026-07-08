@@ -839,11 +839,13 @@ EMSCRIPTEN_BINDINGS(whisper) {
             return out;
         }));
 
-    // Transcribe + raw CTC logits (Omni CTC backend, opted in via
+    // Transcribe + CTC logits (backends with a dense CTC grid: Omni CTC,
+    // wav2vec2/hubert/data2vec, canary-ctc; opted in via
     // sessionSetReturnLogits). Returns { segments, logits } where segments
     // mirrors sessionTranscribe and logits is { nFrames, nVocab, data } with
-    // data a frame-major Float32Array (logits[t*nVocab + v], pre-softmax), or
-    // null for non-CTC backends / when no grid was captured.
+    // data a frame-major Float32Array (logits[t*nVocab + v]) — raw pre-softmax
+    // for Omni & wav2vec2, log-probabilities for canary-ctc — or null for
+    // backends with no dense CTC grid / when no grid was captured.
     emscripten::function("sessionTranscribeWithLogits", emscripten::optional_override(
         [](const emscripten::val& audio, const std::string& lang) -> emscripten::val {
             if (!g_tts_session) return emscripten::val::null();

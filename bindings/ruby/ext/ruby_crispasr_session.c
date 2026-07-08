@@ -109,9 +109,11 @@ extern const char*  crispasr_session_result_word_text(struct crispasr_session_re
 extern int64_t      crispasr_session_result_word_t0(struct crispasr_session_result* r, int i_seg, int i_word);
 extern int64_t      crispasr_session_result_word_t1(struct crispasr_session_result* r, int i_seg, int i_word);
 extern float        crispasr_session_result_word_p(struct crispasr_session_result* r, int i_seg, int i_word);
-// Raw per-frame CTC logits (Omni CTC backend, opted in via set_return_logits);
-// frame-major, pre-softmax: logits[t * n_logit_vocab + v]. _logits is NULL when
-// none captured. Owned by the result, freed with crispasr_session_result_free.
+// Per-frame CTC logits (opted in via set_return_logits) for backends with a
+// dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec, canary-ctc); frame-major:
+// logits[t * n_logit_vocab + v]. Raw pre-softmax for Omni & wav2vec2;
+// log-probabilities for canary-ctc. _logits is NULL when none captured. Owned by
+// the result, freed with crispasr_session_result_free.
 extern int          crispasr_session_result_n_logit_frames(struct crispasr_session_result* r);
 extern int          crispasr_session_result_n_logit_vocab(struct crispasr_session_result* r);
 extern const float* crispasr_session_result_logits(struct crispasr_session_result* r);
@@ -511,9 +513,9 @@ static VALUE rb_session_set_beam_size(VALUE self, VALUE handle, VALUE n) {
     return Qnil;
 }
 
-// Opt in to capturing the raw per-frame CTC logits (Omni CTC backend only).
-// Off by default so the normal path pays no copy; read them back with
-// transcribe_with_logits.
+// Opt in to capturing the per-frame CTC logits (backends with a dense CTC grid:
+// Omni CTC, wav2vec2/hubert/data2vec, canary-ctc). Off by default so the normal
+// path pays no copy; read them back with transcribe_with_logits.
 static VALUE rb_session_set_return_logits(VALUE self, VALUE handle, VALUE enable) {
     struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
     int rc = crispasr_session_set_return_logits(s, RTEST(enable) ? 1 : 0);
@@ -725,8 +727,9 @@ static VALUE rb_session_transcribe(VALUE self, VALUE handle, VALUE pcm_arr) {
 // CrispASR::Session.transcribe_with_logits(handle, pcm_array)
 //   -> [segments, logits]. segments matches transcribe(); logits is nil for
 //   non-CTC backends (or an empty grid) or a hash
-//   { n_frames:, n_vocab:, data: [Float, ...] } holding the frame-major,
-//   pre-softmax grid (data[t * n_vocab + v]). Opts the session into logit
+//   { n_frames:, n_vocab:, data: [Float, ...] } holding the frame-major grid
+//   (data[t * n_vocab + v]; raw logits for Omni & wav2vec2, log-probabilities
+//   for canary-ctc). Opts the session into logit
 //   capture for this call (mirrors set_return_logits(true)).
 static VALUE rb_session_transcribe_with_logits(VALUE self, VALUE handle, VALUE pcm_arr) {
     struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
@@ -765,8 +768,9 @@ static VALUE rb_session_transcribe_with_logits(VALUE self, VALUE handle, VALUE p
         rb_ary_push(segments, seg);
     }
 
-    // Lift the raw CTC logits (Omni CTC only) into a Ruby array before the
-    // result — which owns the float buffer — is freed. Mirrors the synthesize
+    // Lift the CTC logits (Omni CTC, wav2vec2/hubert/data2vec, or canary-ctc)
+    // into a Ruby array before the result — which owns the float buffer — is
+    // freed. Mirrors the synthesize
     // PCM marshalling.
     VALUE logits = Qnil;
     int n_frames = crispasr_session_result_n_logit_frames(r);
