@@ -238,7 +238,8 @@ try:
             f"-DCMAKE_BUILD_TYPE=Release && "
             f"cmake --build build --target crispasr-cli -j{n_jobs}"
         )
-        kh.build_heartbeat(build_cmd, timeout=1200)
+        with kh.build_heartbeat("omnivoice-build"):
+            kh.sh_with_progress(build_cmd)
     else:
         # Fallback build without harness
         subprocess.run("apt-get update -qq && apt-get install -y -qq ninja-build ccache", shell=True)
