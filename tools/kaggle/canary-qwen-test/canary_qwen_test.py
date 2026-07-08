@@ -142,11 +142,21 @@ try:
     GGUF_F16 = WORK / "canary-qwen-2.5b-f16.gguf"
     GGUF_Q4K = WORK / "canary-qwen-2.5b-q4_k.gguf"
 
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import snapshot_download, hf_hub_download
     snapshot_download("nvidia/canary-qwen-2.5b",
                       local_dir=str(MODEL_DIR),
                       token=os.environ.get("HF_TOKEN"))
     kh.step("model_downloaded", free_gb=kh.free_gb())
+
+    # The canary-qwen model doesn't ship a tokenizer.json — it uses the
+    # Qwen3 tokenizer. Download it into the model dir so the converter
+    # finds it.
+    kh.step("download_tokenizer")
+    for tok_file in ("tokenizer.json", "tokenizer_config.json"):
+        if not (MODEL_DIR / tok_file).exists():
+            hf_hub_download("Qwen/Qwen3-1.7B", tok_file,
+                            local_dir=str(MODEL_DIR))
+    kh.step("tokenizer_ready")
 
     # ── Convert to GGUF ──────────────────────────────────────────────
     kh.step("convert_to_gguf")
