@@ -10,7 +10,7 @@
 #include "crispasr_backend_utils.h"
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
-#include "crispasr_tts_ref_cache.h"
+#include "core/tts_ref_cache.h"
 #include "whisper_params.h"
 
 #include "f5_tts.h"
