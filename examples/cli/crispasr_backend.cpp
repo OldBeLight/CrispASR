@@ -10,6 +10,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_whisper_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_nemotron_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_parakeet_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_canary_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_canary_qwen_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_lfm2_audio_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_mini_omni2_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_cohere_backend();
@@ -95,6 +96,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_parakeet_backend();
     if (name == "canary")
         return crispasr_make_canary_backend();
+    if (name == "canary-qwen" || name == "canary_qwen" || name == "canary-qwen-2.5b")
+        return crispasr_make_canary_qwen_backend();
     if (name == "lfm2-audio")
         return crispasr_make_lfm2_audio_backend();
     if (name == "mini-omni2" || name == "mini_omni2" || name == "miniomni2")
@@ -235,6 +238,7 @@ std::vector<std::string> crispasr_list_backends() {
         "parakeet",
         "reazonspeech",
         "canary",
+        "canary-qwen",
         "lfm2-audio",
         "mini-omni2",
         "cohere",
@@ -543,6 +547,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
     // "ctc" qualifier before the broad canary catch-all below.
     if (contains_ci("canary") && contains_ci("ctc"))
         return "fastconformer-ctc";
+    if (contains_ci("canary") && contains_ci("qwen"))
+        return "canary-qwen";
     if (contains_ci("canary"))
         return "canary";
     if (contains_ci("lfm2-audio") || contains_ci("lfm2_audio"))
@@ -657,6 +663,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "parakeet";
             else if (a == "canary")
                 result = "canary";
+            else if (a == "canary_qwen" || a == "canary-qwen")
+                result = "canary-qwen";
             else if (a == "lfm2-audio")
                 result = "lfm2-audio";
             else if (a == "mini-omni2")

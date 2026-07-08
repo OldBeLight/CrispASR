@@ -18,6 +18,7 @@ add_executable(${TARGET}
     crispasr_backend_nemotron.cpp
     crispasr_backend_parakeet.cpp
     crispasr_backend_canary.cpp
+    crispasr_backend_canary_qwen.cpp
     crispasr_backend_lfm2_audio.cpp
     crispasr_backend_mini_omni2.cpp
     crispasr_backend_cohere.cpp

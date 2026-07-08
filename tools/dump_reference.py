@@ -124,6 +124,7 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # branch ("canary") compares mel_spectrogram + encoder_output; the
     # per-layer captures listed in DEFAULT_STAGES are diagnostic-only.
     "canary":     "reference_backends.canary",
+    "canary-qwen": "reference_backends.canary_qwen",
     "gemma4":     "reference_backends.gemma4",
     # Qwen3-TTS-12Hz Base. The audio arg is the voice-clone reference WAV
     # (16 kHz mono); synth text + ref text come from env vars. See

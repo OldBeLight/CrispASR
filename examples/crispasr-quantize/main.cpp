@@ -418,6 +418,13 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     //   - llm.output_norm.weight (small, F32 anyway)
     const bool is_mini_omni2 = (arch.find("mini-omni2") != std::string::npos);
 
+    // Canary-Qwen: FastConformer encoder + linear projection + Qwen3-1.7B LLM.
+    // The encoder is precision-sensitive (conformer drift), keep at source.
+    // Only LLM block projections (blk.*.attn_*, blk.*.ffn_*) should be quantized.
+    // Keep: encoder.*, preprocessor.*, proj.*, token_embd.*, output_norm.*
+    const bool is_canary_qwen = (arch.find("canary_qwen") != std::string::npos ||
+                                  arch.find("canary-qwen") != std::string::npos);
+
     // Bark TTS: 3 GPT-2 sub-models + EnCodec decoder.
     // Embeddings (token_embd, pos_embd), output heads, and the entire
     // EnCodec decoder are read via CPU tensor_get_row_f32 / tensor_get_all_f32
@@ -651,6 +658,9 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             !(is_omnivoice &&
               (sname.find("audio_embd") == 0 || sname.find("audio_output") == 0 ||
                sname.find("llm.token_embd") == 0)) &&
+            !(is_canary_qwen &&
+              (sname.find("encoder.") == 0 || sname.find("preprocessor.") == 0 ||
+               sname.find("proj.") == 0 || sname == "token_embd.weight" || sname == "output.weight")) &&
             !(is_orpheus && sname.find("talker.token_embd") == 0) &&
             !(is_arkasr && (sname.find("dec.embed.") == 0 || sname.find("enc.") == 0 || sname.find("adapter.") == 0)) &&
             !(is_higgs && (sname == "token_embd.weight" || sname == "output.weight")) &&
