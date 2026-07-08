@@ -104,9 +104,13 @@ try:
     from transformers import AutoTokenizer
 
     if OmniVoice is not None:
+        # P100 (sm_60) is not supported by recent PyTorch CUDA builds.
+        # Load on CPU to avoid CUDA kernel errors with weight_norm in
+        # the HiggsAudioV2 tokenizer.
+        load_device = "cpu"
         model = OmniVoice.from_pretrained(
-            MODEL_ID, device_map=device,
-            dtype=torch.float16 if device == "cuda" else torch.float32,
+            MODEL_ID, device_map=load_device,
+            dtype=torch.float32,
         )
         tokenizer = model.text_tokenizer or AutoTokenizer.from_pretrained(MODEL_ID)
         model.text_tokenizer = tokenizer
@@ -138,13 +142,13 @@ try:
     # Text embeddings
     if model is not None and hasattr(model, 'llm'):
         with torch.no_grad():
-            text_embeds = model.llm.embed_tokens(text_ids.unsqueeze(0).to(device))
+            text_embeds = model.llm.embed_tokens(text_ids.unsqueeze(0).to("cpu"))
         stages["text_embeds"] = text_embeds[0].float().cpu().numpy()
         log(f"text_embeds: {stages['text_embeds'].shape}")
 
         # audio_embd row 0
         with torch.no_grad():
-            audio_embd_row = model.audio_embeddings(torch.tensor([0], device=device))
+            audio_embd_row = model.audio_embeddings(torch.tensor([0], device="cpu"))
         stages["audio_embd_row0"] = audio_embd_row[0].float().cpu().numpy()
 
         # Full mixed embeds + LLM forward
@@ -157,13 +161,13 @@ try:
         n_cb = model.config.num_audio_codebook
         mask_id = model.config.audio_mask_id
 
-        input_ids = torch.zeros(1, n_cb, T_total, dtype=torch.long, device=device)
+        input_ids = torch.zeros(1, n_cb, T_total, dtype=torch.long, device="cpu")
         for cb in range(n_cb):
-            input_ids[0, cb, :T_style] = style_ids.to(device)
-            input_ids[0, cb, T_style:T_style+T_text] = text_ids.to(device)
+            input_ids[0, cb, :T_style] = style_ids.to("cpu")
+            input_ids[0, cb, T_style:T_style+T_text] = text_ids.to("cpu")
             input_ids[0, cb, T_style+T_text:] = mask_id
 
-        audio_mask = torch.zeros(1, T_total, dtype=torch.bool, device=device)
+        audio_mask = torch.zeros(1, T_total, dtype=torch.bool, device="cpu")
         audio_mask[0, T_style+T_text:] = True
 
         with torch.no_grad():
@@ -283,7 +287,6 @@ try:
     # ── Decode + ASR via Python OmniVoice ───────────────────────────
     if model is not None and n_codes > 0:
         log("Generating audio via Python OmniVoice.generate()...")
-        model = model.to(device)
         import soundfile as sf
 
         try:
@@ -302,7 +305,7 @@ try:
                 log("ASR roundtrip...")
                 try:
                     import whisper
-                    asr_model = whisper.load_model("base", device=device)
+                    asr_model = whisper.load_model("base", device="cpu")
                     result = asr_model.transcribe(str(out_wav), language="en")
                     transcript = result["text"].strip()
                     match = transcript.lower().strip("., !?") == SYN_TEXT.lower().strip("., !?")
