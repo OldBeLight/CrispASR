@@ -485,6 +485,10 @@ def convert(input_dir: Path, out_path: Path) -> None:
                 # --- Encoder / preprocessor / projection ---
                 enc_name = remap_encoder(hf_name)
                 if enc_name is not None:
+                    # Skip preprocessor tensors — we bake our own above
+                    if enc_name in ("preprocessor.fb", "preprocessor.window"):
+                        n_skipped += 1
+                        continue
                     t = f.get_tensor(hf_name)
                     if t.dtype == torch.bfloat16:
                         arr = t.float().numpy()

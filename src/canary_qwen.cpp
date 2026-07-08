@@ -642,13 +642,16 @@ static std::vector<float> canary_qwen_encode_mel(canary_qwen_context* ctx, const
     ggml_tensor* mel_t = ggml_graph_get_tensor(gf, "mel");
     ggml_backend_tensor_set(mel_t, mel, 0, n_mels * T_mel * sizeof(float));
 
-    // Compute pos_enc (rel-pos sinusoidals)
-    const int d = (int)ctx->model.hparams.enc_d_model;
-    int T_enc = (T_mel + (int)ctx->model.hparams.subsampling_factor - 1) / (int)ctx->model.hparams.subsampling_factor;
+    // Compute pos_enc (rel-pos sinusoidals) — read the actual tensor shape
+    // from the graph rather than estimating T, since build_pre_encode's exact
+    // T depends on conv padding which ceil(T_mel/8) doesn't capture.
+    // pos_enc tensor has shape (d, 2*T-1). Recover T from the tensor shape,
+    // then make_pos_enc(d, T) returns d*(2*T-1) floats.
     ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "pos_enc");
     if (pos_t) {
-        int L_pos = 2 * T_enc - 1;
-        auto pos_data = core_conformer::make_pos_enc(d, L_pos);
+        const int pos_d = (int)pos_t->ne[0];
+        int T_enc_actual = ((int)pos_t->ne[1] + 1) / 2;
+        auto pos_data = core_conformer::make_pos_enc(pos_d, T_enc_actual);
         ggml_backend_tensor_set(pos_t, pos_data.data(), 0, pos_data.size() * sizeof(float));
     }
 
