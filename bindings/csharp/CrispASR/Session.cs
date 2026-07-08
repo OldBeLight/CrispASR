@@ -233,6 +233,15 @@ namespace CrispASR
         public void SetBeamSize(int n)
             => Check(NativeMethods.crispasr_session_set_beam_size(Handle, n), "set_beam_size");
 
+        /// <summary>
+        /// Opt in to capturing the raw per-frame CTC logits (Omni CTC backend
+        /// only) so a following transcribe attaches the dense grid read back
+        /// via <see cref="TranscribeWithLogits"/>. Off by default so the normal
+        /// path pays no <c>[vocab × frames]</c> copy.
+        /// </summary>
+        public void SetReturnLogits(bool enable)
+            => Check(NativeMethods.crispasr_session_set_return_logits(Handle, enable ? 1 : 0), "set_return_logits");
+
         /// <summary>Set a GBNF grammar for constrained whisper decoding.</summary>
         public void SetGrammarText(string gbnfText, string rootRule, float penalty)
         {
@@ -303,6 +312,36 @@ namespace CrispASR
             if (r == IntPtr.Zero) throw new InvalidOperationException("Transcription failed");
             try { return ExtractSegments(r); }
             finally { NativeMethods.crispasr_session_result_free(r); }
+        }
+
+        /// <summary>
+        /// Transcribe and also return the raw per-frame CTC logits captured for
+        /// this call (Omni CTC backend only). Opts in for the duration of the
+        /// call — no need to call <see cref="SetReturnLogits"/> first — then
+        /// returns the segments plus a <see cref="CtcLogits"/> grid, or
+        /// <c>null</c> for backends that produce no dense CTC grid (everything
+        /// but Omni CTC).
+        /// </summary>
+        public (Segment[] Segments, CtcLogits? Logits) TranscribeWithLogits(float[] pcm, string? language = null)
+        {
+            SetReturnLogits(true);
+            var r = NativeMethods.crispasr_session_transcribe_lang(Handle, pcm, pcm.Length, language);
+            if (r == IntPtr.Zero) throw new InvalidOperationException("Transcription failed");
+            try { return (ExtractSegments(r), ExtractLogits(r)); }
+            finally { NativeMethods.crispasr_session_result_free(r); }
+        }
+
+        // Lift the result-owned float* logit grid into a managed float[] before
+        // the result handle is freed (same copy-out idiom as Synthesize).
+        private static CtcLogits? ExtractLogits(IntPtr r)
+        {
+            int nFrames = NativeMethods.crispasr_session_result_n_logit_frames(r);
+            int nVocab = NativeMethods.crispasr_session_result_n_logit_vocab(r);
+            var ptr = NativeMethods.crispasr_session_result_logits(r);
+            if (nFrames <= 0 || nVocab <= 0 || ptr == IntPtr.Zero) return null;
+            var data = new float[nFrames * nVocab];
+            Marshal.Copy(ptr, data, 0, nFrames * nVocab);
+            return new CtcLogits(nVocab, nFrames, data);
         }
 
         /// <summary>Transcribe with VAD segmentation.</summary>
@@ -588,6 +627,30 @@ namespace CrispASR
         }
 
         public override string ToString() => $"[{T0}-{T1}] {Text}";
+    }
+
+    /// <summary>
+    /// Raw per-frame CTC logits from the Omni CTC backend, captured by
+    /// <see cref="Session.TranscribeWithLogits"/>. <see cref="Data"/> is
+    /// frame-major and pre-softmax: <c>Data[t * NVocab + v]</c> is the logit
+    /// for vocabulary entry <c>v</c> at encoder frame <c>t</c>, so its length
+    /// is <c>NFrames * NVocab</c>. Only the Omni CTC backend produces a grid.
+    /// </summary>
+    public readonly struct CtcLogits
+    {
+        /// <summary>Vocabulary size — the number of CTC output classes scored per frame.</summary>
+        public int NVocab { get; }
+
+        /// <summary>Number of encoder frames (the time axis).</summary>
+        public int NFrames { get; }
+
+        /// <summary>Frame-major, pre-softmax logits of length <c>NFrames * NVocab</c>.</summary>
+        public float[] Data { get; }
+
+        public CtcLogits(int nVocab, int nFrames, float[] data)
+        {
+            NVocab = nVocab; NFrames = nFrames; Data = data;
+        }
     }
 
     /// <summary>One aligned word from forced alignment.</summary>

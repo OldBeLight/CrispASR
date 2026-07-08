@@ -146,6 +146,9 @@ namespace CrispASR
         internal static extern int crispasr_session_set_beam_size(IntPtr s, int n);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_set_return_logits(IntPtr s, int enable);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_set_grammar_text(
             IntPtr s,
             [MarshalAs(UnmanagedType.LPUTF8Str)] string gbnfText,
@@ -232,6 +235,18 @@ namespace CrispASR
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern float crispasr_session_result_word_p(IntPtr result, int iSeg, int iWord);
+
+        // Raw per-frame CTC logits (Omni CTC backend, opted in via
+        // crispasr_session_set_return_logits). _logits returns a const float*
+        // (frame-major, pre-softmax; logits[t * nVocab + v]) or NULL when none.
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_result_n_logit_frames(IntPtr result);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_result_n_logit_vocab(IntPtr result);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_result_logits(IntPtr result);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_result_word_n_alts(IntPtr result, int iSeg, int iWord);

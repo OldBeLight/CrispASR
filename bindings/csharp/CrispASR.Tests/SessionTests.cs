@@ -193,6 +193,15 @@ namespace CrispASR.Tests
         }
 
         [Fact]
+        public void SetReturnLogits_DoesNotThrow()
+        {
+            if (!CanLoadLibrary() || !HasWhisper) return;
+            using var s = Session.Open(WhisperModel!, 2);
+            s.SetReturnLogits(true);
+            s.SetReturnLogits(false);
+        }
+
+        [Fact]
         public void SetFallbackThresholds_DoesNotThrow()
         {
             if (!CanLoadLibrary() || !HasWhisper) return;
