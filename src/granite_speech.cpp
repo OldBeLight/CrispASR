@@ -1481,11 +1481,9 @@ static float* granite_run_encoder_graph(granite_speech_context* ctx, const float
     if (!with_rpe)
         fprintf(stderr, "granite_encoder_graph: rpe_per_layer missing entries — using approximate no-RPE path\n");
 
-    // §176s: reuse cached encoder graph when (T, with_rpe) matches.
+    // #235: always rebuild — cached graph has stale GPU buffer handles after sched regrow
     ggml_cgraph* gf;
-    if (ctx->cached_enc_gf && ctx->cached_enc_T == T && ctx->cached_enc_rpe == with_rpe) {
-        gf = ctx->cached_enc_gf;
-    } else {
+    {
         if (ctx->cached_enc_ctx) {
             ggml_free(ctx->cached_enc_ctx);
             ctx->cached_enc_ctx = nullptr;

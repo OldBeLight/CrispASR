@@ -1254,11 +1254,9 @@ extern "C" float* voxtral4b_run_encoder(voxtral4b_context* ctx, const float* mel
     const int N_out = T_enc_ds / 4;
     const int dim = (int)ctx->model.hparams.proj_out_dim;
 
-    // §176s: reuse cached encoder graph when T_mel matches.
+    // #235: always rebuild — cached graph has stale GPU buffer handles after sched regrow
     ggml_cgraph* gf;
-    if (ctx->cached_enc_gf && ctx->cached_enc_T_mel == T_mel) {
-        gf = ctx->cached_enc_gf;
-    } else {
+    {
         if (ctx->cached_enc_ctx) {
             ggml_free(ctx->cached_enc_ctx);
             ctx->cached_enc_ctx = nullptr;

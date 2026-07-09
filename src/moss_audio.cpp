@@ -973,11 +973,9 @@ extern "C" float* moss_audio_run_encoder(struct moss_audio_context* ctx, const f
             }
         }
 
-        // §176s: reuse cached encoder graph when chunk_frames matches.
+        // #235: always rebuild — cached graph has stale GPU buffer handles after sched regrow
         ggml_cgraph* gf;
-        if (ctx->cached_enc_gf && ctx->cached_enc_T_mel == chunk_frames) {
-            gf = ctx->cached_enc_gf;
-        } else {
+        {
             if (ctx->cached_enc_ctx) {
                 ggml_free(ctx->cached_enc_ctx);
                 ctx->cached_enc_ctx = nullptr;

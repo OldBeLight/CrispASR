@@ -1232,11 +1232,14 @@ extern "C" float* voxtral_run_encoder(voxtral_context* ctx, const float* mel_fea
         return nullptr;
     }
 
-    // §176s: reuse cached encoder graph (topology is always fixed at T_mel=3000).
+    // #235: always rebuild — cached graph has stale GPU buffer handles after sched regrow
     ggml_cgraph* gf;
-    if (ctx->cached_enc_gf) {
-        gf = ctx->cached_enc_gf;
-    } else {
+    {
+        if (ctx->cached_enc_ctx) {
+            ggml_free(ctx->cached_enc_ctx);
+            ctx->cached_enc_ctx = nullptr;
+            ctx->cached_enc_gf = nullptr;
+        }
         ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
         ggml_init_params aip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
         ctx->cached_enc_ctx = ggml_init(aip);
