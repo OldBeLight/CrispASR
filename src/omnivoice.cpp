@@ -1230,54 +1230,72 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
             }
         }
 
-        // Prepare embeddings
+        // Prepare conditional embeddings (full context: style + text + ref + target)
         auto embeds = prepare_embeddings(ctx, full_text_ids, audio_tokens, audio_mask, T_total);
 
-        // Build and compute LLM graph
-        // 28 layers × ~40 tensors (Q/K/V/O proj + norms + RoPE + GQA + flash_attn
-        // + FFN gate/up/down + silu + residuals) + graph overhead
-        size_t n_tensors = hp.n_layers * 40 + 100;
-        size_t mem_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(8192, false);
-        std::vector<uint8_t> mem_buf(mem_size);
-        ggml_init_params ip = {mem_size, mem_buf.data(), true};
-        ggml_context* ctx0 = ggml_init(ip);
-
-        ggml_tensor* input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hp.d_model, T_total);
-        ggml_set_name(input, "input_embeds");
-        ggml_set_input(input);
-
-        ggml_cgraph* gf = build_llm_graph(ctx, ctx0, input, T_total);
-
-        ggml_gallocr_t gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-        ggml_gallocr_alloc_graph(gallocr, gf);
-
-        ggml_backend_tensor_set(input, embeds.data(), 0, embeds.size() * sizeof(float));
-
-        // Set position IDs [0, 1, 2, ..., T_total-1]
-        {
-            std::vector<int32_t> pos_data(T_total);
-            for (int i = 0; i < T_total; i++)
+        // Helper: run LLM forward and extract target logits
+        int out_dim = (int)(hp.n_codebooks * hp.audio_vocab_size);
+        auto run_llm_forward = [&](const std::vector<float>& emb, int T_in, int target_offset) -> std::vector<float> {
+            size_t n_tensors = hp.n_layers * 40 + 100;
+            size_t mem_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(8192, false);
+            std::vector<uint8_t> mem_buf(mem_size);
+            ggml_init_params ip2 = {mem_size, mem_buf.data(), true};
+            ggml_context* ctx0 = ggml_init(ip2);
+            ggml_tensor* inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hp.d_model, T_in);
+            ggml_set_name(inp, "input_embeds");
+            ggml_set_input(inp);
+            ggml_cgraph* gf2 = build_llm_graph(ctx, ctx0, inp, T_in);
+            ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+            ggml_gallocr_alloc_graph(ga, gf2);
+            ggml_backend_tensor_set(inp, emb.data(), 0, emb.size() * sizeof(float));
+            std::vector<int32_t> pos_data(T_in);
+            for (int i = 0; i < T_in; i++)
                 pos_data[i] = i;
-            ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "pos_ids");
-            if (pos_t) {
+            ggml_tensor* pos_t = ggml_graph_get_tensor(gf2, "pos_ids");
+            if (pos_t)
                 ggml_backend_tensor_set(pos_t, pos_data.data(), 0, pos_data.size() * sizeof(int32_t));
+            ggml_backend_graph_compute(ctx->backend, gf2);
+            ggml_tensor* logits_out = ggml_graph_get_tensor(gf2, "audio_logits");
+            std::vector<float> all_logits(out_dim * T_in);
+            ggml_backend_tensor_get(logits_out, all_logits.data(), 0, all_logits.size() * sizeof(float));
+            // Extract target portion
+            std::vector<float> tgt(out_dim * T_target);
+            for (int t = 0; t < T_target; t++) {
+                std::memcpy(tgt.data() + (size_t)t * out_dim, all_logits.data() + (size_t)(target_offset + t) * out_dim,
+                            out_dim * sizeof(float));
             }
+            ggml_gallocr_free(ga);
+            ggml_free(ctx0);
+            return tgt;
+        };
+
+        // Conditional forward (full context)
+        int target_start = T_total - T_target;
+        auto c_logits = run_llm_forward(embeds, T_total, target_start);
+
+        // Unconditional forward (target tokens only) for classifier-free guidance
+        std::vector<float> u_logits;
+        if (gen.guidance_scale != 0.0f) {
+            // Build unconditional input: just the target audio tokens
+            std::vector<int32_t> u_text_ids(T_target, 0);
+            std::vector<bool> u_mask(T_target, true);
+            // Extract just target audio tokens
+            std::vector<int32_t> u_audio(hp.n_codebooks * T_target);
+            for (uint32_t cb = 0; cb < hp.n_codebooks; cb++) {
+                for (int t = 0; t < T_target; t++) {
+                    u_audio[cb * T_target + t] = audio_tokens[cb * T_audio + T_ref + t];
+                }
+            }
+            auto u_embeds = prepare_embeddings(ctx, u_text_ids, u_audio, u_mask, T_target);
+            u_logits = run_llm_forward(u_embeds, T_target, 0);
         }
 
-        ggml_backend_graph_compute(ctx->backend, gf);
-
-        // Get audio logits from graph (already includes audio_heads matmul)
-        ggml_tensor* logits_t = ggml_graph_get_tensor(gf, "audio_logits");
-        int out_dim = (int)(hp.n_codebooks * hp.audio_vocab_size);
-        std::vector<float> all_logits(out_dim * T_total);
-        ggml_backend_tensor_get(logits_t, all_logits.data(), 0, all_logits.size() * sizeof(float));
-
-        // Extract logits only for target positions
-        int target_start = T_total - T_target;
-        std::vector<float> target_logits(out_dim * T_target);
-        for (int t = 0; t < T_target; t++) {
-            std::memcpy(target_logits.data() + (size_t)t * out_dim,
-                        all_logits.data() + (size_t)(target_start + t) * out_dim, out_dim * sizeof(float));
+        // Apply classifier-free guidance
+        std::vector<float>& target_logits = c_logits;
+        if (gen.guidance_scale != 0.0f && !u_logits.empty()) {
+            for (size_t i = 0; i < target_logits.size(); i++) {
+                target_logits[i] = c_logits[i] + gen.guidance_scale * (c_logits[i] - u_logits[i]);
+            }
         }
 
         // Reshape logits to (T_target, n_codebooks, audio_vocab_size)
@@ -1362,9 +1380,6 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
         for (int i = 0; i < k; i++) {
             tokens[indices[i]] = pred_tokens[indices[i]];
         }
-
-        ggml_gallocr_free(gallocr);
-        ggml_free(ctx0);
     }
 
     result.codes = std::move(tokens);
