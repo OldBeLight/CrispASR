@@ -615,10 +615,9 @@ static std::vector<float> canary_qwen_encode_mel(canary_qwen_context* ctx, const
     if (ctx->compute_meta.empty())
         ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 
+    // #235: always rebuild — cached graph has stale GPU buffer handles after sched regrow
     ggml_cgraph* gf;
-    if (ctx->cached_enc_gf && ctx->cached_enc_T_mel == T_mel) {
-        gf = ctx->cached_enc_gf;
-    } else {
+    {
         if (ctx->cached_enc_ctx) {
             ggml_free(ctx->cached_enc_ctx);
             ctx->cached_enc_ctx = nullptr;

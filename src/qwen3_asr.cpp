@@ -1737,12 +1737,9 @@ extern "C" float* qwen3_asr_run_encoder(qwen3_asr_context* ctx, const float* mel
     // is ready when we add real per-chunk padding masking later.)
     std::vector<float> mask((size_t)N_padded * N_padded, 0.0f);
 
-    // §176s: reuse cached encoder graph when shape matches.
+    // #235: always rebuild — cached graph has stale GPU buffer handles after sched regrow
     ggml_cgraph* gf;
-    if (ctx->cached_enc_gf && ctx->cached_enc_T_chunk == chunk_T && ctx->cached_enc_num_chunks == num_chunks &&
-        ctx->cached_enc_T_chunk_out == T_chunk_out) {
-        gf = ctx->cached_enc_gf;
-    } else {
+    {
         ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
         std::swap(ctx->compute_meta, ctx->cached_enc_meta);
         gf = qwen3_asr_build_graph_encoder(ctx, chunk_T, num_chunks, T_chunk_out);

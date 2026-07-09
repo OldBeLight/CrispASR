@@ -749,11 +749,9 @@ static std::vector<float> funasr_run_encoder_adaptor(funasr_context* ctx, const 
         compute_encoder_pe(ctx->model, T_lfr + 256);
     }
 
-    // §176s: reuse cached encoder graph when T_lfr matches previous call.
+    // #235: always rebuild — cached graph has stale GPU buffer handles after sched regrow
     ggml_cgraph* gf;
-    if (ctx->cached_enc_gf && ctx->cached_enc_T_lfr == T_lfr) {
-        gf = ctx->cached_enc_gf;
-    } else {
+    {
         if (ctx->cached_enc_ctx) {
             ggml_free(ctx->cached_enc_ctx);
             ctx->cached_enc_ctx = nullptr;

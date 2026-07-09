@@ -6,6 +6,46 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-07-09 — canary-qwen backend (nvidia/canary-qwen-2.5b, #233)
+
+New backend: SALM (Speech-Augmented Language Model) — 32-layer FastConformer
+encoder (d=1024, from canary-1b-flash) → linear projection (1024→2048) →
+Qwen3-1.7B LLM decoder with merged LoRA (r=128, alpha=256). English ASR only.
+
+- **Converter** (`models/convert-canary-qwen-to-gguf.py`): lazy safetensors +
+  LoRA merge at conversion time. 1573 tensors, 56 LoRA merges.
+- **C runtime** (`src/canary_qwen.{h,cpp}`): reuses `core/fastconformer.h`
+  (encoder), `core/mel.h` (NeMo mel), `core/attention.h` (KV-cached GQA),
+  `core/ffn.h` (SwiGLU), `core/bpe.h` (Qwen3 tokenizer). Prompt:
+  `<|im_start|>user\n...<|audio_start|><|audio_pad|>×N<|audio_end|>...<|im_start|>assistant\n`.
+- **Mel filterbank bug**: converter initially baked the filterbank as
+  `(n_freqs, n_mels)` (FreqsMels) but `core_mel` expected `(n_mels, n_freqs)`
+  (MelsFreqs). cos_min = −0.15 against reference → LLM hallucinated.
+  Diagnosed via `crispasr-diff` on Kaggle: `[FAIL] mel_spectrogram cos_min=-0.147`.
+  Fix: transpose in converter. After fix: cos_min = 0.999, JFK exact match.
+- **Integration**: full 12-point checklist — CLI, C API (9 edit points), CMake,
+  registry (Q8_0 default), quantizer (encoder at source precision), diff harness,
+  README, docs/cli.md, docs/architecture.md.
+- **HF**: `cstr/canary-qwen-2.5b-GGUF` — F16 (5.4 GB), Q8_0 (4.1 GB), Q4_K (3.5 GB).
+- **Perf (Kaggle P100)**: mel 22 ms, encoder+proj 248 ms, prefill 171 ms,
+  decode 348 ms (22 tokens) → ~0.8 s total for 11 s JFK audio.
+
+## 2026-07-09 — #235 glm-asr-nano multi-slice segfault (+ 7-backend sweep)
+
+Same root cause as #215 (moss-transcribe Vulkan crash): encoder graph cached
+via `cached_enc_gf` across audio slices. Between slices the LLM prefill/decode
+graphs force the scheduler's allocator to regrow, freeing the GPU buffer objects
+(`VkBuffer` / `CUdeviceptr`) the cached graph's tensors reference. Slice 2
+reuses stale handles → use-after-free → segfault or busy loop.
+
+Fix: always rebuild the encoder graph (~1 ms build, compute is the real cost).
+Applied to glm_asr + 7 other backends with the same vulnerable pattern:
+voxtral4b, moss_audio, canary_qwen, voxtral, granite_speech, funasr, qwen3_asr.
+
+Encoder-only backends (canary, parakeet, nemotron, kyutai_stt, moonshine,
+moonshine_streaming, paraformer) are NOT affected — no LLM decoder on the same
+scheduler, so the allocator never regrows between slices.
+
 ## 2026-07-04 #220 chatterbox T3 CUDA illegal-memory-access — reset+alloc bucket sched per step
 
 Reporter hit `CUDA error: an illegal memory access was encountered` on an

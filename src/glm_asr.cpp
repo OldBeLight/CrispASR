@@ -1245,11 +1245,15 @@ extern "C" float* glm_asr_run_encoder(struct glm_asr_context* ctx, const float* 
     const int T_proj = T_enc / 4;
     const int llm_d = hp.llm_hidden; // 2048
 
-    // §176s: reuse cached encoder graph when T_mel matches.
+    // Build encoder graph fresh every call. The cached-graph optimisation
+    // (§176s) is unsafe on GPU backends: the scheduler's internal allocator
+    // regrows when subsequent larger graphs (LLM prefill/decode) are
+    // allocated, which frees the buffer objects the cached graph's tensors
+    // still reference. The next slice then reuses the cached graph with
+    // stale VkBuffer / CUdeviceptr handles → use-after-free → segfault.
+    // Same root cause as #215 (moss-transcribe Vulkan crash on multi-slice).
     ggml_cgraph* gf;
-    if (ctx->cached_enc_gf && ctx->cached_enc_T_mel == T_mel) {
-        gf = ctx->cached_enc_gf;
-    } else {
+    {
         if (ctx->cached_enc_ctx) {
             ggml_free(ctx->cached_enc_ctx);
             ctx->cached_enc_ctx = nullptr;
