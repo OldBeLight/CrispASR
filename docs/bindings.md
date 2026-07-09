@@ -32,6 +32,7 @@ backend doesn't expose that knob, but the call is safe to make.
 | `set_length_scale(s)` | `set_length_scale` / `set_length_scale` / `SetLengthScale` / `setLengthScale` | Kokoro phoneme duration multiplier (1.0 = normal) |
 | `set_best_of(n)` | `set_best_of` / `set_best_of` / `SetBestOf` / `setBestOf` | Best-of-N sampling for temperature > 0 |
 | `set_beam_size(n)` | `set_beam_size` / `set_beam_size` / `SetBeamSize` / `setBeamSize` | Beam search width |
+| `set_return_logits(enable)` | `set_return_logits` / `set_return_logits` / `SetReturnLogits` / `setReturnLogits` | Opt-in dense CTC grid capture for backends that expose frame-level CTC scores |
 | `set_grammar_text(gbnf, root, penalty)` | `set_grammar_text` / `set_grammar_text` / `SetGrammarText` / `setGrammarText` | GBNF constrained decoding (whisper); empty string clears |
 | `set_fallback_thresholds(...)` | `set_fallback_thresholds` / `set_fallback_thresholds` / `SetFallbackThresholds` / `setFallbackThresholds` | Whisper entropy/logprob/no-speech thresholds + temp-inc |
 | `set_alt_n(n)` | `set_alt_n` / `set_alt_n` / `SetAltN` / `setAltN` | Per-token alternative candidates (whisper greedy) |
@@ -50,6 +51,14 @@ backend doesn't expose that knob, but the call is safe to make.
 > many tokens from `chunk[i]` and rebuilds its own segment / word /
 > text representation. The C declaration lives in `include/crispasr.h`;
 > see also the `--lcs-dedup` / `--lcs-min-length` CLI flags.
+
+> **CTC logits and vocab.** `transcribe_with_logits` / `TranscribeWithLogits`
+> enables `set_return_logits(true)` for a single call, copies the result-owned
+> dense CTC grid into language-owned memory, and then disables capture again.
+> The grid is frame-major (`data[t * n_vocab + v]`). Omni CTC and wav2vec2
+> return raw pre-softmax logits; canary/FastConformer CTC returns log-probs.
+> `ctc_vocab` / `CtcVocab` returns raw token pieces where the backend exposes a
+> CTC vocabulary.
 
 | Language | Status | Surface |
 |---|---|---|

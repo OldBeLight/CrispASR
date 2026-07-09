@@ -93,6 +93,7 @@ crispasr --list-backends
 | `--list-backends` | Print the capability matrix and exit |
 | `--gpu-backend NAME` | Force GPU backend: `cuda`, `vulkan`, `metal`, or `cpu` (default: `auto`) |
 | `--no-gpu` / `--device N` | Disable GPU entirely, or pin to GPU index N |
+| `--return-logits` | For dense CTC backends, write `<audio>.ctc-logits.json` containing the frame-major CTC grid (`data[t * n_vocab + v]`) plus shape metadata and any exposed vocab |
 
 ### Model resolution flags
 

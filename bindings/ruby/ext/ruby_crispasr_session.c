@@ -700,7 +700,10 @@ static VALUE rb_session_transcribe(VALUE self, VALUE handle, VALUE pcm_arr) {
 
     struct crispasr_session_result* r = crispasr_session_transcribe(s, pcm, (int)n);
     free(pcm);
-    if (!r) rb_raise(rb_eRuntimeError, "transcription failed");
+    if (!r) {
+        crispasr_session_set_return_logits(s, 0);
+        rb_raise(rb_eRuntimeError, "transcription failed");
+    }
 
     int n_segs = crispasr_session_result_n_segments(r);
     VALUE segments = rb_ary_new_capa(n_segs);
@@ -791,6 +794,7 @@ static VALUE rb_session_transcribe_with_logits(VALUE self, VALUE handle, VALUE p
         rb_hash_aset(logits, ID2SYM(rb_intern("data")), data);
     }
     crispasr_session_result_free(r);
+    crispasr_session_set_return_logits(s, 0);
 
     VALUE out = rb_ary_new_capa(2);
     rb_ary_push(out, segments);

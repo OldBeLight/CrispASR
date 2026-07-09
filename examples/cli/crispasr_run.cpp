@@ -671,12 +671,20 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
         if (params.output_jsn)
             crispasr_write_json(out_path(".json"), all_segs, backend.name(), params.model, params.language,
                                 params.output_jsn_full, lid_info.lang_code.empty() ? nullptr : &lid_info);
+        if (params.return_logits) {
+            if (const auto* logits = backend.last_ctc_logits()) {
+                crispasr_write_ctc_logits_json(out_path(".ctc-logits.json"), *logits, backend.name());
+            } else if (!params.no_prints) {
+                fprintf(stderr, "crispasr: warning: backend '%s' did not produce CTC logits\n", backend.name());
+            }
+        }
         return 0;
     }
 
     // --------------- Per-slice path (non-VAD or single slice) ---------------
     // Process VAD slices — parallel when multiple slices AND n_processors > 1
     std::vector<std::vector<crispasr_segment>> per_slice(slices.size());
+    std::vector<crispasr_ctc_logits> per_slice_logits(slices.size());
 
     // Pyannote cross-slice fix (issue #107): pre-compute the
     // segmentation posteriors once over the FULL mono audio, then have
@@ -781,6 +789,12 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
 
         std::vector<crispasr_segment> segs =
             be.transcribe(samples.data() + ext_start, ext_end - ext_start, ext_t0_cs, params);
+        if (params.return_logits) {
+            if (const auto* logits = be.last_ctc_logits())
+                per_slice_logits[i] = *logits;
+            else
+                per_slice_logits[i] = {};
+        }
 
         // Trim back to the original slice range when context was added.
         if (use_chunk_context && !segs.empty()) {
@@ -947,7 +961,25 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
         }
     };
 
-    const int n_workers = std::min(params.n_processors, (int32_t)slices.size());
+    const int n_workers = params.return_logits ? 1 : std::min(params.n_processors, (int32_t)slices.size());
+
+    auto merged_ctc_logits = [&]() {
+        crispasr_ctc_logits merged;
+        for (const auto& lg : per_slice_logits) {
+            if (lg.data.empty() || lg.n_frames <= 0 || lg.n_vocab <= 0)
+                continue;
+            if (merged.n_vocab == 0) {
+                merged.n_vocab = lg.n_vocab;
+                merged.normalization = lg.normalization;
+                merged.vocab = lg.vocab;
+            }
+            if (merged.n_vocab != lg.n_vocab)
+                continue;
+            merged.data.insert(merged.data.end(), lg.data.begin(), lg.data.end());
+            merged.n_frames += lg.n_frames;
+        }
+        return merged;
+    };
 
     if (n_workers > 1 && slices.size() > 1) {
         // Parallel slice processing with separate backend instances
@@ -1101,6 +1133,11 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             if (params.output_jsn)
                 crispasr_write_json(out_path(".json"), all_segs, backend.name(), params.model, params.language,
                                     params.output_jsn_full, lid_info.lang_code.empty() ? nullptr : &lid_info);
+            if (params.return_logits) {
+                auto logits = merged_ctc_logits();
+                if (!logits.data.empty())
+                    crispasr_write_ctc_logits_json(out_path(".ctc-logits.json"), logits, backend.name());
+            }
         }
         return 0;
     } else {
@@ -1193,6 +1230,13 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     if (params.output_jsn)
         crispasr_write_json(out_path(".json"), all_segs, backend.name(), params.model, params.language,
                             params.output_jsn_full, lid_info.lang_code.empty() ? nullptr : &lid_info);
+    if (params.return_logits) {
+        auto logits = merged_ctc_logits();
+        if (!logits.data.empty())
+            crispasr_write_ctc_logits_json(out_path(".ctc-logits.json"), logits, backend.name());
+        else if (!params.no_prints)
+            fprintf(stderr, "crispasr: warning: backend '%s' did not produce CTC logits\n", backend.name());
+    }
 
     return 0;
 }
@@ -3329,7 +3373,9 @@ int crispasr_run_backend(const whisper_params& params_in) {
 
         // Transcribe each slice.
         std::vector<std::vector<crispasr_segment>> per_slice;
+        std::vector<crispasr_ctc_logits> per_slice_logits;
         per_slice.reserve(slices.size());
+        per_slice_logits.reserve(slices.size());
         for (size_t i = 0; i < slices.size(); i++) {
             const auto & sl = slices[i];
             // Always transcribe in mono — every backend takes mono PCM
@@ -3339,6 +3385,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 sl.end - sl.start,
                 sl.t0_cs,
                 params);
+            if (params.return_logits) {
+                if (const auto* logits = backend->last_ctc_logits())
+                    per_slice_logits.push_back(*logits);
+                else
+                    per_slice_logits.push_back({});
+            }
 
             // Apply the generic diarize post-step. Stereo-only methods
             // (energy, xcorr) need have_stereo == true; mono-friendly
@@ -3457,6 +3509,24 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 out_path(".json"),
                 all_segs, backend->name(), params.model, params.language,
                 params.output_jsn_full, nullptr);
+        if (params.return_logits) {
+            crispasr_ctc_logits merged;
+            for (const auto& lg : per_slice_logits) {
+                if (lg.data.empty() || lg.n_vocab <= 0 || lg.n_frames <= 0)
+                    continue;
+                if (merged.n_vocab == 0) {
+                    merged.n_vocab = lg.n_vocab;
+                    merged.normalization = lg.normalization;
+                    merged.vocab = lg.vocab;
+                }
+                if (merged.n_vocab != lg.n_vocab)
+                    continue;
+                merged.data.insert(merged.data.end(), lg.data.begin(), lg.data.end());
+                merged.n_frames += lg.n_frames;
+            }
+            if (!merged.data.empty())
+                crispasr_write_ctc_logits_json(out_path(".ctc-logits.json"), merged, backend->name());
+        }
     }
 
     if (punc_ctx) fireredpunc_free(punc_ctx);

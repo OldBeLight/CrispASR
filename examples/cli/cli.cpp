@@ -506,6 +506,8 @@ static bool whisper_params_parse_arg_backend_vad(int argc, char** argv, int& i, 
         params.show_alternatives = true;
     } else if (arg == "--alt-n") {
         params.n_alternatives = std::stoi(ARGV_NEXT);
+    } else if (arg == "--return-logits") {
+        params.return_logits = true;
     } else if (arg == "--stream") {
         params.stream = true;
     } else if (arg == "--mic") {
@@ -982,6 +984,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "             --no-auto-aligner      [%-7s] for --backend canary, skip the implicit "
             "`-am auto --force-aligner` default (SubtitleEdit #10775)\n",
             params.no_auto_aligner ? "true" : "false");
+    fprintf(stderr,
+            "             --return-logits         [%-7s] write dense CTC logits as a sidecar "
+            ".ctc-logits.json when supported\n",
+            params.return_logits ? "true" : "false");
     fprintf(
         stderr,
         "  --lid-backend NAME                [%-7s] language-detect backend: whisper|silero|firered (for non-native "

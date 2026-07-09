@@ -719,6 +719,46 @@ bool crispasr_write_lrc(const std::string& path, const std::vector<crispasr_disp
     return true;
 }
 
+std::string crispasr_ctc_logits_to_json(const crispasr_ctc_logits& logits) {
+    std::ostringstream js;
+    js << "{";
+    js << "\"n_frames\":" << logits.n_frames << ",";
+    js << "\"n_vocab\":" << logits.n_vocab << ",";
+    js << "\"layout\":\"frame_major\",";
+    js << "\"normalization\":\"" << json_escape(logits.normalization) << "\",";
+    if (!logits.vocab.empty()) {
+        js << "\"vocab\":[";
+        for (size_t i = 0; i < logits.vocab.size(); i++) {
+            if (i)
+                js << ",";
+            js << "\"" << json_escape(logits.vocab[i]) << "\"";
+        }
+        js << "],";
+    }
+    js << "\"data\":[";
+    for (size_t i = 0; i < logits.data.size(); i++) {
+        if (i)
+            js << ",";
+        js << logits.data[i];
+    }
+    js << "]}";
+    return js.str();
+}
+
+bool crispasr_write_ctc_logits_json(const std::string& path, const crispasr_ctc_logits& logits,
+                                    const std::string& backend_name) {
+    std::ofstream f(path);
+    if (!f) {
+        fprintf(stderr, "crispasr: warning: cannot write CTC logits JSON '%s'\n", path.c_str());
+        return false;
+    }
+    f << "{\n";
+    f << "  \"backend\": \"" << json_escape(backend_name) << "\",\n";
+    f << "  \"ctc_logits\": " << crispasr_ctc_logits_to_json(logits) << "\n";
+    f << "}\n";
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Punctuation stripping
 // ---------------------------------------------------------------------------

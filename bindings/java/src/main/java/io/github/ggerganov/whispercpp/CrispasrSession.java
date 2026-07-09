@@ -874,10 +874,14 @@ public final class CrispasrSession implements AutoCloseable {
     public TranscriptionWithLogits transcribeWithLogits(float[] pcm, String lang) {
         setReturnLogits(true);
         Pointer r = Lib.INSTANCE.crispasr_session_transcribe_lang(handle, pcm, pcm.length, lang);
-        if (r == null) throw new RuntimeException("transcription failed");
+        if (r == null) {
+            setReturnLogits(false);
+            throw new RuntimeException("transcription failed");
+        }
         try {
             return new TranscriptionWithLogits(extractSegments(r), extractLogits(r));
         } finally {
+            setReturnLogits(false);
             Lib.INSTANCE.crispasr_session_result_free(r);
         }
     }

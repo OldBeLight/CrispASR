@@ -1283,6 +1283,7 @@ class Session:
         else:
             res = self._lib.crispasr_session_transcribe(self._handle, samples_ptr, len(pcm))
         if not res:
+            self.set_return_logits(False)
             raise RuntimeError(f"crispasr_session_transcribe failed for backend {self.backend!r}")
 
         try:
@@ -1388,6 +1389,7 @@ class Session:
                 out.append(SessionSegment(text=text.strip(), start=t0, end=t1, words=words))
             return out
         finally:
+            self.set_return_logits(False)
             self._lib.crispasr_session_result_free(res)
 
     def get_progress(self) -> int:

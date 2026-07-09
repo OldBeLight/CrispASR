@@ -112,6 +112,7 @@ struct whisper_params {
     int flush_after = 0;
     bool show_alternatives = false;
     int32_t n_alternatives = 3;
+    bool return_logits = false;
     std::string aligner_model;
     // PLAN issue #62: when true, the CTC forced aligner runs even on
     // backends that already produce native timestamps — replacing

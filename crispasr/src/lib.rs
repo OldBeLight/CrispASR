@@ -451,7 +451,9 @@ impl Session {
         let res = unsafe {
             crispasr_sys::crispasr_session_transcribe(self.handle, pcm.as_ptr(), pcm.len() as i32)
         };
-        self.parse_session_result_logits(res, "crispasr_session_transcribe")
+        let parsed = self.parse_session_result_logits(res, "crispasr_session_transcribe");
+        let _ = self.set_return_logits(false);
+        parsed
     }
 
     /// Chunked-encode transcribe (issue #208). Forces the Parakeet backend
@@ -533,7 +535,11 @@ impl Session {
             _ => None,
         };
 
-        extern "C" fn trampoline<F: FnMut(i32, i32)>(processed: c_int, total: c_int, ud: *mut c_void) {
+        extern "C" fn trampoline<F: FnMut(i32, i32)>(
+            processed: c_int,
+            total: c_int,
+            ud: *mut c_void,
+        ) {
             if ud.is_null() {
                 return;
             }

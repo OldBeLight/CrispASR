@@ -1059,7 +1059,7 @@ type TranscribeSegment struct {
 // TranscribeWord is one word with timing and confidence.
 type TranscribeWord struct {
 	Text string
-	T0   int64   // centiseconds
+	T0   int64 // centiseconds
 	T1   int64
 	P    float32 // confidence
 }
@@ -1119,6 +1119,7 @@ func (s *CrispasrSession) TranscribeWithLogits(pcm []float32) (*TranscribeResult
 	if err := s.SetReturnLogits(true); err != nil {
 		return nil, nil, err
 	}
+	defer s.SetReturnLogits(false)
 	pcmPtr := (*C.float)(unsafe.Pointer(&pcm[0]))
 	r := C.crispasr_session_transcribe(s.handle, pcmPtr, C.int(len(pcm)))
 	if r == nil {
@@ -1353,10 +1354,10 @@ func VADSegments(vadModelPath string, pcm []float32, sampleRate int, threshold f
 type DiarizeMethod int
 
 const (
-	DiarizeEnergy    DiarizeMethod = 0 // stereo-only, energy-based
-	DiarizeXCorr     DiarizeMethod = 1 // stereo-only, cross-correlation
-	DiarizeVADTurns  DiarizeMethod = 2 // mono-friendly, gap-based
-	DiarizePyannote  DiarizeMethod = 3 // pyannote v3 segmentation model
+	DiarizeEnergy   DiarizeMethod = 0 // stereo-only, energy-based
+	DiarizeXCorr    DiarizeMethod = 1 // stereo-only, cross-correlation
+	DiarizeVADTurns DiarizeMethod = 2 // mono-friendly, gap-based
+	DiarizePyannote DiarizeMethod = 3 // pyannote v3 segmentation model
 )
 
 // DiarizeSeg is one input/output segment for diarization.
@@ -1421,9 +1422,10 @@ func DiarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeS
 // SpeakerEmbedder wraps a pluggable speaker-embedding model.
 //
 // Known aliases (case-insensitive):
-//   "auto" / "titanet"                            -> TitaNet-Large (192-d)
-//   "indextts" / "indextts-bigvgan" / "ecapa"     -> IndexTTS-BigVGAN ECAPA-TDNN (512-d)
-//   any .gguf path                                -> TitaNet (or IndexTTS if "indextts" in name)
+//
+//	"auto" / "titanet"                            -> TitaNet-Large (192-d)
+//	"indextts" / "indextts-bigvgan" / "ecapa"     -> IndexTTS-BigVGAN ECAPA-TDNN (512-d)
+//	any .gguf path                                -> TitaNet (or IndexTTS if "indextts" in name)
 //
 // Always call Close() — the C-side context owns model weights.
 type SpeakerEmbedder struct {

@@ -75,6 +75,9 @@ bool crispasr_write_json(const std::string& path, const std::vector<crispasr_seg
                          const std::string& backend_name, const std::string& model_path, const std::string& language,
                          bool full, const crispasr_lid_info* lid = nullptr);
 
+bool crispasr_write_ctc_logits_json(const std::string& path, const crispasr_ctc_logits& logits,
+                                    const std::string& backend_name);
+
 bool crispasr_write_lrc(const std::string& path, const std::vector<crispasr_disp_segment>& segs);
 
 // Print segments to stdout. If show_timestamps is true, each line is
@@ -122,6 +125,8 @@ std::string crispasr_segments_to_diarized_json(const std::vector<crispasr_segmen
 // CrispASR native JSON (the format returned by /inference).
 std::string crispasr_segments_to_native_json(const std::vector<crispasr_segment>& segs, const std::string& backend_name,
                                              double duration_s);
+
+std::string crispasr_ctc_logits_to_json(const crispasr_ctc_logits& logits);
 
 // Remove punctuation from a segment in-place: from seg.text, each
 // seg.words[i].text, and each seg.tokens[i].text. Called by the

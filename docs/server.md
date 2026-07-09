@@ -117,6 +117,7 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `grammar_rule` | Root rule name for the grammar |
 | `best_of` | Whisper best-of-N sampling candidates |
 | `beam_size` | Whisper beam search width |
+| `return_logits` | `true`/`false` — for supported dense CTC backends, include `ctc_logits` in JSON responses (`n_frames`, `n_vocab`, frame-major `data`, optional `vocab`) |
 | `entropy_thold` | Entropy threshold for decoder fallback |
 | `logprob_thold` | Log-probability threshold for decoder fallback |
 | `no_speech_thold` | No-speech probability threshold |

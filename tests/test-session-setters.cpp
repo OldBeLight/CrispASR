@@ -6,7 +6,7 @@
 // network, safe on every CI tier.  A regression here means a setter lost its
 // null guard (silent crash risk for callers that open sessions lazily).
 //
-// Coverage: all 19 setters declared in include/crispasr.h under the
+// Coverage: all setters declared in include/crispasr.h under the
 // "Unified session decode / sampling controls" block.
 
 #include <catch2/catch_test_macros.hpp>
@@ -87,6 +87,10 @@ TEST_CASE("session setter: set_best_of null-handle → -1", "[unit][setters]") {
 
 TEST_CASE("session setter: set_beam_size null-handle → -1", "[unit][setters]") {
     REQUIRE(crispasr_session_set_beam_size(nullptr, 4) == -1);
+}
+
+TEST_CASE("session setter: set_return_logits null-handle -> -1", "[unit][setters]") {
+    REQUIRE(crispasr_session_set_return_logits(nullptr, 1) == -1);
 }
 
 TEST_CASE("session setter: set_alt_n null-handle → -1", "[unit][setters]") {

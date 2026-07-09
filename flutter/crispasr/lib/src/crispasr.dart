@@ -2166,12 +2166,14 @@ class CrispasrSession {
     calloc.free(samples);
     if (langPtr != null) calloc.free(langPtr);
     if (res == nullptr) {
+      setReturnLogits(false);
       throw Exception('crispasr_session_transcribe returned null');
     }
 
     try {
       return _readSegments(res);
     } finally {
+      setReturnLogits(false);
       final freeFn =
           _lib.lookupFunction<Void Function(Pointer<Void>), void Function(Pointer<Void>)>(
         'crispasr_session_result_free',

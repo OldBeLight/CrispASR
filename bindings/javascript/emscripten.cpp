@@ -861,13 +861,17 @@ EMSCRIPTEN_BINDINGS(whisper) {
             emscripten::val mv = audio["constructor"].new_(memory, reinterpret_cast<uintptr_t>(pcm.data()), n);
             mv.call<void>("set", audio);
 
+            crispasr_session_set_return_logits(g_tts_session, 1);
             crispasr_session_result* res;
             if (!lang.empty()) {
                 res = crispasr_session_transcribe_lang(g_tts_session, pcm.data(), n, lang.c_str());
             } else {
                 res = crispasr_session_transcribe(g_tts_session, pcm.data(), n);
             }
-            if (!res) return emscripten::val::null();
+            if (!res) {
+                crispasr_session_set_return_logits(g_tts_session, 0);
+                return emscripten::val::null();
+            }
 
             emscripten::val out = emscripten::val::object();
             int ns = crispasr_session_result_n_segments(res);
@@ -914,6 +918,7 @@ EMSCRIPTEN_BINDINGS(whisper) {
                 out.set("logits", emscripten::val::null());
             }
 
+            crispasr_session_set_return_logits(g_tts_session, 0);
             crispasr_session_result_free(res);
             return out;
         }));

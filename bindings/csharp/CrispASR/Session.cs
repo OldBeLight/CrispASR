@@ -327,9 +327,9 @@ namespace CrispASR
         {
             SetReturnLogits(true);
             var r = NativeMethods.crispasr_session_transcribe_lang(Handle, pcm, pcm.Length, language);
-            if (r == IntPtr.Zero) throw new InvalidOperationException("Transcription failed");
+            if (r == IntPtr.Zero) { SetReturnLogits(false); throw new InvalidOperationException("Transcription failed"); }
             try { return (ExtractSegments(r), ExtractLogits(r)); }
-            finally { NativeMethods.crispasr_session_result_free(r); }
+            finally { SetReturnLogits(false); NativeMethods.crispasr_session_result_free(r); }
         }
 
         // Lift the result-owned float* logit grid into a managed float[] before

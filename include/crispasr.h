@@ -81,6 +81,7 @@ struct whisper_context;
 struct whisper_state;
 struct whisper_full_params;
 struct crispasr_session;
+struct crispasr_session_result;
 
 typedef int32_t whisper_pos;
 typedef int32_t whisper_token;
@@ -603,6 +604,7 @@ CRISPASR_API int crispasr_session_set_length_scale(struct crispasr_session* s, f
 CRISPASR_API int crispasr_session_set_g2p_dict(struct crispasr_session* s, const char* source);
 CRISPASR_API int crispasr_session_set_best_of(struct crispasr_session* s, int n);
 CRISPASR_API int crispasr_session_set_beam_size(struct crispasr_session* s, int n);
+CRISPASR_API int crispasr_session_set_return_logits(struct crispasr_session* s, int enable);
 CRISPASR_API int crispasr_session_set_grammar_text(struct crispasr_session* s, const char* gbnf_text,
                                                    const char* root_rule, float penalty);
 CRISPASR_API int crispasr_session_set_fallback_thresholds(struct crispasr_session* s, float entropy_thold,
@@ -638,6 +640,19 @@ CRISPASR_API int crispasr_session_set_hotwords(struct crispasr_session* s, const
 // Human-readable error from the last failed synthesize call. Empty string
 // when the last call succeeded. Pointer owned by the session.
 CRISPASR_API const char* crispasr_session_last_synth_error(struct crispasr_session* s);
+
+// CTC vocabulary access. Returns 0 / "" for backends without an exposed CTC
+// vocabulary. The token text pointer is model-owned and must not be freed.
+CRISPASR_API int crispasr_session_n_vocab(struct crispasr_session* s);
+CRISPASR_API const char* crispasr_session_token_text(struct crispasr_session* s, int id);
+
+// Per-frame dense CTC grid captured when crispasr_session_set_return_logits(s,1)
+// was enabled before transcription. Frame-major:
+// logits[t * n_logit_vocab + v]. Pointer is result-owned and valid until
+// crispasr_session_result_free().
+CRISPASR_API int crispasr_session_result_n_logit_frames(struct crispasr_session_result* r);
+CRISPASR_API int crispasr_session_result_n_logit_vocab(struct crispasr_session_result* r);
+CRISPASR_API const float* crispasr_session_result_logits(struct crispasr_session_result* r);
 
 // Run the entire model: PCM -> log mel spectrogram -> encoder -> decoder -> text
 // Not thread safe for same context

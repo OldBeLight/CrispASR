@@ -68,6 +68,14 @@ struct crispasr_segment {
     std::string itn_flag;    // "withitn" or "woitn"
 };
 
+struct crispasr_ctc_logits {
+    int n_frames = 0;
+    int n_vocab = 0;
+    std::vector<float> data;        // frame-major: data[t * n_vocab + v]
+    std::string normalization;      // "logits" or "log_probs"
+    std::vector<std::string> vocab; // optional raw token pieces indexed by id
+};
+
 // ---------------------------------------------------------------------------
 // Capability bitmask
 // ---------------------------------------------------------------------------
@@ -127,6 +135,12 @@ public:
     // offset).
     virtual std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
                                                      const whisper_params& params) = 0;
+
+    // Optional per-frame dense CTC grid captured by the most recent transcribe()
+    // when params.return_logits is true. Backends that do not produce a dense
+    // CTC grid return nullptr. The pointer is owned by the backend and valid
+    // until the next transcribe() / shutdown().
+    virtual const crispasr_ctc_logits* last_ctc_logits() const { return nullptr; }
 
     // Optional stereo-aware overload for backends that can split stereo
     // channels for diarization (currently: whisper). Default

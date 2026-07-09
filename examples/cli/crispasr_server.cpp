@@ -346,10 +346,37 @@ struct transcription_result {
     bool ok = false;
     std::string error;
     std::vector<crispasr_segment> segs;
+    crispasr_ctc_logits logits;
     std::string language;
     double duration_s = 0.0;
     double elapsed_s = 0.0;
 };
+
+static void append_ctc_logits(crispasr_ctc_logits& dst, const crispasr_ctc_logits* src) {
+    if (!src || src->data.empty() || src->n_frames <= 0 || src->n_vocab <= 0)
+        return;
+    if (dst.n_vocab == 0) {
+        dst.n_vocab = src->n_vocab;
+        dst.normalization = src->normalization;
+        dst.vocab = src->vocab;
+    }
+    if (dst.n_vocab != src->n_vocab)
+        return;
+    dst.data.insert(dst.data.end(), src->data.begin(), src->data.end());
+    dst.n_frames += src->n_frames;
+}
+
+static std::string add_ctc_logits_to_json(const std::string& base, const crispasr_ctc_logits& logits) {
+    if (logits.data.empty())
+        return base;
+    try {
+        auto obj = nlohmann::json::parse(base);
+        obj["ctc_logits"] = nlohmann::json::parse(crispasr_ctc_logits_to_json(logits));
+        return obj.dump();
+    } catch (...) {
+        return base;
+    }
+}
 
 // Load audio from a multipart file upload, transcribe it, return result.
 // Acquires model_mutex internally.
@@ -480,6 +507,8 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
             const auto& sl = slices[i];
             auto tc0 = std::chrono::steady_clock::now();
             auto segs = backend->transcribe(pcmf32.data() + sl.start, sl.end - sl.start, sl.t0_cs, rp);
+            if (rp.return_logits)
+                append_ctc_logits(result.logits, backend->last_ctc_logits());
 
             // Issue #89 gap-fill second pass (bounded-window backends only) —
             // same policy as the CLI dispatcher (crispasr_gap_fill.h).
@@ -917,6 +946,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.grammar_rule = form_string(req, "grammar_rule", rp.grammar_rule);
         rp.best_of = form_int(req, "best_of", rp.best_of);
         rp.beam_size = form_int(req, "beam_size", rp.beam_size);
+        rp.return_logits = form_bool(req, "return_logits", rp.return_logits);
         rp.entropy_thold = form_float(req, "entropy_thold", rp.entropy_thold);
         rp.logprob_thold = form_float(req, "logprob_thold", rp.logprob_thold);
         rp.no_speech_thold = form_float(req, "no_speech_thold", rp.no_speech_thold);
@@ -957,6 +987,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
                 result.elapsed_s, result.elapsed_s > 0 ? result.duration_s / result.elapsed_s : 0.0);
 
         std::string json = crispasr_segments_to_native_json(result.segs, backend_name, result.duration_s);
+        if (rp.return_logits)
+            json = add_ctc_logits_to_json(json, result.logits);
         res.set_content(json, "application/json");
     });
 
@@ -969,6 +1001,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     //   language         (optional) — ISO-639-1 code
     //   prompt           (optional) — initial prompt / context
     //   response_format  (optional) — json|verbose_json|text|srt|vtt
+    //   return_logits    (optional) — include dense CTC logits for supported CTC backends
     //   temperature      (optional) — sampling temperature
     //   seed             (optional) — RNG seed for sampling
     //   max_tokens       (optional) — generated-token cap for AR backends
@@ -1071,6 +1104,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         rp.grammar_rule = form_string(req, "grammar_rule", rp.grammar_rule);
         rp.best_of = form_int(req, "best_of", rp.best_of);
         rp.beam_size = form_int(req, "beam_size", rp.beam_size);
+        rp.return_logits = form_bool(req, "return_logits", rp.return_logits);
         rp.entropy_thold = form_float(req, "entropy_thold", rp.entropy_thold);
         rp.logprob_thold = form_float(req, "logprob_thold", rp.logprob_thold);
         rp.no_speech_thold = form_float(req, "no_speech_thold", rp.no_speech_thold);
@@ -1184,17 +1218,24 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             res.set_content(crispasr_segments_to_vtt(result.segs), "text/vtt; charset=utf-8");
         } else if (response_format == "verbose_json") {
             std::string task = rp.translate ? "translate" : "transcribe";
-            res.set_content(crispasr_segments_to_openai_verbose_json(result.segs, result.duration_s, result.language,
-                                                                     task, temperature),
-                            "application/json");
+            std::string json = crispasr_segments_to_openai_verbose_json(result.segs, result.duration_s, result.language,
+                                                                        task, temperature);
+            if (rp.return_logits)
+                json = add_ctc_logits_to_json(json, result.logits);
+            res.set_content(json, "application/json");
         } else if (response_format == "diarized_json") {
             std::string task = rp.translate ? "translate" : "transcribe";
-            res.set_content(
-                crispasr_segments_to_diarized_json(result.segs, result.duration_s, result.language, task, temperature),
-                "application/json");
+            std::string json =
+                crispasr_segments_to_diarized_json(result.segs, result.duration_s, result.language, task, temperature);
+            if (rp.return_logits)
+                json = add_ctc_logits_to_json(json, result.logits);
+            res.set_content(json, "application/json");
         } else {
             // Default: json — {"text": "..."}
-            res.set_content(crispasr_segments_to_openai_json(result.segs), "application/json");
+            std::string json = crispasr_segments_to_openai_json(result.segs);
+            if (rp.return_logits)
+                json = add_ctc_logits_to_json(json, result.logits);
+            res.set_content(json, "application/json");
         }
     });
 
