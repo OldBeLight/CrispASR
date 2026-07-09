@@ -10,6 +10,26 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## Baked mel filterbank layout MUST match core_mel's `fb_layout` — a transpose produces cos_min ≈ −0.15, not a gradual drift (canary-qwen #233, 2026-07-09)
+
+The canary-qwen converter's `compute_mel_filters()` returned `(n_freqs, n_mels)` (FreqsMels layout), but `core_mel::Params` defaults to `FbLayout::MelsFreqs` = `(n_mels, n_freqs)`. A transposed filterbank doesn't produce a "slightly wrong" mel — it produces an **anti-correlated** one: `cos_min = −0.15`, `cos_mean = 0.43` against the Python reference. The LLM hallucinated coherent English ("Yes sir, sir, sir") because it saw noise-like features, not silence.
+
+**Diagnostic that pinpointed it in one run:** `crispasr-diff` on Kaggle comparing just the mel stage — `[FAIL] mel_spectrogram cos_min=-0.147 max_abs=8.30` — instantly identified the filterbank as the root cause vs encoder/projection/LLM bugs. **Fix:** one line: `mel_fb = mel_fb.T` in the converter. After: `cos_min = 0.999`, JFK exact match.
+
+**Lesson:** when baking a mel filterbank from scratch (not copying the model's own), always verify the layout convention. The two conventions (`MelsFreqs` vs `FreqsMels`) produce the exact same values in a different memory order — there's no shape mismatch to catch, no NaN, no OOB. The ONLY way to detect it is a cosine comparison against a Python reference mel. Gate mel parity BEFORE debugging downstream stages.
+
+
+## Never cache a ggml compute graph across calls that share a scheduler with a larger graph — the allocator regrows and frees the cached graph's GPU buffers (#215, #235, 2026-07-09)
+
+The `§176s` encoder graph cache (`cached_enc_gf`) reuses a graph across audio slices when `T_mel` matches. On CPU this is safe — the ggml allocator is stable. On GPU (CUDA/Vulkan), the LLM prefill/decode graphs that run AFTER the encoder are larger, so `ggml_backend_sched_alloc_graph` regrows the scheduler's internal buffer pool, which **frees** the `VkBuffer` / `CUdeviceptr` handles that the cached encoder graph's tensors still reference. Slice 2 re-allocates the cached graph → the scheduler writes through freed GPU handles → use-after-free → segfault or driver-level busy loop.
+
+**Impact:** #215 (moss-transcribe) was the first instance, fixed ad-hoc. #235 (glm-asr-nano) was the second. An audit found the same vulnerable pattern in 8 backends total: glm-asr, voxtral4b, moss_audio, canary_qwen, voxtral, granite_speech, funasr, qwen3_asr. All fixed by removing the cache-hit branch — graph build is ~1 ms, compute is what's expensive.
+
+**Encoder-only backends** (canary, parakeet, nemotron, kyutai_stt, moonshine, paraformer) are safe: they have no LLM decoder on the same scheduler, so the allocator never regrows between slices.
+
+**Rule:** on a shared `ggml_backend_sched`, never cache a graph across calls if ANY other graph on the same scheduler could be larger. The graph topology can be reused (same `ggml_context` arena), but `sched_reset` + `alloc_graph` must run before every compute — and the allocator's regrow in `alloc_graph` for a larger graph frees the previous graph's device buffers. The only safe cache is when the cached graph is the LARGEST graph the scheduler ever sees.
+
+
 ## Flow-matching DiT with JointAttention REQUIRES attention masking even for unconditional generation — skipping masked KV tokens silently corrupts output (2026-07)
 
 Porting Irodori-TTS (RF-DiT flow-matching TTS with JointAttention over self + text + speaker context), the text encoder reached cos=0.9995 parity and single-step DiT v_pred reached cos=0.9984, yet the 40-step ODE produced garbage audio (random language hallucinations on ASR roundtrip). The root cause: **the Python model always includes speaker KV in the JointAttention, even when unconditional (no speaker reference), with an attention mask that has -inf for speaker positions**. The C++ initially skipped speaker KV entirely (no speaker state → don't concat), which changed the KV sequence length and thus the softmax distribution. Even though masked tokens get zero attention weight in Python, their presence in the denominator affects all other weights.
