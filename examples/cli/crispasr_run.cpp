@@ -1694,6 +1694,20 @@ int crispasr_run_backend(const whisper_params& params_in) {
         }
     }
 
+    // #231 — "cohere-ar" is the Arabic shorthand for the cohere backend
+    // (routes to the same runtime; the registry resolves the recommended
+    // Arabic imatrix GGUF for `-m auto`). Default the language to "ar" so
+    // `--backend cohere-ar audio.wav` works without also requiring `-l ar`.
+    // Only fires when the user hasn't already picked a language (matches
+    // the chatterbox block's "auto" == unset convention above); an explicit
+    // `-l <lang>` always wins, e.g. for LID experiments against the model.
+    if (backend_name == "cohere-ar" && (params.language.empty() || params.language == "auto")) {
+        params.language = "ar";
+        if (!params.no_prints) {
+            fprintf(stderr, "crispasr: --backend cohere-ar — defaulting language to 'ar' (pass -l to override)\n");
+        }
+    }
+
     // Resolve "-m auto" via the model registry + curl/wget download.
     const std::string resolved = crispasr_resolve_model_cli(params.model, backend_name, params.no_prints,
                                                             params.cache_dir, params.auto_download, params.model_quant);

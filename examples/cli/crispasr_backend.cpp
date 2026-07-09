@@ -102,7 +102,7 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_lfm2_audio_backend();
     if (name == "mini-omni2" || name == "mini_omni2" || name == "miniomni2")
         return crispasr_make_mini_omni2_backend();
-    if (name == "cohere")
+    if (name == "cohere" || name == "cohere-ar")
         return crispasr_make_cohere_backend();
     if (name == "granite" || name == "granite-4.1" || name == "granite-4.1-plus")
         return crispasr_make_granite_backend();
@@ -675,12 +675,12 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 // encoder-decoder backend, which has no CTC head.
                 result = "fastconformer-ctc";
             else if (a == "cohere")
+                // Also covers the "cohere-ar" alias: the GGUF's general.architecture
+                // is always "cohere" (the Arabic model shares the runtime); the
+                // alias only affects the model-registry lookup and CLI dispatch
+                // (crispasr_create_backend), not this filename/GGUF-metadata pass.
                 result = "cohere";
             else if (a == "cohere-transcribe")
-                result = "cohere";
-            else if (a == "cohere-ar")
-                // Arabic alias: routes to the cohere runtime; `-m auto` resolves
-                // the recommended Arabic imatrix GGUF via the registry (#231).
                 result = "cohere";
             else if (a == "qwen3-asr" || a == "qwen3_asr" || a == "qwen3asr")
                 result = "qwen3";
