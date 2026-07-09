@@ -49,8 +49,8 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF/resolve/main/parakeet-tdt-0.6b-v3-q4_k.gguf", "~467 MB", nullptr, nullptr},
     {"canary", "canary-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/canary-1b-v2-GGUF/resolve/main/canary-1b-v2-q4_k.gguf", "~600 MB", nullptr, nullptr},
-    {"canary-qwen", "canary-qwen-2.5b-f16.gguf",
-     "https://huggingface.co/cstr/canary-qwen-2.5b-GGUF/resolve/main/canary-qwen-2.5b-f16.gguf", "~5.1 GB", nullptr, nullptr},
+    {"canary-qwen", "canary-qwen-2.5b-q8_0.gguf",
+     "https://huggingface.co/cstr/canary-qwen-2.5b-GGUF/resolve/main/canary-qwen-2.5b-q8_0.gguf", "~4.1 GB", nullptr, nullptr},
     // AutoArk-AI/ARK-ASR-3B: Whisper-RoPE encoder + Qwen2.5-3B decoder (19-lang).
     // NOTE: GGUF repo to be published (PLAN §ARK) — placeholder URL.
     {"ark-asr", "ark-asr-3b-q4_k.gguf",
