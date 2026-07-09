@@ -234,6 +234,22 @@ pub struct SessionSegment {
     pub words: Vec<SessionWord>,
 }
 
+/// Per-frame CTC logits captured from a CTC backend.
+///
+/// `data` is frame-major: `data[t * n_vocab + v]` is the score for vocabulary
+/// entry `v` at encoder frame `t`, so its length is `n_vocab * n_frames`.
+/// Produced only by [`Session::transcribe_with_logits`] on a backend with a
+/// dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec, or canary-ctc); other
+/// backends yield no grid. The Omni and wav2vec2 grids are raw logits
+/// (pre-softmax); the canary-ctc grid is log-probabilities. Log-softmax before
+/// use if you need normalized scores — it is idempotent on the canary grid.
+#[derive(Debug, Clone)]
+pub struct CtcLogits {
+    pub n_vocab: usize,
+    pub n_frames: usize,
+    pub data: Vec<f32>,
+}
+
 /// A loaded session over a CrispASR model of any backend.
 pub struct Session {
     handle: *mut crispasr_sys::CrispasrSession,
@@ -339,6 +355,29 @@ impl Session {
         }
     }
 
+    /// The Omni CTC vocabulary as raw SentencePiece pieces, indexed by token
+    /// id (`vocab[id]`). Pieces keep the U+2581 (`▁`) word-boundary marker
+    /// intact, so a consumer can group a greedy CTC decode over
+    /// [`CtcLogits`] into words at `▁` boundaries and map `▁` → space.
+    /// Returns `None` for backends that don't expose a CTC vocab.
+    pub fn ctc_vocab(&self) -> Option<Vec<String>> {
+        let n = unsafe { crispasr_sys::crispasr_session_n_vocab(self.handle) };
+        if n <= 0 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(n as usize);
+        for id in 0..n {
+            let p = unsafe { crispasr_sys::crispasr_session_token_text(self.handle, id) };
+            let piece = if p.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+            };
+            out.push(piece);
+        }
+        Some(out)
+    }
+
     /// Transcribe 16 kHz mono `f32` PCM. The internal dispatcher routes
     /// to whichever backend this session was opened with.
     pub fn transcribe(&self, pcm: &[f32]) -> Result<Vec<SessionSegment>, String> {
@@ -379,6 +418,40 @@ impl Session {
             }
         };
         self.parse_session_result(res, "crispasr_session_transcribe")
+    }
+
+    /// Opt in to capturing the per-frame CTC logits on subsequent transcribe
+    /// calls (backends with a dense CTC grid: Omni CTC, wav2vec2/hubert/data2vec,
+    /// canary-ctc). Off by default: capture copies `n_vocab × n_frames` floats
+    /// per call, so leave it off unless a consumer (e.g. forced alignment) needs
+    /// the grid. Retrieve the logits with [`Self::transcribe_with_logits`].
+    pub fn set_return_logits(&self, on: bool) -> Result<(), String> {
+        let rc = unsafe {
+            crispasr_sys::crispasr_session_set_return_logits(self.handle, if on { 1 } else { 0 })
+        };
+        if rc != 0 {
+            return Err(format!("set_return_logits failed (rc={rc})"));
+        }
+        Ok(())
+    }
+
+    /// Transcribe and also return the CTC logits captured for this call.
+    /// Enables logit capture for the duration, so the caller need not call
+    /// [`Self::set_return_logits`] first. The logits are `None` for backends
+    /// that don't produce a dense CTC grid (only Omni CTC, wav2vec2/hubert/
+    /// data2vec, and canary-ctc do) or when the transcript is empty.
+    pub fn transcribe_with_logits(
+        &self,
+        pcm: &[f32],
+    ) -> Result<(Vec<SessionSegment>, Option<CtcLogits>), String> {
+        if pcm.is_empty() {
+            return Ok((Vec::new(), None));
+        }
+        self.set_return_logits(true)?;
+        let res = unsafe {
+            crispasr_sys::crispasr_session_transcribe(self.handle, pcm.as_ptr(), pcm.len() as i32)
+        };
+        self.parse_session_result_logits(res, "crispasr_session_transcribe")
     }
 
     /// Chunked-encode transcribe (issue #208). Forces the Parakeet backend
@@ -507,6 +580,19 @@ impl Session {
         res: *mut crispasr_sys::CrispasrSessionResult,
         ctx: &str,
     ) -> Result<Vec<SessionSegment>, String> {
+        self.parse_session_result_logits(res, ctx)
+            .map(|(segs, _)| segs)
+    }
+
+    /// Like [`Self::parse_session_result`], but also lifts out any raw CTC
+    /// logits the backend attached to the result (see [`CtcLogits`]) before
+    /// freeing the handle. The logits are `None` unless the session opted in
+    /// via [`Self::set_return_logits`] and the backend produced a grid.
+    fn parse_session_result_logits(
+        &self,
+        res: *mut crispasr_sys::CrispasrSessionResult,
+        ctx: &str,
+    ) -> Result<(Vec<SessionSegment>, Option<CtcLogits>), String> {
         if res.is_null() {
             return Err(format!("{ctx} failed for backend {:?}", self.backend()));
         }
@@ -550,9 +636,23 @@ impl Session {
                     words,
                 });
             }
+            // Lift out the raw CTC logits (if any) before the handle is freed.
+            let n_frames = crispasr_sys::crispasr_session_result_n_logit_frames(res);
+            let n_vocab = crispasr_sys::crispasr_session_result_n_logit_vocab(res);
+            let lp = crispasr_sys::crispasr_session_result_logits(res);
+            let logits = if n_frames > 0 && n_vocab > 0 && !lp.is_null() {
+                let n = n_vocab as usize * n_frames as usize;
+                Some(CtcLogits {
+                    n_vocab: n_vocab as usize,
+                    n_frames: n_frames as usize,
+                    data: std::slice::from_raw_parts(lp, n).to_vec(),
+                })
+            } else {
+                None
+            };
             crispasr_sys::crispasr_session_result_free(res);
+            Ok((out, logits))
         }
-        Ok(out)
     }
 
     /// Transcribe with Silero VAD segmentation + crispasr-style stitching.

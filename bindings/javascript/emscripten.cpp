@@ -59,6 +59,11 @@ int                     crispasr_kokoro_resolve_fallback_voice_abi(const char* m
 // --- Full C-ABI parity declarations ---
 // Session extras
 int          crispasr_session_available_backends(char* out_csv, int out_cap);
+// CTC vocabulary access (Omni CTC backend): n_vocab piece count, token_text
+// maps an id to its model-owned raw piece (do not free) or "" when out of
+// range / unsupported.
+int          crispasr_session_n_vocab(CrispasrSession* s);
+const char*  crispasr_session_token_text(CrispasrSession* s, int id);
 CrispasrSession* crispasr_session_open_explicit(const char* model_path, const char* backend_name, int n_threads);
 CrispasrSession* crispasr_session_open_with_params(const char* model_path, const char* backend_name, const void* params);
 const char*  crispasr_session_backend(CrispasrSession* s);
@@ -86,6 +91,7 @@ int          crispasr_session_set_max_speech_tokens(CrispasrSession* s, int n);
 int          crispasr_session_set_length_scale(CrispasrSession* s, float scale);
 int          crispasr_session_set_best_of(CrispasrSession* s, int n);
 int          crispasr_session_set_beam_size(CrispasrSession* s, int n);
+int          crispasr_session_set_return_logits(CrispasrSession* s, int enable);
 int          crispasr_session_set_grammar_text(CrispasrSession* s, const char* gbnf_text,
                                                const char* root_rule, float penalty);
 int          crispasr_session_set_fallback_thresholds(CrispasrSession* s, float entropy_thold,
@@ -125,6 +131,9 @@ float        crispasr_session_result_word_p(struct crispasr_session_result* r, i
 int          crispasr_session_result_word_n_alts(struct crispasr_session_result* r, int i_seg, int i_word);
 const char*  crispasr_session_result_word_alt_text(struct crispasr_session_result* r, int i_seg, int i_word, int i_alt);
 float        crispasr_session_result_word_alt_p(struct crispasr_session_result* r, int i_seg, int i_word, int i_alt);
+int          crispasr_session_result_n_logit_frames(struct crispasr_session_result* r);
+int          crispasr_session_result_n_logit_vocab(struct crispasr_session_result* r);
+const float* crispasr_session_result_logits(struct crispasr_session_result* r);
 void         crispasr_session_result_free(struct crispasr_session_result* r);
 char*        crispasr_session_translate_text(CrispasrSession* s, const char* text, const char* src_lang,
                                              const char* tgt_lang, int max_tokens);
@@ -765,6 +774,9 @@ EMSCRIPTEN_BINDINGS(whisper) {
     emscripten::function("sessionSetBeamSize", emscripten::optional_override([](int n) {
         return g_tts_session ? crispasr_session_set_beam_size(g_tts_session, n) : -1;
     }));
+    emscripten::function("sessionSetReturnLogits", emscripten::optional_override([](bool enable) {
+        return g_tts_session ? crispasr_session_set_return_logits(g_tts_session, enable ? 1 : 0) : -1;
+    }));
     emscripten::function("sessionSetGrammarText", emscripten::optional_override(
         [](const std::string& text, const std::string& root, float penalty) {
             return g_tts_session ? crispasr_session_set_grammar_text(
@@ -830,6 +842,98 @@ EMSCRIPTEN_BINDINGS(whisper) {
             }
             crispasr_session_result_free(res);
             return out;
+        }));
+
+    // Transcribe + CTC logits (backends with a dense CTC grid: Omni CTC,
+    // wav2vec2/hubert/data2vec, canary-ctc; opted in via
+    // sessionSetReturnLogits). Returns { segments, logits } where segments
+    // mirrors sessionTranscribe and logits is { nFrames, nVocab, data } with
+    // data a frame-major Float32Array (logits[t*nVocab + v]) — raw pre-softmax
+    // for Omni & wav2vec2, log-probabilities for canary-ctc — or null for
+    // backends with no dense CTC grid / when no grid was captured.
+    emscripten::function("sessionTranscribeWithLogits", emscripten::optional_override(
+        [](const emscripten::val& audio, const std::string& lang) -> emscripten::val {
+            if (!g_tts_session) return emscripten::val::null();
+            const int n = audio["length"].as<int>();
+            std::vector<float> pcm(n);
+            emscripten::val heap = emscripten::val::module_property("HEAPU8");
+            emscripten::val memory = heap["buffer"];
+            emscripten::val mv = audio["constructor"].new_(memory, reinterpret_cast<uintptr_t>(pcm.data()), n);
+            mv.call<void>("set", audio);
+
+            crispasr_session_result* res;
+            if (!lang.empty()) {
+                res = crispasr_session_transcribe_lang(g_tts_session, pcm.data(), n, lang.c_str());
+            } else {
+                res = crispasr_session_transcribe(g_tts_session, pcm.data(), n);
+            }
+            if (!res) return emscripten::val::null();
+
+            emscripten::val out = emscripten::val::object();
+            int ns = crispasr_session_result_n_segments(res);
+            emscripten::val segs = emscripten::val::array();
+            for (int i = 0; i < ns; i++) {
+                emscripten::val seg = emscripten::val::object();
+                const char* t = crispasr_session_result_segment_text(res, i);
+                seg.set("text", std::string(t ? t : ""));
+                seg.set("t0", crispasr_session_result_segment_t0(res, i) / 100.0);
+                seg.set("t1", crispasr_session_result_segment_t1(res, i) / 100.0);
+                int nw = crispasr_session_result_n_words(res, i);
+                emscripten::val words = emscripten::val::array();
+                for (int j = 0; j < nw; j++) {
+                    emscripten::val w = emscripten::val::object();
+                    const char* wt = crispasr_session_result_word_text(res, i, j);
+                    w.set("text", std::string(wt ? wt : ""));
+                    w.set("t0", crispasr_session_result_word_t0(res, i, j) / 100.0);
+                    w.set("t1", crispasr_session_result_word_t1(res, i, j) / 100.0);
+                    w.set("p", (double)crispasr_session_result_word_p(res, i, j));
+                    words.call<void>("push", w);
+                }
+                seg.set("words", words);
+                segs.call<void>("push", seg);
+            }
+            out.set("segments", segs);
+
+            // Copy the result-owned logit grid into a JS Float32Array before the
+            // result (and its buffer) is freed — same owned-then-freed idiom as
+            // ttsSynthesize.
+            int nf = crispasr_session_result_n_logit_frames(res);
+            int nv = crispasr_session_result_n_logit_vocab(res);
+            const float* lg = crispasr_session_result_logits(res);
+            if (nf > 0 && nv > 0 && lg) {
+                const int total = nf * nv;
+                emscripten::val data = emscripten::val::global("Float32Array").new_(total);
+                emscripten::val memoryView = emscripten::val(emscripten::typed_memory_view(total, lg));
+                data.call<void>("set", memoryView);
+                emscripten::val logits = emscripten::val::object();
+                logits.set("nFrames", nf);
+                logits.set("nVocab", nv);
+                logits.set("data", data);
+                out.set("logits", logits);
+            } else {
+                out.set("logits", emscripten::val::null());
+            }
+
+            crispasr_session_result_free(res);
+            return out;
+        }));
+
+    // CTC vocabulary access (Omni CTC backend). Returns the vocab as a JS array
+    // of raw piece strings indexed by token id (word-boundary marker intact —
+    // v2 uses a literal space, v1 uses U+2581), for detokenizing a greedy CTC
+    // decode over sessionTranscribeWithLogits' grid. null when no session is
+    // open or the backend exposes no CTC vocab.
+    emscripten::function("sessionCtcVocab", emscripten::optional_override(
+        []() -> emscripten::val {
+            if (!g_tts_session) return emscripten::val::null();
+            const int n = crispasr_session_n_vocab(g_tts_session);
+            if (n <= 0) return emscripten::val::null();
+            emscripten::val vocab = emscripten::val::array();
+            for (int i = 0; i < n; i++) {
+                const char* p = crispasr_session_token_text(g_tts_session, i);
+                vocab.call<void>("push", std::string(p ? p : ""));
+            }
+            return vocab;
         }));
 
     // --- Session translate ---

@@ -195,6 +195,14 @@ CRISPASR_SESSION_API crispasr_session* crispasr_session_open_with_params(const c
                                                                          const crispasr_open_params_v1* params);
 CRISPASR_SESSION_API const char* crispasr_session_backend(crispasr_session* s);
 CRISPASR_SESSION_API int crispasr_session_available_backends(char* out_csv, int out_cap);
+// CTC vocabulary access (Omni CTC backend). crispasr_session_n_vocab returns
+// the number of SentencePiece pieces in the loaded model (0 for backends that
+// don't expose a CTC vocab); crispasr_session_token_text maps a token id in
+// [0, n_vocab) to its raw piece (U+2581 word-boundary marker intact), or ""
+// when out of range or unsupported. Pairs with crispasr_session_result_logits
+// to detokenize a greedy CTC decode.
+CRISPASR_SESSION_API int crispasr_session_n_vocab(crispasr_session* s);
+CRISPASR_SESSION_API const char* crispasr_session_token_text(crispasr_session* s, int id);
 CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe_lang(crispasr_session* s, const float* pcm,
                                                                                int n_samples, const char* language);
 CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe(crispasr_session* s, const float* pcm,
@@ -257,6 +265,14 @@ CRISPASR_SESSION_API const char* crispasr_session_result_word_text(crispasr_sess
 CRISPASR_SESSION_API int64_t crispasr_session_result_word_t0(crispasr_session_result* r, int i_seg, int i_word);
 CRISPASR_SESSION_API int64_t crispasr_session_result_word_t1(crispasr_session_result* r, int i_seg, int i_word);
 CRISPASR_SESSION_API float crispasr_session_result_word_p(crispasr_session_result* r, int i_seg, int i_word);
+// Per-frame CTC logits (opted in via crispasr_session_set_return_logits) for
+// backends that produce a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,
+// canary-ctc). Frame-major: logits[t * n_logit_vocab + v]. Raw pre-softmax for
+// Omni & wav2vec2; log-probabilities for canary-ctc. _logits returns NULL when
+// none captured.
+CRISPASR_SESSION_API int crispasr_session_result_n_logit_frames(crispasr_session_result* r);
+CRISPASR_SESSION_API int crispasr_session_result_n_logit_vocab(crispasr_session_result* r);
+CRISPASR_SESSION_API const float* crispasr_session_result_logits(crispasr_session_result* r);
 CRISPASR_SESSION_API int crispasr_session_result_word_n_alts(crispasr_session_result* r, int i_seg, int i_word);
 CRISPASR_SESSION_API const char* crispasr_session_result_word_alt_text(crispasr_session_result* r, int i_seg,
                                                                        int i_word, int i_alt);
@@ -372,6 +388,7 @@ CRISPASR_SESSION_API int crispasr_session_set_best_of(crispasr_session* s, int n
 CRISPASR_SESSION_API int crispasr_session_set_max_new_tokens(crispasr_session* s, int n);
 CRISPASR_SESSION_API int crispasr_session_set_frequency_penalty(crispasr_session* s, float penalty);
 CRISPASR_SESSION_API int crispasr_session_set_beam_size(crispasr_session* s, int n);
+CRISPASR_SESSION_API int crispasr_session_set_return_logits(crispasr_session* s, int enable);
 CRISPASR_SESSION_API int crispasr_session_set_grammar_text(crispasr_session* s, const char* gbnf_text,
                                                            const char* root_rule, float penalty);
 CRISPASR_SESSION_API int crispasr_session_set_fallback_thresholds(crispasr_session* s, float entropy_thold,

@@ -193,6 +193,24 @@ namespace CrispASR.Tests
         }
 
         [Fact]
+        public void SetReturnLogits_DoesNotThrow()
+        {
+            if (!CanLoadLibrary() || !HasWhisper) return;
+            using var s = Session.Open(WhisperModel!, 2);
+            s.SetReturnLogits(true);
+            s.SetReturnLogits(false);
+        }
+
+        [Fact]
+        public void CtcVocab_NullForNonCtcBackend()
+        {
+            if (!CanLoadLibrary() || !HasWhisper) return;
+            using var s = Session.Open(WhisperModel!, 2);
+            // Whisper isn't the Omni CTC backend, so no vocab is exposed.
+            Assert.Null(s.CtcVocab());
+        }
+
+        [Fact]
         public void SetFallbackThresholds_DoesNotThrow()
         {
             if (!CanLoadLibrary() || !HasWhisper) return;

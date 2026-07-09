@@ -142,6 +142,15 @@ struct omniasr_context {
     std::vector<int32_t>* capture_token_ids = nullptr;
     std::vector<float>* capture_token_probs = nullptr;
 
+    // Per-call capture for the raw CTC logits (model_type 0). When
+    // capture_ctc_logits is non-null the greedy CTC path copies its
+    // [n_vocab * n_frames] logit grid (frame-major: logits[t*V + v]) here and
+    // records the shape. Used by omniasr_transcribe_with_logits for downstream
+    // forced alignment; nullptr on the normal greedy path.
+    std::vector<float>* capture_ctc_logits = nullptr;
+    int* capture_ctc_n_vocab = nullptr;
+    int* capture_ctc_n_frames = nullptr;
+
     // Sticky per-call seed override for best-of-N sampling. 0 = derive
     // deterministically from the encoder output (repeated calls with the
     // same audio give identical samples). Non-zero lets the caller inject
@@ -923,6 +932,17 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
     ggml_backend_tensor_get(logits_t, logits.data(), 0, V * T * sizeof(float));
     ggml_free(ctx0);
 
+    // Optional raw-logits capture for forced alignment (opt-in via
+    // omniasr_transcribe_with_logits). Copy, not move: the greedy decode
+    // below still consumes `logits`.
+    if (ctx->capture_ctc_logits) {
+        *ctx->capture_ctc_logits = logits;
+        if (ctx->capture_ctc_n_vocab)
+            *ctx->capture_ctc_n_vocab = V;
+        if (ctx->capture_ctc_n_frames)
+            *ctx->capture_ctc_n_frames = T;
+    }
+
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "omniasr: logits [%d, %d], CTC decoding...\n", V, T);
 
@@ -987,6 +1007,47 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
     perf.t_total_us = ggml_time_us() - t_total0;
     omniasr_perf_print(perf, n_samples, ctx->params.verbosity);
     return out;
+}
+
+extern "C" char* omniasr_transcribe_with_logits(struct omniasr_context* ctx, const float* samples, int n_samples,
+                                                float** out_logits, int* out_n_vocab, int* out_n_frames) {
+    if (out_logits)
+        *out_logits = nullptr;
+    if (out_n_vocab)
+        *out_n_vocab = 0;
+    if (out_n_frames)
+        *out_n_frames = 0;
+    if (!ctx || !samples || n_samples <= 0)
+        return nullptr;
+
+    // Only the non-autoregressive CTC head exposes a dense per-frame logit
+    // grid. The LLM variant decodes token-by-token — there is no [V, T] grid to
+    // hand back — so fall through to plain transcribe with empty logits.
+    if (ctx->model.hp.model_type != 0)
+        return omniasr_transcribe(ctx, samples, n_samples);
+
+    std::vector<float> logits;
+    int V = 0, T = 0;
+    ctx->capture_ctc_logits = &logits;
+    ctx->capture_ctc_n_vocab = &V;
+    ctx->capture_ctc_n_frames = &T;
+    char* text = omniasr_transcribe(ctx, samples, n_samples);
+    ctx->capture_ctc_logits = nullptr;
+    ctx->capture_ctc_n_vocab = nullptr;
+    ctx->capture_ctc_n_frames = nullptr;
+
+    if (out_logits && !logits.empty()) {
+        float* buf = (float*)malloc(logits.size() * sizeof(float));
+        if (buf) {
+            memcpy(buf, logits.data(), logits.size() * sizeof(float));
+            *out_logits = buf;
+            if (out_n_vocab)
+                *out_n_vocab = V;
+            if (out_n_frames)
+                *out_n_frames = T;
+        }
+    }
+    return text;
 }
 
 // ===========================================================================
@@ -1702,6 +1763,10 @@ extern "C" const char* omniasr_token_text(struct omniasr_context* ctx, int id) {
     if (!ctx || id < 0 || id >= (int)ctx->model.vocab.size())
         return "";
     return ctx->model.vocab[id].c_str();
+}
+
+extern "C" int omniasr_n_vocab(struct omniasr_context* ctx) {
+    return ctx ? (int)ctx->model.vocab.size() : 0;
 }
 
 extern "C" void omniasr_set_seed(struct omniasr_context* ctx, uint64_t seed) {

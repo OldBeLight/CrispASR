@@ -10,7 +10,7 @@ import platform
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -1095,6 +1095,14 @@ class Session:
         lib.crispasr_session_backend.restype = ctypes.c_char_p
         lib.crispasr_session_available_backends.argtypes = [ctypes.c_char_p, ctypes.c_int]
         lib.crispasr_session_available_backends.restype = ctypes.c_int
+        # 2026-07-08: CTC vocabulary access (Omni CTC backend). n_vocab is the
+        # piece count; token_text maps an id to its raw piece. hasattr-guarded
+        # so a binding loaded against an older dylib still works.
+        if hasattr(lib, "crispasr_session_token_text"):
+            lib.crispasr_session_n_vocab.argtypes = [ctypes.c_void_p]
+            lib.crispasr_session_n_vocab.restype = ctypes.c_int
+            lib.crispasr_session_token_text.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            lib.crispasr_session_token_text.restype = ctypes.c_char_p
         lib.crispasr_session_transcribe.argtypes = [
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int,
         ]
@@ -1209,6 +1217,19 @@ class Session:
         if hasattr(lib, "crispasr_session_result_word_alt_p"):
             lib.crispasr_session_result_word_alt_p.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
             lib.crispasr_session_result_word_alt_p.restype = ctypes.c_float
+        # 2026-07-07: per-frame CTC logits for backends with a dense CTC grid
+        # (Omni CTC, wav2vec2/hubert/data2vec, canary-ctc), opted in via
+        # crispasr_session_set_return_logits. Frame-major (raw pre-softmax for
+        # Omni & wav2vec2, log-probabilities for canary-ctc);
+        # crispasr_session_result_logits returns NULL when none were captured.
+        # hasattr-guarded so a binding loaded against an older dylib still works.
+        if hasattr(lib, "crispasr_session_result_logits"):
+            lib.crispasr_session_result_n_logit_frames.argtypes = [ctypes.c_void_p]
+            lib.crispasr_session_result_n_logit_frames.restype = ctypes.c_int
+            lib.crispasr_session_result_n_logit_vocab.argtypes = [ctypes.c_void_p]
+            lib.crispasr_session_result_n_logit_vocab.restype = ctypes.c_int
+            lib.crispasr_session_result_logits.argtypes = [ctypes.c_void_p]
+            lib.crispasr_session_result_logits.restype = ctypes.POINTER(ctypes.c_float)
         lib.crispasr_session_result_free.argtypes = [ctypes.c_void_p]
         lib.crispasr_session_result_free.restype = None
         lib.crispasr_session_close.argtypes = [ctypes.c_void_p]
@@ -1492,6 +1513,101 @@ class Session:
             return out
         finally:
             self._lib.crispasr_session_result_free(res)
+
+    def transcribe_with_logits(
+        self, pcm: np.ndarray, sample_rate: int = 16000,
+        *,
+        language: Optional[str] = None,
+    ) -> Tuple[List[SessionSegment], Optional[np.ndarray]]:
+        """Transcribe and also return the per-frame CTC logits.
+
+        Enables logit capture for this call (no prior :meth:`set_return_logits`
+        needed), then returns ``(segments, logits)``. ``logits`` is a 2D
+        float32 numpy array of shape ``(n_frames, n_vocab)`` — frame-major, i.e.
+        ``logits[t, v]`` is the score for vocabulary entry ``v`` at encoder
+        frame ``t``. The Omni CTC and wav2vec2/hubert/data2vec grids are raw
+        logits (pre-softmax); the canary-ctc grid is log-probabilities. It is
+        ``None`` for backends that don't produce a dense CTC grid, when the
+        transcript is empty, or on dylibs predating the accessor.
+
+        ``sample_rate`` / ``language`` behave exactly as in :meth:`transcribe`.
+        """
+        segs = []  # type: List[SessionSegment]
+        if not hasattr(self._lib, "crispasr_session_result_logits"):
+            return self.transcribe(pcm, sample_rate, language=language), None
+        if len(pcm) == 0:
+            return segs, None
+
+        self.set_return_logits(True)
+        if sample_rate != 16000:
+            ratio = 16000 / sample_rate
+            new_len = int(len(pcm) * ratio)
+            indices = np.linspace(0, len(pcm) - 1, new_len)
+            pcm = np.interp(indices, np.arange(len(pcm)), pcm).astype(np.float32)
+        pcm = np.asarray(pcm, dtype=np.float32)
+        samples_ptr = pcm.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+        if language and hasattr(self._lib, "crispasr_session_transcribe_lang"):
+            res = self._lib.crispasr_session_transcribe_lang(
+                self._handle, samples_ptr, len(pcm), language.encode("utf-8"))
+        else:
+            res = self._lib.crispasr_session_transcribe(self._handle, samples_ptr, len(pcm))
+        if not res:
+            raise RuntimeError(f"crispasr_session_transcribe failed for backend {self.backend!r}")
+
+        try:
+            n_seg = self._lib.crispasr_session_result_n_segments(res)
+            has_word_p = hasattr(self._lib, "crispasr_session_result_word_p")
+            for i in range(n_seg):
+                t = self._lib.crispasr_session_result_segment_text(res, i)
+                text = t.decode("utf-8") if t else ""
+                t0 = self._lib.crispasr_session_result_segment_t0(res, i) / 100.0
+                t1 = self._lib.crispasr_session_result_segment_t1(res, i) / 100.0
+                wn = self._lib.crispasr_session_result_n_words(res, i)
+                words: List[SessionWord] = []
+                for j in range(wn):
+                    wt = self._lib.crispasr_session_result_word_text(res, i, j)
+                    raw_p = self._lib.crispasr_session_result_word_p(res, i, j) if has_word_p else 1.0
+                    words.append(SessionWord(
+                        text=wt.decode("utf-8") if wt else "",
+                        start=self._lib.crispasr_session_result_word_t0(res, i, j) / 100.0,
+                        end=self._lib.crispasr_session_result_word_t1(res, i, j) / 100.0,
+                        confidence=1.0 if raw_p < 0 else raw_p,
+                    ))
+                segs.append(SessionSegment(text=text.strip(), start=t0, end=t1, words=words))
+
+            # Lift out the CTC logits (if any) before the handle is freed.
+            n_frames = self._lib.crispasr_session_result_n_logit_frames(res)
+            n_vocab = self._lib.crispasr_session_result_n_logit_vocab(res)
+            lp = self._lib.crispasr_session_result_logits(res)
+            logits: Optional[np.ndarray] = None
+            if n_frames > 0 and n_vocab > 0 and lp:
+                # Buffer is owned by the result — copy before the free below.
+                logits = np.ctypeslib.as_array(
+                    lp, shape=(n_frames, n_vocab)).copy()
+            return segs, logits
+        finally:
+            self._lib.crispasr_session_result_free(res)
+
+    def ctc_vocab(self) -> Optional[List[str]]:
+        """Return the Omni CTC vocabulary as raw pieces, indexed by token id.
+
+        ``vocab[id]`` is the raw piece for token ``id`` — word-boundary marker
+        intact (the v2 Omni vocab uses a literal space, v1 uses U+2581) — so a
+        consumer can detokenize a greedy CTC decode over the grid from
+        :meth:`transcribe_with_logits`. Returns ``None`` for backends that
+        don't expose a CTC vocab or on dylibs predating the accessor.
+        """
+        if not hasattr(self._lib, "crispasr_session_token_text"):
+            return None
+        n = self._lib.crispasr_session_n_vocab(self._handle)
+        if n <= 0:
+            return None
+        vocab: List[str] = []
+        for i in range(n):
+            p = self._lib.crispasr_session_token_text(self._handle, i)
+            vocab.append(p.decode("utf-8") if p else "")
+        return vocab
 
     # ---------------------------------------------------------------------
     # TTS synthesis (vibevoice, qwen3-tts, omnivoice, kokoro, orpheus, chatterbox, outetts, indextts, voxcpm2, csm, dia, zonos-tts, bark, speecht5, parler-tts, pocket-tts, kugelaudio, tada, lfm2-audio, dots-tts)
@@ -1924,6 +2040,23 @@ class Session:
         rc = self._lib.crispasr_session_set_beam_size(self._handle, int(n))
         if rc != 0:
             raise RuntimeError(f"set_beam_size failed (rc={rc})")
+
+    def set_return_logits(self, on: bool) -> None:
+        """Opt in to capturing per-frame CTC logits (backends with a dense CTC
+        grid: Omni CTC, wav2vec2/hubert/data2vec, canary-ctc).
+
+        Off by default: capture copies an ``n_frames × n_vocab`` float grid per
+        transcribe, so leave it off unless a consumer (e.g. forced alignment)
+        needs the logits. Retrieve them with :meth:`transcribe_with_logits`.
+        No-op on dylibs predating the accessor.
+        """
+        if not hasattr(self._lib, "crispasr_session_set_return_logits"):
+            return
+        self._lib.crispasr_session_set_return_logits.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.crispasr_session_set_return_logits.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_return_logits(self._handle, 1 if on else 0)
+        if rc != 0:
+            raise RuntimeError(f"set_return_logits failed (rc={rc})")
 
     def set_grammar_text(self, gbnf_text: str, root_rule: str = "root", penalty: float = 100.0) -> None:
         """Set a GBNF grammar for constrained whisper decoding. Pass "" to clear."""

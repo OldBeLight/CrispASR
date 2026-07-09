@@ -233,6 +233,16 @@ namespace CrispASR
         public void SetBeamSize(int n)
             => Check(NativeMethods.crispasr_session_set_beam_size(Handle, n), "set_beam_size");
 
+        /// <summary>
+        /// Opt in to capturing the per-frame CTC logits (backends with a dense
+        /// CTC grid: Omni CTC, wav2vec2/hubert/data2vec, canary-ctc) so a
+        /// following transcribe attaches the dense grid read back
+        /// via <see cref="TranscribeWithLogits"/>. Off by default so the normal
+        /// path pays no <c>[vocab × frames]</c> copy.
+        /// </summary>
+        public void SetReturnLogits(bool enable)
+            => Check(NativeMethods.crispasr_session_set_return_logits(Handle, enable ? 1 : 0), "set_return_logits");
+
         /// <summary>Set a GBNF grammar for constrained whisper decoding.</summary>
         public void SetGrammarText(string gbnfText, string rootRule, float penalty)
         {
@@ -303,6 +313,54 @@ namespace CrispASR
             if (r == IntPtr.Zero) throw new InvalidOperationException("Transcription failed");
             try { return ExtractSegments(r); }
             finally { NativeMethods.crispasr_session_result_free(r); }
+        }
+
+        /// <summary>
+        /// Transcribe and also return the per-frame CTC logits captured for
+        /// this call (backends with a dense CTC grid: Omni CTC, wav2vec2/hubert/
+        /// data2vec, canary-ctc). Opts in for the duration of the call — no need
+        /// to call <see cref="SetReturnLogits"/> first — then returns the
+        /// segments plus a <see cref="CtcLogits"/> grid, or <c>null</c> for
+        /// backends that produce no dense CTC grid.
+        /// </summary>
+        public (Segment[] Segments, CtcLogits? Logits) TranscribeWithLogits(float[] pcm, string? language = null)
+        {
+            SetReturnLogits(true);
+            var r = NativeMethods.crispasr_session_transcribe_lang(Handle, pcm, pcm.Length, language);
+            if (r == IntPtr.Zero) throw new InvalidOperationException("Transcription failed");
+            try { return (ExtractSegments(r), ExtractLogits(r)); }
+            finally { NativeMethods.crispasr_session_result_free(r); }
+        }
+
+        // Lift the result-owned float* logit grid into a managed float[] before
+        // the result handle is freed (same copy-out idiom as Synthesize).
+        private static CtcLogits? ExtractLogits(IntPtr r)
+        {
+            int nFrames = NativeMethods.crispasr_session_result_n_logit_frames(r);
+            int nVocab = NativeMethods.crispasr_session_result_n_logit_vocab(r);
+            var ptr = NativeMethods.crispasr_session_result_logits(r);
+            if (nFrames <= 0 || nVocab <= 0 || ptr == IntPtr.Zero) return null;
+            var data = new float[nFrames * nVocab];
+            Marshal.Copy(ptr, data, 0, nFrames * nVocab);
+            return new CtcLogits(nVocab, nFrames, data);
+        }
+
+        /// <summary>
+        /// The Omni CTC vocabulary as raw pieces, indexed by token id
+        /// (<c>vocab[id]</c>). Pieces keep their word-boundary marker intact
+        /// (the v2 Omni vocab uses a literal space, v1 uses U+2581), so a
+        /// consumer can detokenize a greedy CTC decode over the grid from
+        /// <see cref="TranscribeWithLogits"/>. Returns <c>null</c> for backends
+        /// that don't expose a CTC vocab.
+        /// </summary>
+        public string[]? CtcVocab()
+        {
+            int n = NativeMethods.crispasr_session_n_vocab(Handle);
+            if (n <= 0) return null;
+            var vocab = new string[n];
+            for (int i = 0; i < n; i++)
+                vocab[i] = NativeMethods.PtrToUtf8(NativeMethods.crispasr_session_token_text(Handle, i)) ?? "";
+            return vocab;
         }
 
         /// <summary>Transcribe with VAD segmentation.</summary>
@@ -588,6 +646,32 @@ namespace CrispASR
         }
 
         public override string ToString() => $"[{T0}-{T1}] {Text}";
+    }
+
+    /// <summary>
+    /// Per-frame CTC logits from a CTC backend (Omni CTC, wav2vec2/hubert/
+    /// data2vec, or canary-ctc), captured by
+    /// <see cref="Session.TranscribeWithLogits"/>. <see cref="Data"/> is
+    /// frame-major: <c>Data[t * NVocab + v]</c> is the score for vocabulary
+    /// entry <c>v</c> at encoder frame <c>t</c>, so its length is
+    /// <c>NFrames * NVocab</c>. The Omni and wav2vec2 grids are raw logits
+    /// (pre-softmax); the canary-ctc grid is log-probabilities.
+    /// </summary>
+    public readonly struct CtcLogits
+    {
+        /// <summary>Vocabulary size — the number of CTC output classes scored per frame.</summary>
+        public int NVocab { get; }
+
+        /// <summary>Number of encoder frames (the time axis).</summary>
+        public int NFrames { get; }
+
+        /// <summary>Frame-major CTC grid of length <c>NFrames * NVocab</c> (raw logits for Omni &amp; wav2vec2, log-probabilities for canary-ctc).</summary>
+        public float[] Data { get; }
+
+        public CtcLogits(int nVocab, int nFrames, float[] data)
+        {
+            NVocab = nVocab; NFrames = nFrames; Data = data;
+        }
     }
 
     /// <summary>One aligned word from forced alignment.</summary>

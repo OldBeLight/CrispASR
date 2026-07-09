@@ -1445,6 +1445,13 @@ struct crispasr_session {
     // Default 1 preserves greedy bit-identical output (no-regression contract).
     int beam_size = 1;
 
+    // Opt-in capture of the per-frame CTC logits on backends that produce a
+    // dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec, canary-ctc), via
+    // crispasr_session_set_return_logits. Off by default so the normal path
+    // doesn't pay the [vocab × frames] copy; when on, the result carries the
+    // logit grid for downstream forced alignment.
+    bool return_logits = false;
+
     // Whisper text-suppression + prompt-carry extras (whisper-only).
     // Map 1-to-1 onto wparams.suppress_nst / suppress_regex /
     // carry_initial_prompt on every transcribe dispatch.
@@ -1753,6 +1760,15 @@ struct crispasr_session_seg {
 struct crispasr_session_result {
     std::vector<crispasr_session_seg> segments;
     std::string backend;
+    // Per-frame CTC logits, populated only when the session opted in via
+    // crispasr_session_set_return_logits and the backend produces a dense CTC
+    // grid (Omni CTC, wav2vec2/hubert/data2vec, canary-ctc). Frame-major:
+    // logits[t * n_logit_vocab + v]. Raw pre-softmax for Omni & wav2vec2;
+    // log-probabilities for canary-ctc (log-softmax is idempotent on it, so a
+    // consumer can log-softmax uniformly). Empty otherwise.
+    std::vector<float> logits;
+    int n_logit_vocab = 0;
+    int n_logit_frames = 0;
 };
 
 // ── Streamed-segment polling buffer (Dart FFI path) ─────────────────────
@@ -3150,6 +3166,29 @@ CA_EXPORT crispasr_session* crispasr_session_open_with_params(const char* model_
 
 CA_EXPORT const char* crispasr_session_backend(crispasr_session* s) {
     return s ? s->backend.c_str() : "";
+}
+
+// CTC vocabulary access (Omni CTC backend). Surfaces the SentencePiece pieces
+// already loaded from the GGUF so callers can detokenize a greedy CTC decode
+// over crispasr_session_result_logits. Returns 0 / "" for other backends.
+CA_EXPORT int crispasr_session_n_vocab(crispasr_session* s) {
+    if (!s)
+        return 0;
+#ifdef CA_HAVE_OMNIASR
+    if ((s->backend.rfind("omniasr", 0) == 0) && s->omniasr_ctx)
+        return omniasr_n_vocab((omniasr_context*)s->omniasr_ctx);
+#endif
+    return 0;
+}
+
+CA_EXPORT const char* crispasr_session_token_text(crispasr_session* s, int id) {
+    if (!s || id < 0)
+        return "";
+#ifdef CA_HAVE_OMNIASR
+    if ((s->backend.rfind("omniasr", 0) == 0) && s->omniasr_ctx)
+        return omniasr_token_text((omniasr_context*)s->omniasr_ctx, id);
+#endif
+    return "";
 }
 
 /// Comma-separated list of backend names compiled into this libwhisper.
@@ -4987,6 +5026,14 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         }
         const int V = (int)s->wav2vec2_ctx->hparams.vocab_size;
         const int T = (int)(logits.size() / (size_t)V);
+        // Opt-in raw-logits capture for forced alignment (see
+        // crispasr_session_set_return_logits). Raw pre-softmax grid, frame-major
+        // [n_frames × n_vocab]; copy so the decode below still consumes `logits`.
+        if (s->return_logits) {
+            r->logits.assign(logits.begin(), logits.end());
+            r->n_logit_vocab = V;
+            r->n_logit_frames = T;
+        }
         auto emits = (s->beam_size > 1)
                          ? wav2vec2_beam_decode_with_probs(*s->wav2vec2_ctx, logits.data(), T, s->beam_size, 2.3f)
                          : wav2vec2_greedy_decode_with_probs(*s->wav2vec2_ctx, logits.data(), T);
@@ -5094,6 +5141,15 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             return nullptr;
         }
         canary_ctc_decode_result* dr = canary_ctc_greedy_decode_with_probs(s->ctc_ctx, logits, T_enc, V);
+        // Opt-in logits capture for forced alignment (see
+        // crispasr_session_set_return_logits). canary_ctc_compute_logits returns
+        // per-frame log-probabilities (already log-softmaxed), frame-major
+        // [n_frames × n_vocab]; copy before the buffer is freed below.
+        if (s->return_logits) {
+            r->logits.assign(logits, logits + (size_t)T_enc * V);
+            r->n_logit_vocab = V;
+            r->n_logit_frames = T_enc;
+        }
         std::free(logits);
         if (!dr || !dr->text) {
             if (dr)
@@ -5373,7 +5429,21 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         }
         if (oar)
             omniasr_result_free(oar);
-        // CTC variant: text only.
+        // CTC variant: text only (+ optional raw logits for forced alignment).
+        if (s->return_logits) {
+            float* lg = nullptr;
+            int lv = 0, lf = 0;
+            char* text =
+                omniasr_transcribe_with_logits((omniasr_context*)s->omniasr_ctx, pcm, n_samples, &lg, &lv, &lf);
+            crispasr_session_result* res = package_text_only(text, true);
+            if (res && lg) {
+                res->logits.assign(lg, lg + (size_t)lv * lf);
+                res->n_logit_vocab = lv;
+                res->n_logit_frames = lf;
+            }
+            free(lg);
+            return res;
+        }
         return package_text_only(omniasr_transcribe((omniasr_context*)s->omniasr_ctx, pcm, n_samples), true);
     }
 #endif
@@ -6136,6 +6206,23 @@ CA_EXPORT float crispasr_session_result_word_p(crispasr_session_result* r, int i
         return -1.0f;
     auto& ws = r->segments[i_seg].words;
     return (i_word >= 0 && i_word < (int)ws.size()) ? ws[i_word].p : -1.0f;
+}
+
+// Per-frame CTC logits (opted in via crispasr_session_set_return_logits) for
+// backends that produce a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,
+// canary-ctc). Shape is n_logit_vocab × n_logit_frames;
+// crispasr_session_result_logits returns a frame-major buffer
+// (logits[t * n_logit_vocab + v]) valid for that many floats, or NULL when none
+// were captured. Raw pre-softmax for Omni & wav2vec2; log-probabilities for
+// canary-ctc. Owned by `r`; freed with crispasr_session_result_free.
+CA_EXPORT int crispasr_session_result_n_logit_frames(crispasr_session_result* r) {
+    return r ? r->n_logit_frames : 0;
+}
+CA_EXPORT int crispasr_session_result_n_logit_vocab(crispasr_session_result* r) {
+    return r ? r->n_logit_vocab : 0;
+}
+CA_EXPORT const float* crispasr_session_result_logits(crispasr_session_result* r) {
+    return (r && !r->logits.empty()) ? r->logits.data() : nullptr;
 }
 
 // Top-N alternative candidates for the word's first content token.
@@ -8560,6 +8647,13 @@ CA_EXPORT int crispasr_session_set_beam_size(crispasr_session* s, int n) {
     if (!s)
         return -1;
     s->beam_size = n > 0 ? n : 1;
+    return 0;
+}
+
+CA_EXPORT int crispasr_session_set_return_logits(crispasr_session* s, int enable) {
+    if (!s)
+        return -1;
+    s->return_logits = enable != 0;
     return 0;
 }
 
