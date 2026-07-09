@@ -662,20 +662,15 @@ static std::vector<float> higgs_decode(omnivoice_context* ctx, const int32_t* co
     ggml_tensor* z_q = nullptr;
     for (int k = 0; k < n_codebooks; k++) {
         auto& q = tok.quantizers[k];
-        // Codebook lookup: (codebook_dim, T_frames)
+        // Codebook lookup: get_rows on (codebook_dim=64, codebook_size=1024)
+        // returns (codebook_dim=64, T_frames) — ne[0]=64
         ggml_tensor* z = ggml_get_rows(ctx0, q.codebook, code_inputs[k]);
         z = ggml_cont(ctx0, ggml_cast(ctx0, z, GGML_TYPE_F32));
-        // project_out: Linear(codebook_dim → hidden_size)
-        // z is (T_frames, codebook_dim) from get_rows, transpose to (codebook_dim, T_frames)
-        z = ggml_cont(ctx0, ggml_transpose(ctx0, z));
-        // mul_mat: proj_out_w is (codebook_dim, hidden_size) in ggml
+        // project_out: Linear(64 → 1024). proj_out_w ne[0]=64, z ne[0]=64 → match
         z = ggml_mul_mat(ctx0, tok.quantizers[k].proj_out_w, z);
         if (q.proj_out_b)
             z = ggml_add(ctx0, z, q.proj_out_b);
-        // z is now (hidden_size, T_frames)
-        // Transpose back to (hidden_size, T_frames) for the sum
-        // Actually get_rows returns (T, codebook_dim), transpose gives (codebook_dim, T)
-        // mul_mat(proj_out_w, z) where proj_out_w ne[0]=codebook_dim -> result (hidden_size, T)
+        // z: (hidden_size=1024, T_frames)
         z_q = k == 0 ? z : ggml_add(ctx0, z_q, z);
     }
 
