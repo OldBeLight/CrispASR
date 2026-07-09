@@ -640,10 +640,13 @@ static std::vector<float> higgs_decode(omnivoice_context* ctx, const int32_t* co
         return {};
 
     // Graph context
-    // Each DAC block: snake(3 ops) + convt(~5 ops) + 3×ResUnit(~8 ops each) = ~32 ops
-    // RVQ: 8 quantizers × 4 ops + fc2(2) + conv1(5) + final snake+conv(8) = ~50
-    size_t n_tensors = (size_t)(tok.n_dec_blocks * 40 + tok.n_quantizers * 6 + 80);
-    size_t mem_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(4096, false);
+    // Generous allocation — conv1d creates ~7 intermediate tensors each (transpose,
+    // im2col, cast, reshape×3, mul_mat). 5 blocks × (snake+convt+3×resunit×2conv) =
+    // ~40 convolutions × 7 = 280 tensor ops, plus RVQ/fc2/reshapes. Add 50% margin.
+    size_t n_tensors = 700;
+    // ggml_tensor_overhead() doesn't include GGML_MEM_ALIGN padding per object.
+    // Use 2× overhead + generous flat padding to avoid off-by-alignment failures.
+    size_t mem_size = n_tensors * 2 * ggml_tensor_overhead() + ggml_graph_overhead_custom(4096, false);
     std::vector<uint8_t> mem_buf(mem_size);
     ggml_init_params ip = {mem_size, mem_buf.data(), true};
     ggml_context* ctx0 = ggml_init(ip);
@@ -685,6 +688,13 @@ static std::vector<float> higgs_decode(omnivoice_context* ctx, const int32_t* co
 
     // DAC decoder: conv1 → 5 blocks → snake → conv2
     // Input conv: Conv1d(256, 1024, k=7, p=3)
+    if (env_bool("OMNIVOICE_DEBUG")) {
+        fprintf(stderr, "  decode: pre-fc2 z_q ne=[%ld,%ld]\n", z_q->ne[0], z_q->ne[1]);
+        fprintf(stderr, "  decode: fc2_w ne=[%ld,%ld] fc2_b ne=[%ld]\n", tok.fc2_w->ne[0], tok.fc2_w->ne[1],
+                tok.fc2_b ? tok.fc2_b->ne[0] : -1);
+        fprintf(stderr, "  decode: h ne=[%ld,%ld] conv1_w ne=[%ld,%ld,%ld]\n", h->ne[0], h->ne[1],
+                tok.dec_conv1_w->ne[0], tok.dec_conv1_w->ne[1], tok.dec_conv1_w->ne[2]);
+    }
     h = core_dac::conv1d(ctx0, h, tok.dec_conv1_w, tok.dec_conv1_b, 7);
 
     // 5 decoder blocks with strides [8, 5, 4, 2, 3]
