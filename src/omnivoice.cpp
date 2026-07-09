@@ -6,8 +6,8 @@
 // Status (July 2026):
 //   ✓ LLM forward (28L Qwen3 with Q/K-norm, standard RoPE)
 //   ✓ Masked iterative generation loop
+//   ✓ Audio tokenizer decode (HiggsAudioV2 DAC: codes → waveform)
 //   ✗ Audio tokenizer encode (reference audio → codes for voice cloning)
-//   ✗ Audio tokenizer decode (codes → waveform)
 //
 // Env knobs:
 //   OMNIVOICE_DEBUG=1      — verbose per-step trace
@@ -23,6 +23,8 @@
 #include "core/activation.h"
 #include "core/attention.h"
 #include "core/bpe.h"
+#include "core/conv.h"
+#include "core/dac_decoder.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h"
@@ -151,6 +153,68 @@ struct ov_vocab {
 };
 
 // ---------------------------------------------------------------------------
+// HiggsAudioV2 tokenizer (decode path only)
+// ---------------------------------------------------------------------------
+
+struct ov_higgs_vq {
+    ggml_tensor* codebook = nullptr; // (codebook_dim=64, codebook_size=1024)
+    ggml_tensor* proj_out_w = nullptr;
+    ggml_tensor* proj_out_b = nullptr;
+};
+
+struct ov_higgs_res_unit {
+    ggml_tensor* snake1_alpha = nullptr;
+    ggml_tensor* conv1_w = nullptr;
+    ggml_tensor* conv1_b = nullptr;
+    ggml_tensor* snake2_alpha = nullptr;
+    ggml_tensor* conv2_w = nullptr;
+    ggml_tensor* conv2_b = nullptr;
+};
+
+struct ov_higgs_dec_block {
+    ggml_tensor* snake_alpha = nullptr;
+    ggml_tensor* conv_t1_w = nullptr;
+    ggml_tensor* conv_t1_b = nullptr;
+    ov_higgs_res_unit res[3]; // dilation 1, 3, 9
+};
+
+struct ov_higgs_tokenizer {
+    // Quantizer: 8 VQ layers (for OmniVoice's 8 codebooks)
+    std::vector<ov_higgs_vq> quantizers;
+
+    // fc2: project from quantizer hidden_size (1024) → DAC hidden (256)
+    ggml_tensor* fc2_w = nullptr;
+    ggml_tensor* fc2_b = nullptr;
+
+    // DAC decoder
+    ggml_tensor* dec_conv1_w = nullptr; // Conv1d(256, 1024, k=7)
+    ggml_tensor* dec_conv1_b = nullptr;
+    std::vector<ov_higgs_dec_block> dec_blocks; // 5 blocks
+    ggml_tensor* dec_snake_alpha = nullptr;     // final Snake1d
+    ggml_tensor* dec_conv2_w = nullptr;         // Conv1d(32, 1, k=7)
+    ggml_tensor* dec_conv2_b = nullptr;
+
+    // Config
+    int n_quantizers = 8;
+    int codebook_size = 1024;
+    int codebook_dim = 64;
+    int hidden_size = 1024; // quantizer output dim
+    int dac_hidden = 256;   // DAC input (after fc2)
+    int dec_hidden = 1024;  // DAC decoder first conv output
+    int n_dec_blocks = 5;
+    int upsampling_ratios[5] = {8, 5, 4, 2, 3};
+    int dec_channels[6] = {1024, 512, 256, 128, 64, 32};
+    int hop_length = 960;    // total upsample = 8*5*4*2*3 = 960
+    int sample_rate = 24000; // output sample rate
+
+    // Backend
+    ggml_context* ctx_w = nullptr;
+    ggml_backend_t backend = nullptr;
+    ggml_backend_buffer_t buf_w = nullptr;
+    bool loaded = false;
+};
+
+// ---------------------------------------------------------------------------
 // Generation config
 // ---------------------------------------------------------------------------
 
@@ -175,6 +239,7 @@ struct omnivoice_context {
     ov_model model;
     ov_vocab vocab;
     ov_gen_config gen;
+    ov_higgs_tokenizer tokenizer;
 
     int n_threads = 4;
     int verbosity = 1;
@@ -430,6 +495,255 @@ static bool load_model(omnivoice_context* ctx, const char* path) {
     }
 
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// HiggsAudioV2 tokenizer loading
+// ---------------------------------------------------------------------------
+
+static bool load_tokenizer(omnivoice_context* ctx, const char* path) {
+    auto& tok = ctx->tokenizer;
+
+    struct gguf_init_params gp = {/*.no_alloc=*/true, /*.ctx=*/&tok.ctx_w};
+    struct gguf_context* gf = gguf_init_from_file(path, gp);
+    if (!gf) {
+        fprintf(stderr, "omnivoice: failed to open tokenizer %s\n", path);
+        return false;
+    }
+
+    auto find = [&](const char* name) -> ggml_tensor* { return ggml_get_tensor(tok.ctx_w, name); };
+
+    // Quantizer: 8 VQ layers
+    tok.n_quantizers = 8; // OmniVoice uses 8 of HiggsAudioV2's quantizers
+    tok.quantizers.resize(tok.n_quantizers);
+    for (int i = 0; i < tok.n_quantizers; i++) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "quantizer.quantizers.%d.codebook.embed", i);
+        tok.quantizers[i].codebook = find(buf);
+        snprintf(buf, sizeof(buf), "quantizer.quantizers.%d.project_out.weight", i);
+        tok.quantizers[i].proj_out_w = find(buf);
+        snprintf(buf, sizeof(buf), "quantizer.quantizers.%d.project_out.bias", i);
+        tok.quantizers[i].proj_out_b = find(buf);
+    }
+
+    // fc2: project quantizer output → DAC decoder input
+    tok.fc2_w = find("fc2.weight");
+    tok.fc2_b = find("fc2.bias");
+
+    // DAC decoder
+    tok.dec_conv1_w = find("acoustic_decoder.conv1.weight");
+    tok.dec_conv1_b = find("acoustic_decoder.conv1.bias");
+    tok.dec_snake_alpha = find("acoustic_decoder.snake1.alpha");
+    tok.dec_conv2_w = find("acoustic_decoder.conv2.weight");
+    tok.dec_conv2_b = find("acoustic_decoder.conv2.bias");
+
+    tok.n_dec_blocks = 5;
+    tok.dec_blocks.resize(tok.n_dec_blocks);
+    for (int b = 0; b < tok.n_dec_blocks; b++) {
+        char buf[128];
+        auto& blk = tok.dec_blocks[b];
+        snprintf(buf, sizeof(buf), "acoustic_decoder.block.%d.snake1.alpha", b);
+        blk.snake_alpha = find(buf);
+        snprintf(buf, sizeof(buf), "acoustic_decoder.block.%d.conv_t1.weight", b);
+        blk.conv_t1_w = find(buf);
+        snprintf(buf, sizeof(buf), "acoustic_decoder.block.%d.conv_t1.bias", b);
+        blk.conv_t1_b = find(buf);
+
+        static const char* ru_names[] = {"res_unit1", "res_unit2", "res_unit3"};
+        for (int r = 0; r < 3; r++) {
+            snprintf(buf, sizeof(buf), "acoustic_decoder.block.%d.%s.snake1.alpha", b, ru_names[r]);
+            blk.res[r].snake1_alpha = find(buf);
+            snprintf(buf, sizeof(buf), "acoustic_decoder.block.%d.%s.conv1.weight", b, ru_names[r]);
+            blk.res[r].conv1_w = find(buf);
+            snprintf(buf, sizeof(buf), "acoustic_decoder.block.%d.%s.conv1.bias", b, ru_names[r]);
+            blk.res[r].conv1_b = find(buf);
+            snprintf(buf, sizeof(buf), "acoustic_decoder.block.%d.%s.snake2.alpha", b, ru_names[r]);
+            blk.res[r].snake2_alpha = find(buf);
+            snprintf(buf, sizeof(buf), "acoustic_decoder.block.%d.%s.conv2.weight", b, ru_names[r]);
+            blk.res[r].conv2_w = find(buf);
+            snprintf(buf, sizeof(buf), "acoustic_decoder.block.%d.%s.conv2.bias", b, ru_names[r]);
+            blk.res[r].conv2_b = find(buf);
+        }
+    }
+
+    // Verify critical weights
+    bool ok = true;
+    if (!tok.fc2_w) {
+        fprintf(stderr, "omnivoice: tokenizer missing fc2.weight\n");
+        ok = false;
+    }
+    if (!tok.dec_conv1_w) {
+        fprintf(stderr, "omnivoice: tokenizer missing acoustic_decoder.conv1.weight\n");
+        ok = false;
+    }
+    for (int i = 0; i < tok.n_quantizers && ok; i++) {
+        if (!tok.quantizers[i].codebook) {
+            fprintf(stderr, "omnivoice: tokenizer missing quantizer.%d.codebook.embed\n", i);
+            ok = false;
+        }
+    }
+    if (!ok) {
+        gguf_free(gf);
+        return false;
+    }
+
+    // Create backend + buffer
+    tok.backend = ggml_backend_cpu_init();
+    ggml_backend_cpu_set_n_threads(tok.backend, ctx->n_threads);
+    tok.buf_w = ggml_backend_alloc_ctx_tensors(tok.ctx_w, tok.backend);
+
+    // Load tensor data
+    {
+        FILE* fp = fopen(path, "rb");
+        if (!fp) {
+            gguf_free(gf);
+            return false;
+        }
+        int n_tensors = gguf_get_n_tensors(gf);
+        for (int i = 0; i < n_tensors; i++) {
+            const char* name = gguf_get_tensor_name(gf, i);
+            ggml_tensor* t = ggml_get_tensor(tok.ctx_w, name);
+            if (!t)
+                continue;
+            size_t offset = gguf_get_data_offset(gf) + gguf_get_tensor_offset(gf, i);
+            fseek(fp, (long)offset, SEEK_SET);
+            size_t nbytes = ggml_nbytes(t);
+            std::vector<uint8_t> tmp(nbytes);
+            if (fread(tmp.data(), 1, nbytes, fp) != nbytes) {
+                fclose(fp);
+                gguf_free(gf);
+                return false;
+            }
+            ggml_backend_tensor_set(t, tmp.data(), 0, nbytes);
+        }
+        fclose(fp);
+    }
+
+    gguf_free(gf);
+    tok.loaded = true;
+
+    if (ctx->verbosity >= 1) {
+        size_t total = ggml_backend_buffer_get_size(tok.buf_w);
+        fprintf(stderr, "omnivoice: tokenizer loaded %s (%.2f MB, %d quantizers)\n", path, total / 1e6,
+                tok.n_quantizers);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// HiggsAudioV2 decode: codes → PCM
+// ---------------------------------------------------------------------------
+
+static std::vector<float> higgs_decode(omnivoice_context* ctx, const int32_t* codes, int n_codebooks, int T_frames) {
+    auto& tok = ctx->tokenizer;
+    if (!tok.loaded)
+        return {};
+
+    // Graph context
+    size_t n_tensors = (size_t)(tok.n_dec_blocks * 30 + tok.n_quantizers * 5 + 50);
+    size_t mem_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(4096, false);
+    std::vector<uint8_t> mem_buf(mem_size);
+    ggml_init_params ip = {mem_size, mem_buf.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
+
+    // Create code input tensors
+    std::vector<ggml_tensor*> code_inputs(n_codebooks);
+    for (int k = 0; k < n_codebooks; k++) {
+        code_inputs[k] = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_frames);
+        char name[32];
+        snprintf(name, sizeof(name), "codes_%d", k);
+        ggml_set_name(code_inputs[k], name);
+        ggml_set_input(code_inputs[k]);
+    }
+
+    // RVQ decode: for each quantizer, lookup + project_out + sum
+    ggml_tensor* z_q = nullptr;
+    for (int k = 0; k < n_codebooks; k++) {
+        auto& q = tok.quantizers[k];
+        // Codebook lookup: (codebook_dim, T_frames)
+        ggml_tensor* z = ggml_get_rows(ctx0, q.codebook, code_inputs[k]);
+        z = ggml_cont(ctx0, ggml_cast(ctx0, z, GGML_TYPE_F32));
+        // project_out: Linear(codebook_dim → hidden_size)
+        // z is (T_frames, codebook_dim) from get_rows, transpose to (codebook_dim, T_frames)
+        z = ggml_cont(ctx0, ggml_transpose(ctx0, z));
+        // mul_mat: proj_out_w is (codebook_dim, hidden_size) in ggml
+        z = ggml_mul_mat(ctx0, tok.quantizers[k].proj_out_w, z);
+        if (q.proj_out_b)
+            z = ggml_add(ctx0, z, q.proj_out_b);
+        // z is now (hidden_size, T_frames)
+        // Transpose back to (hidden_size, T_frames) for the sum
+        // Actually get_rows returns (T, codebook_dim), transpose gives (codebook_dim, T)
+        // mul_mat(proj_out_w, z) where proj_out_w ne[0]=codebook_dim -> result (hidden_size, T)
+        z_q = k == 0 ? z : ggml_add(ctx0, z_q, z);
+    }
+
+    // fc2: Linear(hidden_size=1024 → dac_hidden=256)
+    // fc2_w is (hidden_size, dac_hidden) in ggml convention
+    ggml_tensor* h = ggml_mul_mat(ctx0, tok.fc2_w, z_q);
+    if (tok.fc2_b)
+        h = ggml_add(ctx0, h, tok.fc2_b);
+    // h is now (dac_hidden=256, T_frames)
+
+    // DAC decoder: conv1 → 5 blocks → snake → conv2
+    // Input conv: Conv1d(256, 1024, k=7, p=3)
+    h = core_dac::conv1d(ctx0, h, tok.dec_conv1_w, tok.dec_conv1_b, 7);
+
+    // 5 decoder blocks with strides [8, 5, 4, 2, 3]
+    static const int dilations[3] = {1, 3, 9};
+    for (int b = 0; b < tok.n_dec_blocks; b++) {
+        auto& blk = tok.dec_blocks[b];
+        int stride = tok.upsampling_ratios[b];
+
+        // Snake → ConvTranspose1d
+        h = core_dac::snake(ctx0, h, blk.snake_alpha);
+        int pad = (int)std::ceil((double)stride / 2.0);
+        h = core_convt::convt1d_crop(ctx0, h, blk.conv_t1_w, blk.conv_t1_b, stride, pad, pad);
+
+        // 3 ResidualUnits (d=1, 3, 9)
+        for (int r = 0; r < 3; r++) {
+            auto& ru = blk.res[r];
+            ggml_tensor* y = core_dac::snake(ctx0, h, ru.snake1_alpha);
+            y = core_dac::conv1d(ctx0, y, ru.conv1_w, ru.conv1_b, 7, dilations[r]);
+            y = core_dac::snake(ctx0, y, ru.snake2_alpha);
+            y = core_dac::conv1d(ctx0, y, ru.conv2_w, ru.conv2_b, 1);
+            h = ggml_add(ctx0, h, y);
+        }
+        h = ggml_cont(ctx0, h);
+    }
+
+    // Final: Snake → Conv1d(32, 1, k=7) — no Tanh (HiggsAudio removes it)
+    h = core_dac::snake(ctx0, h, tok.dec_snake_alpha);
+    h = core_dac::conv1d(ctx0, h, tok.dec_conv2_w, tok.dec_conv2_b, 7);
+
+    // Output: (1, T_pcm) → flatten
+    int T_pcm = (int)h->ne[1];
+    h = ggml_reshape_1d(ctx0, h, T_pcm);
+    ggml_set_name(h, "pcm");
+    ggml_set_output(h);
+    ggml_build_forward_expand(gf, h);
+
+    // Allocate and compute
+    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(tok.backend));
+    ggml_gallocr_alloc_graph(ga, gf);
+
+    // Set code inputs
+    for (int k = 0; k < n_codebooks; k++) {
+        ggml_backend_tensor_set(code_inputs[k], codes + (size_t)k * T_frames, 0, T_frames * sizeof(int32_t));
+    }
+
+    ggml_backend_graph_compute(tok.backend, gf);
+
+    // Read PCM output
+    ggml_tensor* pcm_out = ggml_graph_get_tensor(gf, "pcm");
+    std::vector<float> pcm(T_pcm);
+    ggml_backend_tensor_get(pcm_out, pcm.data(), 0, T_pcm * sizeof(float));
+
+    ggml_gallocr_free(ga);
+    ggml_free(ctx0);
+
+    return pcm;
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,10 +1340,10 @@ int omnivoice_set_tokenizer_path(struct omnivoice_context* ctx, const char* path
     if (!ctx || !path)
         return -1;
     ctx->tokenizer_path = path;
-    if (ctx->verbosity >= 1) {
-        fprintf(stderr, "omnivoice: tokenizer path set to %s\n", path);
+    if (!load_tokenizer(ctx, path)) {
+        fprintf(stderr, "omnivoice: failed to load tokenizer from %s\n", path);
+        return -1;
     }
-    // TODO: load the tokenizer GGUF and init the HiggsAudioV2 runtime
     return 0;
 }
 
@@ -1085,14 +1399,42 @@ void omnivoice_codes_free(int32_t* codes) {
 }
 
 float* omnivoice_decode_codes(struct omnivoice_context* ctx, const int32_t* codes, int n_codes, int* out_n_samples) {
-    (void)ctx;
-    (void)codes;
-    (void)n_codes;
-    if (out_n_samples)
+    if (!ctx || !codes || n_codes <= 0 || !out_n_samples)
+        return nullptr;
+    if (!ctx->tokenizer.loaded) {
+        fprintf(stderr, "omnivoice: decode requires audio tokenizer — call omnivoice_set_tokenizer_path first\n");
         *out_n_samples = 0;
-    // TODO: decode via HiggsAudioV2 tokenizer
-    fprintf(stderr, "omnivoice: decode_codes not yet implemented (audio tokenizer pending)\n");
-    return nullptr;
+        return nullptr;
+    }
+
+    int n_cb = (int)ctx->hp.n_codebooks;
+    int T_frames = n_codes / n_cb;
+    if (T_frames <= 0 || n_codes != n_cb * T_frames) {
+        fprintf(stderr, "omnivoice: decode_codes: n_codes=%d not divisible by n_codebooks=%d\n", n_codes, n_cb);
+        *out_n_samples = 0;
+        return nullptr;
+    }
+
+    if (ctx->verbosity >= 1) {
+        fprintf(stderr, "omnivoice: decoding %d codes (%d codebooks × %d frames)\n", n_codes, n_cb, T_frames);
+    }
+
+    ov_bench_stage bench("decode");
+    auto pcm = higgs_decode(ctx, codes, n_cb, T_frames);
+    if (pcm.empty()) {
+        *out_n_samples = 0;
+        return nullptr;
+    }
+
+    int n = (int)pcm.size();
+    float* out = (float*)malloc(n * sizeof(float));
+    std::memcpy(out, pcm.data(), n * sizeof(float));
+    *out_n_samples = n;
+
+    if (ctx->verbosity >= 1) {
+        fprintf(stderr, "omnivoice: decoded %d samples (%.2f s at %d Hz)\n", n, (float)n / 24000.0f, 24000);
+    }
+    return out;
 }
 
 float* omnivoice_synthesize(struct omnivoice_context* ctx, const char* text, int* out_n_samples) {
@@ -1118,12 +1460,20 @@ void omnivoice_pcm_free(float* pcm) {
 void omnivoice_free(struct omnivoice_context* ctx) {
     if (!ctx)
         return;
+    // Main model
     if (ctx->buf_w)
         ggml_backend_buffer_free(ctx->buf_w);
     if (ctx->backend)
         ggml_backend_free(ctx->backend);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
+    // Tokenizer
+    if (ctx->tokenizer.buf_w)
+        ggml_backend_buffer_free(ctx->tokenizer.buf_w);
+    if (ctx->tokenizer.backend)
+        ggml_backend_free(ctx->tokenizer.backend);
+    if (ctx->tokenizer.ctx_w)
+        ggml_free(ctx->tokenizer.ctx_w);
     delete ctx;
 }
 
