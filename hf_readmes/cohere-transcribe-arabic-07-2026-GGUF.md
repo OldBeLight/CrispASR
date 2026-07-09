@@ -52,7 +52,18 @@ cd CrispASR
 cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
-# Auto-download + transcribe (Arabic)
+# Shorthand: auto-downloads the recommended imatrix GGUF and defaults
+# the language to Arabic — no -m / --hf-repo / -l needed.
+build/bin/crispasr --backend cohere-ar audio.wav
+```
+
+`cohere-ar` is a CLI alias for the `cohere` backend: it routes to the same
+runtime, resolves `cohere-transcribe-arabic-q4_k-imatrix.gguf` via `-m auto`,
+and sets `-l ar` unless you pass an explicit `-l` (which always wins — useful
+if you want to run this model with the LID pre-step or force another
+language for testing). It's equivalent to:
+
+```bash
 build/bin/crispasr --backend cohere \
     --hf-repo cstr/cohere-transcribe-arabic-07-2026-GGUF:cohere-transcribe-arabic-q4_k-imatrix.gguf \
     audio.wav -l ar
