@@ -165,6 +165,7 @@ regression test against `samples/jfk.wav`:
 | whisper | Enc-dec transformer | ✔ | ✔ | ✔ | CUDA / Metal / Vulkan | (upstream) |
 | parakeet | FastConformer + TDT | ✔ | ✔ | partial | CPU | mel, fastconformer |
 | canary | FastConformer + Transformer dec | ✔ | ✔ | ✔ | CUDA / Metal | mel, fastconformer |
+| canary-qwen | FastConformer + Qwen3-1.7B SALM | ✔ | ✔ | ✔ | CUDA | mel, fastconformer, kv_self_attn, swiglu, bpe |
 | cohere | Conformer + Transformer dec | ✔ | ✔ | ✔ | CUDA / Metal | mel |
 | granite | Conformer + Q-Former + LLM | ✔ | ✔ | ✔ | CPU | mel, kv_self_attn, swiglu, greedy_decode, bpe |
 | voxtral | Whisper enc + Mistral LLM | ✔ | ✔ | ✔ | CUDA / Metal | mel, kv_self_attn, encoder_self_attn, swiglu, greedy_decode, bpe |
