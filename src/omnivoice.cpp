@@ -150,6 +150,8 @@ struct ov_vocab {
     std::vector<std::string> id_to_token;
     std::unordered_map<std::string, int32_t> token_to_id;
     std::unordered_map<std::string, int32_t> merge_rank;
+    // Special tokens: <|text_start|>, <|lang_start|>, etc.
+    std::unordered_map<std::string, int32_t> special_tokens;
 };
 
 // ---------------------------------------------------------------------------
@@ -487,6 +489,23 @@ static bool load_model(omnivoice_context* ctx, const char* path) {
         }
     }
 
+    // Load special tokens (omnivoice.special_token_names + _ids)
+    {
+        int nidx = gguf_find_key(gf, "omnivoice.special_token_names");
+        int iidx = gguf_find_key(gf, "omnivoice.special_token_ids");
+        if (nidx >= 0 && iidx >= 0) {
+            int n = (int)gguf_get_arr_n(gf, nidx);
+            const int32_t* ids = (const int32_t*)gguf_get_arr_data(gf, iidx);
+            for (int i = 0; i < n; i++) {
+                std::string name = gguf_get_arr_str(gf, nidx, i);
+                ctx->vocab.special_tokens[name] = ids[i];
+            }
+            if (ctx->verbosity >= 1) {
+                fprintf(stderr, "omnivoice: loaded %d special tokens\n", n);
+            }
+        }
+    }
+
     gguf_free(gf);
 
     if (ctx->verbosity >= 1) {
@@ -757,8 +776,41 @@ static std::vector<float> higgs_decode(omnivoice_context* ctx, const int32_t* co
 // BPE tokenizer
 // ---------------------------------------------------------------------------
 
+// Tokenize with special token handling. Scans for <|...|> patterns first,
+// replaces with their IDs, then BPE-tokenizes the remaining text segments.
 static std::vector<int32_t> tokenize(const ov_vocab& vocab, const std::string& text) {
-    return core_bpe::tokenize_simple(vocab.token_to_id, vocab.merge_rank, text);
+    if (vocab.special_tokens.empty()) {
+        return core_bpe::tokenize_simple(vocab.token_to_id, vocab.merge_rank, text);
+    }
+    std::vector<int32_t> result;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        // Look for <| at current position
+        if (text[pos] == '<' && pos + 1 < text.size() && text[pos + 1] == '|') {
+            // Find closing |>
+            size_t end = text.find("|>", pos + 2);
+            if (end != std::string::npos) {
+                std::string token = text.substr(pos, end + 2 - pos);
+                auto it = vocab.special_tokens.find(token);
+                if (it != vocab.special_tokens.end()) {
+                    result.push_back(it->second);
+                    pos = end + 2;
+                    continue;
+                }
+            }
+        }
+        // Find next special token or end
+        size_t next = text.find("<|", pos + 1);
+        if (next == std::string::npos)
+            next = text.size();
+        std::string segment = text.substr(pos, next - pos);
+        if (!segment.empty()) {
+            auto seg_tokens = core_bpe::tokenize_simple(vocab.token_to_id, vocab.merge_rank, segment);
+            result.insert(result.end(), seg_tokens.begin(), seg_tokens.end());
+        }
+        pos = next;
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,6 +1132,12 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
 
     if (debug) {
         fprintf(stderr, "omnivoice: text tokens=%d, target audio frames=%d\n", T_text, T_target);
+        fprintf(stderr, "omnivoice: token ids:");
+        for (int i = 0; i < std::min(T_text, 20); i++)
+            fprintf(stderr, " %d", text_token_ids[i]);
+        if (T_text > 20)
+            fprintf(stderr, " ...");
+        fprintf(stderr, "\n");
     }
 
     // 3. Build style prefix (simplified — language + instruct)
