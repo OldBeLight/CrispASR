@@ -299,6 +299,11 @@ extern int crispasr_cache_dir_abi(const char* cache_dir_override, char* out_buf,
 
 // Session extras
 extern int crispasr_session_available_backends(char* out_csv, int out_cap);
+// CTC vocabulary access (Omni CTC backend): n_vocab piece count, token_text
+// maps an id to its model-owned raw piece (do not free) or "" when out of
+// range / unsupported.
+extern int         crispasr_session_n_vocab(struct CrispasrSession* s);
+extern const char* crispasr_session_token_text(struct CrispasrSession* s, int id);
 extern struct CrispasrSession* crispasr_session_open_explicit(const char* model_path, const char* backend_name, int n_threads);
 extern struct CrispasrSession* crispasr_session_open_with_params(const char* model_path, const char* backend_name, const void* params);
 extern struct crispasr_session_result* crispasr_session_transcribe_vad(struct CrispasrSession* s, const float* pcm, int n_samples,
@@ -791,6 +796,23 @@ static VALUE rb_session_transcribe_with_logits(VALUE self, VALUE handle, VALUE p
     rb_ary_push(out, segments);
     rb_ary_push(out, logits);
     return out;
+}
+
+// CrispASR::Session.ctc_vocab(handle) -> [String, ...] or nil
+//   The Omni CTC vocabulary as raw pieces indexed by token id (vocab[id]).
+//   Pieces keep their word-boundary marker intact (v2 uses a literal space, v1
+//   uses U+2581), so a consumer can detokenize a greedy CTC decode over the
+//   transcribe_with_logits grid. nil for backends without a CTC vocab.
+static VALUE rb_session_ctc_vocab(VALUE self, VALUE handle) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int n = crispasr_session_n_vocab(s);
+    if (n <= 0) return Qnil;
+    VALUE vocab = rb_ary_new_capa(n);
+    for (int i = 0; i < n; i++) {
+        const char* p = crispasr_session_token_text(s, i);
+        rb_ary_push(vocab, rb_utf8_str_new_cstr(p ? p : ""));
+    }
+    return vocab;
 }
 
 // CrispASR::Session.transcribe_chunked(handle, pcm, chunk_seconds, overlap_seconds, language)
@@ -1503,6 +1525,7 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "synthesize",           rb_session_synthesize,       2);
     rb_define_singleton_method(mSession, "transcribe",           rb_session_transcribe,       2);
     rb_define_singleton_method(mSession, "transcribe_with_logits", rb_session_transcribe_with_logits, 2);
+    rb_define_singleton_method(mSession, "ctc_vocab",              rb_session_ctc_vocab,             1);
     rb_define_singleton_method(mSession, "transcribe_chunked",   rb_session_transcribe_chunked, 5);
     rb_define_singleton_method(mSession, "get_progress",         rb_session_get_progress,     0);
     rb_define_singleton_method(mSession, "vad_segments",         rb_session_vad_segments,    -1);

@@ -79,6 +79,84 @@ class CrispasrLogitsTest {
         }
     }
 
+    /**
+     * CTC vocabulary accessor: a greedy decode over the exposed logits,
+     * detokenized via the exposed vocab, must reproduce the built-in
+     * transcript — proving the vocab shares the logits' id space. Mirrors the
+     * Rust {@code session_omni_ctc_vocab} case. Uses the low-level {@code Lib}
+     * API for the omniasr open, like {@link #sessionOmniCtcLogits()}.
+     */
+    @Test
+    @EnabledIfEnvironmentVariable(named = "OMNI_CTC_MODEL", matches = ".+")
+    void sessionOmniCtcVocab() throws Exception {
+        String modelPath = System.getenv("OMNI_CTC_MODEL");
+        float[] full = readWavPcm(new File(System.getProperty("user.dir"), "../../samples/jfk.wav"));
+        int n = Math.min(full.length, 16000 * 4);
+        float[] pcm = new float[n];
+        System.arraycopy(full, 0, pcm, 0, n);
+
+        Pointer session = CrispasrSession.Lib.INSTANCE.crispasr_session_open_explicit(modelPath, "omniasr", 4);
+        assertNotNull(session, "session open omniasr");
+        try {
+            int nVocab = CrispasrSession.Lib.INSTANCE.crispasr_session_n_vocab(session);
+            assertTrue(nVocab > 1000, "unexpectedly small vocab: " + nVocab);
+            String[] vocab = new String[nVocab];
+            boolean boundary = false;
+            for (int i = 0; i < nVocab; i++) {
+                String p = CrispasrSession.Lib.INSTANCE.crispasr_session_token_text(session, i);
+                vocab[i] = p != null ? p : "";
+                if (vocab[i].equals(" ") || vocab[i].contains("▁")) boundary = true;
+            }
+            assertTrue(boundary, "no word-boundary token in vocab");
+
+            // Greedy CTC decode over the logits, detokenized via the vocab, must
+            // reproduce the built-in transcript.
+            assertEquals(0,
+                    CrispasrSession.Lib.INSTANCE.crispasr_session_set_return_logits(session, 1), "set_return_logits");
+            Pointer r = CrispasrSession.Lib.INSTANCE.crispasr_session_transcribe_lang(session, pcm, pcm.length, null);
+            assertNotNull(r, "transcribe_lang");
+            try {
+                int nSeg = CrispasrSession.Lib.INSTANCE.crispasr_session_result_n_segments(r);
+                StringBuilder textB = new StringBuilder();
+                for (int i = 0; i < nSeg; i++) {
+                    String t = CrispasrSession.Lib.INSTANCE.crispasr_session_result_segment_text(r, i);
+                    if (t != null && !t.isEmpty()) {
+                        if (textB.length() > 0) textB.append(' ');
+                        textB.append(t);
+                    }
+                }
+                String text = textB.toString().trim();
+                assertFalse(text.isEmpty(), "expected a transcript");
+
+                int nFrames = CrispasrSession.Lib.INSTANCE.crispasr_session_result_n_logit_frames(r);
+                int nv = CrispasrSession.Lib.INSTANCE.crispasr_session_result_n_logit_vocab(r);
+                Pointer ptr = CrispasrSession.Lib.INSTANCE.crispasr_session_result_logits(r);
+                assertEquals(nVocab, nv, "logit vocab dim != vocab len");
+                float[] data = ptr.getFloatArray(0, nFrames * nv);
+
+                // Argmax per frame, collapse repeats, drop blank (id 0);
+                // detokenize with U+2581 → space, then trim.
+                StringBuilder decoded = new StringBuilder();
+                int prev = -1;
+                for (int t = 0; t < nFrames; t++) {
+                    int base = t * nv;
+                    int best = 0;
+                    for (int v = 1; v < nv; v++) {
+                        if (data[base + v] > data[base + best]) best = v;
+                    }
+                    if (best != 0 && best != prev) decoded.append(vocab[best].replace("▁", " "));
+                    prev = best;
+                }
+                assertEquals(text, decoded.toString().trim(),
+                        "vocab-detokenized greedy decode != built-in transcript");
+            } finally {
+                CrispasrSession.Lib.INSTANCE.crispasr_session_result_free(r);
+            }
+        } finally {
+            CrispasrSession.Lib.INSTANCE.crispasr_session_close(session);
+        }
+    }
+
     /** Read a 16 kHz mono 16-bit PCM WAV into float32 (same idiom as WhisperCppTest). */
     private static float[] readWavPcm(File file) throws Exception {
         try (AudioInputStream ais = AudioSystem.getAudioInputStream(file)) {

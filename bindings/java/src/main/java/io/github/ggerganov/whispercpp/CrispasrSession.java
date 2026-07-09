@@ -289,6 +289,11 @@ public final class CrispasrSession implements AutoCloseable {
 
         // Session extras
         int     crispasr_session_available_backends(byte[] outCsv, int outCap);
+        // CTC vocabulary access (Omni CTC backend): n_vocab piece count,
+        // token_text maps an id to its raw piece (JNA copies the model-owned
+        // const char*; do not free) or "" when out of range / unsupported.
+        int     crispasr_session_n_vocab(Pointer session);
+        String  crispasr_session_token_text(Pointer session, int id);
         Pointer crispasr_session_open_explicit(String modelPath, String backendName, int nThreads);
         Pointer crispasr_session_open_with_params(String modelPath, String backendName, Pointer params);
         Pointer crispasr_session_transcribe_vad_lang(Pointer session, float[] pcm, int nSamples,
@@ -939,6 +944,25 @@ public final class CrispasrSession implements AutoCloseable {
         if (nFrames <= 0 || nVocab <= 0 || ptr == null) return null;
         float[] data = ptr.getFloatArray(0, nFrames * nVocab);
         return new CtcLogits(nVocab, nFrames, data);
+    }
+
+    /**
+     * The Omni CTC vocabulary as raw pieces, indexed by token id
+     * ({@code vocab[id]}). Pieces keep their word-boundary marker intact (the
+     * v2 Omni vocab uses a literal space, v1 uses U+2581), so a consumer can
+     * detokenize a greedy CTC decode over the grid from
+     * {@link #transcribeWithLogits(float[], String)}. Returns {@code null} for
+     * backends that don't expose a CTC vocab.
+     */
+    public String[] ctcVocab() {
+        int n = Lib.INSTANCE.crispasr_session_n_vocab(handle);
+        if (n <= 0) return null;
+        String[] vocab = new String[n];
+        for (int i = 0; i < n; i++) {
+            String p = Lib.INSTANCE.crispasr_session_token_text(handle, i);
+            vocab[i] = p != null ? p : "";
+        }
+        return vocab;
     }
 
     // -----------------------------------------------------------------

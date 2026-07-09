@@ -31,6 +31,15 @@ namespace CrispASR
         internal static extern int crispasr_session_available_backends(
             byte[] outCsv, int outCap);
 
+        // CTC vocabulary access (Omni CTC backend). n_vocab is the piece count;
+        // token_text returns a model-owned const char* (do not free) or "" when
+        // out of range / unsupported.
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_n_vocab(IntPtr s);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_token_text(IntPtr s, int id);
+
         // ---- Session setters ----
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_set_codec_path(

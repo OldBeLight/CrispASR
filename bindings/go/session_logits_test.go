@@ -104,6 +104,74 @@ func Test_OmniCtcLogits(t *testing.T) {
 	assert.Less(nTokens, logits.NFrames)
 }
 
+// Test_OmniCtcVocab exercises the CTC vocabulary accessor: a greedy decode over
+// the exposed logits, detokenized via the exposed vocab, must reproduce the
+// built-in transcript — proving the vocab shares the logits' id space. Mirrors
+// the Rust session_omni_ctc_vocab case. Self-skips unless OMNI_CTC_MODEL is set.
+func Test_OmniCtcVocab(t *testing.T) {
+	assert := assert.New(t)
+	modelPath := os.Getenv("OMNI_CTC_MODEL")
+	if modelPath == "" {
+		t.Skip("Skipping test, OMNI_CTC_MODEL not set")
+	}
+	if _, err := os.Stat(modelPath); os.IsNotExist(err) {
+		t.Skip("Skipping test, Omni CTC model not found:", modelPath)
+	}
+
+	sess, err := whisper.SessionOpenExplicit(modelPath, "omniasr", 4)
+	assert.NoError(err)
+	defer sess.Close()
+
+	vocab := sess.CtcVocab()
+	assert.NotNil(vocab, "CTC backend should expose a vocab")
+	assert.Greater(len(vocab), 1000)
+	hasBoundary := false
+	for _, p := range vocab {
+		if p == " " || strings.Contains(p, "▁") {
+			hasBoundary = true
+			break
+		}
+	}
+	assert.True(hasBoundary, "no word-boundary token in vocab")
+
+	pcm := loadJFKClip(t)
+	res, logits, err := sess.TranscribeWithLogits(pcm)
+	assert.NoError(err)
+	assert.NotNil(res)
+	assert.NotNil(logits)
+	if res == nil || logits == nil {
+		return
+	}
+	parts := make([]string, 0, len(res.Segments))
+	for _, s := range res.Segments {
+		parts = append(parts, s.Text)
+	}
+	text := strings.TrimSpace(strings.Join(parts, " "))
+	assert.NotEmpty(text)
+	assert.Equal(len(vocab), logits.NVocab, "logit vocab dim != vocab len")
+
+	// Greedy CTC: argmax per frame, collapse repeats, drop blank (id 0);
+	// detokenize with U+2581 → space, then trim.
+	var decoded strings.Builder
+	prev := -1
+	for tf := 0; tf < logits.NFrames; tf++ {
+		best, bestV := 0, float32(math.Inf(-1))
+		base := tf * logits.NVocab
+		for v := 0; v < logits.NVocab; v++ {
+			if logits.Data[base+v] > bestV {
+				bestV = logits.Data[base+v]
+				best = v
+			}
+		}
+		if best != 0 && best != prev {
+			decoded.WriteString(strings.ReplaceAll(vocab[best], "▁", " "))
+		}
+		prev = best
+	}
+	assert.Equal(text, strings.TrimSpace(decoded.String()),
+		"vocab-detokenized greedy decode != built-in transcript")
+}
+
 // Test_OmniCtcLogits_CapturePreservesTranscript verifies that turning logit
 // capture on and back off leaves the plain transcript unchanged. Mirrors the
 // Python test_logits_capture_preserves_transcript case.

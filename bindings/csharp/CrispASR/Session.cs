@@ -345,6 +345,24 @@ namespace CrispASR
             return new CtcLogits(nVocab, nFrames, data);
         }
 
+        /// <summary>
+        /// The Omni CTC vocabulary as raw pieces, indexed by token id
+        /// (<c>vocab[id]</c>). Pieces keep their word-boundary marker intact
+        /// (the v2 Omni vocab uses a literal space, v1 uses U+2581), so a
+        /// consumer can detokenize a greedy CTC decode over the grid from
+        /// <see cref="TranscribeWithLogits"/>. Returns <c>null</c> for backends
+        /// that don't expose a CTC vocab.
+        /// </summary>
+        public string[]? CtcVocab()
+        {
+            int n = NativeMethods.crispasr_session_n_vocab(Handle);
+            if (n <= 0) return null;
+            var vocab = new string[n];
+            for (int i = 0; i < n; i++)
+                vocab[i] = NativeMethods.PtrToUtf8(NativeMethods.crispasr_session_token_text(Handle, i)) ?? "";
+            return vocab;
+        }
+
         /// <summary>Transcribe with VAD segmentation.</summary>
         public Segment[] TranscribeVad(float[] pcm, int sampleRate, string vadModelPath)
         {

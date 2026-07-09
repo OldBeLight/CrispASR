@@ -306,6 +306,11 @@ int crispasr_registry_list_backends_abi(char* out_csv, int out_cap);
 
 // --- Session extras ---
 int crispasr_session_available_backends(char* out_csv, int out_cap);
+// CTC vocabulary access (Omni CTC backend): n_vocab piece count, token_text
+// maps an id to its raw piece (word-boundary marker intact) or "" when out of
+// range / unsupported. Pairs with the result logits accessor for detokenization.
+int          crispasr_session_n_vocab(CrispasrSession* s);
+const char*  crispasr_session_token_text(CrispasrSession* s, int id);
 CrispasrSession* crispasr_session_open_explicit(const char* model_path, const char* backend_name, int n_threads);
 CrispasrSession* crispasr_session_open_with_params(const char* model_path, const char* backend_name, const void* params);
 crispasr_session_result* crispasr_session_transcribe_vad_lang(CrispasrSession* s, const float* pcm, int n_samples,
@@ -1215,6 +1220,26 @@ func extractLogits(r *C.crispasr_session_result) *CtcLogits {
 	src := unsafe.Slice((*float32)(unsafe.Pointer(ptr)), n)
 	copy(data, src)
 	return &CtcLogits{NVocab: nVocab, NFrames: nFrames, Data: data}
+}
+
+// CtcVocab returns the Omni CTC vocabulary as raw pieces indexed by token id
+// (vocab[id]). Pieces keep their word-boundary marker intact (the v2 Omni vocab
+// uses a literal space, v1 uses U+2581), so a consumer can detokenize a greedy
+// CTC decode over the grid from TranscribeWithLogits. Returns nil for backends
+// that don't expose a CTC vocab.
+func (s *CrispasrSession) CtcVocab() []string {
+	if s.handle == nil {
+		return nil
+	}
+	n := int(C.crispasr_session_n_vocab(s.handle))
+	if n <= 0 {
+		return nil
+	}
+	vocab := make([]string, n)
+	for i := 0; i < n; i++ {
+		vocab[i] = C.GoString(C.crispasr_session_token_text(s.handle, C.int(i)))
+	}
+	return vocab
 }
 
 // ---------------------------------------------------------------------------

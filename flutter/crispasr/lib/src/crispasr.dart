@@ -2513,6 +2513,30 @@ class CrispasrSession {
     );
   }
 
+  /// The Omni CTC vocabulary as raw pieces, indexed by token id
+  /// (`vocab[id]`). Pieces keep their word-boundary marker intact (the v2
+  /// Omni vocab uses a literal space, v1 uses U+2581), so a consumer can
+  /// detokenize a greedy CTC decode over the grid from [transcribeWithLogits].
+  /// Returns `null` for backends that don't expose a CTC vocab or on a dylib
+  /// predating the accessor.
+  List<String>? ctcVocab() {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_token_text')) return null;
+    final nVocabFn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_n_vocab');
+    final tokenTextFn = _lib.lookupFunction<
+        Pointer<Utf8> Function(Pointer<Void>, Int32),
+        Pointer<Utf8> Function(Pointer<Void>, int)>('crispasr_session_token_text');
+    final n = nVocabFn(_handle);
+    if (n <= 0) return null;
+    final vocab = List<String>.filled(n, '');
+    for (var i = 0; i < n; i++) {
+      final p = tokenTextFn(_handle, i);
+      vocab[i] = p == nullptr ? '' : p.toDartString();
+    }
+    return vocab;
+  }
+
   // ---------------------------------------------------------------------------
   // TTS synthesis (vibevoice, qwen3-tts, kokoro, orpheus, chatterbox, zonos-tts, lfm2-audio, dots-tts, and others)
   // ---------------------------------------------------------------------------

@@ -59,6 +59,11 @@ int                     crispasr_kokoro_resolve_fallback_voice_abi(const char* m
 // --- Full C-ABI parity declarations ---
 // Session extras
 int          crispasr_session_available_backends(char* out_csv, int out_cap);
+// CTC vocabulary access (Omni CTC backend): n_vocab piece count, token_text
+// maps an id to its model-owned raw piece (do not free) or "" when out of
+// range / unsupported.
+int          crispasr_session_n_vocab(CrispasrSession* s);
+const char*  crispasr_session_token_text(CrispasrSession* s, int id);
 CrispasrSession* crispasr_session_open_explicit(const char* model_path, const char* backend_name, int n_threads);
 CrispasrSession* crispasr_session_open_with_params(const char* model_path, const char* backend_name, const void* params);
 const char*  crispasr_session_backend(CrispasrSession* s);
@@ -911,6 +916,24 @@ EMSCRIPTEN_BINDINGS(whisper) {
 
             crispasr_session_result_free(res);
             return out;
+        }));
+
+    // CTC vocabulary access (Omni CTC backend). Returns the vocab as a JS array
+    // of raw piece strings indexed by token id (word-boundary marker intact —
+    // v2 uses a literal space, v1 uses U+2581), for detokenizing a greedy CTC
+    // decode over sessionTranscribeWithLogits' grid. null when no session is
+    // open or the backend exposes no CTC vocab.
+    emscripten::function("sessionCtcVocab", emscripten::optional_override(
+        []() -> emscripten::val {
+            if (!g_tts_session) return emscripten::val::null();
+            const int n = crispasr_session_n_vocab(g_tts_session);
+            if (n <= 0) return emscripten::val::null();
+            emscripten::val vocab = emscripten::val::array();
+            for (int i = 0; i < n; i++) {
+                const char* p = crispasr_session_token_text(g_tts_session, i);
+                vocab.call<void>("push", std::string(p ? p : ""));
+            }
+            return vocab;
         }));
 
     // --- Session translate ---

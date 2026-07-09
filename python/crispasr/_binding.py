@@ -1095,6 +1095,14 @@ class Session:
         lib.crispasr_session_backend.restype = ctypes.c_char_p
         lib.crispasr_session_available_backends.argtypes = [ctypes.c_char_p, ctypes.c_int]
         lib.crispasr_session_available_backends.restype = ctypes.c_int
+        # 2026-07-08: CTC vocabulary access (Omni CTC backend). n_vocab is the
+        # piece count; token_text maps an id to its raw piece. hasattr-guarded
+        # so a binding loaded against an older dylib still works.
+        if hasattr(lib, "crispasr_session_token_text"):
+            lib.crispasr_session_n_vocab.argtypes = [ctypes.c_void_p]
+            lib.crispasr_session_n_vocab.restype = ctypes.c_int
+            lib.crispasr_session_token_text.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            lib.crispasr_session_token_text.restype = ctypes.c_char_p
         lib.crispasr_session_transcribe.argtypes = [
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int,
         ]
@@ -1580,6 +1588,26 @@ class Session:
             return segs, logits
         finally:
             self._lib.crispasr_session_result_free(res)
+
+    def ctc_vocab(self) -> Optional[List[str]]:
+        """Return the Omni CTC vocabulary as raw pieces, indexed by token id.
+
+        ``vocab[id]`` is the raw piece for token ``id`` — word-boundary marker
+        intact (the v2 Omni vocab uses a literal space, v1 uses U+2581) — so a
+        consumer can detokenize a greedy CTC decode over the grid from
+        :meth:`transcribe_with_logits`. Returns ``None`` for backends that
+        don't expose a CTC vocab or on dylibs predating the accessor.
+        """
+        if not hasattr(self._lib, "crispasr_session_token_text"):
+            return None
+        n = self._lib.crispasr_session_n_vocab(self._handle)
+        if n <= 0:
+            return None
+        vocab: List[str] = []
+        for i in range(n):
+            p = self._lib.crispasr_session_token_text(self._handle, i)
+            vocab.append(p.decode("utf-8") if p else "")
+        return vocab
 
     # ---------------------------------------------------------------------
     # TTS synthesis (vibevoice, qwen3-tts, kokoro, orpheus, chatterbox, outetts, indextts, voxcpm2, csm, dia, zonos-tts, bark, speecht5, parler-tts, pocket-tts, kugelaudio, tada, lfm2-audio, dots-tts)

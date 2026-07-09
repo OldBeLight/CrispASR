@@ -221,6 +221,29 @@ class TestOmniCtcLogits(unittest.TestCase):
         plain = " ".join(s.text for s in self.session.transcribe(pcm)).strip()
         self.assertEqual(plain, with_logits, "logits capture changed the transcript")
 
+    def test_ctc_vocab(self):
+        vocab = self.session.ctc_vocab()
+        self.assertIsNotNone(vocab, "CTC backend should expose a vocab")
+        self.assertGreater(len(vocab), 1000)
+        # A word-boundary token exists — literal space (v2) or U+2581 (v1).
+        self.assertTrue(any(p == " " or "▁" in p for p in vocab),
+                        "no word-boundary token in vocab")
+
+        # End-to-end: a greedy CTC decode over the exposed logits, detokenized
+        # via the exposed vocab, must reproduce the built-in transcript. Proves
+        # the vocab shares the logits' id space.
+        pcm = self._clip()
+        segs, logits = self.session.transcribe_with_logits(pcm)
+        text = " ".join(s.text for s in segs).strip()
+        self.assertTrue(text)
+        self.assertEqual(logits.shape[1], len(vocab))
+        best = logits.argmax(axis=1)
+        keep = best != 0
+        keep[1:] &= best[1:] != best[:-1]
+        decoded = "".join(vocab[i].replace("▁", " ") for i in best[keep]).strip()
+        self.assertEqual(decoded, text,
+                         "vocab-detokenized greedy decode != built-in transcript")
+
 
 @unittest.skipUnless(LIB_PATH, "libwhisper not built")
 class TestAvailableBackends(unittest.TestCase):
