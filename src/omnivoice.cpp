@@ -640,7 +640,9 @@ static std::vector<float> higgs_decode(omnivoice_context* ctx, const int32_t* co
         return {};
 
     // Graph context
-    size_t n_tensors = (size_t)(tok.n_dec_blocks * 30 + tok.n_quantizers * 5 + 50);
+    // Each DAC block: snake(3 ops) + convt(~5 ops) + 3×ResUnit(~8 ops each) = ~32 ops
+    // RVQ: 8 quantizers × 4 ops + fc2(2) + conv1(5) + final snake+conv(8) = ~50
+    size_t n_tensors = (size_t)(tok.n_dec_blocks * 40 + tok.n_quantizers * 6 + 80);
     size_t mem_size = n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(4096, false);
     std::vector<uint8_t> mem_buf(mem_size);
     ggml_init_params ip = {mem_size, mem_buf.data(), true};
