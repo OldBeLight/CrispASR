@@ -179,6 +179,14 @@ extern "C" {
 
     pub fn crispasr_session_backend(s: *mut CrispasrSession) -> *const c_char;
 
+    // CTC vocabulary access (Omni CTC backend). `n_vocab` is the number of
+    // SentencePiece pieces (0 for backends without an exposed CTC vocab);
+    // `token_text` maps an id in `[0, n_vocab)` to its raw piece (U+2581 marker
+    // intact), or "" when out of range / unsupported. Pairs with the result
+    // logits accessor to detokenize a greedy CTC decode.
+    pub fn crispasr_session_n_vocab(s: *mut CrispasrSession) -> c_int;
+    pub fn crispasr_session_token_text(s: *mut CrispasrSession, id: c_int) -> *const c_char;
+
     /// Write a comma-separated list of backend names the loaded dylib
     /// was built with. Returns the number of bytes written (not counting
     /// NUL) or a negative error.

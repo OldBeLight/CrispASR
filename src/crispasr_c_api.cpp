@@ -3120,6 +3120,29 @@ CA_EXPORT const char* crispasr_session_backend(crispasr_session* s) {
     return s ? s->backend.c_str() : "";
 }
 
+// CTC vocabulary access (Omni CTC backend). Surfaces the SentencePiece pieces
+// already loaded from the GGUF so callers can detokenize a greedy CTC decode
+// over crispasr_session_result_logits. Returns 0 / "" for other backends.
+CA_EXPORT int crispasr_session_n_vocab(crispasr_session* s) {
+    if (!s)
+        return 0;
+#ifdef CA_HAVE_OMNIASR
+    if ((s->backend.rfind("omniasr", 0) == 0) && s->omniasr_ctx)
+        return omniasr_n_vocab((omniasr_context*)s->omniasr_ctx);
+#endif
+    return 0;
+}
+
+CA_EXPORT const char* crispasr_session_token_text(crispasr_session* s, int id) {
+    if (!s || id < 0)
+        return "";
+#ifdef CA_HAVE_OMNIASR
+    if ((s->backend.rfind("omniasr", 0) == 0) && s->omniasr_ctx)
+        return omniasr_token_text((omniasr_context*)s->omniasr_ctx, id);
+#endif
+    return "";
+}
+
 /// Comma-separated list of backend names compiled into this libwhisper.
 /// e.g. "whisper,parakeet". Slim builds expose fewer. Used by language
 /// bindings to show the user which formats are runtime-ready.

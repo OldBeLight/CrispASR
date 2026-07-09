@@ -195,6 +195,14 @@ CRISPASR_SESSION_API crispasr_session* crispasr_session_open_with_params(const c
                                                                          const crispasr_open_params_v1* params);
 CRISPASR_SESSION_API const char* crispasr_session_backend(crispasr_session* s);
 CRISPASR_SESSION_API int crispasr_session_available_backends(char* out_csv, int out_cap);
+// CTC vocabulary access (Omni CTC backend). crispasr_session_n_vocab returns
+// the number of SentencePiece pieces in the loaded model (0 for backends that
+// don't expose a CTC vocab); crispasr_session_token_text maps a token id in
+// [0, n_vocab) to its raw piece (U+2581 word-boundary marker intact), or ""
+// when out of range or unsupported. Pairs with crispasr_session_result_logits
+// to detokenize a greedy CTC decode.
+CRISPASR_SESSION_API int crispasr_session_n_vocab(crispasr_session* s);
+CRISPASR_SESSION_API const char* crispasr_session_token_text(crispasr_session* s, int id);
 CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe_lang(crispasr_session* s, const float* pcm,
                                                                                int n_samples, const char* language);
 CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe(crispasr_session* s, const float* pcm,

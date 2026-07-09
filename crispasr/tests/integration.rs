@@ -307,6 +307,70 @@ fn session_omni_ctc_logits() {
 }
 
 #[test]
+fn session_omni_ctc_vocab() {
+    let model_path = match omni_ctc_model() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: omni CTC model not found (set OMNI_CTC_MODEL)");
+            return;
+        }
+    };
+    let sess = crispasr::Session::open_with_backend(&model_path, "omniasr", 4)
+        .expect("session open omniasr");
+
+    // Accessor contract: a non-empty vocab of raw SentencePiece pieces.
+    let vocab = sess.ctc_vocab().expect("CTC backend should expose a vocab");
+    assert!(vocab.len() > 1000, "unexpectedly small vocab: {}", vocab.len());
+    // Real pieces carry a word-boundary marker. The v2 Omni CTC vocab is built
+    // verbatim from vocab.json and uses a literal ASCII space; v1 (SentencePiece)
+    // uses U+2581 (▁). Accept either so the accessor test isn't tied to one
+    // tokenizer flavour.
+    assert!(
+        vocab
+            .iter()
+            .any(|p| p.contains('\u{2581}') || p == " "),
+        "no word-boundary token (U+2581 piece or literal space) — not a real vocab"
+    );
+
+    // End-to-end: a greedy CTC decode over the exposed logits, detokenized via
+    // the exposed vocab, must reproduce the backend's built-in transcript. This
+    // proves the vocab indexing aligns with the logits argmax (same id space).
+    let pcm: Vec<f32> = jfk_pcm().into_iter().take(16_000 * 4).collect();
+    let (segs, logits) = sess
+        .transcribe_with_logits(&pcm)
+        .expect("transcribe_with_logits");
+    let text = segs
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(!text.trim().is_empty(), "expected a transcript");
+    let lg = logits.expect("CTC backend should return Some(CtcLogits)");
+    assert_eq!(lg.n_vocab, vocab.len(), "logit vocab dim != vocab len");
+
+    // Greedy CTC: argmax per frame, collapse repeats, drop blank (id 0);
+    // detokenize SentencePiece pieces with U+2581 → space, then trim.
+    let v = lg.n_vocab;
+    let mut prev: i32 = -1;
+    let mut decoded = String::new();
+    for t in 0..lg.n_frames {
+        let frame = &lg.data[t * v..(t + 1) * v];
+        let best = (0..v)
+            .max_by(|&a, &b| frame[a].partial_cmp(&frame[b]).unwrap())
+            .unwrap() as i32;
+        if best != 0 && best != prev {
+            decoded.push_str(&vocab[best as usize].replace('\u{2581}', " "));
+        }
+        prev = best;
+    }
+    let decoded = decoded.trim();
+    assert_eq!(
+        decoded, text,
+        "vocab-detokenized greedy decode != built-in transcript"
+    );
+}
+
+#[test]
 fn session_canary_ctc_logits() {
     let model_path = match canary_ctc_model() {
         Some(p) => p,

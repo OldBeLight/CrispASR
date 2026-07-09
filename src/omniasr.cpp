@@ -1765,6 +1765,10 @@ extern "C" const char* omniasr_token_text(struct omniasr_context* ctx, int id) {
     return ctx->model.vocab[id].c_str();
 }
 
+extern "C" int omniasr_n_vocab(struct omniasr_context* ctx) {
+    return ctx ? (int)ctx->model.vocab.size() : 0;
+}
+
 extern "C" void omniasr_set_seed(struct omniasr_context* ctx, uint64_t seed) {
     if (ctx)
         ctx->seed_override = seed;

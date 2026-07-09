@@ -355,6 +355,29 @@ impl Session {
         }
     }
 
+    /// The Omni CTC vocabulary as raw SentencePiece pieces, indexed by token
+    /// id (`vocab[id]`). Pieces keep the U+2581 (`▁`) word-boundary marker
+    /// intact, so a consumer can group a greedy CTC decode over
+    /// [`CtcLogits`] into words at `▁` boundaries and map `▁` → space.
+    /// Returns `None` for backends that don't expose a CTC vocab.
+    pub fn ctc_vocab(&self) -> Option<Vec<String>> {
+        let n = unsafe { crispasr_sys::crispasr_session_n_vocab(self.handle) };
+        if n <= 0 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(n as usize);
+        for id in 0..n {
+            let p = unsafe { crispasr_sys::crispasr_session_token_text(self.handle, id) };
+            let piece = if p.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+            };
+            out.push(piece);
+        }
+        Some(out)
+    }
+
     /// Transcribe 16 kHz mono `f32` PCM. The internal dispatcher routes
     /// to whichever backend this session was opened with.
     pub fn transcribe(&self, pcm: &[f32]) -> Result<Vec<SessionSegment>, String> {
